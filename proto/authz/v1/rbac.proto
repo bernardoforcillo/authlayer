@@ -1,0 +1,160 @@
+syntax = "proto3";
+
+package authz.v1;
+
+option go_package = "authz-go/pkg/proto/authz/v1;authzv1";
+
+import "authz/v1/common.proto";
+
+service RBACService {
+  rpc CreateRole(CreateRoleRequest) returns (CreateRoleResponse);
+  rpc GetRole(GetRoleRequest) returns (GetRoleResponse);
+  rpc UpdateRole(UpdateRoleRequest) returns (UpdateRoleResponse);
+  rpc DeleteRole(DeleteRoleRequest) returns (DeleteRoleResponse);
+  rpc ListRoles(ListRolesRequest) returns (ListRolesResponse);
+  rpc AssignRole(AssignRoleRequest) returns (AssignRoleResponse);
+  rpc RevokeRole(RevokeRoleRequest) returns (RevokeRoleResponse);
+  rpc CreatePermission(CreatePermissionRequest) returns (CreatePermissionResponse);
+  rpc ListPermissions(ListPermissionsRequest) returns (ListPermissionsResponse);
+  rpc AssignPermission(AssignPermissionRequest) returns (AssignPermissionResponse);
+  rpc RevokePermission(RevokePermissionRequest) returns (RevokePermissionResponse);
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+  rpc GetUserPermissions(GetUserPermissionsRequest) returns (GetUserPermissionsResponse);
+}
+
+message RoleInfo {
+  string id = 1;
+  string name = 2;
+  optional string description = 3;
+  optional string org_id = 4;
+  optional string parent_role_id = 5;
+  repeated PermissionInfo permissions = 6;
+}
+
+message PermissionInfo {
+  string id = 1;
+  string name = 2;
+  optional string description = 3;
+}
+
+message CreateRoleRequest {
+  string name = 1;
+  optional string description = 2;
+  optional string org_id = 3;
+  optional string parent_role_id = 4;
+}
+
+message CreateRoleResponse {
+  RoleInfo role = 1;
+}
+
+message GetRoleRequest {
+  string role_id = 1;
+}
+
+message GetRoleResponse {
+  RoleInfo role = 1;
+  repeated PermissionInfo inherited_permissions = 2;
+}
+
+message UpdateRoleRequest {
+  string role_id = 1;
+  optional string name = 2;
+  optional string description = 3;
+  optional string parent_role_id = 4;
+}
+
+message UpdateRoleResponse {
+  RoleInfo role = 1;
+}
+
+message DeleteRoleRequest {
+  string role_id = 1;
+}
+
+message DeleteRoleResponse {}
+
+message ListRolesRequest {
+  optional string org_id = 1;
+  PaginationRequest pagination = 2;
+}
+
+message ListRolesResponse {
+  repeated RoleInfo roles = 1;
+  PaginationResponse pagination = 2;
+}
+
+message AssignRoleRequest {
+  string user_id = 1;
+  string role_id = 2;
+  oneof scope {
+    string org_id = 3;
+    string team_id = 4;
+  }
+}
+
+message AssignRoleResponse {}
+
+message RevokeRoleRequest {
+  string user_id = 1;
+  string role_id = 2;
+  oneof scope {
+    string org_id = 3;
+    string team_id = 4;
+  }
+}
+
+message RevokeRoleResponse {}
+
+message CreatePermissionRequest {
+  string name = 1;
+  optional string description = 2;
+}
+
+message CreatePermissionResponse {
+  PermissionInfo permission = 1;
+}
+
+message ListPermissionsRequest {
+  PaginationRequest pagination = 1;
+}
+
+message ListPermissionsResponse {
+  repeated PermissionInfo permissions = 1;
+  PaginationResponse pagination = 2;
+}
+
+message AssignPermissionRequest {
+  string role_id = 1;
+  string permission_id = 2;
+}
+
+message AssignPermissionResponse {}
+
+message RevokePermissionRequest {
+  string role_id = 1;
+  string permission_id = 2;
+}
+
+message RevokePermissionResponse {}
+
+message CheckPermissionRequest {
+  string user_id = 1;
+  string permission_name = 2;
+  optional string org_id = 3;
+  optional string team_id = 4;
+}
+
+message CheckPermissionResponse {
+  bool allowed = 1;
+  string matched_role = 2;
+}
+
+message GetUserPermissionsRequest {
+  string user_id = 1;
+  optional string org_id = 2;
+}
+
+message GetUserPermissionsResponse {
+  repeated PermissionInfo permissions = 1;
+}

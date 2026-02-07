@@ -1,0 +1,39 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+authz-server
+
+# Test binary
+*.test
+
+# Output
+*.out
+bin/
+dist/
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated proto (optional: track or not)
+# pkg/proto/
+
+# Temporary
+tmp/

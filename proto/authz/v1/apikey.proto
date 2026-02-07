@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package authz.v1;
+
+option go_package = "authz-go/pkg/proto/authz/v1;authzv1";
+
+import "authz/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+service APIKeyService {
+  rpc CreateAPIKey(CreateAPIKeyRequest) returns (CreateAPIKeyResponse);
+  rpc RevokeAPIKey(RevokeAPIKeyRequest) returns (RevokeAPIKeyResponse);
+  rpc ListAPIKeys(ListAPIKeysRequest) returns (ListAPIKeysResponse);
+  rpc ValidateAPIKey(ValidateAPIKeyRequest) returns (ValidateAPIKeyResponse);
+}
+
+message APIKeyInfo {
+  string id = 1;
+  string name = 2;
+  string key_prefix = 3;
+  repeated string scopes = 4;
+  optional google.protobuf.Timestamp expires_at = 5;
+  optional google.protobuf.Timestamp last_used_at = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+message CreateAPIKeyRequest {
+  string name = 1;
+  repeated string scopes = 2;
+  optional google.protobuf.Timestamp expires_at = 3;
+}
+
+message CreateAPIKeyResponse {
+  APIKeyInfo api_key = 1;
+  string plain_text_key = 2;
+}
+
+message RevokeAPIKeyRequest {
+  string api_key_id = 1;
+}
+
+message RevokeAPIKeyResponse {}
+
+message ListAPIKeysRequest {
+  PaginationRequest pagination = 1;
+}
+
+message ListAPIKeysResponse {
+  repeated APIKeyInfo api_keys = 1;
+  PaginationResponse pagination = 2;
+}
+
+message ValidateAPIKeyRequest {
+  string key = 1;
+}
+
+message ValidateAPIKeyResponse {
+  bool valid = 1;
+  optional string user_id = 2;
+  repeated string scopes = 3;
+}

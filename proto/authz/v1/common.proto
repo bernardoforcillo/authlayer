@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package authz.v1;
+
+option go_package = "authz-go/pkg/proto/authz/v1;authzv1";
+
+import "google/protobuf/timestamp.proto";
+
+message PaginationRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message PaginationResponse {
+  string next_page_token = 1;
+  int32 total_count = 2;
+}
+
+enum UserStatus {
+  USER_STATUS_UNSPECIFIED = 0;
+  USER_STATUS_ACTIVE = 1;
+  USER_STATUS_INACTIVE = 2;
+  USER_STATUS_BANNED = 3;
+}
+
+message UserInfo {
+  string id = 1;
+  string email = 2;
+  string name = 3;
+  optional string avatar = 4;
+  bool email_verified = 5;
+  UserStatus status = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message MemberInfo {
+  string user_id = 1;
+  string name = 2;
+  string email = 3;
+  string role_id = 4;
+  string role_name = 5;
+  google.protobuf.Timestamp joined_at = 6;
+}
