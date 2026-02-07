@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 
-	"authz-go/internal/middleware"
-	"authz-go/internal/model"
-	"authz-go/internal/repository"
-	authzv1 "authz-go/pkg/proto/authz/v1"
+	"github.com/bernardoforcillo/authlayer/internal/middleware"
+	"github.com/bernardoforcillo/authlayer/internal/model"
+	"github.com/bernardoforcillo/authlayer/internal/repository"
+	authlayerv1 "github.com/bernardoforcillo/authlayer/pkg/proto/authlayer/v1"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -18,7 +18,7 @@ import (
 )
 
 type TeamService struct {
-	authzv1.UnimplementedTeamServiceServer
+	authlayerv1.UnimplementedTeamServiceServer
 
 	teamRepo       repository.TeamRepository
 	teamMemberRepo repository.TeamMemberRepository
@@ -37,7 +37,7 @@ func NewTeamService(
 	}
 }
 
-func (s *TeamService) CreateTeam(ctx context.Context, req *authzv1.CreateTeamRequest) (*authzv1.CreateTeamResponse, error) {
+func (s *TeamService) CreateTeam(ctx context.Context, req *authlayerv1.CreateTeamRequest) (*authlayerv1.CreateTeamResponse, error) {
 	if req.OrgId == "" || req.Name == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "org_id and name are required")
 	}
@@ -56,12 +56,12 @@ func (s *TeamService) CreateTeam(ctx context.Context, req *authzv1.CreateTeamReq
 		return nil, status.Errorf(codes.Internal, "failed to create team: %v", err)
 	}
 
-	return &authzv1.CreateTeamResponse{
+	return &authlayerv1.CreateTeamResponse{
 		Team: teamToProto(team),
 	}, nil
 }
 
-func (s *TeamService) GetTeam(ctx context.Context, req *authzv1.GetTeamRequest) (*authzv1.GetTeamResponse, error) {
+func (s *TeamService) GetTeam(ctx context.Context, req *authlayerv1.GetTeamRequest) (*authlayerv1.GetTeamResponse, error) {
 	id, err := uuid.Parse(req.TeamId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid team_id")
@@ -75,10 +75,10 @@ func (s *TeamService) GetTeam(ctx context.Context, req *authzv1.GetTeamRequest) 
 		return nil, status.Errorf(codes.Internal, "failed to get team")
 	}
 
-	return &authzv1.GetTeamResponse{Team: teamToProto(team)}, nil
+	return &authlayerv1.GetTeamResponse{Team: teamToProto(team)}, nil
 }
 
-func (s *TeamService) UpdateTeam(ctx context.Context, req *authzv1.UpdateTeamRequest) (*authzv1.UpdateTeamResponse, error) {
+func (s *TeamService) UpdateTeam(ctx context.Context, req *authlayerv1.UpdateTeamRequest) (*authlayerv1.UpdateTeamResponse, error) {
 	id, err := uuid.Parse(req.TeamId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid team_id")
@@ -97,10 +97,10 @@ func (s *TeamService) UpdateTeam(ctx context.Context, req *authzv1.UpdateTeamReq
 		return nil, status.Errorf(codes.Internal, "failed to update team")
 	}
 
-	return &authzv1.UpdateTeamResponse{Team: teamToProto(team)}, nil
+	return &authlayerv1.UpdateTeamResponse{Team: teamToProto(team)}, nil
 }
 
-func (s *TeamService) DeleteTeam(ctx context.Context, req *authzv1.DeleteTeamRequest) (*authzv1.DeleteTeamResponse, error) {
+func (s *TeamService) DeleteTeam(ctx context.Context, req *authlayerv1.DeleteTeamRequest) (*authlayerv1.DeleteTeamResponse, error) {
 	id, err := uuid.Parse(req.TeamId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid team_id")
@@ -110,10 +110,10 @@ func (s *TeamService) DeleteTeam(ctx context.Context, req *authzv1.DeleteTeamReq
 		return nil, status.Errorf(codes.Internal, "failed to delete team")
 	}
 
-	return &authzv1.DeleteTeamResponse{}, nil
+	return &authlayerv1.DeleteTeamResponse{}, nil
 }
 
-func (s *TeamService) ListTeams(ctx context.Context, req *authzv1.ListTeamsRequest) (*authzv1.ListTeamsResponse, error) {
+func (s *TeamService) ListTeams(ctx context.Context, req *authlayerv1.ListTeamsRequest) (*authlayerv1.ListTeamsResponse, error) {
 	orgID, err := uuid.Parse(req.OrgId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid org_id")
@@ -130,20 +130,20 @@ func (s *TeamService) ListTeams(ctx context.Context, req *authzv1.ListTeamsReque
 		return nil, status.Errorf(codes.Internal, "failed to list teams")
 	}
 
-	protoTeams := make([]*authzv1.TeamInfo, len(teams))
+	protoTeams := make([]*authlayerv1.TeamInfo, len(teams))
 	for i, t := range teams {
 		protoTeams[i] = teamToProto(&t)
 	}
 
-	return &authzv1.ListTeamsResponse{
+	return &authlayerv1.ListTeamsResponse{
 		Teams: protoTeams,
-		Pagination: &authzv1.PaginationResponse{
+		Pagination: &authlayerv1.PaginationResponse{
 			TotalCount: int32(total),
 		},
 	}, nil
 }
 
-func (s *TeamService) AddMember(ctx context.Context, req *authzv1.AddTeamMemberRequest) (*authzv1.AddTeamMemberResponse, error) {
+func (s *TeamService) AddMember(ctx context.Context, req *authlayerv1.AddTeamMemberRequest) (*authlayerv1.AddTeamMemberResponse, error) {
 	teamID, err := uuid.Parse(req.TeamId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid team_id")
@@ -167,10 +167,10 @@ func (s *TeamService) AddMember(ctx context.Context, req *authzv1.AddTeamMemberR
 		return nil, status.Errorf(codes.Internal, "failed to add team member")
 	}
 
-	return &authzv1.AddTeamMemberResponse{}, nil
+	return &authlayerv1.AddTeamMemberResponse{}, nil
 }
 
-func (s *TeamService) RemoveMember(ctx context.Context, req *authzv1.RemoveTeamMemberRequest) (*authzv1.RemoveTeamMemberResponse, error) {
+func (s *TeamService) RemoveMember(ctx context.Context, req *authlayerv1.RemoveTeamMemberRequest) (*authlayerv1.RemoveTeamMemberResponse, error) {
 	teamID, err := uuid.Parse(req.TeamId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid team_id")
@@ -184,10 +184,10 @@ func (s *TeamService) RemoveMember(ctx context.Context, req *authzv1.RemoveTeamM
 		return nil, status.Errorf(codes.Internal, "failed to remove team member")
 	}
 
-	return &authzv1.RemoveTeamMemberResponse{}, nil
+	return &authlayerv1.RemoveTeamMemberResponse{}, nil
 }
 
-func (s *TeamService) ListMembers(ctx context.Context, req *authzv1.ListTeamMembersRequest) (*authzv1.ListTeamMembersResponse, error) {
+func (s *TeamService) ListMembers(ctx context.Context, req *authlayerv1.ListTeamMembersRequest) (*authlayerv1.ListTeamMembersResponse, error) {
 	teamID, err := uuid.Parse(req.TeamId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid team_id")
@@ -204,9 +204,9 @@ func (s *TeamService) ListMembers(ctx context.Context, req *authzv1.ListTeamMemb
 		return nil, status.Errorf(codes.Internal, "failed to list members")
 	}
 
-	protoMembers := make([]*authzv1.MemberInfo, len(members))
+	protoMembers := make([]*authlayerv1.MemberInfo, len(members))
 	for i, m := range members {
-		protoMembers[i] = &authzv1.MemberInfo{
+		protoMembers[i] = &authlayerv1.MemberInfo{
 			UserId:   m.UserID.String(),
 			Name:     m.User.Name,
 			Email:    m.User.Email,
@@ -216,16 +216,16 @@ func (s *TeamService) ListMembers(ctx context.Context, req *authzv1.ListTeamMemb
 		}
 	}
 
-	return &authzv1.ListTeamMembersResponse{
+	return &authlayerv1.ListTeamMembersResponse{
 		Members: protoMembers,
-		Pagination: &authzv1.PaginationResponse{
+		Pagination: &authlayerv1.PaginationResponse{
 			TotalCount: int32(total),
 		},
 	}, nil
 }
 
-func teamToProto(t *model.Team) *authzv1.TeamInfo {
-	return &authzv1.TeamInfo{
+func teamToProto(t *model.Team) *authlayerv1.TeamInfo {
+	return &authlayerv1.TeamInfo{
 		Id:    t.ID.String(),
 		Name:  t.Name,
 		OrgId: t.OrgID.String(),

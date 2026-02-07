@@ -2,20 +2,20 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: authz
-      POSTGRES_PASSWORD: authz
-      POSTGRES_DB: authz
+      POSTGRES_USER: authlayer
+      POSTGRES_PASSWORD: authlayer
+      POSTGRES_DB: authlayer
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U authz"]
+      test: [ "CMD-SHELL", "pg_isready -U authlayer" ]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  authz-server:
+  authlayer-server:
     build: .
     ports:
       - "50051:50051"

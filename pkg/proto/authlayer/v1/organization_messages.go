@@ -1,4 +1,4 @@
-package authzv1
+package authlayerv1
 
 type CreateOrganizationRequest struct {
 	Name string `json:"name,omitempty"`

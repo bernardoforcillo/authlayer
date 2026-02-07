@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"net"
 
-	"authz-go/internal/config"
-	"authz-go/internal/middleware"
-	"authz-go/internal/service"
-	authzv1 "authz-go/pkg/proto/authz/v1"
+	"github.com/bernardoforcillo/authlayer/internal/config"
+	"github.com/bernardoforcillo/authlayer/internal/middleware"
+	"github.com/bernardoforcillo/authlayer/internal/service"
+	authlayerv1 "github.com/bernardoforcillo/authlayer/pkg/proto/authlayer/v1"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -52,13 +52,13 @@ func New(
 	)
 
 	// Register services
-	authzv1.RegisterAuthServiceServer(grpcServer, authSvc)
-	authzv1.RegisterUserServiceServer(grpcServer, userSvc)
-	authzv1.RegisterOrganizationServiceServer(grpcServer, orgSvc)
-	authzv1.RegisterTeamServiceServer(grpcServer, teamSvc)
-	authzv1.RegisterRBACServiceServer(grpcServer, rbacSvc)
-	authzv1.RegisterAPIKeyServiceServer(grpcServer, apiKeySvc)
-	authzv1.RegisterServiceAccountServiceServer(grpcServer, serviceAccountSvc)
+	authlayerv1.RegisterAuthServiceServer(grpcServer, authSvc)
+	authlayerv1.RegisterUserServiceServer(grpcServer, userSvc)
+	authlayerv1.RegisterOrganizationServiceServer(grpcServer, orgSvc)
+	authlayerv1.RegisterTeamServiceServer(grpcServer, teamSvc)
+	authlayerv1.RegisterRBACServiceServer(grpcServer, rbacSvc)
+	authlayerv1.RegisterAPIKeyServiceServer(grpcServer, apiKeySvc)
+	authlayerv1.RegisterServiceAccountServiceServer(grpcServer, serviceAccountSvc)
 
 	// Register reflection for grpcurl/debugging
 	reflection.Register(grpcServer)

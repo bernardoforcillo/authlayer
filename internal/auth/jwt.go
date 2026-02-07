@@ -4,7 +4,7 @@ import (
 	"errors"
 	"time"
 
-	"authz-go/internal/config"
+	"github.com/bernardoforcillo/authlayer/internal/config"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"

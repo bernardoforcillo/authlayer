@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 
-	"authz-go/internal/model"
-	"authz-go/internal/rbac"
-	"authz-go/internal/repository"
-	authzv1 "authz-go/pkg/proto/authz/v1"
+	"github.com/bernardoforcillo/authlayer/internal/model"
+	"github.com/bernardoforcillo/authlayer/internal/rbac"
+	"github.com/bernardoforcillo/authlayer/internal/repository"
+	authlayerv1 "github.com/bernardoforcillo/authlayer/pkg/proto/authlayer/v1"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -17,7 +17,7 @@ import (
 )
 
 type RBACService struct {
-	authzv1.UnimplementedRBACServiceServer
+	authlayerv1.UnimplementedRBACServiceServer
 
 	roleRepo     repository.RoleRepository
 	permRepo     repository.PermissionRepository
@@ -48,7 +48,7 @@ func NewRBACService(
 	}
 }
 
-func (s *RBACService) CreateRole(ctx context.Context, req *authzv1.CreateRoleRequest) (*authzv1.CreateRoleResponse, error) {
+func (s *RBACService) CreateRole(ctx context.Context, req *authlayerv1.CreateRoleRequest) (*authlayerv1.CreateRoleResponse, error) {
 	if req.Name == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "name is required")
 	}
@@ -78,12 +78,12 @@ func (s *RBACService) CreateRole(ctx context.Context, req *authzv1.CreateRoleReq
 		return nil, status.Errorf(codes.Internal, "failed to create role: %v", err)
 	}
 
-	return &authzv1.CreateRoleResponse{
+	return &authlayerv1.CreateRoleResponse{
 		Role: roleToProto(role),
 	}, nil
 }
 
-func (s *RBACService) GetRole(ctx context.Context, req *authzv1.GetRoleRequest) (*authzv1.GetRoleResponse, error) {
+func (s *RBACService) GetRole(ctx context.Context, req *authlayerv1.GetRoleRequest) (*authlayerv1.GetRoleResponse, error) {
 	id, err := uuid.Parse(req.RoleId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid role_id")
@@ -113,18 +113,18 @@ func (s *RBACService) GetRole(ctx context.Context, req *authzv1.GetRoleRequest) 
 		return nil, status.Errorf(codes.Internal, "failed to get permissions")
 	}
 
-	inherited := make([]*authzv1.PermissionInfo, len(inheritedPerms))
+	inherited := make([]*authlayerv1.PermissionInfo, len(inheritedPerms))
 	for i, p := range inheritedPerms {
 		inherited[i] = permToProto(&p)
 	}
 
-	return &authzv1.GetRoleResponse{
+	return &authlayerv1.GetRoleResponse{
 		Role:                 roleToProto(role),
 		InheritedPermissions: inherited,
 	}, nil
 }
 
-func (s *RBACService) UpdateRole(ctx context.Context, req *authzv1.UpdateRoleRequest) (*authzv1.UpdateRoleResponse, error) {
+func (s *RBACService) UpdateRole(ctx context.Context, req *authlayerv1.UpdateRoleRequest) (*authlayerv1.UpdateRoleResponse, error) {
 	id, err := uuid.Parse(req.RoleId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid role_id")
@@ -153,10 +153,10 @@ func (s *RBACService) UpdateRole(ctx context.Context, req *authzv1.UpdateRoleReq
 		return nil, status.Errorf(codes.Internal, "failed to update role")
 	}
 
-	return &authzv1.UpdateRoleResponse{Role: roleToProto(role)}, nil
+	return &authlayerv1.UpdateRoleResponse{Role: roleToProto(role)}, nil
 }
 
-func (s *RBACService) DeleteRole(ctx context.Context, req *authzv1.DeleteRoleRequest) (*authzv1.DeleteRoleResponse, error) {
+func (s *RBACService) DeleteRole(ctx context.Context, req *authlayerv1.DeleteRoleRequest) (*authlayerv1.DeleteRoleResponse, error) {
 	id, err := uuid.Parse(req.RoleId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid role_id")
@@ -166,10 +166,10 @@ func (s *RBACService) DeleteRole(ctx context.Context, req *authzv1.DeleteRoleReq
 		return nil, status.Errorf(codes.Internal, "failed to delete role")
 	}
 
-	return &authzv1.DeleteRoleResponse{}, nil
+	return &authlayerv1.DeleteRoleResponse{}, nil
 }
 
-func (s *RBACService) ListRoles(ctx context.Context, req *authzv1.ListRolesRequest) (*authzv1.ListRolesResponse, error) {
+func (s *RBACService) ListRoles(ctx context.Context, req *authlayerv1.ListRolesRequest) (*authlayerv1.ListRolesResponse, error) {
 	var orgID *uuid.UUID
 	if req.OrgId != nil {
 		id, err := uuid.Parse(*req.OrgId)
@@ -190,20 +190,20 @@ func (s *RBACService) ListRoles(ctx context.Context, req *authzv1.ListRolesReque
 		return nil, status.Errorf(codes.Internal, "failed to list roles")
 	}
 
-	protoRoles := make([]*authzv1.RoleInfo, len(roles))
+	protoRoles := make([]*authlayerv1.RoleInfo, len(roles))
 	for i, r := range roles {
 		protoRoles[i] = roleToProto(&r)
 	}
 
-	return &authzv1.ListRolesResponse{
+	return &authlayerv1.ListRolesResponse{
 		Roles: protoRoles,
-		Pagination: &authzv1.PaginationResponse{
+		Pagination: &authlayerv1.PaginationResponse{
 			TotalCount: int32(total),
 		},
 	}, nil
 }
 
-func (s *RBACService) AssignRole(ctx context.Context, req *authzv1.AssignRoleRequest) (*authzv1.AssignRoleResponse, error) {
+func (s *RBACService) AssignRole(ctx context.Context, req *authlayerv1.AssignRoleRequest) (*authlayerv1.AssignRoleResponse, error) {
 	userID, err := uuid.Parse(req.UserId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid user_id")
@@ -228,10 +228,10 @@ func (s *RBACService) AssignRole(ctx context.Context, req *authzv1.AssignRoleReq
 
 	s.checker.InvalidateUserCache(userID)
 
-	return &authzv1.AssignRoleResponse{}, nil
+	return &authlayerv1.AssignRoleResponse{}, nil
 }
 
-func (s *RBACService) RevokeRole(ctx context.Context, req *authzv1.RevokeRoleRequest) (*authzv1.RevokeRoleResponse, error) {
+func (s *RBACService) RevokeRole(ctx context.Context, req *authlayerv1.RevokeRoleRequest) (*authlayerv1.RevokeRoleResponse, error) {
 	userID, err := uuid.Parse(req.UserId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid user_id")
@@ -249,10 +249,10 @@ func (s *RBACService) RevokeRole(ctx context.Context, req *authzv1.RevokeRoleReq
 
 	s.checker.InvalidateUserCache(userID)
 
-	return &authzv1.RevokeRoleResponse{}, nil
+	return &authlayerv1.RevokeRoleResponse{}, nil
 }
 
-func (s *RBACService) CreatePermission(ctx context.Context, req *authzv1.CreatePermissionRequest) (*authzv1.CreatePermissionResponse, error) {
+func (s *RBACService) CreatePermission(ctx context.Context, req *authlayerv1.CreatePermissionRequest) (*authlayerv1.CreatePermissionResponse, error) {
 	if req.Name == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "name is required")
 	}
@@ -266,12 +266,12 @@ func (s *RBACService) CreatePermission(ctx context.Context, req *authzv1.CreateP
 		return nil, status.Errorf(codes.Internal, "failed to create permission: %v", err)
 	}
 
-	return &authzv1.CreatePermissionResponse{
+	return &authlayerv1.CreatePermissionResponse{
 		Permission: permToProto(perm),
 	}, nil
 }
 
-func (s *RBACService) ListPermissions(ctx context.Context, req *authzv1.ListPermissionsRequest) (*authzv1.ListPermissionsResponse, error) {
+func (s *RBACService) ListPermissions(ctx context.Context, req *authlayerv1.ListPermissionsRequest) (*authlayerv1.ListPermissionsResponse, error) {
 	pagination := repository.Pagination{PageSize: 50}
 	if req.Pagination != nil {
 		pagination.PageSize = int(req.Pagination.PageSize)
@@ -283,20 +283,20 @@ func (s *RBACService) ListPermissions(ctx context.Context, req *authzv1.ListPerm
 		return nil, status.Errorf(codes.Internal, "failed to list permissions")
 	}
 
-	protoPerms := make([]*authzv1.PermissionInfo, len(perms))
+	protoPerms := make([]*authlayerv1.PermissionInfo, len(perms))
 	for i, p := range perms {
 		protoPerms[i] = permToProto(&p)
 	}
 
-	return &authzv1.ListPermissionsResponse{
+	return &authlayerv1.ListPermissionsResponse{
 		Permissions: protoPerms,
-		Pagination: &authzv1.PaginationResponse{
+		Pagination: &authlayerv1.PaginationResponse{
 			TotalCount: int32(total),
 		},
 	}, nil
 }
 
-func (s *RBACService) AssignPermission(ctx context.Context, req *authzv1.AssignPermissionRequest) (*authzv1.AssignPermissionResponse, error) {
+func (s *RBACService) AssignPermission(ctx context.Context, req *authlayerv1.AssignPermissionRequest) (*authlayerv1.AssignPermissionResponse, error) {
 	roleID, err := uuid.Parse(req.RoleId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid role_id")
@@ -310,10 +310,10 @@ func (s *RBACService) AssignPermission(ctx context.Context, req *authzv1.AssignP
 		return nil, status.Errorf(codes.Internal, "failed to assign permission")
 	}
 
-	return &authzv1.AssignPermissionResponse{}, nil
+	return &authlayerv1.AssignPermissionResponse{}, nil
 }
 
-func (s *RBACService) RevokePermission(ctx context.Context, req *authzv1.RevokePermissionRequest) (*authzv1.RevokePermissionResponse, error) {
+func (s *RBACService) RevokePermission(ctx context.Context, req *authlayerv1.RevokePermissionRequest) (*authlayerv1.RevokePermissionResponse, error) {
 	roleID, err := uuid.Parse(req.RoleId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid role_id")
@@ -327,10 +327,10 @@ func (s *RBACService) RevokePermission(ctx context.Context, req *authzv1.RevokeP
 		return nil, status.Errorf(codes.Internal, "failed to revoke permission")
 	}
 
-	return &authzv1.RevokePermissionResponse{}, nil
+	return &authlayerv1.RevokePermissionResponse{}, nil
 }
 
-func (s *RBACService) CheckPermission(ctx context.Context, req *authzv1.CheckPermissionRequest) (*authzv1.CheckPermissionResponse, error) {
+func (s *RBACService) CheckPermission(ctx context.Context, req *authlayerv1.CheckPermissionRequest) (*authlayerv1.CheckPermissionResponse, error) {
 	userID, err := uuid.Parse(req.UserId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid user_id")
@@ -350,13 +350,13 @@ func (s *RBACService) CheckPermission(ctx context.Context, req *authzv1.CheckPer
 		return nil, status.Errorf(codes.Internal, "failed to check permission")
 	}
 
-	return &authzv1.CheckPermissionResponse{
+	return &authlayerv1.CheckPermissionResponse{
 		Allowed:     allowed,
 		MatchedRole: matchedRole,
 	}, nil
 }
 
-func (s *RBACService) GetUserPermissions(ctx context.Context, req *authzv1.GetUserPermissionsRequest) (*authzv1.GetUserPermissionsResponse, error) {
+func (s *RBACService) GetUserPermissions(ctx context.Context, req *authlayerv1.GetUserPermissionsRequest) (*authlayerv1.GetUserPermissionsResponse, error) {
 	userID, err := uuid.Parse(req.UserId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid user_id")
@@ -377,8 +377,8 @@ func (s *RBACService) GetUserPermissions(ctx context.Context, req *authzv1.GetUs
 	return nil, status.Errorf(codes.Unimplemented, "GetUserPermissions not yet implemented; use CheckPermission for individual checks")
 }
 
-func roleToProto(r *model.Role) *authzv1.RoleInfo {
-	info := &authzv1.RoleInfo{
+func roleToProto(r *model.Role) *authlayerv1.RoleInfo {
+	info := &authlayerv1.RoleInfo{
 		Id:   r.ID.String(),
 		Name: r.Name,
 	}
@@ -394,7 +394,7 @@ func roleToProto(r *model.Role) *authzv1.RoleInfo {
 		info.ParentRoleId = &parentID
 	}
 	if len(r.Permissions) > 0 {
-		info.Permissions = make([]*authzv1.PermissionInfo, len(r.Permissions))
+		info.Permissions = make([]*authlayerv1.PermissionInfo, len(r.Permissions))
 		for i, p := range r.Permissions {
 			info.Permissions[i] = permToProto(&p)
 		}
@@ -402,8 +402,8 @@ func roleToProto(r *model.Role) *authzv1.RoleInfo {
 	return info
 }
 
-func permToProto(p *model.Permission) *authzv1.PermissionInfo {
-	info := &authzv1.PermissionInfo{
+func permToProto(p *model.Permission) *authlayerv1.PermissionInfo {
+	info := &authlayerv1.PermissionInfo{
 		Id:   p.ID.String(),
 		Name: p.Name,
 	}

@@ -1,7 +1,7 @@
 package migrations
 
 import (
-	"authz-go/internal/model"
+	"github.com/bernardoforcillo/authlayer/internal/model"
 
 	"go.uber.org/zap"
 	"gorm.io/gorm"

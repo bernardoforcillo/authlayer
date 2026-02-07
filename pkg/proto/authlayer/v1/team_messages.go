@@ -1,4 +1,4 @@
-package authzv1
+package authlayerv1
 
 type CreateTeamRequest struct {
 	OrgId string `json:"org_id,omitempty"`

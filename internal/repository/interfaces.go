@@ -3,7 +3,7 @@ package repository
 import (
 	"context"
 
-	"authz-go/internal/model"
+	"github.com/bernardoforcillo/authlayer/internal/model"
 
 	"github.com/google/uuid"
 )

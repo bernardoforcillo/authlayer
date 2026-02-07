@@ -12,12 +12,12 @@ func RegisterHealthService(s *grpc.Server) {
 	healthpb.RegisterHealthServer(s, healthServer)
 
 	// Set all services as serving
-	healthServer.SetServingStatus("authz.v1.AuthService", healthpb.HealthCheckResponse_SERVING)
-	healthServer.SetServingStatus("authz.v1.UserService", healthpb.HealthCheckResponse_SERVING)
-	healthServer.SetServingStatus("authz.v1.OrganizationService", healthpb.HealthCheckResponse_SERVING)
-	healthServer.SetServingStatus("authz.v1.TeamService", healthpb.HealthCheckResponse_SERVING)
-	healthServer.SetServingStatus("authz.v1.RBACService", healthpb.HealthCheckResponse_SERVING)
-	healthServer.SetServingStatus("authz.v1.APIKeyService", healthpb.HealthCheckResponse_SERVING)
-	healthServer.SetServingStatus("authz.v1.ServiceAccountService", healthpb.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("authlayer.v1.AuthService", healthpb.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("authlayer.v1.UserService", healthpb.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("authlayer.v1.OrganizationService", healthpb.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("authlayer.v1.TeamService", healthpb.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("authlayer.v1.RBACService", healthpb.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("authlayer.v1.APIKeyService", healthpb.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus("authlayer.v1.ServiceAccountService", healthpb.HealthCheckResponse_SERVING)
 	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 }

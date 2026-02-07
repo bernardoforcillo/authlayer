@@ -1,10 +1,10 @@
 .PHONY: build run test proto clean docker-up docker-down seed lint
 
-BINARY_NAME=authz-server
+BINARY_NAME=authlayer-server
 BUILD_DIR=bin
 
 build:
-	go build -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/authz-server
+	go build -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/authlayer-server
 
 run: build
 	./$(BUILD_DIR)/$(BINARY_NAME)

@@ -3,7 +3,7 @@ package middleware
 import (
 	"context"
 
-	"authz-go/internal/rbac"
+	"github.com/bernardoforcillo/authlayer/internal/rbac"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"

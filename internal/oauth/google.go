@@ -3,7 +3,7 @@ package oauth
 import (
 	"context"
 
-	"authz-go/internal/config"
+	"github.com/bernardoforcillo/authlayer/internal/config"
 )
 
 // NewGoogleProvider creates an OIDC provider pre-configured for Google.

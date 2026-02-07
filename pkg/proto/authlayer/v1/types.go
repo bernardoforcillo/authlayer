@@ -1,7 +1,7 @@
-// Package authzv1 contains the generated protobuf and gRPC types for the authz API.
+// Package authlayerv1 contains the generated protobuf and gRPC types for the authz API.
 // This file provides hand-written stubs that mirror what protoc-gen-go would generate.
 // Replace these with actual generated code by running: buf generate
-package authzv1
+package authlayerv1
 
 import (
 	"google.golang.org/protobuf/types/known/timestamppb"

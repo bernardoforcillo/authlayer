@@ -1,10 +1,10 @@
 syntax = "proto3";
 
-package authz.v1;
+package authlayer.v1;
 
-option go_package = "authz-go/pkg/proto/authz/v1;authzv1";
+option go_package = "github.com/bernardoforcillo/authlayer/pkg/proto/authlayer/v1;authlayerv1";
 
-import "authz/v1/common.proto";
+import "authlayer/v1/common.proto";
 
 service UserService {
   rpc GetUser(GetUserRequest) returns (GetUserResponse);

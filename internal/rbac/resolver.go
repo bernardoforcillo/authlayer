@@ -3,8 +3,8 @@ package rbac
 import (
 	"context"
 
-	"authz-go/internal/model"
-	"authz-go/internal/repository"
+	"github.com/bernardoforcillo/authlayer/internal/model"
+	"github.com/bernardoforcillo/authlayer/internal/repository"
 
 	"github.com/google/uuid"
 )

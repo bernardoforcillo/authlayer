@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"time"
 
-	"authz-go/internal/auth"
-	"authz-go/internal/middleware"
-	"authz-go/internal/model"
-	"authz-go/internal/repository"
-	authzv1 "authz-go/pkg/proto/authz/v1"
+	"github.com/bernardoforcillo/authlayer/internal/auth"
+	"github.com/bernardoforcillo/authlayer/internal/middleware"
+	"github.com/bernardoforcillo/authlayer/internal/model"
+	"github.com/bernardoforcillo/authlayer/internal/repository"
+	authlayerv1 "github.com/bernardoforcillo/authlayer/pkg/proto/authlayer/v1"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -19,7 +19,7 @@ import (
 )
 
 type APIKeyService struct {
-	authzv1.UnimplementedAPIKeyServiceServer
+	authlayerv1.UnimplementedAPIKeyServiceServer
 
 	apiKeyRepo repository.APIKeyRepository
 	logger     *zap.Logger
@@ -32,7 +32,7 @@ func NewAPIKeyService(apiKeyRepo repository.APIKeyRepository, logger *zap.Logger
 	}
 }
 
-func (s *APIKeyService) CreateAPIKey(ctx context.Context, req *authzv1.CreateAPIKeyRequest) (*authzv1.CreateAPIKeyResponse, error) {
+func (s *APIKeyService) CreateAPIKey(ctx context.Context, req *authlayerv1.CreateAPIKeyRequest) (*authlayerv1.CreateAPIKeyResponse, error) {
 	callerID, err := middleware.UserIDFromContext(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "not authenticated")
@@ -67,13 +67,13 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, req *authzv1.CreateAPI
 		return nil, status.Errorf(codes.Internal, "failed to create API key")
 	}
 
-	return &authzv1.CreateAPIKeyResponse{
+	return &authlayerv1.CreateAPIKeyResponse{
 		ApiKey:       apiKeyToProto(apiKey),
 		PlainTextKey: plainKey,
 	}, nil
 }
 
-func (s *APIKeyService) RevokeAPIKey(ctx context.Context, req *authzv1.RevokeAPIKeyRequest) (*authzv1.RevokeAPIKeyResponse, error) {
+func (s *APIKeyService) RevokeAPIKey(ctx context.Context, req *authlayerv1.RevokeAPIKeyRequest) (*authlayerv1.RevokeAPIKeyResponse, error) {
 	id, err := uuid.Parse(req.ApiKeyId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid api_key_id")
@@ -97,10 +97,10 @@ func (s *APIKeyService) RevokeAPIKey(ctx context.Context, req *authzv1.RevokeAPI
 		return nil, status.Errorf(codes.Internal, "failed to revoke API key")
 	}
 
-	return &authzv1.RevokeAPIKeyResponse{}, nil
+	return &authlayerv1.RevokeAPIKeyResponse{}, nil
 }
 
-func (s *APIKeyService) ListAPIKeys(ctx context.Context, req *authzv1.ListAPIKeysRequest) (*authzv1.ListAPIKeysResponse, error) {
+func (s *APIKeyService) ListAPIKeys(ctx context.Context, req *authlayerv1.ListAPIKeysRequest) (*authlayerv1.ListAPIKeysResponse, error) {
 	callerID, err := middleware.UserIDFromContext(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "not authenticated")
@@ -117,20 +117,20 @@ func (s *APIKeyService) ListAPIKeys(ctx context.Context, req *authzv1.ListAPIKey
 		return nil, status.Errorf(codes.Internal, "failed to list API keys")
 	}
 
-	protoKeys := make([]*authzv1.APIKeyInfo, len(keys))
+	protoKeys := make([]*authlayerv1.APIKeyInfo, len(keys))
 	for i, k := range keys {
 		protoKeys[i] = apiKeyToProto(&k)
 	}
 
-	return &authzv1.ListAPIKeysResponse{
+	return &authlayerv1.ListAPIKeysResponse{
 		ApiKeys: protoKeys,
-		Pagination: &authzv1.PaginationResponse{
+		Pagination: &authlayerv1.PaginationResponse{
 			TotalCount: int32(total),
 		},
 	}, nil
 }
 
-func (s *APIKeyService) ValidateAPIKey(ctx context.Context, req *authzv1.ValidateAPIKeyRequest) (*authzv1.ValidateAPIKeyResponse, error) {
+func (s *APIKeyService) ValidateAPIKey(ctx context.Context, req *authlayerv1.ValidateAPIKeyRequest) (*authlayerv1.ValidateAPIKeyResponse, error) {
 	if req.Key == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "key is required")
 	}
@@ -138,11 +138,11 @@ func (s *APIKeyService) ValidateAPIKey(ctx context.Context, req *authzv1.Validat
 	keyHash := auth.HashToken(req.Key)
 	key, err := s.apiKeyRepo.GetByKeyHash(ctx, keyHash)
 	if err != nil {
-		return &authzv1.ValidateAPIKeyResponse{Valid: false}, nil
+		return &authlayerv1.ValidateAPIKeyResponse{Valid: false}, nil
 	}
 
 	if key.ExpiresAt != nil && key.ExpiresAt.Before(time.Now()) {
-		return &authzv1.ValidateAPIKeyResponse{Valid: false}, nil
+		return &authlayerv1.ValidateAPIKeyResponse{Valid: false}, nil
 	}
 
 	var scopes []string
@@ -151,15 +151,15 @@ func (s *APIKeyService) ValidateAPIKey(ctx context.Context, req *authzv1.Validat
 	}
 
 	userID := key.UserID.String()
-	return &authzv1.ValidateAPIKeyResponse{
+	return &authlayerv1.ValidateAPIKeyResponse{
 		Valid:  true,
 		UserId: &userID,
 		Scopes: scopes,
 	}, nil
 }
 
-func apiKeyToProto(k *model.APIKey) *authzv1.APIKeyInfo {
-	info := &authzv1.APIKeyInfo{
+func apiKeyToProto(k *model.APIKey) *authlayerv1.APIKeyInfo {
+	info := &authlayerv1.APIKeyInfo{
 		Id:        k.ID.String(),
 		Name:      k.Name,
 		KeyPrefix: k.KeyPrefix,

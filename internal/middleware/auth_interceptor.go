@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"strings"
 
-	"authz-go/internal/auth"
-	"authz-go/internal/repository"
+	"github.com/bernardoforcillo/authlayer/internal/auth"
+	"github.com/bernardoforcillo/authlayer/internal/repository"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc"

@@ -3,7 +3,7 @@ package oauth
 import (
 	"context"
 
-	"authz-go/internal/config"
+	"github.com/bernardoforcillo/authlayer/internal/config"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"

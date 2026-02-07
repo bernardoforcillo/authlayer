@@ -5,11 +5,11 @@ import (
 	"errors"
 	"time"
 
-	"authz-go/internal/auth"
-	"authz-go/internal/middleware"
-	"authz-go/internal/model"
-	"authz-go/internal/repository"
-	authzv1 "authz-go/pkg/proto/authz/v1"
+	"github.com/bernardoforcillo/authlayer/internal/auth"
+	"github.com/bernardoforcillo/authlayer/internal/middleware"
+	"github.com/bernardoforcillo/authlayer/internal/model"
+	"github.com/bernardoforcillo/authlayer/internal/repository"
+	authlayerv1 "github.com/bernardoforcillo/authlayer/pkg/proto/authlayer/v1"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -20,7 +20,7 @@ import (
 )
 
 type OrganizationService struct {
-	authzv1.UnimplementedOrganizationServiceServer
+	authlayerv1.UnimplementedOrganizationServiceServer
 
 	orgRepo       repository.OrganizationRepository
 	orgMemberRepo repository.OrganizationMemberRepository
@@ -48,7 +48,7 @@ func NewOrganizationService(
 	}
 }
 
-func (s *OrganizationService) CreateOrganization(ctx context.Context, req *authzv1.CreateOrganizationRequest) (*authzv1.CreateOrganizationResponse, error) {
+func (s *OrganizationService) CreateOrganization(ctx context.Context, req *authlayerv1.CreateOrganizationRequest) (*authlayerv1.CreateOrganizationResponse, error) {
 	callerID, err := middleware.UserIDFromContext(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "not authenticated")
@@ -84,12 +84,12 @@ func (s *OrganizationService) CreateOrganization(ctx context.Context, req *authz
 		}
 	}
 
-	return &authzv1.CreateOrganizationResponse{
+	return &authlayerv1.CreateOrganizationResponse{
 		Organization: orgToProto(org),
 	}, nil
 }
 
-func (s *OrganizationService) GetOrganization(ctx context.Context, req *authzv1.GetOrganizationRequest) (*authzv1.GetOrganizationResponse, error) {
+func (s *OrganizationService) GetOrganization(ctx context.Context, req *authlayerv1.GetOrganizationRequest) (*authlayerv1.GetOrganizationResponse, error) {
 	var org *model.Organization
 	var err error
 
@@ -112,10 +112,10 @@ func (s *OrganizationService) GetOrganization(ctx context.Context, req *authzv1.
 		return nil, status.Errorf(codes.Internal, "failed to get organization")
 	}
 
-	return &authzv1.GetOrganizationResponse{Organization: orgToProto(org)}, nil
+	return &authlayerv1.GetOrganizationResponse{Organization: orgToProto(org)}, nil
 }
 
-func (s *OrganizationService) UpdateOrganization(ctx context.Context, req *authzv1.UpdateOrganizationRequest) (*authzv1.UpdateOrganizationResponse, error) {
+func (s *OrganizationService) UpdateOrganization(ctx context.Context, req *authlayerv1.UpdateOrganizationRequest) (*authlayerv1.UpdateOrganizationResponse, error) {
 	orgID, err := uuid.Parse(req.OrgId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid org_id")
@@ -137,10 +137,10 @@ func (s *OrganizationService) UpdateOrganization(ctx context.Context, req *authz
 		return nil, status.Errorf(codes.Internal, "failed to update organization")
 	}
 
-	return &authzv1.UpdateOrganizationResponse{Organization: orgToProto(org)}, nil
+	return &authlayerv1.UpdateOrganizationResponse{Organization: orgToProto(org)}, nil
 }
 
-func (s *OrganizationService) DeleteOrganization(ctx context.Context, req *authzv1.DeleteOrganizationRequest) (*authzv1.DeleteOrganizationResponse, error) {
+func (s *OrganizationService) DeleteOrganization(ctx context.Context, req *authlayerv1.DeleteOrganizationRequest) (*authlayerv1.DeleteOrganizationResponse, error) {
 	orgID, err := uuid.Parse(req.OrgId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid org_id")
@@ -150,10 +150,10 @@ func (s *OrganizationService) DeleteOrganization(ctx context.Context, req *authz
 		return nil, status.Errorf(codes.Internal, "failed to delete organization")
 	}
 
-	return &authzv1.DeleteOrganizationResponse{}, nil
+	return &authlayerv1.DeleteOrganizationResponse{}, nil
 }
 
-func (s *OrganizationService) ListOrganizations(ctx context.Context, req *authzv1.ListOrganizationsRequest) (*authzv1.ListOrganizationsResponse, error) {
+func (s *OrganizationService) ListOrganizations(ctx context.Context, req *authlayerv1.ListOrganizationsRequest) (*authlayerv1.ListOrganizationsResponse, error) {
 	callerID, err := middleware.UserIDFromContext(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "not authenticated")
@@ -170,20 +170,20 @@ func (s *OrganizationService) ListOrganizations(ctx context.Context, req *authzv
 		return nil, status.Errorf(codes.Internal, "failed to list organizations")
 	}
 
-	protoOrgs := make([]*authzv1.OrganizationInfo, len(orgs))
+	protoOrgs := make([]*authlayerv1.OrganizationInfo, len(orgs))
 	for i, o := range orgs {
 		protoOrgs[i] = orgToProto(&o)
 	}
 
-	return &authzv1.ListOrganizationsResponse{
+	return &authlayerv1.ListOrganizationsResponse{
 		Organizations: protoOrgs,
-		Pagination: &authzv1.PaginationResponse{
+		Pagination: &authlayerv1.PaginationResponse{
 			TotalCount: int32(total),
 		},
 	}, nil
 }
 
-func (s *OrganizationService) ListMembers(ctx context.Context, req *authzv1.ListOrgMembersRequest) (*authzv1.ListOrgMembersResponse, error) {
+func (s *OrganizationService) ListMembers(ctx context.Context, req *authlayerv1.ListOrgMembersRequest) (*authlayerv1.ListOrgMembersResponse, error) {
 	orgID, err := uuid.Parse(req.OrgId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid org_id")
@@ -200,9 +200,9 @@ func (s *OrganizationService) ListMembers(ctx context.Context, req *authzv1.List
 		return nil, status.Errorf(codes.Internal, "failed to list members")
 	}
 
-	protoMembers := make([]*authzv1.MemberInfo, len(members))
+	protoMembers := make([]*authlayerv1.MemberInfo, len(members))
 	for i, m := range members {
-		protoMembers[i] = &authzv1.MemberInfo{
+		protoMembers[i] = &authlayerv1.MemberInfo{
 			UserId:   m.UserID.String(),
 			Name:     m.User.Name,
 			Email:    m.User.Email,
@@ -212,15 +212,15 @@ func (s *OrganizationService) ListMembers(ctx context.Context, req *authzv1.List
 		}
 	}
 
-	return &authzv1.ListOrgMembersResponse{
+	return &authlayerv1.ListOrgMembersResponse{
 		Members: protoMembers,
-		Pagination: &authzv1.PaginationResponse{
+		Pagination: &authlayerv1.PaginationResponse{
 			TotalCount: int32(total),
 		},
 	}, nil
 }
 
-func (s *OrganizationService) InviteMember(ctx context.Context, req *authzv1.InviteMemberRequest) (*authzv1.InviteMemberResponse, error) {
+func (s *OrganizationService) InviteMember(ctx context.Context, req *authlayerv1.InviteMemberRequest) (*authlayerv1.InviteMemberResponse, error) {
 	callerID, err := middleware.UserIDFromContext(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "not authenticated")
@@ -255,12 +255,12 @@ func (s *OrganizationService) InviteMember(ctx context.Context, req *authzv1.Inv
 		return nil, status.Errorf(codes.Internal, "failed to create invitation")
 	}
 
-	return &authzv1.InviteMemberResponse{
+	return &authlayerv1.InviteMemberResponse{
 		InvitationId: invitation.ID.String(),
 	}, nil
 }
 
-func (s *OrganizationService) AcceptInvitation(ctx context.Context, req *authzv1.AcceptInvitationRequest) (*authzv1.AcceptInvitationResponse, error) {
+func (s *OrganizationService) AcceptInvitation(ctx context.Context, req *authlayerv1.AcceptInvitationRequest) (*authlayerv1.AcceptInvitationResponse, error) {
 	callerID, err := middleware.UserIDFromContext(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "not authenticated")
@@ -295,12 +295,12 @@ func (s *OrganizationService) AcceptInvitation(ctx context.Context, req *authzv1
 
 	org, _ := s.orgRepo.GetByID(ctx, invitation.OrgID)
 
-	return &authzv1.AcceptInvitationResponse{
+	return &authlayerv1.AcceptInvitationResponse{
 		Organization: orgToProto(org),
 	}, nil
 }
 
-func (s *OrganizationService) RemoveMember(ctx context.Context, req *authzv1.RemoveOrgMemberRequest) (*authzv1.RemoveOrgMemberResponse, error) {
+func (s *OrganizationService) RemoveMember(ctx context.Context, req *authlayerv1.RemoveOrgMemberRequest) (*authlayerv1.RemoveOrgMemberResponse, error) {
 	orgID, err := uuid.Parse(req.OrgId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid org_id")
@@ -314,10 +314,10 @@ func (s *OrganizationService) RemoveMember(ctx context.Context, req *authzv1.Rem
 		return nil, status.Errorf(codes.Internal, "failed to remove member")
 	}
 
-	return &authzv1.RemoveOrgMemberResponse{}, nil
+	return &authlayerv1.RemoveOrgMemberResponse{}, nil
 }
 
-func (s *OrganizationService) UpdateMemberRole(ctx context.Context, req *authzv1.UpdateOrgMemberRoleRequest) (*authzv1.UpdateOrgMemberRoleResponse, error) {
+func (s *OrganizationService) UpdateMemberRole(ctx context.Context, req *authlayerv1.UpdateOrgMemberRoleRequest) (*authlayerv1.UpdateOrgMemberRoleResponse, error) {
 	orgID, err := uuid.Parse(req.OrgId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid org_id")
@@ -335,14 +335,14 @@ func (s *OrganizationService) UpdateMemberRole(ctx context.Context, req *authzv1
 		return nil, status.Errorf(codes.Internal, "failed to update member role")
 	}
 
-	return &authzv1.UpdateOrgMemberRoleResponse{}, nil
+	return &authlayerv1.UpdateOrgMemberRoleResponse{}, nil
 }
 
-func orgToProto(o *model.Organization) *authzv1.OrganizationInfo {
+func orgToProto(o *model.Organization) *authlayerv1.OrganizationInfo {
 	if o == nil {
 		return nil
 	}
-	return &authzv1.OrganizationInfo{
+	return &authlayerv1.OrganizationInfo{
 		Id:        o.ID.String(),
 		Name:      o.Name,
 		Slug:      o.Slug,

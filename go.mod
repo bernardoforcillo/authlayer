@@ -1,4 +1,4 @@
-module authz-go
+module github.com/bernardoforcillo/authlayer
 
 go 1.25.5
 

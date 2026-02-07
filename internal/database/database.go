@@ -3,8 +3,8 @@ package database
 import (
 	"time"
 
-	"authz-go/internal/config"
-	"authz-go/internal/model"
+	"github.com/bernardoforcillo/authlayer/internal/config"
+	"github.com/bernardoforcillo/authlayer/internal/model"
 
 	"go.uber.org/zap"
 	"gorm.io/driver/postgres"

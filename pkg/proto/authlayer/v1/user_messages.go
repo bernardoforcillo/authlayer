@@ -1,4 +1,4 @@
-package authzv1
+package authlayerv1
 
 type GetUserRequest struct {
 	UserId string `json:"user_id,omitempty"`

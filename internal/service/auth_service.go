@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 
-	"authz-go/internal/auth"
-	"authz-go/internal/middleware"
-	"authz-go/internal/model"
-	"authz-go/internal/oauth"
-	"authz-go/internal/repository"
-	authzv1 "authz-go/pkg/proto/authz/v1"
+	"github.com/bernardoforcillo/authlayer/internal/auth"
+	"github.com/bernardoforcillo/authlayer/internal/middleware"
+	"github.com/bernardoforcillo/authlayer/internal/model"
+	"github.com/bernardoforcillo/authlayer/internal/oauth"
+	"github.com/bernardoforcillo/authlayer/internal/repository"
+	authlayerv1 "github.com/bernardoforcillo/authlayer/pkg/proto/authlayer/v1"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -20,7 +20,7 @@ import (
 )
 
 type AuthService struct {
-	authzv1.UnimplementedAuthServiceServer
+	authlayerv1.UnimplementedAuthServiceServer
 
 	userRepo    repository.UserRepository
 	accountRepo repository.AccountRepository
@@ -48,7 +48,7 @@ func NewAuthService(
 	}
 }
 
-func (s *AuthService) Register(ctx context.Context, req *authzv1.RegisterRequest) (*authzv1.RegisterResponse, error) {
+func (s *AuthService) Register(ctx context.Context, req *authlayerv1.RegisterRequest) (*authlayerv1.RegisterResponse, error) {
 	if req.Email == "" || req.Password == "" || req.Name == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "email, password, and name are required")
 	}
@@ -90,13 +90,13 @@ func (s *AuthService) Register(ctx context.Context, req *authzv1.RegisterRequest
 		return nil, status.Errorf(codes.Internal, "failed to store session")
 	}
 
-	return &authzv1.RegisterResponse{
+	return &authlayerv1.RegisterResponse{
 		User:   userToProto(user),
 		Tokens: tokenPairToProto(tokens),
 	}, nil
 }
 
-func (s *AuthService) Login(ctx context.Context, req *authzv1.LoginRequest) (*authzv1.LoginResponse, error) {
+func (s *AuthService) Login(ctx context.Context, req *authlayerv1.LoginRequest) (*authlayerv1.LoginResponse, error) {
 	if req.Email == "" || req.Password == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "email and password are required")
 	}
@@ -130,13 +130,13 @@ func (s *AuthService) Login(ctx context.Context, req *authzv1.LoginRequest) (*au
 		return nil, status.Errorf(codes.Internal, "failed to store session")
 	}
 
-	return &authzv1.LoginResponse{
+	return &authlayerv1.LoginResponse{
 		User:   userToProto(user),
 		Tokens: tokenPairToProto(tokens),
 	}, nil
 }
 
-func (s *AuthService) Logout(ctx context.Context, req *authzv1.LogoutRequest) (*authzv1.LogoutResponse, error) {
+func (s *AuthService) Logout(ctx context.Context, req *authlayerv1.LogoutRequest) (*authlayerv1.LogoutResponse, error) {
 	if req.RefreshToken == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "refresh_token is required")
 	}
@@ -146,10 +146,10 @@ func (s *AuthService) Logout(ctx context.Context, req *authzv1.LogoutRequest) (*
 		s.logger.Warn("failed to revoke session", zap.Error(err))
 	}
 
-	return &authzv1.LogoutResponse{}, nil
+	return &authlayerv1.LogoutResponse{}, nil
 }
 
-func (s *AuthService) RefreshToken(ctx context.Context, req *authzv1.RefreshTokenRequest) (*authzv1.RefreshTokenResponse, error) {
+func (s *AuthService) RefreshToken(ctx context.Context, req *authlayerv1.RefreshTokenRequest) (*authlayerv1.RefreshTokenResponse, error) {
 	if req.RefreshToken == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "refresh_token is required")
 	}
@@ -191,12 +191,12 @@ func (s *AuthService) RefreshToken(ctx context.Context, req *authzv1.RefreshToke
 		return nil, status.Errorf(codes.Internal, "failed to store session")
 	}
 
-	return &authzv1.RefreshTokenResponse{
+	return &authlayerv1.RefreshTokenResponse{
 		Tokens: tokenPairToProto(tokens),
 	}, nil
 }
 
-func (s *AuthService) GetOAuthURL(ctx context.Context, req *authzv1.GetOAuthURLRequest) (*authzv1.GetOAuthURLResponse, error) {
+func (s *AuthService) GetOAuthURL(ctx context.Context, req *authlayerv1.GetOAuthURLRequest) (*authlayerv1.GetOAuthURLResponse, error) {
 	if req.Provider == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "provider is required")
 	}
@@ -213,13 +213,13 @@ func (s *AuthService) GetOAuthURL(ctx context.Context, req *authzv1.GetOAuthURLR
 
 	url := provider.GetAuthorizationURL(state, req.RedirectUri)
 
-	return &authzv1.GetOAuthURLResponse{
+	return &authlayerv1.GetOAuthURLResponse{
 		AuthorizationUrl: url,
 		State:            state,
 	}, nil
 }
 
-func (s *AuthService) OAuthCallback(ctx context.Context, req *authzv1.OAuthCallbackRequest) (*authzv1.OAuthCallbackResponse, error) {
+func (s *AuthService) OAuthCallback(ctx context.Context, req *authlayerv1.OAuthCallbackRequest) (*authlayerv1.OAuthCallbackResponse, error) {
 	if req.Provider == "" || req.Code == "" {
 		return nil, status.Errorf(codes.InvalidArgument, "provider and code are required")
 	}
@@ -290,24 +290,24 @@ func (s *AuthService) OAuthCallback(ctx context.Context, req *authzv1.OAuthCallb
 		return nil, status.Errorf(codes.Internal, "failed to store session")
 	}
 
-	return &authzv1.OAuthCallbackResponse{
+	return &authlayerv1.OAuthCallbackResponse{
 		User:      userToProto(user),
 		Tokens:    tokenPairToProto(tokens),
 		IsNewUser: isNewUser,
 	}, nil
 }
 
-func (s *AuthService) VerifyEmail(ctx context.Context, req *authzv1.VerifyEmailRequest) (*authzv1.VerifyEmailResponse, error) {
+func (s *AuthService) VerifyEmail(ctx context.Context, req *authlayerv1.VerifyEmailRequest) (*authlayerv1.VerifyEmailResponse, error) {
 	// TODO: implement email verification token logic
 	return nil, status.Errorf(codes.Unimplemented, "email verification not yet implemented")
 }
 
-func (s *AuthService) RequestPasswordReset(ctx context.Context, req *authzv1.RequestPasswordResetRequest) (*authzv1.RequestPasswordResetResponse, error) {
+func (s *AuthService) RequestPasswordReset(ctx context.Context, req *authlayerv1.RequestPasswordResetRequest) (*authlayerv1.RequestPasswordResetResponse, error) {
 	// TODO: implement password reset token generation + email sending
-	return &authzv1.RequestPasswordResetResponse{}, nil
+	return &authlayerv1.RequestPasswordResetResponse{}, nil
 }
 
-func (s *AuthService) ResetPassword(ctx context.Context, req *authzv1.ResetPasswordRequest) (*authzv1.ResetPasswordResponse, error) {
+func (s *AuthService) ResetPassword(ctx context.Context, req *authlayerv1.ResetPasswordRequest) (*authlayerv1.ResetPasswordResponse, error) {
 	// TODO: implement password reset with token validation
 	return nil, status.Errorf(codes.Unimplemented, "password reset not yet implemented")
 }
@@ -330,8 +330,8 @@ func (s *AuthService) storeSession(ctx context.Context, userID uuid.UUID, tokens
 
 // ---- Helpers ----
 
-func userToProto(u *model.User) *authzv1.UserInfo {
-	info := &authzv1.UserInfo{
+func userToProto(u *model.User) *authlayerv1.UserInfo {
+	info := &authlayerv1.UserInfo{
 		Id:            u.ID.String(),
 		Email:         u.Email,
 		Name:          u.Name,
@@ -344,21 +344,21 @@ func userToProto(u *model.User) *authzv1.UserInfo {
 	return info
 }
 
-func userStatusToProto(s model.UserStatus) authzv1.UserStatus {
+func userStatusToProto(s model.UserStatus) authlayerv1.UserStatus {
 	switch s {
 	case model.UserStatusActive:
-		return authzv1.UserStatus_USER_STATUS_ACTIVE
+		return authlayerv1.UserStatus_USER_STATUS_ACTIVE
 	case model.UserStatusInactive:
-		return authzv1.UserStatus_USER_STATUS_INACTIVE
+		return authlayerv1.UserStatus_USER_STATUS_INACTIVE
 	case model.UserStatusBanned:
-		return authzv1.UserStatus_USER_STATUS_BANNED
+		return authlayerv1.UserStatus_USER_STATUS_BANNED
 	default:
-		return authzv1.UserStatus_USER_STATUS_UNSPECIFIED
+		return authlayerv1.UserStatus_USER_STATUS_UNSPECIFIED
 	}
 }
 
-func tokenPairToProto(tp *auth.TokenPair) *authzv1.TokenPair {
-	return &authzv1.TokenPair{
+func tokenPairToProto(tp *auth.TokenPair) *authlayerv1.TokenPair {
+	return &authlayerv1.TokenPair{
 		AccessToken:           tp.AccessToken,
 		RefreshToken:          tp.RefreshToken,
 		AccessTokenExpiresAt:  timestamppb.New(tp.AccessTokenExpiresAt),

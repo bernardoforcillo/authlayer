@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"authz-go/internal/model"
+	"github.com/bernardoforcillo/authlayer/internal/model"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"

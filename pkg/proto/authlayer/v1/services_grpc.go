@@ -1,4 +1,4 @@
-package authzv1
+package authlayerv1
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 
 // ---- AuthService ----
 
-const AuthService_ServiceName = "authz.v1.AuthService"
+const AuthService_ServiceName = "authlayer.v1.AuthService"
 
 type AuthServiceServer interface {
 	Register(context.Context, *RegisterRequest) (*RegisterResponse, error)
@@ -149,7 +149,7 @@ func _AuthService_OAuthCallback_Handler(srv interface{}, ctx context.Context, de
 
 // ---- UserService ----
 
-const UserService_ServiceName = "authz.v1.UserService"
+const UserService_ServiceName = "authlayer.v1.UserService"
 
 type UserServiceServer interface {
 	GetUser(context.Context, *GetUserRequest) (*GetUserResponse, error)
@@ -236,7 +236,7 @@ func _UserService_ChangePassword_Handler(srv interface{}, ctx context.Context, d
 
 // ---- OrganizationService ----
 
-const OrganizationService_ServiceName = "authz.v1.OrganizationService"
+const OrganizationService_ServiceName = "authlayer.v1.OrganizationService"
 
 type OrganizationServiceServer interface {
 	CreateOrganization(context.Context, *CreateOrganizationRequest) (*CreateOrganizationResponse, error)
@@ -277,7 +277,7 @@ var OrganizationService_ServiceDesc = grpc.ServiceDesc{
 
 // ---- TeamService ----
 
-const TeamService_ServiceName = "authz.v1.TeamService"
+const TeamService_ServiceName = "authlayer.v1.TeamService"
 
 type TeamServiceServer interface {
 	CreateTeam(context.Context, *CreateTeamRequest) (*CreateTeamResponse, error)
@@ -314,7 +314,7 @@ var TeamService_ServiceDesc = grpc.ServiceDesc{
 
 // ---- RBACService ----
 
-const RBACService_ServiceName = "authz.v1.RBACService"
+const RBACService_ServiceName = "authlayer.v1.RBACService"
 
 type RBACServiceServer interface {
 	CreateRole(context.Context, *CreateRoleRequest) (*CreateRoleResponse, error)
@@ -361,7 +361,7 @@ var RBACService_ServiceDesc = grpc.ServiceDesc{
 
 // ---- APIKeyService ----
 
-const APIKeyService_ServiceName = "authz.v1.APIKeyService"
+const APIKeyService_ServiceName = "authlayer.v1.APIKeyService"
 
 type APIKeyServiceServer interface {
 	CreateAPIKey(context.Context, *CreateAPIKeyRequest) (*CreateAPIKeyResponse, error)
@@ -390,7 +390,7 @@ var APIKeyService_ServiceDesc = grpc.ServiceDesc{
 
 // ---- ServiceAccountService ----
 
-const ServiceAccountService_ServiceName = "authz.v1.ServiceAccountService"
+const ServiceAccountService_ServiceName = "authlayer.v1.ServiceAccountService"
 
 type ServiceAccountServiceServer interface {
 	CreateServiceAccount(context.Context, *CreateServiceAccountRequest) (*CreateServiceAccountResponse, error)

@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 
-	"authz-go/internal/auth"
-	"authz-go/internal/middleware"
-	"authz-go/internal/model"
-	"authz-go/internal/repository"
-	authzv1 "authz-go/pkg/proto/authz/v1"
+	"github.com/bernardoforcillo/authlayer/internal/auth"
+	"github.com/bernardoforcillo/authlayer/internal/middleware"
+	"github.com/bernardoforcillo/authlayer/internal/model"
+	"github.com/bernardoforcillo/authlayer/internal/repository"
+	authlayerv1 "github.com/bernardoforcillo/authlayer/pkg/proto/authlayer/v1"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -19,7 +19,7 @@ import (
 )
 
 type ServiceAccountService struct {
-	authzv1.UnimplementedServiceAccountServiceServer
+	authlayerv1.UnimplementedServiceAccountServiceServer
 
 	saRepo     repository.ServiceAccountRepository
 	saKeyRepo  repository.ServiceAccountKeyRepository
@@ -44,7 +44,7 @@ func NewServiceAccountService(
 	}
 }
 
-func (s *ServiceAccountService) CreateServiceAccount(ctx context.Context, req *authzv1.CreateServiceAccountRequest) (*authzv1.CreateServiceAccountResponse, error) {
+func (s *ServiceAccountService) CreateServiceAccount(ctx context.Context, req *authlayerv1.CreateServiceAccountRequest) (*authlayerv1.CreateServiceAccountResponse, error) {
 	callerID, err := middleware.UserIDFromContext(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.Unauthenticated, "not authenticated")
@@ -71,12 +71,12 @@ func (s *ServiceAccountService) CreateServiceAccount(ctx context.Context, req *a
 		return nil, status.Errorf(codes.Internal, "failed to create service account: %v", err)
 	}
 
-	return &authzv1.CreateServiceAccountResponse{
+	return &authlayerv1.CreateServiceAccountResponse{
 		ServiceAccount: serviceAccountToProto(sa),
 	}, nil
 }
 
-func (s *ServiceAccountService) GetServiceAccount(ctx context.Context, req *authzv1.GetServiceAccountRequest) (*authzv1.GetServiceAccountResponse, error) {
+func (s *ServiceAccountService) GetServiceAccount(ctx context.Context, req *authlayerv1.GetServiceAccountRequest) (*authlayerv1.GetServiceAccountResponse, error) {
 	id, err := uuid.Parse(req.ServiceAccountId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid service_account_id")
@@ -90,12 +90,12 @@ func (s *ServiceAccountService) GetServiceAccount(ctx context.Context, req *auth
 		return nil, status.Errorf(codes.Internal, "failed to get service account")
 	}
 
-	return &authzv1.GetServiceAccountResponse{
+	return &authlayerv1.GetServiceAccountResponse{
 		ServiceAccount: serviceAccountToProto(sa),
 	}, nil
 }
 
-func (s *ServiceAccountService) UpdateServiceAccount(ctx context.Context, req *authzv1.UpdateServiceAccountRequest) (*authzv1.UpdateServiceAccountResponse, error) {
+func (s *ServiceAccountService) UpdateServiceAccount(ctx context.Context, req *authlayerv1.UpdateServiceAccountRequest) (*authlayerv1.UpdateServiceAccountResponse, error) {
 	id, err := uuid.Parse(req.ServiceAccountId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid service_account_id")
@@ -114,9 +114,9 @@ func (s *ServiceAccountService) UpdateServiceAccount(ctx context.Context, req *a
 	}
 	if req.Status != nil {
 		switch *req.Status {
-		case authzv1.ServiceAccountStatus_SERVICE_ACCOUNT_STATUS_ACTIVE:
+		case authlayerv1.ServiceAccountStatus_SERVICE_ACCOUNT_STATUS_ACTIVE:
 			sa.Status = model.ServiceAccountStatusActive
-		case authzv1.ServiceAccountStatus_SERVICE_ACCOUNT_STATUS_DISABLED:
+		case authlayerv1.ServiceAccountStatus_SERVICE_ACCOUNT_STATUS_DISABLED:
 			sa.Status = model.ServiceAccountStatusDisabled
 		}
 	}
@@ -125,12 +125,12 @@ func (s *ServiceAccountService) UpdateServiceAccount(ctx context.Context, req *a
 		return nil, status.Errorf(codes.Internal, "failed to update service account")
 	}
 
-	return &authzv1.UpdateServiceAccountResponse{
+	return &authlayerv1.UpdateServiceAccountResponse{
 		ServiceAccount: serviceAccountToProto(sa),
 	}, nil
 }
 
-func (s *ServiceAccountService) DeleteServiceAccount(ctx context.Context, req *authzv1.DeleteServiceAccountRequest) (*authzv1.DeleteServiceAccountResponse, error) {
+func (s *ServiceAccountService) DeleteServiceAccount(ctx context.Context, req *authlayerv1.DeleteServiceAccountRequest) (*authlayerv1.DeleteServiceAccountResponse, error) {
 	id, err := uuid.Parse(req.ServiceAccountId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid service_account_id")
@@ -140,10 +140,10 @@ func (s *ServiceAccountService) DeleteServiceAccount(ctx context.Context, req *a
 		return nil, status.Errorf(codes.Internal, "failed to delete service account")
 	}
 
-	return &authzv1.DeleteServiceAccountResponse{}, nil
+	return &authlayerv1.DeleteServiceAccountResponse{}, nil
 }
 
-func (s *ServiceAccountService) ListServiceAccounts(ctx context.Context, req *authzv1.ListServiceAccountsRequest) (*authzv1.ListServiceAccountsResponse, error) {
+func (s *ServiceAccountService) ListServiceAccounts(ctx context.Context, req *authlayerv1.ListServiceAccountsRequest) (*authlayerv1.ListServiceAccountsResponse, error) {
 	orgID, err := uuid.Parse(req.OrgId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid org_id")
@@ -160,20 +160,20 @@ func (s *ServiceAccountService) ListServiceAccounts(ctx context.Context, req *au
 		return nil, status.Errorf(codes.Internal, "failed to list service accounts")
 	}
 
-	protoAccounts := make([]*authzv1.ServiceAccountInfo, len(accounts))
+	protoAccounts := make([]*authlayerv1.ServiceAccountInfo, len(accounts))
 	for i, sa := range accounts {
 		protoAccounts[i] = serviceAccountToProto(&sa)
 	}
 
-	return &authzv1.ListServiceAccountsResponse{
+	return &authlayerv1.ListServiceAccountsResponse{
 		ServiceAccounts: protoAccounts,
-		Pagination: &authzv1.PaginationResponse{
+		Pagination: &authlayerv1.PaginationResponse{
 			TotalCount: int32(total),
 		},
 	}, nil
 }
 
-func (s *ServiceAccountService) CreateServiceAccountKey(ctx context.Context, req *authzv1.CreateServiceAccountKeyRequest) (*authzv1.CreateServiceAccountKeyResponse, error) {
+func (s *ServiceAccountService) CreateServiceAccountKey(ctx context.Context, req *authlayerv1.CreateServiceAccountKeyRequest) (*authlayerv1.CreateServiceAccountKeyResponse, error) {
 	saID, err := uuid.Parse(req.ServiceAccountId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid service_account_id")
@@ -210,13 +210,13 @@ func (s *ServiceAccountService) CreateServiceAccountKey(ctx context.Context, req
 		return nil, status.Errorf(codes.Internal, "failed to create service account key")
 	}
 
-	return &authzv1.CreateServiceAccountKeyResponse{
+	return &authlayerv1.CreateServiceAccountKeyResponse{
 		KeyInfo:      saKeyToProto(key),
 		PlainTextKey: plainKey,
 	}, nil
 }
 
-func (s *ServiceAccountService) RevokeServiceAccountKey(ctx context.Context, req *authzv1.RevokeServiceAccountKeyRequest) (*authzv1.RevokeServiceAccountKeyResponse, error) {
+func (s *ServiceAccountService) RevokeServiceAccountKey(ctx context.Context, req *authlayerv1.RevokeServiceAccountKeyRequest) (*authlayerv1.RevokeServiceAccountKeyResponse, error) {
 	id, err := uuid.Parse(req.KeyId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid key_id")
@@ -226,10 +226,10 @@ func (s *ServiceAccountService) RevokeServiceAccountKey(ctx context.Context, req
 		return nil, status.Errorf(codes.Internal, "failed to revoke key")
 	}
 
-	return &authzv1.RevokeServiceAccountKeyResponse{}, nil
+	return &authlayerv1.RevokeServiceAccountKeyResponse{}, nil
 }
 
-func (s *ServiceAccountService) ListServiceAccountKeys(ctx context.Context, req *authzv1.ListServiceAccountKeysRequest) (*authzv1.ListServiceAccountKeysResponse, error) {
+func (s *ServiceAccountService) ListServiceAccountKeys(ctx context.Context, req *authlayerv1.ListServiceAccountKeysRequest) (*authlayerv1.ListServiceAccountKeysResponse, error) {
 	saID, err := uuid.Parse(req.ServiceAccountId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid service_account_id")
@@ -246,20 +246,20 @@ func (s *ServiceAccountService) ListServiceAccountKeys(ctx context.Context, req 
 		return nil, status.Errorf(codes.Internal, "failed to list keys")
 	}
 
-	protoKeys := make([]*authzv1.ServiceAccountKeyInfo, len(keys))
+	protoKeys := make([]*authlayerv1.ServiceAccountKeyInfo, len(keys))
 	for i, k := range keys {
 		protoKeys[i] = saKeyToProto(&k)
 	}
 
-	return &authzv1.ListServiceAccountKeysResponse{
+	return &authlayerv1.ListServiceAccountKeysResponse{
 		Keys: protoKeys,
-		Pagination: &authzv1.PaginationResponse{
+		Pagination: &authlayerv1.PaginationResponse{
 			TotalCount: int32(total),
 		},
 	}, nil
 }
 
-func (s *ServiceAccountService) AssignRole(ctx context.Context, req *authzv1.AssignServiceAccountRoleRequest) (*authzv1.AssignServiceAccountRoleResponse, error) {
+func (s *ServiceAccountService) AssignRole(ctx context.Context, req *authlayerv1.AssignServiceAccountRoleRequest) (*authlayerv1.AssignServiceAccountRoleResponse, error) {
 	saID, err := uuid.Parse(req.ServiceAccountId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid service_account_id")
@@ -283,10 +283,10 @@ func (s *ServiceAccountService) AssignRole(ctx context.Context, req *authzv1.Ass
 		return nil, status.Errorf(codes.Internal, "failed to assign role: %v", err)
 	}
 
-	return &authzv1.AssignServiceAccountRoleResponse{}, nil
+	return &authlayerv1.AssignServiceAccountRoleResponse{}, nil
 }
 
-func (s *ServiceAccountService) RevokeRole(ctx context.Context, req *authzv1.RevokeServiceAccountRoleRequest) (*authzv1.RevokeServiceAccountRoleResponse, error) {
+func (s *ServiceAccountService) RevokeRole(ctx context.Context, req *authlayerv1.RevokeServiceAccountRoleRequest) (*authlayerv1.RevokeServiceAccountRoleResponse, error) {
 	saID, err := uuid.Parse(req.ServiceAccountId)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid service_account_id")
@@ -304,13 +304,13 @@ func (s *ServiceAccountService) RevokeRole(ctx context.Context, req *authzv1.Rev
 		return nil, status.Errorf(codes.Internal, "failed to revoke role")
 	}
 
-	return &authzv1.RevokeServiceAccountRoleResponse{}, nil
+	return &authlayerv1.RevokeServiceAccountRoleResponse{}, nil
 }
 
 // ---- Converters ----
 
-func serviceAccountToProto(sa *model.ServiceAccount) *authzv1.ServiceAccountInfo {
-	info := &authzv1.ServiceAccountInfo{
+func serviceAccountToProto(sa *model.ServiceAccount) *authlayerv1.ServiceAccountInfo {
+	info := &authlayerv1.ServiceAccountInfo{
 		Id:          sa.ID.String(),
 		DisplayName: sa.DisplayName,
 		Description: sa.Description,
@@ -322,9 +322,9 @@ func serviceAccountToProto(sa *model.ServiceAccount) *authzv1.ServiceAccountInfo
 
 	switch sa.Status {
 	case model.ServiceAccountStatusActive:
-		info.Status = authzv1.ServiceAccountStatus_SERVICE_ACCOUNT_STATUS_ACTIVE
+		info.Status = authlayerv1.ServiceAccountStatus_SERVICE_ACCOUNT_STATUS_ACTIVE
 	case model.ServiceAccountStatusDisabled:
-		info.Status = authzv1.ServiceAccountStatus_SERVICE_ACCOUNT_STATUS_DISABLED
+		info.Status = authlayerv1.ServiceAccountStatus_SERVICE_ACCOUNT_STATUS_DISABLED
 	}
 
 	if sa.LastAuthenticatedAt != nil {
@@ -332,7 +332,7 @@ func serviceAccountToProto(sa *model.ServiceAccount) *authzv1.ServiceAccountInfo
 	}
 
 	if len(sa.Roles) > 0 {
-		info.Roles = make([]*authzv1.RoleInfo, len(sa.Roles))
+		info.Roles = make([]*authlayerv1.RoleInfo, len(sa.Roles))
 		for i, r := range sa.Roles {
 			info.Roles[i] = roleToProto(&r.Role)
 		}
@@ -341,8 +341,8 @@ func serviceAccountToProto(sa *model.ServiceAccount) *authzv1.ServiceAccountInfo
 	return info
 }
 
-func saKeyToProto(k *model.ServiceAccountKey) *authzv1.ServiceAccountKeyInfo {
-	info := &authzv1.ServiceAccountKeyInfo{
+func saKeyToProto(k *model.ServiceAccountKey) *authlayerv1.ServiceAccountKeyInfo {
+	info := &authlayerv1.ServiceAccountKeyInfo{
 		Id:               k.ID.String(),
 		ServiceAccountId: k.ServiceAccountID.String(),
 		KeyPrefix:        k.KeyPrefix,

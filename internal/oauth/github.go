@@ -7,7 +7,7 @@ import (
 	"io"
 	"net/http"
 
-	"authz-go/internal/config"
+	"github.com/bernardoforcillo/authlayer/internal/config"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/github"
