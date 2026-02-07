@@ -6,17 +6,61 @@ option go_package = "github.com/bernardoforcillo/authlayer/pkg/proto/authlayer/v
 
 import "authlayer/v1/common.proto";
 import "google/protobuf/timestamp.proto";
+import "google/api/annotations.proto";
 
 service AuthService {
-  rpc Register(RegisterRequest) returns (RegisterResponse);
-  rpc Login(LoginRequest) returns (LoginResponse);
-  rpc Logout(LogoutRequest) returns (LogoutResponse);
-  rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse);
-  rpc VerifyEmail(VerifyEmailRequest) returns (VerifyEmailResponse);
-  rpc RequestPasswordReset(RequestPasswordResetRequest) returns (RequestPasswordResetResponse);
-  rpc ResetPassword(ResetPasswordRequest) returns (ResetPasswordResponse);
-  rpc GetOAuthURL(GetOAuthURLRequest) returns (GetOAuthURLResponse);
-  rpc OAuthCallback(OAuthCallbackRequest) returns (OAuthCallbackResponse);
+  rpc Register(RegisterRequest) returns (RegisterResponse) {
+    option (google.api.http) = {
+      post: "/v1/auth/register"
+      body: "*"
+    };
+  }
+  rpc Login(LoginRequest) returns (LoginResponse) {
+    option (google.api.http) = {
+      post: "/v1/auth/login"
+      body: "*"
+    };
+  }
+  rpc Logout(LogoutRequest) returns (LogoutResponse) {
+    option (google.api.http) = {
+      post: "/v1/auth/logout"
+      body: "*"
+    };
+  }
+  rpc RefreshToken(RefreshTokenRequest) returns (RefreshTokenResponse) {
+    option (google.api.http) = {
+      post: "/v1/auth/refresh"
+      body: "*"
+    };
+  }
+  rpc VerifyEmail(VerifyEmailRequest) returns (VerifyEmailResponse) {
+    option (google.api.http) = {
+      post: "/v1/auth/verify-email"
+      body: "*"
+    };
+  }
+  rpc RequestPasswordReset(RequestPasswordResetRequest) returns (RequestPasswordResetResponse) {
+    option (google.api.http) = {
+      post: "/v1/auth/password-reset"
+      body: "*"
+    };
+  }
+  rpc ResetPassword(ResetPasswordRequest) returns (ResetPasswordResponse) {
+    option (google.api.http) = {
+      post: "/v1/auth/reset-password"
+      body: "*"
+    };
+  }
+  rpc GetOAuthURL(GetOAuthURLRequest) returns (GetOAuthURLResponse) {
+    option (google.api.http) = {
+      get: "/v1/auth/oauth"
+    };
+  }
+  rpc OAuthCallback(OAuthCallbackRequest) returns (OAuthCallbackResponse) {
+    option (google.api.http) = {
+      get: "/v1/auth/oauth/callback"
+    };
+  }
 }
 
 message TokenPair {

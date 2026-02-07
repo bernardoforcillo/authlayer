@@ -1,16 +1,20 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net"
+	"net/http"
 
 	"github.com/bernardoforcillo/authlayer/internal/config"
 	"github.com/bernardoforcillo/authlayer/internal/middleware"
 	"github.com/bernardoforcillo/authlayer/internal/service"
 	authlayerv1 "github.com/bernardoforcillo/authlayer/pkg/proto/authlayer/v1"
 
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -81,8 +85,39 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
 
+	// Start Gateway in background
+	go func() {
+		if err := s.startGateway(); err != nil {
+			s.logger.Error("failed to start gateway", zap.Error(err))
+		}
+	}()
+
 	s.logger.Info("gRPC server starting", zap.String("address", addr))
 	return s.grpcServer.Serve(lis)
+}
+
+func (s *Server) startGateway() error {
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	mux := runtime.NewServeMux()
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	grpcAddr := fmt.Sprintf(":%d", s.cfg.GRPCPort)
+
+	// Register services
+	if err := authlayerv1.RegisterAuthServiceHandlerFromEndpoint(ctx, mux, grpcAddr, opts); err != nil {
+		return fmt.Errorf("failed to register auth service gateway: %w", err)
+	}
+	if err := authlayerv1.RegisterUserServiceHandlerFromEndpoint(ctx, mux, grpcAddr, opts); err != nil {
+		return fmt.Errorf("failed to register user service gateway: %w", err)
+	}
+
+	httpAddr := fmt.Sprintf(":%d", s.cfg.HTTPPort)
+	s.logger.Info("HTTP gateway starting", zap.String("address", httpAddr))
+
+	// Use standard http server
+	return http.ListenAndServe(httpAddr, mux)
 }
 
 // GracefulStop gracefully shuts down the server.

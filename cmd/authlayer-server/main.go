@@ -13,11 +13,11 @@ import (
 	"github.com/bernardoforcillo/authlayer/internal/database"
 	"github.com/bernardoforcillo/authlayer/internal/middleware"
 	"github.com/bernardoforcillo/authlayer/internal/oauth"
-	"github.com/bernardoforcillo/authlayer/migrations"
 	"github.com/bernardoforcillo/authlayer/internal/rbac"
 	"github.com/bernardoforcillo/authlayer/internal/repository"
 	"github.com/bernardoforcillo/authlayer/internal/server"
 	"github.com/bernardoforcillo/authlayer/internal/service"
+	"github.com/bernardoforcillo/authlayer/migrations"
 
 	"go.uber.org/zap"
 )
@@ -122,15 +122,15 @@ func main() {
 
 	// 10. Create interceptors
 	publicMethods := []string{
-		"/authz.v1.AuthService/Register",
-		"/authz.v1.AuthService/Login",
-		"/authz.v1.AuthService/RefreshToken",
-		"/authz.v1.AuthService/GetOAuthURL",
-		"/authz.v1.AuthService/OAuthCallback",
-		"/authz.v1.AuthService/VerifyEmail",
-		"/authz.v1.AuthService/RequestPasswordReset",
-		"/authz.v1.AuthService/ResetPassword",
-		"/authz.v1.APIKeyService/ValidateAPIKey",
+		"/authlayer.v1.AuthService/Register",
+		"/authlayer.v1.AuthService/Login",
+		"/authlayer.v1.AuthService/RefreshToken",
+		"/authlayer.v1.AuthService/GetOAuthURL",
+		"/authlayer.v1.AuthService/OAuthCallback",
+		"/authlayer.v1.AuthService/VerifyEmail",
+		"/authlayer.v1.AuthService/RequestPasswordReset",
+		"/authlayer.v1.AuthService/ResetPassword",
+		"/authlayer.v1.APIKeyService/ValidateAPIKey",
 		"/grpc.health.v1.Health/Check",
 		"/grpc.health.v1.Health/Watch",
 	}
@@ -139,17 +139,17 @@ func main() {
 
 	// Method-level permission requirements (can be expanded)
 	methodPerms := map[string]middleware.PermissionRequirement{
-		"/authz.v1.UserService/ListUsers":                    {Permission: "user:list"},
-		"/authz.v1.UserService/DeleteUser":                   {Permission: "user:delete"},
-		"/authz.v1.OrganizationService/DeleteOrganization":   {Permission: "org:delete"},
-		"/authz.v1.RBACService/CreateRole":                   {Permission: "role:create"},
-		"/authz.v1.RBACService/DeleteRole":                   {Permission: "role:delete"},
-		"/authz.v1.RBACService/AssignRole":                   {Permission: "role:assign"},
-		"/authz.v1.RBACService/AssignPermission":             {Permission: "permission:assign"},
-		"/authz.v1.RBACService/RevokePermission":             {Permission: "permission:assign"},
-		"/authz.v1.OrganizationService/InviteMember":         {Permission: "member:invite"},
-		"/authz.v1.OrganizationService/RemoveMember":         {Permission: "member:remove"},
-		"/authz.v1.OrganizationService/UpdateMemberRole":     {Permission: "member:update_role"},
+		"/authlayer.v1.UserService/ListUsers":                  {Permission: "user:list"},
+		"/authlayer.v1.UserService/DeleteUser":                 {Permission: "user:delete"},
+		"/authlayer.v1.OrganizationService/DeleteOrganization": {Permission: "org:delete"},
+		"/authlayer.v1.RBACService/CreateRole":                 {Permission: "role:create"},
+		"/authlayer.v1.RBACService/DeleteRole":                 {Permission: "role:delete"},
+		"/authlayer.v1.RBACService/AssignRole":                 {Permission: "role:assign"},
+		"/authlayer.v1.RBACService/AssignPermission":           {Permission: "permission:assign"},
+		"/authlayer.v1.RBACService/RevokePermission":           {Permission: "permission:assign"},
+		"/authlayer.v1.OrganizationService/InviteMember":       {Permission: "member:invite"},
+		"/authlayer.v1.OrganizationService/RemoveMember":       {Permission: "member:remove"},
+		"/authlayer.v1.OrganizationService/UpdateMemberRole":   {Permission: "member:update_role"},
 	}
 
 	rbacInterceptor := middleware.NewRBACInterceptor(rbacChecker, methodPerms)

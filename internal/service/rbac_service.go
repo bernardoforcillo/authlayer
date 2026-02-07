@@ -19,13 +19,13 @@ import (
 type RBACService struct {
 	authlayerv1.UnimplementedRBACServiceServer
 
-	roleRepo     repository.RoleRepository
-	permRepo     repository.PermissionRepository
-	rolePermRepo repository.RolePermissionRepository
-	orgMemberRepo repository.OrganizationMemberRepository
+	roleRepo       repository.RoleRepository
+	permRepo       repository.PermissionRepository
+	rolePermRepo   repository.RolePermissionRepository
+	orgMemberRepo  repository.OrganizationMemberRepository
 	teamMemberRepo repository.TeamMemberRepository
-	checker      *rbac.Checker
-	logger       *zap.Logger
+	checker        *rbac.Checker
+	logger         *zap.Logger
 }
 
 func NewRBACService(
@@ -213,15 +213,15 @@ func (s *RBACService) AssignRole(ctx context.Context, req *authlayerv1.AssignRol
 		return nil, status.Errorf(codes.InvalidArgument, "invalid role_id")
 	}
 
-	if req.OrgId != "" {
-		orgID, err := uuid.Parse(req.OrgId)
+	if req.GetOrgId() != "" {
+		orgID, err := uuid.Parse(req.GetOrgId())
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid org_id")
 		}
 		if err := s.orgMemberRepo.UpdateRole(ctx, orgID, userID, roleID); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to assign role")
 		}
-	} else if req.TeamId != "" {
+	} else if req.GetTeamId() != "" {
 		// For teams, we'd update team member role
 		return nil, status.Errorf(codes.Unimplemented, "team role assignment not yet implemented")
 	}
@@ -237,14 +237,16 @@ func (s *RBACService) RevokeRole(ctx context.Context, req *authlayerv1.RevokeRol
 		return nil, status.Errorf(codes.InvalidArgument, "invalid user_id")
 	}
 
-	if req.OrgId != "" {
-		orgID, err := uuid.Parse(req.OrgId)
+	if req.GetOrgId() != "" {
+		orgID, err := uuid.Parse(req.GetOrgId())
 		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid org_id")
 		}
 		if err := s.orgMemberRepo.Remove(ctx, orgID, userID); err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to revoke role")
 		}
+	} else if req.GetTeamId() != "" {
+		// handle team
 	}
 
 	s.checker.InvalidateUserCache(userID)

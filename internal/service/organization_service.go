@@ -93,14 +93,14 @@ func (s *OrganizationService) GetOrganization(ctx context.Context, req *authlaye
 	var org *model.Organization
 	var err error
 
-	if req.Id != "" {
-		id, parseErr := uuid.Parse(req.Id)
+	if req.GetId() != "" {
+		id, parseErr := uuid.Parse(req.GetId())
 		if parseErr != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid id")
 		}
 		org, err = s.orgRepo.GetByID(ctx, id)
-	} else if req.Slug != "" {
-		org, err = s.orgRepo.GetBySlug(ctx, req.Slug)
+	} else if req.GetSlug() != "" {
+		org, err = s.orgRepo.GetBySlug(ctx, req.GetSlug())
 	} else {
 		return nil, status.Errorf(codes.InvalidArgument, "id or slug is required")
 	}

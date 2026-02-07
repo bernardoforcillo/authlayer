@@ -11,6 +11,7 @@ import (
 type Config struct {
 	// Server
 	GRPCPort    int    `env:"GRPC_PORT" envDefault:"50051"`
+	HTTPPort    int    `env:"HTTP_PORT" envDefault:"8080"`
 	Environment string `env:"ENVIRONMENT" envDefault:"development"`
 
 	// Database
