@@ -1,0 +1,23 @@
+# Build / test artifacts
+*.exe
+*.out
+*.test
+/bin/
+/dist/
+coverage.out
+coverage.txt
+
+# Go workspace files (keep local, not committed)
+go.work
+go.work.sum
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Planning / spec / design docs — never committed (user preference)
+plans/
+specs/
+docs/superpowers/
+*.plan.md
