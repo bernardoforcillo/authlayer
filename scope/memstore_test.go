@@ -23,6 +23,12 @@ type memStore[C Container, M Member,
 	// findRoleCalls counts calls to FindRole, so tests can assert how many
 	// custom-role lookups a call made (e.g. to verify memoization).
 	findRoleCalls int
+
+	// failFindRole and failListUserStandings, when set, make those methods
+	// return the given error, so a test can drive the store-failure paths a
+	// working double never reaches.
+	failFindRole          error
+	failListUserStandings error
 }
 
 func newMemStore[C Container, M Member,
@@ -147,6 +153,9 @@ func (s *memStore[C, M, PC, PM]) CountMembersWithRole(_ context.Context, cid, ro
 }
 
 func (s *memStore[C, M, PC, PM]) ListUserStandings(_ context.Context, userID string) ([]MemberStanding, error) {
+	if s.failListUserStandings != nil {
+		return nil, s.failListUserStandings
+	}
 	var out []MemberStanding
 	for containerID, members := range s.members {
 		m, ok := members[userID]
@@ -180,6 +189,9 @@ func (s *memStore[C, M, PC, PM]) CreateRole(_ context.Context, r RoleRecord) (Ro
 
 func (s *memStore[C, M, PC, PM]) FindRole(_ context.Context, cid, key string) (RoleRecord, error) {
 	s.findRoleCalls++
+	if s.failFindRole != nil {
+		return RoleRecord{}, s.failFindRole
+	}
 	r, ok := s.roles[cid][key]
 	if !ok {
 		return RoleRecord{}, ErrRoleNotFound

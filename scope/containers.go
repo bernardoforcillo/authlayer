@@ -2,6 +2,7 @@ package scope
 
 import (
 	"context"
+	"errors"
 
 	"github.com/bernardoforcillo/authlayer/access"
 )
@@ -12,11 +13,19 @@ import (
 // It resolves each membership through the same ladder [Service.Can] uses —
 // owner bypass, then a code-defined default role, then a custom role from the
 // store — so the two agree for every container where the subject holds a
-// membership row. The one exception is an owner whose own membership row has
-// been removed, reachable only with LastOwnerLocked disabled: ContainersWith
-// omits that container, so a guard built on it fails closed there rather than
-// leaking access. Zero actions returns an empty slice: there is nothing to
-// authorize, which is the same rule [access.Permission.Allows] applies.
+// membership whose role key resolves. Where they diverge, this side denies: a
+// guard built on it shows fewer rows, never more. Examples, not a closed list:
+// a role key that resolves to nothing drops its own container here while Can
+// returns ErrRoleNotFound; a membership whose container row is gone is omitted
+// here while Can returns ErrContainerNotFound; an owner with no membership row
+// of their own — reachable by provisioning through the [Store] port, or with
+// LastOwnerLocked disabled — is omitted here while Can still lets them in under
+// OwnerBypass.
+//
+// A store failure is never one of those divergences: it aborts the call, since
+// a database error must not be narrowed into "you may see nothing". Zero
+// actions returns an empty slice: there is nothing to authorize, which is the
+// same rule [access.Permission.Allows] applies.
 //
 // Cost is one store round trip for the standings, plus one role lookup per
 // distinct (container, role key) pair that names a custom role; default roles
@@ -24,7 +33,12 @@ import (
 // and no error — that is an answer, not a failure.
 //
 // This is the out-of-band form, taking the user id explicitly, so it needs no
-// subject on the context. [Service.PermissionGuard] is the context-driven form.
+// subject on the context. Like [Service.HasPermission], it performs no check
+// that the *caller* is entitled to ask about userID, and its answer enumerates
+// that user's memberships and how privileged they are in each. Do not expose it
+// directly to end users. [Service.PermissionGuard] is the context-driven form,
+// and the safe one: it takes the subject from the context rather than an
+// argument, so a caller cannot ask about somebody else.
 func (s *Service[C, M, PC, PM]) ContainersWith(
 	ctx context.Context, userID, resource string, actions ...access.Action,
 ) ([]string, error) {
@@ -50,10 +64,21 @@ func (s *Service[C, M, PC, PM]) ContainersWith(
 		k := roleKey{st.ContainerID, st.RoleKey}
 		perms, ok := resolved[k]
 		if !ok {
-			perms, err = s.resolveRole(ctx, st.ContainerID, st.RoleKey)
-			if err != nil {
+			p, err := s.resolveRole(ctx, st.ContainerID, st.RoleKey)
+			switch {
+			case errors.Is(err, ErrRoleNotFound):
+				// The key names nothing, so the standing grants nothing:
+				// deny this container and carry on. Aborting here would let
+				// one bad membership row deny every container the user is in,
+				// including those in other tenants.
+				continue
+			case err != nil:
+				// Anything else is the store failing to answer, not an answer.
+				// Skipping would narrow the result silently, which a guard
+				// renders as "you may see nothing".
 				return nil, err
 			}
+			perms = p
 			resolved[k] = perms
 		}
 		if perms.IsFull() || perms.Allows(resource, actions...) {

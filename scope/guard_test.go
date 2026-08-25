@@ -3,6 +3,7 @@ package scope
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -50,7 +51,7 @@ func renderExpr(t *testing.T, expr drops.Expression) (string, []any) {
 }
 
 func TestPermissionGuardEmitsTheContainerSet(t *testing.T) {
-	svc := containersWithFixture(t)
+	svc, _ := containersWithFixture(t)
 	tbl := pg.NewTable("projects")
 	col := pg.Add(tbl, pg.Text("organization_id"))
 
@@ -65,15 +66,46 @@ func TestPermissionGuardEmitsTheContainerSet(t *testing.T) {
 	if !strings.Contains(sql, `"organization_id" IN`) {
 		t.Fatalf("predicate does not filter the column:\n%s", sql)
 	}
-	if len(args) != 2 {
-		t.Fatalf("got %d args (%v), want the 2 qualifying container ids", len(args), args)
+	// The values matter, not just the count: a guard that bound the containers
+	// alice may *not* delete in would emit two args and filter nothing right.
+	ids := make([]string, 0, len(args))
+	for _, a := range args {
+		id, ok := a.(string)
+		if !ok {
+			t.Fatalf("bound arg %v is %T, want a container id string", a, a)
+		}
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	if want := []string{"admin", "owned"}; !slices.Equal(ids, want) {
+		t.Fatalf("guard bound %v, want %v — the containers granting project:delete", ids, want)
+	}
+}
+
+// A guard that swallowed a store failure would render as a false predicate and
+// silently show the user nothing. It must surface the error instead, which
+// drops turns into an aborted query at every guardPredicate call site.
+func TestPermissionGuardPropagatesStoreErrors(t *testing.T) {
+	svc, st := containersWithFixture(t)
+	tbl := pg.NewTable("projects")
+	col := pg.Add(tbl, pg.Text("organization_id"))
+	errBoom := errors.New("store is down")
+	st.failListUserStandings = errBoom
+
+	g := svc.PermissionGuard(col.Column, "project", "delete")
+	expr, err := g.Predicate(WithSubject(context.Background(), "alice"))
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("err = %v, want the store error", err)
+	}
+	if expr != nil {
+		t.Fatalf("got predicate %v alongside the error; a failed guard must render nothing", expr)
 	}
 }
 
 // The whole point of a guard: no qualifying container must mean no rows, never
 // an unfiltered query.
 func TestPermissionGuardWithNoContainersDeniesEverything(t *testing.T) {
-	svc := containersWithFixture(t)
+	svc, _ := containersWithFixture(t)
 	tbl := pg.NewTable("projects")
 	col := pg.Add(tbl, pg.Text("organization_id"))
 
@@ -94,7 +126,7 @@ func TestPermissionGuardWithNoContainersDeniesEverything(t *testing.T) {
 }
 
 func TestPermissionGuardWithoutSubjectFailsClosed(t *testing.T) {
-	svc := containersWithFixture(t)
+	svc, _ := containersWithFixture(t)
 	tbl := pg.NewTable("projects")
 	col := pg.Add(tbl, pg.Text("organization_id"))
 

@@ -2,6 +2,7 @@ package scope
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 
@@ -49,14 +50,16 @@ func seedRole(t *testing.T, st cwStore, containerID, key string, perms access.Pe
 
 // containersWithFixture builds a service whose subject "alice" has three
 // different kinds of standing, so one call exercises every branch of the
-// resolution ladder.
-func containersWithFixture(t *testing.T) *Service[testContainer, testMember, *testContainer, *testMember] {
+// resolution ladder. It returns the store too, so a test can iterate the
+// fixture's containers or extend it, and takes options so the same fixture can
+// be rebuilt under a different [Policy].
+func containersWithFixture(t *testing.T, opts ...Option) (*Service[testContainer, testMember, *testContainer, *testMember], cwStore) {
 	t.Helper()
 	ac := NewAccess("organization", map[string][]access.Action{
 		"project": {"create", "read", "delete"},
 	})
 	st := newCWStore()
-	svc := New[testContainer, testMember](ac, st)
+	svc := New[testContainer, testMember](ac, st, opts...)
 
 	// owned: alice owns it but holds the weakest role — OwnerBypass must win.
 	seedContainer(t, st, "owned", "alice")
@@ -70,11 +73,34 @@ func containersWithFixture(t *testing.T) *Service[testContainer, testMember, *te
 	// absent: alice is not a member at all.
 	seedContainer(t, st, "absent", "bob")
 
-	return svc
+	return svc, st
+}
+
+// fixtureContainerIDs lists every container the fixture holds, sorted. Tests
+// that must cover the whole fixture read it from the store rather than from a
+// hardcoded list, so they keep covering it as the fixture grows.
+func fixtureContainerIDs(st cwStore) []string {
+	ids := make([]string, 0, len(st.containers))
+	for id := range st.containers {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// strictNoBypass is the default policy with the one deviation that matters to
+// ContainersWith: the container owner is an ordinary member, subject to the
+// role key on their own membership row.
+func strictNoBypass() Policy {
+	return Policy{
+		Escalation:      EscalationStrict,
+		LastOwnerLocked: true,
+		OwnerBypass:     false,
+	}
 }
 
 func TestContainersWithAppliesTheSameLadderAsCan(t *testing.T) {
-	svc := containersWithFixture(t)
+	svc, _ := containersWithFixture(t)
 
 	got, err := svc.ContainersWith(context.Background(), "alice", "project", "delete")
 	if err != nil {
@@ -87,8 +113,74 @@ func TestContainersWithAppliesTheSameLadderAsCan(t *testing.T) {
 	}
 }
 
+// The feature exists because the container set must not be able to disagree
+// with the in-memory check, so the assertion here is that comparison itself
+// rather than a hardcoded set: for every container in the fixture, membership
+// of ContainersWith's result must match what Can answers for the same subject,
+// resource and actions. It runs under both owner policies, because the one
+// direction in which a disagreement leaks access — an owner treated as elevated
+// when the policy says they are not — is reachable only with OwnerBypass off.
+func TestContainersWithAgreesWithCanAcrossTheFixture(t *testing.T) {
+	policies := map[string][]Option{
+		"default policy":   nil,
+		"owner bypass off": {WithPolicy(strictNoBypass())},
+	}
+	requests := [][]access.Action{{"delete"}, {"read"}, {"read", "delete"}}
+
+	for name, opts := range policies {
+		t.Run(name, func(t *testing.T) {
+			svc, st := containersWithFixture(t, opts...)
+			ids := fixtureContainerIDs(st)
+			for _, actions := range requests {
+				got, err := svc.ContainersWith(context.Background(), "alice", "project", actions...)
+				if err != nil {
+					t.Fatalf("ContainersWith(project, %v): %v", actions, err)
+				}
+				for _, id := range ids {
+					ctx := WithScope(WithSubject(context.Background(), "alice"), id)
+					can, err := svc.Can(ctx, "project", actions...)
+					if err != nil {
+						t.Fatalf("Can(%q, project, %v): %v", id, actions, err)
+					}
+					if listed := slices.Contains(got, id); listed != can {
+						t.Fatalf("container %q, project %v: ContainersWith says %t, Can says %t (set %v)",
+							id, actions, listed, can, got)
+					}
+				}
+			}
+		})
+	}
+}
+
+// OwnerBypass is the one field whose loss fails open: drop it from the check
+// and an owner holding only a bare member role is handed every row the guard
+// should deny. With the policy off, Can denies them, so ContainersWith must.
+func TestContainersWithoutOwnerBypassDeniesTheBareMemberOwner(t *testing.T) {
+	svc, _ := containersWithFixture(t, WithPolicy(strictNoBypass()))
+
+	got, err := svc.ContainersWith(context.Background(), "alice", "project", "delete")
+	if err != nil {
+		t.Fatalf("ContainersWith: %v", err)
+	}
+	slices.Sort(got)
+	want := []string{"admin"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v — alice owns %q but holds only the %q role there, and OwnerBypass is off",
+			got, want, "owned", RoleMember)
+	}
+
+	ctx := WithScope(WithSubject(context.Background(), "alice"), "owned")
+	can, err := svc.Can(ctx, "project", "delete")
+	if err != nil {
+		t.Fatalf("Can: %v", err)
+	}
+	if can {
+		t.Fatal("Can allows project:delete in the owned container with OwnerBypass off; the policy is not reaching the ladder")
+	}
+}
+
 func TestContainersWithZeroActionsDenies(t *testing.T) {
-	svc := containersWithFixture(t)
+	svc, _ := containersWithFixture(t)
 
 	got, err := svc.ContainersWith(context.Background(), "alice", "project")
 	if err != nil {
@@ -100,14 +192,14 @@ func TestContainersWithZeroActionsDenies(t *testing.T) {
 }
 
 func TestContainersWithUndeclaredResourceDenies(t *testing.T) {
-	svc := containersWithFixture(t)
+	svc, _ := containersWithFixture(t)
 
 	got, err := svc.ContainersWith(context.Background(), "alice", "typo", "delete")
 	if err != nil {
 		t.Fatalf("ContainersWith: %v", err)
 	}
-	// The owner is elevated and passes every check, including on an undeclared
-	// resource; nobody else may.
+	// The owner is elevated and passes every fine-grained check on a non-empty
+	// action list, including on an undeclared resource; nobody else may.
 	slices.Sort(got)
 	if !slices.Equal(got, []string{"owned"}) {
 		t.Fatalf("got %v, want only the owned container", got)
@@ -115,7 +207,7 @@ func TestContainersWithUndeclaredResourceDenies(t *testing.T) {
 }
 
 func TestContainersWithUnknownUserIsEmpty(t *testing.T) {
-	svc := containersWithFixture(t)
+	svc, _ := containersWithFixture(t)
 
 	got, err := svc.ContainersWith(context.Background(), "nobody", "project", "read")
 	if err != nil {
@@ -124,6 +216,61 @@ func TestContainersWithUnknownUserIsEmpty(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("got %v, want none", got)
 	}
+}
+
+// A membership naming a role that resolves to nothing must deny its own
+// container and no other. ContainersWith answers across every container the
+// user belongs to, so aborting the batch would let one mistyped role key in one
+// container blank out the guard everywhere — including in other tenants, whose
+// data the mistake never touched. This is a documented divergence from Can,
+// which still surfaces the bad key as an error, and it denies rather than leaks.
+func TestContainersWithUnresolvableRoleSkipsOnlyThatContainer(t *testing.T) {
+	svc, st := containersWithFixture(t)
+	seedContainer(t, st, "mistyped", "bob")
+	seedMember(t, st, "mistyped", "alice", "edtior")
+
+	got, err := svc.ContainersWith(context.Background(), "alice", "project", "delete")
+	if err != nil {
+		t.Fatalf("ContainersWith: %v", err)
+	}
+	slices.Sort(got)
+	want := []string{"admin", "owned"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v, want %v — an unresolvable role must deny its own container only", got, want)
+	}
+
+	ctx := WithScope(WithSubject(context.Background(), "alice"), "mistyped")
+	if _, err := svc.Can(ctx, "project", "delete"); !errors.Is(err, ErrRoleNotFound) {
+		t.Fatalf("Can in the container with the bad role key = %v, want ErrRoleNotFound", err)
+	}
+}
+
+// A store failure is not a denial. Skipping the container it concerns would
+// turn a database outage into "you may see nothing", which a guard renders as a
+// false predicate — an answer nobody asked for. Only ErrRoleNotFound skips;
+// everything else aborts the call.
+func TestContainersWithPropagatesStoreErrors(t *testing.T) {
+	errBoom := errors.New("store is down")
+
+	t.Run("standings lookup", func(t *testing.T) {
+		svc, st := containersWithFixture(t)
+		st.failListUserStandings = errBoom
+
+		if _, err := svc.ContainersWith(context.Background(), "alice", "project", "delete"); !errors.Is(err, errBoom) {
+			t.Fatalf("err = %v, want the store error", err)
+		}
+	})
+
+	t.Run("custom role lookup", func(t *testing.T) {
+		svc, st := containersWithFixture(t)
+		seedContainer(t, st, "custom", "bob")
+		seedMember(t, st, "custom", "alice", "editor")
+		st.failFindRole = errBoom
+
+		if _, err := svc.ContainersWith(context.Background(), "alice", "project", "delete"); !errors.Is(err, errBoom) {
+			t.Fatalf("err = %v, want the store error", err)
+		}
+	})
 }
 
 // A custom role must be fetched once per (container, roleKey), not once per
