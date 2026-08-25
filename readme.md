@@ -48,8 +48,12 @@ else pulls in `drops` (and `pgx/v5` for the PostgreSQL store).
 - **Two enforcement points.** An in-memory decision (`Can` / `Authorize` /
   `HasPermission`) *and* a drops `pg.Guard` that filters rows at the database.
   Both read the acting subject and the active scope from the same `context`.
-- **No user table.** authlayer never stores users. A user id is an opaque string
-  from your own schema, and nothing is checked against it.
+- **No user table.** authlayer stores no users and declares no foreign key to
+  yours — a user id is a value it carries, never one it validates against a
+  schema of its own. The one thing that does check it is PostgreSQL: the drops
+  store types user-id columns `uuid` by default, because authlayer generates
+  UUIDv7 user ids. Bring your own non-UUID ids with
+  `dropsstore.WithTextUserIDs()`.
 
 ## Quick start
 
@@ -409,9 +413,21 @@ teams := dropsstore.New[team.Team, team.Member](db, dropsstore.WithNames(
     dropsstore.Names{Containers: "teams", Members: "team_members", Roles: "team_roles"}))
 ```
 
-Ids authlayer generates are UUIDv7 and their columns are `uuid`. If you use only
-the RBAC half against an existing user table whose ids are not UUIDs, pass
-`dropsstore.WithTextUserIDs()`.
+Fields must be `string`, `time.Time`, `[]byte`, `int` or `int32` — or a named
+type over `string`, `int` or `int32`. Anything else, a pointer included, panics
+at construction with the column named; nullable columns are not supported yet.
+A field with no `drop:` tag (or `drop:"-"`) is not persisted, and your container
+type must tag `id`, `owner_id`, `created_at` and `updated_at` while your member
+type must tag `container_id`, `user_id`, `role_key` and `joined_at` — embedding
+`scope.ContainerBase` and `scope.MemberBase` does that for you, and a type that
+misses one is rejected at construction rather than at the first query.
+
+Ids authlayer generates are UUIDv7 and their columns are `uuid`. So are the
+columns holding a user id — `owner_id` as much as `user_id` — since authlayer
+generates user ids too. If you use only the RBAC half against an existing user
+table whose ids are not UUIDs, pass `dropsstore.WithTextUserIDs()`: it retypes
+every user-id column at once, and leaves the ids authlayer mints for itself
+(`id`, `container_id`, `parent_id`) as `uuid`.
 
 The unique constraints are load-bearing: they are what turn a concurrent
 double-insert into `ErrSlugTaken`, `ErrAlreadyMember` or `ErrRoleKeyTaken`

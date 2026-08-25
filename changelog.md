@@ -17,8 +17,13 @@ once a 1.0 is cut. Until then, minor versions may break API.
 - **Generic PostgreSQL store** (`authlayer/store/drops`) — `Store[C, M]` derives
   its columns from the `drop:` tags of the container and member types and takes
   its table names from `WithNames`, so a new scope instance needs no new store.
-  `WithTextUserIDs` keeps `user_id` columns as `text` for consumers using only
-  the RBAC half against a non-UUID user table.
+  `WithTextUserIDs` keeps the user-id columns — `user_id`, `owner_id`,
+  `invited_by`, `created_by` — as `text` for consumers using only the RBAC half
+  against a non-UUID user table. The ids authlayer mints for itself (`id`,
+  `container_id`, `parent_id`) stay `uuid` either way. A container or member
+  type missing a required `drop:` tag, or carrying an unsupported field type, is
+  now rejected at construction with the type and the tag named, rather than
+  nil-dereferencing at the first query.
 
 ### Changed
 
@@ -31,18 +36,42 @@ once a 1.0 is cut. Until then, minor versions may break API.
   that to every column holding or referencing an id, not just the primary
   keys: `organization_members.container_id` and
   `organization_roles.container_id` need the same widen-and-cast, combined
-  with the rename below rather than as a separate migration. `user_id`
-  columns are `uuid` by default too; a non-UUID user table should pass
-  `dropsstore.WithTextUserIDs()` instead of rewriting them.
+  with the rename below rather than as a separate migration. The columns
+  holding a user id are `uuid` by default too — `organizations.owner_id` as
+  much as `organization_members.user_id`, since authlayer generates user ids
+  as well; a non-UUID user table should pass `dropsstore.WithTextUserIDs()`
+  instead of rewriting them.
 - **BREAKING (schema): the membership and role container column is now
   `container_id`.** It follows `scope.MemberBase`'s own `drop:` tag; the
   hand-written schema previously called it `organization_id`. Migrate with
   `ALTER TABLE organization_members RENAME COLUMN organization_id TO
   container_id` and likewise for `organization_roles`.
+- **BREAKING (schema): the roles UNIQUE constraint is renamed.** Its name is now
+  derived from the roles table name, so `organization_roles_org_key` becomes
+  `organization_roles_container_key` — and a second scope instance gets
+  `<its_roles_table>_container_key` rather than colliding on the organization
+  one. Immaterial if you let `CreateSchema` build the tables; if you own them,
+  `ALTER TABLE organization_roles RENAME CONSTRAINT organization_roles_org_key
+  TO organization_roles_container_key`.
 - **BREAKING (API): `dropsstore.New` takes type parameters.**
   `dropsstore.New(db)` becomes
   `dropsstore.New[org.Organization, org.Member](db)`. `dropsstore.NewSchema`
   likewise. `Schema.Organizations` is now `Schema.Containers`.
+
+### Fixed
+
+- **`CreateSchema` now emits the composite constraints it declares.** drops'
+  `CreateTableIfNotExists` writes column definitions only, so the members
+  `PRIMARY KEY (container_id, user_id)` and the roles
+  `UNIQUE (container_id, key)` lived in the in-memory table registry and never
+  reached the database. Since the engine relies on the database to enforce both
+  — it does not pre-check — a second `AddMember` inserted a duplicate row and
+  returned `nil` instead of `ErrAlreadyMember`, and two custom roles could share
+  a `(container, key)` with different permission sets. `CreateSchema` now
+  follows each `CREATE TABLE` with idempotent `ALTER TABLE ... ADD CONSTRAINT`
+  statements, so it stays safe to re-run. Databases created by an earlier
+  version need the constraints added by hand — re-running `CreateSchema` does
+  it, once any duplicate rows are cleared.
 
 ## [0.0.1] - 2026-07-25
 
