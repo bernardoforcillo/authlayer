@@ -81,6 +81,13 @@ type MemberStore[M any] interface {
 	// It backs Service.ContainersWith and therefore the per-action query
 	// guards: a backend should satisfy it with a single join rather than a
 	// query per container.
+	//
+	// Fill each standing's OwnerID from the container, never from the
+	// membership (see [MemberStanding]). The engine compares it against userID
+	// to apply OwnerBypass, so a backend that returns the member's own id there
+	// makes every standing look owned: every per-action guard silently degrades
+	// to membership level and every member passes every check. It is the one
+	// implementer mistake in this port that fails open.
 	ListUserStandings(ctx context.Context, userID string) ([]MemberStanding, error)
 }
 
