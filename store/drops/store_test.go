@@ -322,3 +322,58 @@ func TestEmittedSQLNamesTheDerivedColumns(t *testing.T) {
 		}
 	}
 }
+
+func TestListUserStandingsJoinsMembersToContainers(t *testing.T) {
+	fd := &fakeDriver{rows: &fakeRows{
+		cols: []string{"container_id", "role_key", "owner_id"},
+		data: [][]any{{"acme", "owner", "alice"}},
+	}}
+	st := newStore(fd)
+
+	got, err := st.ListUserStandings(context.Background(), "alice")
+	if err != nil {
+		t.Fatalf("ListUserStandings: %v", err)
+	}
+	if len(got) != 1 || got[0] != (scope.MemberStanding{
+		ContainerID: "acme", RoleKey: "owner", OwnerID: "alice",
+	}) {
+		t.Fatalf("got %+v, want one acme/owner/alice standing", got)
+	}
+
+	if len(fd.queries) != 1 {
+		t.Fatalf("issued %d queries, want exactly 1 — this must be a join, not a query per container", len(fd.queries))
+	}
+	sql := fd.queries[0]
+	for _, want := range []string{
+		`"organization_members"`,
+		`"organizations"`,
+		"JOIN",
+		`"user_id"`,
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("query missing %q:\n%s", want, sql)
+		}
+	}
+}
+
+func TestListUserContainersJoinsThroughMembership(t *testing.T) {
+	fd := &fakeDriver{rows: &fakeRows{
+		cols: []string{"id", "name", "slug", "owner_id", "created_at", "updated_at"},
+		data: [][]any{{"acme", "Acme", "acme", "alice", time.Time{}, time.Time{}}},
+	}}
+	st := newStore(fd)
+
+	got, err := st.ListUserContainers(context.Background(), "alice")
+	if err != nil {
+		t.Fatalf("ListUserContainers: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "acme" || got[0].Name != "Acme" {
+		t.Fatalf("got %+v, want the whole Acme container", got)
+	}
+	if len(fd.queries) != 1 {
+		t.Fatalf("issued %d queries, want exactly 1", len(fd.queries))
+	}
+	if !strings.Contains(fd.queries[0], "JOIN") {
+		t.Fatalf("query is not a join:\n%s", fd.queries[0])
+	}
+}

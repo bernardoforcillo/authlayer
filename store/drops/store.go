@@ -167,6 +167,52 @@ func (st *Store[C, M]) ListMembers(ctx context.Context, containerID string) ([]M
 	return out, nil
 }
 
+// ListUserStandings returns one standing per membership the user holds, across
+// every container, in a single join: the membership supplies the container and
+// role, the container its owner.
+//
+// This is the query behind Service.ContainersWith and therefore behind every
+// per-action query guard, so it is deliberately one round trip rather than a
+// lookup per container.
+func (st *Store[C, M]) ListUserStandings(ctx context.Context, userID string) ([]scope.MemberStanding, error) {
+	var out []scope.MemberStanding
+	err := st.db.Select(
+		st.s.members.col("container_id"),
+		st.s.members.col("role_key"),
+		st.s.containers.col("owner_id"),
+	).
+		From(st.s.Members).
+		Join(st.s.Containers, pg.Eq(st.s.containers.col("id"), st.s.members.col("container_id"))).
+		Where(st.s.members.eq("user_id", userID)).
+		All(ctx, &out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListUserContainers returns the containers the user is a member of, joined
+// through the membership table. A user with no memberships yields an empty
+// slice, not an error.
+func (st *Store[C, M]) ListUserContainers(ctx context.Context, userID string) ([]C, error) {
+	cols := st.s.Containers.Columns()
+	exprs := make([]drops.Expression, len(cols))
+	for i, c := range cols {
+		exprs[i] = c
+	}
+
+	var out []C
+	err := st.db.Select(exprs...).
+		From(st.s.Containers).
+		Join(st.s.Members, pg.Eq(st.s.containers.col("id"), st.s.members.col("container_id"))).
+		Where(st.s.members.eq("user_id", userID)).
+		All(ctx, &out)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // UpdateMemberRole rewrites role_key, reporting scope.ErrNotMember when the
 // UPDATE matched no row.
 func (st *Store[C, M]) UpdateMemberRole(ctx context.Context, containerID, userID, roleKey string) error {
