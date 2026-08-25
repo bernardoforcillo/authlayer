@@ -1,7 +1,10 @@
 package dropsstore
 
 import (
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/bernardoforcillo/authlayer/org"
 	"github.com/bernardoforcillo/authlayer/scope"
@@ -156,4 +159,86 @@ func TestSchemaSupportsASecondContainerType(t *testing.T) {
 	if s.Containers.Col("name") == nil {
 		t.Fatal("teams table missing the custom name column")
 	}
+}
+
+// A member type that satisfies scope.Member but tags its container column
+// something else used to build a schema, render DDL, and then nil-deref on the
+// first FindMember. Fail at construction instead, and say what is missing.
+func TestNewSchemaPanicsOnMemberTypeMissingARequiredTag(t *testing.T) {
+	type badMember struct {
+		OrgID    string    `drop:"org_id"`
+		UserID   string    `drop:"user_id"`
+		RoleKey  string    `drop:"role_key"`
+		JoinedAt time.Time `drop:"joined_at"`
+	}
+
+	msg := recoverPanic(t, func() { NewSchema[org.Organization, badMember]() })
+	for _, want := range []string{"badMember", "scope.MemberBase"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("panic message %q does not mention %q", msg, want)
+		}
+	}
+	// The missing list is exactly the missing tag, not every required one.
+	if !strings.Contains(msg, "no drop: tag for container_id;") {
+		t.Fatalf("panic message %q does not name container_id as the missing tag", msg)
+	}
+}
+
+func TestNewSchemaPanicsOnContainerTypeMissingARequiredTag(t *testing.T) {
+	type badContainer struct {
+		ID   string `drop:"id"`
+		Name string `drop:"name"`
+	}
+
+	msg := recoverPanic(t, func() { NewSchema[badContainer, org.Member]() })
+	for _, want := range []string{"badContainer", "owner_id", "created_at", "updated_at"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("panic message %q does not mention %q", msg, want)
+		}
+	}
+}
+
+// A pointer type parameter used to die inside reflect with "NumField of
+// non-struct type" instead of the package's own message.
+func TestNewSchemaPanicsOnPointerContainerType(t *testing.T) {
+	msg := recoverPanic(t, func() { NewSchema[*org.Organization, org.Member]() })
+	if !strings.Contains(msg, "authlayer/store/drops") || !strings.Contains(msg, "not a struct") {
+		t.Fatalf("pointer C panicked with %q, want the package's own message", msg)
+	}
+}
+
+// A fully-tagged pair that does not embed the bases is still accepted: the
+// check is on the tags, not on the embedding.
+func TestNewSchemaAcceptsHandTaggedTypes(t *testing.T) {
+	type container struct {
+		ID        string    `drop:"id"`
+		OwnerID   string    `drop:"owner_id"`
+		CreatedAt time.Time `drop:"created_at"`
+		UpdatedAt time.Time `drop:"updated_at"`
+	}
+	type member struct {
+		ContainerID string    `drop:"container_id"`
+		UserID      string    `drop:"user_id"`
+		RoleKey     string    `drop:"role_key"`
+		JoinedAt    time.Time `drop:"joined_at"`
+	}
+	s := NewSchema[container, member]()
+	if s.Members.Col("container_id") == nil {
+		t.Fatal("hand-tagged member type produced no container_id column")
+	}
+}
+
+// recoverPanic runs fn and returns the panic value as a string, failing the
+// test if fn returns normally.
+func recoverPanic(t *testing.T, fn func()) (msg string) {
+	t.Helper()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected a panic, got none")
+		}
+		msg = fmt.Sprint(r)
+	}()
+	fn()
+	return ""
 }

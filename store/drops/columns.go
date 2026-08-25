@@ -63,6 +63,14 @@ type colSet struct {
 // a startup programming error, and the same idiom is already used by
 // access.NewRole for a mis-declared role.
 func newColSet(tbl *pg.Table, model any, uuidUserIDs bool) *colSet {
+	t := reflect.TypeOf(model)
+	if t == nil || t.Kind() != reflect.Struct {
+		panic(fmt.Sprintf(
+			"authlayer/store/drops: %s is not a struct; the container and member "+
+				"type parameters must be struct types (embed scope.ContainerBase / "+
+				"scope.MemberBase), not pointers or interfaces", typeName(t)))
+	}
+
 	c := &colSet{
 		tbl:   tbl,
 		str:   map[string]*pg.Col[string]{},
@@ -70,8 +78,51 @@ func newColSet(tbl *pg.Table, model any, uuidUserIDs bool) *colSet {
 		bytes: map[string]*pg.Col[[]byte]{},
 		i32:   map[string]*pg.Col[int32]{},
 	}
-	c.walk(reflect.TypeOf(model), uuidUserIDs)
+	c.walk(t, uuidUserIDs)
 	return c
+}
+
+// The tags the store's own queries name. A model missing one of these builds a
+// schema whose DDL renders and whose first query nil-dereferences, so they are
+// checked at construction — see colSet.require.
+var (
+	requiredContainerColumns = []string{"id", "owner_id", "created_at", "updated_at"}
+	requiredMemberColumns    = []string{"container_id", "user_id", "role_key", "joined_at"}
+)
+
+// require panics unless model tagged every column in names.
+//
+// Neither type parameter can carry this in its constraint: scope.Member asks
+// for three accessor methods and says nothing about tags, so a member type that
+// tags its container column drop:"org_id" satisfies it, builds a schema, and
+// renders DDL — then dies on the first FindMember with a bare nil dereference,
+// because col returns nil for an absent tag and drops stores that nil. Failing
+// at construction with the type and the missing tag named is the same idiom
+// newColSet already uses for an unmappable field type.
+func (c *colSet) require(model any, role, base string, names []string) {
+	var missing []string
+	for _, n := range names {
+		if c.col(n) == nil {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	panic(fmt.Sprintf(
+		"authlayer/store/drops: %s type %s has no drop: tag for %s; "+
+			"a %s type must tag %s — embedding %s supplies them all",
+		role, typeName(reflect.TypeOf(model)), strings.Join(missing, ", "),
+		role, strings.Join(names, ", "), base))
+}
+
+// typeName renders a reflect.Type for a panic message, including the nil type a
+// nil interface value yields.
+func typeName(t reflect.Type) string {
+	if t == nil {
+		return "nil"
+	}
+	return t.String()
 }
 
 func (c *colSet) walk(t reflect.Type, uuidUserIDs bool) {

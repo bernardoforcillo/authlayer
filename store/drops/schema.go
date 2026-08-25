@@ -90,6 +90,22 @@ type Schema[C any, M any] struct {
 // NewSchema builds the schema for one scope instance. [New] calls it, so use it
 // directly only when you need the table definitions without a Store — to
 // generate DDL for a migration, for instance.
+//
+// Columns come from the drop: tags on C, M and scope.RoleRecord. Embedded
+// structs are flattened, and a field with no drop: tag (or drop:"-") is not
+// persisted. The supported field types are string, time.Time, []byte, int and
+// int32, plus any named type whose underlying type is string, int or int32;
+// nullable columns are not supported yet, so a pointer field is rejected.
+//
+// It panics rather than returning an error, because a model the store cannot
+// persist is a startup programming error, not a runtime condition. The cases:
+//
+//   - C or M is not a struct type;
+//   - a tagged field's type is outside the supported set;
+//   - C does not tag id, owner_id, created_at and updated_at, or M does not tag
+//     container_id, user_id, role_key and joined_at. Embedding
+//     scope.ContainerBase and scope.MemberBase supplies all of them, and the
+//     panic names the type and the missing tag.
 func NewSchema[C any, M any](opts ...Option) *Schema[C, M] {
 	cfg := settings{uuidUserIDs: true}
 	for _, o := range opts {
@@ -108,6 +124,9 @@ func NewSchema[C any, M any](opts ...Option) *Schema[C, M] {
 	s.containers = newColSet(s.Containers, zeroC, cfg.uuidUserIDs)
 	s.members = newColSet(s.Members, zeroM, cfg.uuidUserIDs)
 	s.roles = newColSet(s.Roles, scope.RoleRecord{}, cfg.uuidUserIDs)
+
+	s.containers.require(zeroC, "container", "scope.ContainerBase", requiredContainerColumns)
+	s.members.require(zeroM, "member", "scope.MemberBase", requiredMemberColumns)
 
 	s.Members.PrimaryKey(s.members.col("container_id"), s.members.col("user_id"))
 	s.Roles.AddUnique(names.Roles+"_container_key",
