@@ -43,6 +43,18 @@ func TestCreateContainerMakesSubjectOwner(t *testing.T) {
 	}
 }
 
+func TestCanWithZeroActionsDeniesEvenForOwner(t *testing.T) {
+	svc := newTestService()
+	octx, _ := ownerCtx(t, svc, "alice")
+
+	// The owner is elevated and would pass any fine-grained check, but zero
+	// actions has nothing to authorize — that must deny regardless of
+	// elevation, matching access.Permission.Allows' own rule.
+	if ok, err := svc.Can(octx, resOrg); err != nil || ok {
+		t.Fatalf("owner with zero actions = %v,%v; want false,nil", ok, err)
+	}
+}
+
 func TestCreateContainerRequiresSubject(t *testing.T) {
 	svc := newTestService()
 	if _, err := svc.CreateContainer(context.Background(), testContainer{}); !errors.Is(err, ErrSubjectMissing) {

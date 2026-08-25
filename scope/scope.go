@@ -252,6 +252,12 @@ func (s *Service[C, M, PC, PM]) authorize(ctx context.Context, containerID, user
 	if err != nil {
 		return authz{}, err
 	}
+	// Zero actions denies even for an elevated actor — there is nothing to
+	// authorize, the same rule access.Permission.Allows applies on its own.
+	// The elevated short-circuit below is only for the normal, non-empty case.
+	if len(actions) == 0 {
+		return authz{}, ErrForbidden
+	}
 	if !a.elevated && !a.perms.Allows(resource, actions...) {
 		return authz{}, ErrForbidden
 	}
