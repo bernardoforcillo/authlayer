@@ -214,3 +214,76 @@ func TestDecodeDropsRemovedCapabilities(t *testing.T) {
 		t.Fatal("member:create must survive; legacy:do is simply dropped")
 	}
 }
+
+func TestUnionCombinesGrants(t *testing.T) {
+	ac := New(NewStatements(map[string][]Action{
+		"doc": {"read", "write"}, "billing": {"read"},
+	}))
+	a, err := ac.Permission(map[string][]Action{"doc": {"read"}})
+	if err != nil {
+		t.Fatalf("build a: %v", err)
+	}
+	b, err := ac.Permission(map[string][]Action{"billing": {"read"}})
+	if err != nil {
+		t.Fatalf("build b: %v", err)
+	}
+
+	u, err := ac.Union(a, b)
+	if err != nil {
+		t.Fatalf("Union: %v", err)
+	}
+	if !u.Allows("doc", "read") || !u.Allows("billing", "read") {
+		t.Fatal("union does not grant both inputs' grants")
+	}
+	if u.Allows("doc", "write") {
+		t.Fatal("union invented a grant neither input held")
+	}
+	// Inputs are immutable.
+	if a.Allows("billing", "read") {
+		t.Fatal("Union mutated its first argument")
+	}
+}
+
+func TestUnionOfNoneGrantsNothing(t *testing.T) {
+	ac := New(NewStatements(map[string][]Action{"doc": {"read"}}))
+	u, err := ac.Union()
+	if err != nil {
+		t.Fatalf("Union: %v", err)
+	}
+	if u.Allows("doc", "read") {
+		t.Fatal("empty union grants something")
+	}
+}
+
+// The point of the method: a permission from another Statements space has
+// meaningless bits here and must be refused, not silently reinterpreted.
+func TestUnionRejectsAForeignPermission(t *testing.T) {
+	parent := New(NewStatements(map[string][]Action{"org": {"admin"}}))
+	child := New(NewStatements(map[string][]Action{"team": {"read"}}))
+
+	foreign, err := parent.Permission(map[string][]Action{"org": {"admin"}})
+	if err != nil {
+		t.Fatalf("build foreign: %v", err)
+	}
+	if _, err := child.Union(foreign); err == nil {
+		t.Fatal("Union accepted a permission built from a different Statements — bits would be reinterpreted")
+	}
+}
+
+func TestUnionAcceptsTheZeroPermission(t *testing.T) {
+	ac := New(NewStatements(map[string][]Action{"doc": {"read"}}))
+	granted, err := ac.Permission(map[string][]Action{"doc": {"read"}})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	// The zero Permission has no statements and grants nothing; unioning it
+	// must be a no-op rather than an error, so callers need not special-case
+	// "no inherited grants".
+	u, err := ac.Union(granted, Permission{})
+	if err != nil {
+		t.Fatalf("Union with the zero permission: %v", err)
+	}
+	if !u.Allows("doc", "read") {
+		t.Fatal("unioning the zero permission dropped a grant")
+	}
+}

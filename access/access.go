@@ -133,6 +133,34 @@ func (a *Access) Permission(grants map[string][]Action) (Permission, error) {
 	return p, nil
 }
 
+// Union returns the permission granting every pair granted by any of ps.
+//
+// All arguments must come from this Access's Statements: a Permission is a
+// bitset over one statement space, so combining permissions from two spaces
+// would reinterpret bits rather than merge grants. A foreign permission is
+// rejected with an error rather than silently misread. The zero Permission is
+// accepted and contributes nothing, so a caller with no permission to merge
+// need not special-case it.
+//
+// It backs nested scopes, where a member's own role permissions merge with the
+// grants projected from their standing in the parent scope — both compiled
+// against the child's statements.
+func (a *Access) Union(ps ...Permission) (Permission, error) {
+	out := newPermission(a.s)
+	for _, p := range ps {
+		if p.s == nil {
+			continue // the zero Permission grants nothing
+		}
+		if p.s != a.s {
+			return Permission{}, fmt.Errorf("access: Union of a permission from a different Statements")
+		}
+		for i := range p.bits {
+			out.bits[i] |= p.bits[i]
+		}
+	}
+	return out, nil
+}
+
 // Decode rebuilds a Permission from Encode's output, re-resolving each
 // "resource:action" token against the current statements. Tokens for
 // capabilities that no longer exist are dropped (a removed capability can no
