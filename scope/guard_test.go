@@ -82,6 +82,22 @@ func TestPermissionGuardEmitsTheContainerSet(t *testing.T) {
 	}
 }
 
+// A nil column is a wiring mistake, and drops' own guards report it. Passing it
+// through to pg.In would instead panic inside the query builder, where the
+// stack says nothing about which guard was mis-wired.
+func TestPermissionGuardWithNilColumnErrors(t *testing.T) {
+	svc, _ := containersWithFixture(t)
+
+	g := svc.PermissionGuard(nil, "project", "delete")
+	expr, err := g.Predicate(WithSubject(context.Background(), "alice"))
+	if err == nil {
+		t.Fatalf("Predicate with a nil column = %v, nil; want an error", expr)
+	}
+	if !strings.Contains(err.Error(), "col") {
+		t.Fatalf("err = %v; want it to name the nil column", err)
+	}
+}
+
 // A guard that swallowed a store failure would render as a false predicate and
 // silently show the user nothing. It must surface the error instead, which
 // drops turns into an aborted query at every guardPredicate call site.

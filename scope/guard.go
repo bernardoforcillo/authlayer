@@ -2,6 +2,7 @@ package scope
 
 import (
 	"context"
+	"errors"
 
 	"github.com/bernardoforcillo/authlayer/access"
 	"github.com/bernardoforcillo/drops"
@@ -45,20 +46,30 @@ func MembershipGuard(junction *pg.Table, subjectCol, containerCol, resourceConta
 //	    projectsTbl.Col("organization_id"), "project", org.ActionDelete))
 //	// WHERE "organization_id" IN ($1, $2)
 //
-// col is the container-id column on the table being guarded. The subject comes
+// col is the container-id column on the table being guarded; a nil one is an
+// error from Predicate, not a panic in the builder. The subject comes
 // from the same context the Service reads ([WithSubject]); a missing subject is
 // pg.ErrSubjectMissing and no predicate is produced. A subject with no
 // qualifying containers renders as a false predicate, so the query returns
 // nothing rather than everything.
 //
 // The predicate is resolved per query, which costs one round trip for the
-// subject's standings plus one lookup per distinct custom role involved — see
-// [Service.ContainersWith], which is exported so a hot path can hoist the id
-// set and reuse it. Compose with other guards using pg.AnyOf / pg.AllOf.
+// subject's standings plus one role lookup per distinct (container, role key)
+// pair that names a custom role — a custom role is per-container, so the same
+// role key in two containers is two lookups. [Service.ContainersWith] is
+// exported so a hot path can hoist the id set and reuse it. The rendered IN
+// list binds one parameter per qualifying container, so a subject who belongs
+// to very many containers is another reason to hoist. Compose with other
+// guards using pg.AnyOf / pg.AllOf.
 func (s *Service[C, M, PC, PM]) PermissionGuard(
 	col *pg.Column, resource string, actions ...access.Action,
 ) pg.Guard {
 	return pg.CustomGuard(func(ctx context.Context) (drops.Expression, error) {
+		// Reported like drops' own guards report a missing column, rather
+		// than nil-dereferencing inside the query builder.
+		if col == nil {
+			return nil, errors.New("authlayer/scope: PermissionGuard col is nil")
+		}
 		subject, ok := SubjectFrom(ctx)
 		if !ok {
 			return nil, pg.ErrSubjectMissing
