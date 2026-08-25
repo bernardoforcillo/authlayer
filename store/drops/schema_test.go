@@ -73,6 +73,8 @@ func TestSchemaWithTextUserIDs(t *testing.T) {
 	}
 }
 
+// The UNIQUE (container_id, key) constraint is load-bearing: it is what turns
+// a concurrent double-insert into ErrRoleKeyTaken instead of a duplicate row.
 func TestSchemaRolesHaveUniqueContainerKey(t *testing.T) {
 	s := NewSchema[org.Organization, org.Member]()
 	if s.Roles.Col("permissions") == nil {
@@ -80,5 +82,40 @@ func TestSchemaRolesHaveUniqueContainerKey(t *testing.T) {
 	}
 	if s.Roles.Col("key") == nil {
 		t.Fatal("roles table missing key column")
+	}
+
+	uniques := s.Roles.CompositeUniques()
+	cols, ok := uniques["organization_roles_container_key"]
+	if !ok {
+		t.Fatalf("roles table missing UNIQUE constraint %q; have %v",
+			"organization_roles_container_key", uniques)
+	}
+	if len(cols) != 2 {
+		t.Fatalf("roles unique constraint has %d columns, want 2", len(cols))
+	}
+	got := []string{cols[0].Name(), cols[1].Name()}
+	want := []string{"container_id", "key"}
+	if got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("roles unique constraint columns = %v, want %v", got, want)
+	}
+}
+
+// The constraint name is derived from the configured Roles table name, so a
+// second scope instance (teams, projects) gets its own, non-colliding
+// constraint rather than reusing "organization_roles_container_key".
+func TestSchemaRolesUniqueConstraintNameFollowsCustomNames(t *testing.T) {
+	s := NewSchema[org.Organization, org.Member](WithNames(Names{
+		Containers: "teams", Members: "team_members", Roles: "team_roles",
+	}))
+	uniques := s.Roles.CompositeUniques()
+	cols, ok := uniques["team_roles_container_key"]
+	if !ok {
+		t.Fatalf("roles table missing UNIQUE constraint %q; have %v",
+			"team_roles_container_key", uniques)
+	}
+	got := []string{cols[0].Name(), cols[1].Name()}
+	want := []string{"container_id", "key"}
+	if got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("roles unique constraint columns = %v, want %v", got, want)
 	}
 }
