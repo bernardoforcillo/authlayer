@@ -1,7 +1,7 @@
 package dropsstore
 
 import (
-	"sort"
+	"slices"
 
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
@@ -43,7 +43,7 @@ func compositeConstraintDDL(t *pg.Table) []drops.Expression {
 	for name := range uniques {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	for _, name := range names {
 		out = append(out, addConstraint(t, name, "UNIQUE", uniques[name]))
 	}
