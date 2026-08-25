@@ -24,9 +24,16 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 - **BREAKING (schema): id columns are now `uuid`.** Every id authlayer
   generates is a UUIDv7 and its column is typed `uuid` rather than `text`.
-  Migrate with `ALTER TABLE <t> ALTER COLUMN id TYPE uuid USING id::uuid` per
-  affected column. `CreateSchema` only ever creates, so it will not migrate an
-  existing database forward.
+  `CreateSchema` on a fresh database needs nothing; on an existing one the old
+  ids are 24 hex characters, too short for the 32 hex digits `uuid` requires,
+  so widen before casting rather than casting directly — `ALTER TABLE <t>
+  ALTER COLUMN <col> TYPE uuid USING lpad(<col>, 32, '0')::uuid` — and apply
+  that to every column holding or referencing an id, not just the primary
+  keys: `organization_members.container_id` and
+  `organization_roles.container_id` need the same widen-and-cast, combined
+  with the rename below rather than as a separate migration. `user_id`
+  columns are `uuid` by default too; a non-UUID user table should pass
+  `dropsstore.WithTextUserIDs()` instead of rewriting them.
 - **BREAKING (schema): the membership and role container column is now
   `container_id`.** It follows `scope.MemberBase`'s own `drop:` tag; the
   hand-written schema previously called it `organization_id`. Migrate with
