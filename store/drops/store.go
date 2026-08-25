@@ -46,17 +46,30 @@ func (st *Store[C, M]) MembershipGuard(resourceContainerCol *pg.Column) pg.Guard
 		st.s.members.col("user_id"), st.s.members.col("container_id"), resourceContainerCol)
 }
 
-// CreateSchema issues CREATE TABLE IF NOT EXISTS for the three tables, in
-// dependency order.
+// CreateSchema issues CREATE TABLE IF NOT EXISTS for the containers, members
+// and roles tables, followed by the composite constraints CREATE TABLE cannot
+// carry: PRIMARY KEY (container_id, user_id) on the members table and
+// UNIQUE (container_id, key) on the roles table. Those two are load-bearing —
+// the engine does not pre-check membership or role-key uniqueness, it relies on
+// the unique violation coming back from PostgreSQL — so they are emitted rather
+// than left to the in-memory table registry. No foreign keys are declared
+// between the three tables, so the order is arbitrary.
 //
-// It is a convenience for development, tests, and getting started. It creates
-// tables but never alters them, so it will not migrate an existing schema
-// forward — production deployments should own these tables in their own
-// migrations and skip this call.
+// Every statement is idempotent, so the call is safe to re-run. It is a
+// convenience for development, tests, and getting started: it adds what is
+// missing and never alters what is already there, so it will not migrate an
+// existing schema forward — a table whose columns or constraints differ is left
+// exactly as it stands, with no error. Production deployments should own these
+// tables in their own migrations and skip this call.
 func (st *Store[C, M]) CreateSchema(ctx context.Context) error {
 	for _, t := range []*pg.Table{st.s.Containers, st.s.Members, st.s.Roles} {
 		if _, err := st.db.ExecExpr(ctx, pg.CreateTableIfNotExists(t)); err != nil {
 			return err
+		}
+		for _, ddl := range compositeConstraintDDL(t) {
+			if _, err := st.db.ExecExpr(ctx, ddl); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

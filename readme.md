@@ -415,10 +415,16 @@ the RBAC half against an existing user table whose ids are not UUIDs, pass
 
 The unique constraints are load-bearing: they are what turn a concurrent
 double-insert into `ErrSlugTaken`, `ErrAlreadyMember` or `ErrRoleKeyTaken`
-instead of a duplicate row. Keep them if you own these tables in your own
-migrations — `CreateSchema` only ever creates, never alters, so it will not
-migrate an existing schema forward. `st.Schema()` exposes the table definitions
-if you would rather generate the DDL.
+instead of a duplicate row, because the engine does not pre-check any of the
+three. `CreateSchema` emits them — including the composite
+`PRIMARY KEY (container_id, user_id)` on the members table and
+`UNIQUE (container_id, key)` on the roles table, which a `CREATE TABLE` cannot
+carry — and keep them if you own these tables in your own migrations instead.
+Every statement it issues is idempotent, so the call is safe to re-run, but it
+only ever adds what is missing: a table that already exists with different
+columns or constraints is left as it stands, so `CreateSchema` will not migrate
+an existing schema forward. `st.Schema()` exposes the table definitions if you
+would rather generate the DDL.
 
 No foreign key to a users table is declared, because authlayer does not own one.
 

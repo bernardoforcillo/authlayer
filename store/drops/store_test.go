@@ -163,6 +163,68 @@ func TestRemoveMemberAffectsRowsOrNotFound(t *testing.T) {
 	}
 }
 
+// drops' CreateTableIfNotExists writes column definitions only, so the composite
+// PK and UNIQUE registered on the *pg.Table would never reach the database
+// unless CreateSchema emits them itself. Assert the SQL, not the registry: the
+// registry is what was already true before the constraints were emitted.
+func TestCreateSchemaEmitsCompositeConstraints(t *testing.T) {
+	fd := &fakeDriver{}
+	st := newStore(fd)
+	if err := st.CreateSchema(context.Background()); err != nil {
+		t.Fatalf("CreateSchema: %v", err)
+	}
+
+	// 3 CREATE TABLE + the members PK + the roles UNIQUE.
+	if len(fd.execs) != 5 {
+		t.Fatalf("CreateSchema issued %d statements, want 5:\n%s",
+			len(fd.execs), strings.Join(fd.execs, "\n--\n"))
+	}
+
+	want := []string{
+		`ALTER TABLE "organization_members" ADD CONSTRAINT "organization_members_pkey" ` +
+			`PRIMARY KEY ("container_id", "user_id");`,
+		`ALTER TABLE "organization_roles" ADD CONSTRAINT "organization_roles_container_key" ` +
+			`UNIQUE ("container_id", "key");`,
+	}
+	all := strings.Join(fd.execs, "\n--\n")
+	for _, w := range want {
+		if !strings.Contains(all, w) {
+			t.Fatalf("CreateSchema never emitted:\n%s\ngot:\n%s", w, all)
+		}
+	}
+
+	// Re-running must be safe, so each ALTER is guarded rather than bare.
+	for _, sql := range fd.execs {
+		if strings.Contains(sql, "ALTER TABLE") && !strings.Contains(sql, "EXCEPTION") {
+			t.Fatalf("unguarded ALTER, so CreateSchema is not re-runnable:\n%s", sql)
+		}
+	}
+
+	// The containers table declares no composite constraint, so it gets one
+	// statement and no ALTER.
+	if strings.Contains(all, `ALTER TABLE "organizations"`) {
+		t.Fatalf("containers table has no composite constraint but got an ALTER:\n%s", all)
+	}
+}
+
+// The constraint names follow the configured table names, so a second scope
+// instance does not collide with the organization one.
+func TestCreateSchemaConstraintNamesFollowCustomNames(t *testing.T) {
+	fd := &fakeDriver{}
+	st := New[org.Organization, org.Member](pg.New(fd), WithNames(Names{
+		Containers: "teams", Members: "team_members", Roles: "team_roles",
+	}))
+	if err := st.CreateSchema(context.Background()); err != nil {
+		t.Fatalf("CreateSchema: %v", err)
+	}
+	all := strings.Join(fd.execs, "\n--\n")
+	for _, w := range []string{`"team_members_pkey"`, `"team_roles_container_key"`} {
+		if !strings.Contains(all, w) {
+			t.Fatalf("constraint %s missing from:\n%s", w, all)
+		}
+	}
+}
+
 func TestWithTxCommitsAndRollsBack(t *testing.T) {
 	fd := &fakeDriver{}
 	st := newStore(fd)

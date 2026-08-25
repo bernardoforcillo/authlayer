@@ -69,8 +69,10 @@ func WithTextUserIDs() Option { return func(s *settings) { s.uuidUserIDs = false
 //
 // The unique constraints are load-bearing, not decoration: they are what turn a
 // concurrent double-insert into scope.ErrConflict, scope.ErrAlreadyMember or
-// scope.ErrRoleKeyTaken instead of a duplicate row. Keep them if you manage
-// these tables with your own migrations.
+// scope.ErrRoleKeyTaken instead of a duplicate row, because the engine does not
+// pre-check any of the three. [Store.CreateSchema] emits the two composite ones
+// itself, since drops' CREATE TABLE covers single-column constraints only. Keep
+// them if you manage these tables with your own migrations.
 //
 // permissions holds encoded grant names (see access.Permission.Encode), never
 // bit indices, so the column survives changes to the application's statement
