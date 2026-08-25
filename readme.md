@@ -331,7 +331,7 @@ goroutine; the first error stops the chain.
 | `WithPolicy(p)` | Replace the authorization policy. |
 | `WithHooks(h...)` | Append lifecycle hooks (accumulates across calls). |
 | `WithClock(fn)` | Timestamp source; default `time.Now().UTC()`. Inject a fixed clock for deterministic tests. |
-| `WithIDGenerator(fn)` | Id source for containers and custom roles; default is 24 hex chars from `crypto/rand`. Swap in UUIDv7, ULIDs, whatever your schema expects. |
+| `WithIDGenerator(fn)` | Id source for containers and custom roles; default is UUIDv7 from `crypto/rand`. Swap in ULIDs or whatever your schema expects. |
 
 Options apply at construction and never after, so a `Service` is immutable once
 built.
@@ -345,7 +345,7 @@ tenant's rows.
 ```go
 projects.AuthorizeWith(st.MembershipGuard(projectsTbl.Col("organization_id")))
 // SELECT ... WHERE "organization_id" IN (
-//     SELECT "organization_id" FROM "organization_members" WHERE "user_id" = $subject)
+//     SELECT "container_id" FROM "organization_members" WHERE "user_id" = $subject)
 ```
 
 `st.MembershipGuard` is the drops store's convenience — it fills in the junction
@@ -353,7 +353,7 @@ table and its columns. The general form works against any membership table:
 
 ```go
 guard := org.MembershipGuard(membersTbl,
-    membersTbl.Col("user_id"), membersTbl.Col("organization_id"),
+    membersTbl.Col("user_id"), membersTbl.Col("container_id"),
     projectsTbl.Col("organization_id"))
 ```
 
@@ -385,21 +385,33 @@ a mutex.
 
 ### `store/drops`
 
-The PostgreSQL store, on three tables:
+The PostgreSQL store, generic over the container and member types:
 
 ```
-organizations         id PK, name, slug UNIQUE, owner_id, created_at, updated_at
-organization_members  (organization_id, user_id) PK, role_key, joined_at
-organization_roles    id PK, organization_id, key, name, permissions BYTEA,
-                      created_at, UNIQUE (organization_id, key)
+organizations         id PK (uuid), name, slug UNIQUE, owner_id, created_at, updated_at
+organization_members  (container_id, user_id) PK, role_key, joined_at
+organization_roles    id PK, container_id, key, name, permissions BYTEA,
+                      created_at, UNIQUE (container_id, key)
 ```
 
 ```go
 db := pg.New(stdlib.New(sqlDB)) // sqlDB is a *sql.DB on a pgx connection
-st := dropsstore.New(db)
+st := dropsstore.New[org.Organization, org.Member](db)
 st.CreateSchema(ctx)            // or manage the tables with your migrations
 svc := org.New(org.NewAccess(nil), st)
 ```
+
+Columns are derived from the `drop:` tags on your types, so a different scope
+needs only table names:
+
+```go
+teams := dropsstore.New[team.Team, team.Member](db, dropsstore.WithNames(
+    dropsstore.Names{Containers: "teams", Members: "team_members", Roles: "team_roles"}))
+```
+
+Ids authlayer generates are UUIDv7 and their columns are `uuid`. If you use only
+the RBAC half against an existing user table whose ids are not UUIDs, pass
+`dropsstore.WithTextUserIDs()`.
 
 The unique constraints are load-bearing: they are what turn a concurrent
 double-insert into `ErrSlugTaken`, `ErrAlreadyMember` or `ErrRoleKeyTaken`

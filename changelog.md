@@ -8,6 +8,35 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ## [Unreleased]
 
+### Added
+
+- **UUIDv7 identifiers** (`authlayer/internal/uid`) — a dependency-free RFC 9562
+  generator, now the default for containers and custom roles. Time-ordered, so
+  ids sort in creation order and a primary-key index stays dense.
+  `WithIDGenerator` still overrides it.
+- **Generic PostgreSQL store** (`authlayer/store/drops`) — `Store[C, M]` derives
+  its columns from the `drop:` tags of the container and member types and takes
+  its table names from `WithNames`, so a new scope instance needs no new store.
+  `WithTextUserIDs` keeps `user_id` columns as `text` for consumers using only
+  the RBAC half against a non-UUID user table.
+
+### Changed
+
+- **BREAKING (schema): id columns are now `uuid`.** Every id authlayer
+  generates is a UUIDv7 and its column is typed `uuid` rather than `text`.
+  Migrate with `ALTER TABLE <t> ALTER COLUMN id TYPE uuid USING id::uuid` per
+  affected column. `CreateSchema` only ever creates, so it will not migrate an
+  existing database forward.
+- **BREAKING (schema): the membership and role container column is now
+  `container_id`.** It follows `scope.MemberBase`'s own `drop:` tag; the
+  hand-written schema previously called it `organization_id`. Migrate with
+  `ALTER TABLE organization_members RENAME COLUMN organization_id TO
+  container_id` and likewise for `organization_roles`.
+- **BREAKING (API): `dropsstore.New` takes type parameters.**
+  `dropsstore.New(db)` becomes
+  `dropsstore.New[org.Organization, org.Member](db)`. `dropsstore.NewSchema`
+  likewise. `Schema.Organizations` is now `Schema.Containers`.
+
 ## [0.0.1] - 2026-07-25
 
 Initial release. Milestone 1: scope RBAC — code-defined permission statements,
