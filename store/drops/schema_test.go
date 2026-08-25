@@ -135,6 +135,10 @@ func TestSchemaSupportsASecondContainerType(t *testing.T) {
 	s := NewSchema[Team, TeamMember](WithNames(Names{
 		Containers: "teams", Members: "team_members", Roles: "team_roles",
 	}))
+	if s.Containers.Name() != "teams" || s.Members.Name() != "team_members" || s.Roles.Name() != "team_roles" {
+		t.Fatalf("unexpected table names: %s %s %s",
+			s.Containers.Name(), s.Members.Name(), s.Roles.Name())
+	}
 	if got := s.Containers.Col("parent_id").Type().TypeSQL(); got != "uuid" {
 		t.Fatalf("parent_id type = %q, want uuid", got)
 	}
