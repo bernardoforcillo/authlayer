@@ -1,6 +1,12 @@
 package scope
 
-import "github.com/bernardoforcillo/drops/pg"
+import (
+	"context"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/drops"
+	"github.com/bernardoforcillo/drops/pg"
+)
 
 // MembershipGuard builds a drops query guard that restricts a resource table's
 // rows to the containers the context subject belongs to. It reuses drops'
@@ -25,4 +31,43 @@ func MembershipGuard(junction *pg.Table, subjectCol, containerCol, resourceConta
 		JunctionResource: containerCol,
 		ResourceOwner:    resourceContainerCol,
 	}
+}
+
+// PermissionGuard returns a drops query guard restricting a table's rows to the
+// containers in which the context subject may perform every action on resource.
+//
+// Where [MembershipGuard] asks "is the subject a member?", this asks "may the
+// subject do this?" — the difference between showing every project in the
+// user's organizations and showing only those they may delete.
+//
+//	projects.AuthorizeWith(svc.PermissionGuard(
+//	    projectsTbl.Col("organization_id"), "project", org.ActionDelete))
+//	// WHERE "organization_id" IN ($1, $2)
+//
+// col is the container-id column on the table being guarded. The subject comes
+// from the same context the Service reads ([WithSubject]); a missing subject is
+// pg.ErrSubjectMissing and no predicate is produced. A subject with no
+// qualifying containers renders as a false predicate, so the query returns
+// nothing rather than everything.
+//
+// The predicate is resolved per query, which costs one round trip for the
+// subject's standings plus one lookup per distinct custom role involved — see
+// [Service.ContainersWith], which is exported so a hot path can hoist the id
+// set and reuse it. Compose with other guards using pg.AnyOf / pg.AllOf.
+func (s *Service[C, M, PC, PM]) PermissionGuard(
+	col *pg.Column, resource string, actions ...access.Action,
+) pg.Guard {
+	return pg.CustomGuard(func(ctx context.Context) (drops.Expression, error) {
+		subject, ok := SubjectFrom(ctx)
+		if !ok {
+			return nil, pg.ErrSubjectMissing
+		}
+		ids, err := s.ContainersWith(ctx, subject, resource, actions...)
+		if err != nil {
+			return nil, err
+		}
+		// pg.In renders an empty list as a false predicate, so this fails
+		// closed without a special case.
+		return pg.In(col, ids), nil
+	})
 }
