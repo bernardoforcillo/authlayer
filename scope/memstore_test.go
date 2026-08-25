@@ -64,6 +64,19 @@ func (s *memStore[C, M, PC, PM]) UpdateContainerOwner(_ context.Context, id, new
 	return nil
 }
 
+func (s *memStore[C, M, PC, PM]) ListUserContainers(_ context.Context, userID string) ([]C, error) {
+	var out []C
+	for containerID, members := range s.members {
+		if _, ok := members[userID]; !ok {
+			continue
+		}
+		if c, ok := s.containers[containerID]; ok {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
 func (s *memStore[C, M, PC, PM]) AddMember(_ context.Context, m M) (M, error) {
 	cid, uid := m.MemberContainer(), m.MemberUser()
 	mm, ok := s.members[cid]
@@ -127,6 +140,26 @@ func (s *memStore[C, M, PC, PM]) CountMembersWithRole(_ context.Context, cid, ro
 		}
 	}
 	return n, nil
+}
+
+func (s *memStore[C, M, PC, PM]) ListUserStandings(_ context.Context, userID string) ([]MemberStanding, error) {
+	var out []MemberStanding
+	for containerID, members := range s.members {
+		m, ok := members[userID]
+		if !ok {
+			continue
+		}
+		c, ok := s.containers[containerID]
+		if !ok {
+			continue
+		}
+		out = append(out, MemberStanding{
+			ContainerID: containerID,
+			RoleKey:     m.MemberRole(),
+			OwnerID:     c.ContainerOwner(),
+		})
+	}
+	return out, nil
 }
 
 func (s *memStore[C, M, PC, PM]) CreateRole(_ context.Context, r RoleRecord) (RoleRecord, error) {

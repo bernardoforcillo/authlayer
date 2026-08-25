@@ -88,6 +88,24 @@ func (s *Store[C, M, PC, PM]) UpdateContainerOwner(_ context.Context, id, newOwn
 	return nil
 }
 
+// ListUserContainers returns every container the user belongs to, resolved
+// through the membership map.
+func (s *Store[C, M, PC, PM]) ListUserContainers(_ context.Context, userID string) ([]C, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var out []C
+	for containerID, members := range s.members {
+		if _, ok := members[userID]; !ok {
+			continue
+		}
+		if c, ok := s.containers[containerID]; ok {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
 // AddMember stores a membership, returning scope.ErrAlreadyMember when the
 // (container, user) pair is taken and scope.ErrContainerNotFound when the
 // container does not exist.
@@ -176,6 +194,32 @@ func (s *Store[C, M, PC, PM]) CountMembersWithRole(_ context.Context, cid, roleK
 		}
 	}
 	return n, nil
+}
+
+// ListUserStandings flattens the user's memberships against their containers'
+// owners — the in-memory equivalent of the drops store's single join.
+func (s *Store[C, M, PC, PM]) ListUserStandings(_ context.Context, userID string) ([]scope.MemberStanding, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var out []scope.MemberStanding
+	for containerID, members := range s.members {
+		m, ok := members[userID]
+		if !ok {
+			continue
+		}
+		c, ok := s.containers[containerID]
+		if !ok {
+			// A membership whose container is gone is not a standing.
+			continue
+		}
+		out = append(out, scope.MemberStanding{
+			ContainerID: containerID,
+			RoleKey:     m.MemberRole(),
+			OwnerID:     c.ContainerOwner(),
+		})
+	}
+	return out, nil
 }
 
 // CreateRole stores a custom role, returning scope.ErrRoleKeyTaken when the

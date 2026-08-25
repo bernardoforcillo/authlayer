@@ -14,6 +14,24 @@ import "context"
 // method owes is documented on it below; store/memory is the reference
 // implementation and store/drops the production one.
 
+// MemberStanding is a flattened membership row: which container, which role
+// key, and who owns that container. It is what a cross-container decision
+// needs, and a backend can fetch it in one join rather than one query per
+// container.
+//
+// It is deliberately not generic. The engine reads only these three fields
+// when answering "which containers grant this user X?", so pulling whole
+// container and member values would cost more and buy nothing.
+type MemberStanding struct {
+	// ContainerID is the container the membership belongs to.
+	ContainerID string `drop:"container_id"`
+	// RoleKey is the role held there — a code-defined default or a custom key.
+	RoleKey string `drop:"role_key"`
+	// OwnerID is the CONTAINER's owner, not the member. It lets the engine
+	// apply OwnerBypass without a second lookup.
+	OwnerID string `drop:"owner_id"`
+}
+
 // ContainerStore persists scope containers of type C.
 type ContainerStore[C any] interface {
 	// CreateContainer persists an already-populated container (the engine has
@@ -28,6 +46,10 @@ type ContainerStore[C any] interface {
 	// ErrContainerNotFound when no row matched. It must change only the owner
 	// (and any updated-at bookkeeping), never a membership.
 	UpdateContainerOwner(ctx context.Context, id, newOwnerID string) error
+	// ListUserContainers returns every container userID is a member of. A user
+	// with no memberships yields an empty slice, not an error. Order is
+	// unspecified.
+	ListUserContainers(ctx context.Context, userID string) ([]C, error)
 }
 
 // MemberStore persists memberships of type M, keyed by (containerID, userID).
@@ -52,6 +74,14 @@ type MemberStore[M any] interface {
 	// ErrRoleInUse check in DeleteRole, so it must count committed rows rather
 	// than an estimate.
 	CountMembersWithRole(ctx context.Context, containerID, roleKey string) (int, error)
+	// ListUserStandings returns one [MemberStanding] per membership userID
+	// holds, across every container. A user with no memberships yields an
+	// empty slice, not an error. Order is unspecified.
+	//
+	// It backs Service.ContainersWith and therefore the per-action query
+	// guards: a backend should satisfy it with a single join rather than a
+	// query per container.
+	ListUserStandings(ctx context.Context, userID string) ([]MemberStanding, error)
 }
 
 // RoleStore persists custom roles. It is not generic: [RoleRecord] is fixed, so
