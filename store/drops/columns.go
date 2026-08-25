@@ -10,18 +10,32 @@ import (
 	"github.com/bernardoforcillo/drops/pg"
 )
 
-// idColumns are the column names authlayer generates itself and therefore types
-// as uuid. user_id is conditional: it is a uuid when authlayer's own auth owns
-// the user table, and text for consumers who use only the RBAC half with their
-// own id scheme (see WithTextUserIDs).
-var idColumns = map[string]bool{
-	"id":           true,
-	"owner_id":     true,
-	"parent_id":    true,
-	"container_id": true,
-	"invited_by":   true,
-	"created_by":   true,
-}
+// The id-bearing column names split by who mints the value, because only one
+// half has an escape hatch.
+//
+// libraryIDColumns hold ids authlayer generates itself (uid.NewV7), so they are
+// always uuid: there is no configuration under which they hold anything else.
+//
+// userIDColumns hold a *user* id. authlayer generates those too when its own
+// auth owns the user table — hence the uuid default — but a consumer using only
+// the RBAC half supplies them from an existing user table, which may key on
+// anything. Those columns therefore follow WithTextUserIDs together: owner_id
+// is stamped from the context subject (scope/scope.go, pc.SetOwner(subject)),
+// exactly like organization_members.user_id, and invited_by / created_by are
+// the same class of value.
+var (
+	libraryIDColumns = map[string]bool{
+		"id":           true,
+		"parent_id":    true,
+		"container_id": true,
+	}
+	userIDColumns = map[string]bool{
+		"user_id":    true,
+		"owner_id":   true,
+		"invited_by": true,
+		"created_by": true,
+	}
+)
 
 // colSet is the set of typed drops columns for one table, derived by walking a
 // model struct's drop: tags.
@@ -87,7 +101,7 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, uuidUserIDs bo
 	switch {
 	case ft.Kind() == reflect.String:
 		def := pg.Text(name)
-		if idColumns[name] || (name == "user_id" && uuidUserIDs) {
+		if libraryIDColumns[name] || (userIDColumns[name] && uuidUserIDs) {
 			def = pg.UUID(name)
 		}
 		def = def.NotNull()

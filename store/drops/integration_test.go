@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/internal/uid"
 	"github.com/bernardoforcillo/authlayer/org"
 	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
 	"github.com/bernardoforcillo/drops/pg"
@@ -50,19 +51,31 @@ func TestDropsStoreIntegration(t *testing.T) {
 		"project": {"create", "delete"},
 	}), st)
 
+	// Subjects are UUIDs because that is the default: authlayer generates
+	// UUIDv7 user ids, so owner_id and user_id are uuid columns unless the
+	// store is built WithTextUserIDs. Minting them here also proves
+	// uid.NewV7's output round-trips through PostgreSQL's uuid parser.
+	aliceID, bobID, carolID := uid.NewV7(), uid.NewV7(), uid.NewV7()
+
 	// Owner creates an org and adds an admin.
-	alice := org.WithSubject(ctx, "alice")
+	alice := org.WithSubject(ctx, aliceID)
 	acme, err := svc.CreateOrganization(alice, "Acme", "acme")
 	if err != nil {
 		t.Fatalf("CreateOrganization: %v", err)
 	}
 	aliceOrg := org.WithOrg(alice, acme.ID)
-	if _, err := svc.AddMember(aliceOrg, "bob", org.RoleAdmin); err != nil {
+	if _, err := svc.AddMember(aliceOrg, bobID, org.RoleAdmin); err != nil {
 		t.Fatalf("AddMember: %v", err)
 	}
 
+	// The members composite primary key is what makes a second add fail; if
+	// CreateSchema stopped emitting it this would silently insert a duplicate.
+	if _, err := svc.AddMember(aliceOrg, bobID, org.RoleAdmin); !errors.Is(err, org.ErrAlreadyMember) {
+		t.Fatalf("duplicate AddMember err = %v, want ErrAlreadyMember", err)
+	}
+
 	// The unique slug constraint surfaces as ErrSlugTaken.
-	if _, err := svc.CreateOrganization(org.WithSubject(ctx, "x"), "Acme2", "acme"); !errors.Is(err, org.ErrSlugTaken) {
+	if _, err := svc.CreateOrganization(org.WithSubject(ctx, carolID), "Acme2", "acme"); !errors.Is(err, org.ErrSlugTaken) {
 		t.Fatalf("duplicate slug err = %v, want ErrSlugTaken", err)
 	}
 
@@ -72,11 +85,20 @@ func TestDropsStoreIntegration(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateRole: %v", err)
 	}
-	if err := svc.ChangeMemberRole(aliceOrg, "bob", "editor"); err != nil {
+
+	// The roles UNIQUE (container_id, key) is what makes the second create
+	// fail — the other constraint CreateSchema has to emit itself.
+	if _, err := svc.CreateRole(aliceOrg, "editor", "Editor Again", map[string][]access.Action{
+		"project": {"create"},
+	}); !errors.Is(err, org.ErrRoleKeyTaken) {
+		t.Fatalf("duplicate CreateRole err = %v, want ErrRoleKeyTaken", err)
+	}
+
+	if err := svc.ChangeMemberRole(aliceOrg, bobID, "editor"); err != nil {
 		t.Fatalf("ChangeMemberRole: %v", err)
 	}
 
-	bob := org.WithOrg(org.WithSubject(ctx, "bob"), acme.ID)
+	bob := org.WithOrg(org.WithSubject(ctx, bobID), acme.ID)
 	if ok, _ := svc.Can(bob, "project", "create"); !ok {
 		t.Fatal("editor bob should be allowed project:create")
 	}

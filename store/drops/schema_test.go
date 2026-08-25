@@ -69,8 +69,19 @@ func TestSchemaWithTextUserIDs(t *testing.T) {
 	if got := s.Members.Col("user_id").Type().TypeSQL(); got != "text" {
 		t.Fatalf("user_id type = %q, want text under WithTextUserIDs", got)
 	}
+	// owner_id holds a user id too, so the option must reach it — otherwise
+	// every CreateOrganization fails against a non-UUID user table.
+	if got := s.Containers.Col("owner_id").Type().TypeSQL(); got != "text" {
+		t.Fatalf("owner_id type = %q, want text under WithTextUserIDs", got)
+	}
 	if got := s.Members.Col("container_id").Type().TypeSQL(); got != "uuid" {
 		t.Fatalf("WithTextUserIDs leaked into container_id: %q", got)
+	}
+	if got := s.Containers.Col("id").Type().TypeSQL(); got != "uuid" {
+		t.Fatalf("WithTextUserIDs leaked into the container id: %q", got)
+	}
+	if got := s.Roles.Col("id").Type().TypeSQL(); got != "uuid" {
+		t.Fatalf("WithTextUserIDs leaked into the role id: %q", got)
 	}
 }
 
