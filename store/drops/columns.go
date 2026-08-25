@@ -2,6 +2,7 @@ package dropsstore
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"time"
@@ -171,8 +172,9 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, uuidUserIDs bo
 		c.i32[name] = pg.Add(c.tbl, pg.Integer(name).NotNull())
 	default:
 		panic(fmt.Sprintf(
-			"authlayer/store/drops: column %q has unsupported Go type %s; "+
-				"supported: string, time.Time, []byte, int, int32", name, ft))
+			"authlayer/store/drops: column %q has unsupported Go type %s; supported: "+
+				"string, time.Time, []byte, int, int32, and named types whose "+
+				"underlying type is string, int or int32", name, ft))
 	}
 	c.order = append(c.order, name)
 }
@@ -194,20 +196,47 @@ func (c *colSet) col(tag string) *pg.Column {
 }
 
 // bind pairs a column with a value for an INSERT row or an UPDATE assignment.
+//
+// It classifies exactly as add does — by reflect.Kind for the string and
+// integer families, by concrete type for time.Time and []byte — because the two
+// must accept the same set. Type-switching on concrete string here while add
+// accepted any Kind String meant a model with a `type Slug string` field built
+// a schema, rendered DDL, and then panicked on its first INSERT.
 func (c *colSet) bind(tag string, v any) pg.ColumnValue {
 	switch x := v.(type) {
-	case string:
-		return c.str[tag].Val(x)
 	case time.Time:
-		return c.ts[tag].Val(x)
+		return bindOne(c.ts[tag], tag, x, "timestamptz")
 	case []byte:
-		return c.bytes[tag].Val(x)
-	case int:
-		return c.i32[tag].Val(int32(x))
-	case int32:
-		return c.i32[tag].Val(x)
+		return bindOne(c.bytes[tag], tag, x, "bytea")
+	}
+
+	if rv := reflect.ValueOf(v); rv.IsValid() {
+		switch rv.Kind() {
+		case reflect.String:
+			return bindOne(c.str[tag], tag, rv.String(), "text/uuid")
+		case reflect.Int, reflect.Int32:
+			n := rv.Int()
+			if n < math.MinInt32 || n > math.MaxInt32 {
+				panic(fmt.Sprintf(
+					"authlayer/store/drops: value %d for column %q does not fit the "+
+						"integer column type", n, tag))
+			}
+			return bindOne(c.i32[tag], tag, int32(n), "integer")
+		}
 	}
 	panic(fmt.Sprintf("authlayer/store/drops: cannot bind %T to column %q", v, tag))
+}
+
+// bindOne turns a typed column and a value into a binding, reporting a missing
+// column rather than dereferencing nil. A nil column here means the tag names
+// no column at all, or names one of a different type.
+func bindOne[T any](col *pg.Col[T], tag string, v T, kind string) pg.ColumnValue {
+	if col == nil {
+		panic(fmt.Sprintf(
+			"authlayer/store/drops: no %s column %q; the model's drop: tags declare "+
+				"no such column, or declare it with a different type", kind, tag))
+	}
+	return col.Val(v)
 }
 
 // eq builds a column = value predicate.

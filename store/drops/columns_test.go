@@ -1,6 +1,9 @@
 package dropsstore
 
 import (
+	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -150,4 +153,67 @@ func TestColSetRowPanicsOnUnsupportedFieldType(t *testing.T) {
 		}
 	}()
 	newColSet(pg.NewTable("bad"), bad{}, true)
+}
+
+// add classifies by reflect.Kind, so bind must too: a `type Slug string` field
+// built a column happily and then panicked on the first INSERT with
+// "cannot bind main.Slug to column". Named string and int types are ordinary Go
+// domain modelling and the readme invites arbitrary container types.
+func TestColSetBindsNamedStringAndIntTypes(t *testing.T) {
+	type Slug string
+	type Seats int
+	type model struct {
+		ID    string `drop:"id"`
+		Slug  Slug   `drop:"slug"`
+		Seats Seats  `drop:"seats"`
+	}
+
+	cs := newColSet(pg.NewTable("t"), model{}, true)
+	if got := cs.col("slug").Type().TypeSQL(); got != "text" {
+		t.Fatalf("slug type = %q, want text", got)
+	}
+	if got := cs.col("seats").Type().TypeSQL(); got != "integer" {
+		t.Fatalf("seats type = %q, want integer", got)
+	}
+
+	vals := cs.row(model{ID: "i", Slug: "acme", Seats: 12})
+	if len(vals) != 3 {
+		t.Fatalf("row() produced %d bindings, want 3", len(vals))
+	}
+}
+
+// The int -> int32 narrowing used to be unchecked, so an out-of-range value was
+// silently truncated into a different number.
+func TestColSetBindRejectsOutOfRangeIntegers(t *testing.T) {
+	type model struct {
+		ID    string `drop:"id"`
+		Seats int    `drop:"seats"`
+	}
+	cs := newColSet(pg.NewTable("t"), model{}, true)
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("bind silently truncated an out-of-range int")
+		}
+		if msg := fmt.Sprint(r); !strings.Contains(msg, "seats") {
+			t.Fatalf("panic %q does not name the column", msg)
+		}
+	}()
+	cs.row(model{ID: "i", Seats: math.MaxInt32 + 1})
+}
+
+// A tag that names no column must say so rather than dereferencing nil.
+func TestColSetBindReportsAnUnknownColumn(t *testing.T) {
+	cs := newColSet(pg.NewTable("organizations"), org.Organization{}, true)
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("bind accepted a tag that names no column")
+		}
+		if msg := fmt.Sprint(r); !strings.Contains(msg, "nope") {
+			t.Fatalf("panic %q does not name the column", msg)
+		}
+	}()
+	cs.bind("nope", "x")
 }

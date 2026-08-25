@@ -245,3 +245,33 @@ func TestWithTxCommitsAndRollsBack(t *testing.T) {
 		t.Fatalf("rollback path: begins=%d commits=%d rollbacks=%d", fd2.begins, fd2.commits, fd2.rollbacks)
 	}
 }
+
+// The whole point of deriving columns from tags is that a consumer brings its
+// own container type. A named string type — `type Slug string` — is ordinary Go
+// domain modelling; it used to build a schema and then panic on the first
+// INSERT, in production, on a model the library accepted at startup.
+func TestCreateContainerAcceptsNamedStringFields(t *testing.T) {
+	fd := &fakeDriver{}
+	st := New[slugOrg, org.Member](pg.New(fd))
+
+	now := time.Now().UTC()
+	in := slugOrg{
+		ContainerBase: scope.ContainerBase{ID: "o1", OwnerID: "u1", CreatedAt: now, UpdatedAt: now},
+		Slug:          "acme",
+		Seats:         12,
+	}
+	if _, err := st.CreateContainer(context.Background(), in); err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	if len(fd.execs) != 1 || !strings.Contains(fd.execs[0], "INSERT") {
+		t.Fatalf("unexpected exec: %v", fd.execs)
+	}
+}
+
+type slug string
+
+type slugOrg struct {
+	scope.ContainerBase
+	Slug  slug `drop:"slug"`
+	Seats int  `drop:"seats"`
+}
