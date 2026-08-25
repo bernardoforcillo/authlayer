@@ -19,6 +19,10 @@ type memStore[C Container, M Member,
 	containers map[string]C
 	members    map[string]map[string]M
 	roles      map[string]map[string]RoleRecord
+
+	// findRoleCalls counts calls to FindRole, so tests can assert how many
+	// custom-role lookups a call made (e.g. to verify memoization).
+	findRoleCalls int
 }
 
 func newMemStore[C Container, M Member,
@@ -175,11 +179,24 @@ func (s *memStore[C, M, PC, PM]) CreateRole(_ context.Context, r RoleRecord) (Ro
 }
 
 func (s *memStore[C, M, PC, PM]) FindRole(_ context.Context, cid, key string) (RoleRecord, error) {
+	s.findRoleCalls++
 	r, ok := s.roles[cid][key]
 	if !ok {
 		return RoleRecord{}, ErrRoleNotFound
 	}
 	return r, nil
+}
+
+// resetRoleLookups zeroes the FindRole call counter, so a test can isolate the
+// lookups a call under test makes from any made while seeding fixtures.
+func (s *memStore[C, M, PC, PM]) resetRoleLookups() {
+	s.findRoleCalls = 0
+}
+
+// roleLookups reports how many times FindRole has been called since
+// construction or the last resetRoleLookups.
+func (s *memStore[C, M, PC, PM]) roleLookups() int {
+	return s.findRoleCalls
 }
 
 func (s *memStore[C, M, PC, PM]) ListRoles(_ context.Context, cid string) ([]RoleRecord, error) {
