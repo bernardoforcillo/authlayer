@@ -1,9 +1,9 @@
 package scope
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"time"
+
+	"github.com/bernardoforcillo/authlayer/internal/uid"
 )
 
 // config is the resolved engine configuration. Build it with the defaults and
@@ -23,11 +23,7 @@ func defaultConfig() config {
 	}
 }
 
-func defaultID() string {
-	var b [12]byte
-	_, _ = rand.Read(b[:])
-	return hex.EncodeToString(b[:])
-}
+func defaultID() string { return uid.NewV7() }
 
 // Option customizes a Service. Options are applied in order at construction
 // and never afterwards, so a Service's configuration is immutable once built.
@@ -35,12 +31,13 @@ type Option func(*config)
 
 // WithIDGenerator sets the id generator used for containers and custom roles.
 //
-// The default is 12 bytes of crypto/rand hex-encoded (24 chars). Override it to
-// use UUIDv7, ULIDs, or anything else your schema expects — the engine only
+// The default is UUIDv7 (RFC 9562) — time-ordered, so ids minted later sort
+// later and a b-tree index on the primary key stays dense. Override it for
+// ULIDs, a database sequence, or whatever your schema expects; the engine only
 // requires that ids are unique and stable. A nil generator is ignored, leaving
 // the default in place.
 //
-//	org.New(ac, store, org.WithIDGenerator(func() string { return uuid.NewString() }))
+//	org.New(ac, store, org.WithIDGenerator(func() string { return ulid.Make().String() }))
 func WithIDGenerator(gen func() string) Option {
 	return func(c *config) {
 		if gen != nil {
