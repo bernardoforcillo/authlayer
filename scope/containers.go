@@ -20,7 +20,9 @@ import (
 // here while Can returns ErrContainerNotFound; an owner with no membership row
 // of their own — reachable by provisioning through the [Store] port, or with
 // LastOwnerLocked disabled — is omitted here while Can still lets them in under
-// OwnerBypass.
+// OwnerBypass; and in a nested scope ([WithParent]) it reads memberships only,
+// so a container the subject may reach purely through standing in the parent
+// is omitted here while Can admits them.
 //
 // A store failure is never one of those divergences: it aborts the call, since
 // a database error must not be narrowed into "you may see nothing". Zero

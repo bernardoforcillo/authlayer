@@ -60,3 +60,28 @@ func WithParent(p ParentScope, inherit Inheritance) Option {
 		c.inherit = inherit
 	}
 }
+
+// WithContainerResource names this scope's own container resource — the same
+// string given to [NewAccess], "team" for a team scope.
+//
+// It matters only under [WithParent], and only for [Service.CreateContainer],
+// which asks the parent whether the subject may perform <resource>:create
+// there. The name has to be declared on the *parent's* surface for anyone but
+// an elevated parent actor to hold it, which is why a nested scope package
+// publishes the statements its parent must merge in.
+//
+//	scope.New[Team, TeamMember](ac, store,
+//	    scope.WithParent(orgSvc, nil),
+//	    scope.WithContainerResource("team"))
+//
+// Leaving it unset fails closed rather than open: an undeclared resource is
+// never allowed, so creating a container in the parent then requires elevated
+// standing there.
+func WithContainerResource(resource string) Option {
+	return func(c *config) { c.containerResource = resource }
+}
+
+// nestedSetter is the write half of a parent link. It stays unexported because
+// SetParent is promoted from [NestedBase] and the engine is its only caller;
+// [New] verifies a parented container type provides it.
+type nestedSetter interface{ SetParent(string) }

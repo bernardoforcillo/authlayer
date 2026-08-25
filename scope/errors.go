@@ -13,7 +13,8 @@ import "errors"
 //     ErrPrivilegeEscalation (403). Note that [Service.Can] already folds the
 //     first two into a plain false.
 //   - Conflict / invariant — ErrAlreadyMember, ErrRoleKeyTaken, ErrConflict,
-//     ErrRoleInUse, ErrDefaultRole, ErrLastOwner (409 or 422).
+//     ErrRoleInUse, ErrDefaultRole, ErrLastOwner, ErrNotParentMember (409 or
+//     422).
 //   - Caller bug — ErrSubjectMissing, ErrScopeMissing (500; the context was
 //     not populated, which is a wiring mistake rather than a user error).
 //
@@ -52,6 +53,12 @@ var (
 	// ErrRoleKeyTaken: the key collides with a default role or with an existing
 	// custom role of this container.
 	ErrRoleKeyTaken = errors.New("authlayer/scope: role key already exists")
+	// ErrNotParentMember: Policy.MembersFromParent is in force and the user
+	// being added holds no standing in the parent scope — you cannot be on a
+	// team without being in the organization that owns it. Add them to the
+	// parent first. It is distinct from ErrNotMember, which is about this
+	// container.
+	ErrNotParentMember = errors.New("authlayer/scope: user is not a member of the parent scope")
 	// ErrConflict: a container violated a unique constraint on one of the
 	// application's own fields — a duplicate slug, say. org re-exports it as
 	// ErrSlugTaken.

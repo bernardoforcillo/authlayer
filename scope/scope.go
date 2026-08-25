@@ -19,11 +19,17 @@ import (
 //  1. Load the container. Not found → ErrContainerNotFound.
 //  2. If OwnerBypass is on and the actor owns it → elevated, full permissions.
 //     No membership lookup, no role resolution.
-//  3. Load the membership. Not a member → ErrNotMember.
-//  4. Resolve the membership's role key: a code-defined default if the Access
+//  3. If the scope is nested ([WithParent]) and this container names a parent,
+//     resolve the actor's standing there and project it onto this scope
+//     through the [Inheritance] — as grant names and elevation, never as bits.
+//  4. Load the membership. Present → the role's permissions merged with the
+//     projected grants. Absent → ErrNotMember, unless the parent conferred
+//     something, in which case the actor stands on that alone.
+//  5. Resolve the membership's role key: a code-defined default if the Access
 //     registry knows it, otherwise a custom role loaded from the store and
 //     decoded. Unknown key → ErrRoleNotFound.
-//  5. The actor is elevated if the resolved permission set is full.
+//  6. The actor is elevated if the resolved permission set is full, or if the
+//     parent conferred elevation.
 //
 // An elevated actor passes every fine-grained check naming at least one action,
 // and the privilege-escalation guard. Everyone else must hold every requested
@@ -60,6 +66,13 @@ type Service[C Container, M Member,
 
 // New wires an access engine, a Store and options into a Service. The pointer
 // type parameters are inferred, so callers write New[C, M](ac, store).
+//
+// It panics when [WithParent] is given but C carries no parent link — that is,
+// when C does not embed [NestedBase] — because a scope nested inside another
+// with nowhere to record which one is a construction-time wiring bug, and the
+// alternative is a runtime denial nobody can explain. This matches
+// [access.Access.NewRole], which panics on a mis-declared code-defined role for
+// the same reason.
 func New[C Container, M Member,
 	PC interface {
 		*C
@@ -73,6 +86,19 @@ func New[C Container, M Member,
 	for _, o := range opts {
 		o(&cfg)
 	}
+	if cfg.parent != nil {
+		var zero C
+		// A zero NestedBase satisfies Nested (the readers are value receivers),
+		// so the zero value is enough to ask the question. Both halves are
+		// required: without the reader the rung can never fire, without the
+		// writer CreateContainer would silently leave ParentID empty, which
+		// looks exactly the same from the outside.
+		_, reads := any(zero).(Nested)
+		_, writes := any(PC(&zero)).(nestedSetter)
+		if !reads || !writes {
+			panic("scope: WithParent requires a container type embedding NestedBase")
+		}
+	}
 	return &Service[C, M, PC, PM]{ac: ac, store: store, cfg: cfg}
 }
 
@@ -81,6 +107,10 @@ type authz struct {
 	perms    access.Permission
 	elevated bool
 	ownerID  string
+	// parentID is the container's parent link, empty when the scope is not
+	// nested or the container names no parent. It rides along so a mutation
+	// that must consult the parent needs no second container load.
+	parentID string
 }
 
 func (s *Service[C, M, PC, PM]) newMember(containerID, userID, roleKey string) M {
@@ -113,10 +143,22 @@ func (s *Service[C, M, PC, PM]) emit(ctx context.Context, e Event) error {
 // ContainerCreated hook, so a failing hook rolls back both and a container can
 // never be left without its owner-member row.
 //
-// This is the one mutation that does not require a container on the context —
-// there is no container yet — and the one that runs no permission check:
-// anyone with a subject may create a container, and becomes its owner. Gate it
-// upstream if your application restricts who may create containers.
+// On an unparented scope this is the one mutation that does not require a
+// container on the context — there is no container yet — and the one that runs
+// no permission check: anyone with a subject may create a container, and
+// becomes its owner. Gate it upstream if your application restricts who may
+// create containers.
+//
+// # On a nested scope
+//
+// A scope configured with [WithParent] behaves differently, and deliberately
+// so: the container on the context is the *parent* it is being created in, so
+// it is required (ErrScopeMissing), and the subject must be entitled to create
+// one there — <containerResource>:create, named by [WithContainerResource], or
+// elevated standing in the parent. A subject with no standing in the parent
+// gets ErrNotMember, one with standing but not that grant ErrForbidden. The
+// new container's ParentID is stamped from that parent, not from the value you
+// pass, so setting it beforehand has no effect either.
 //
 // A unique-constraint violation on one of your own fields (a slug, say) is
 // reported by the Store as ErrConflict.
@@ -126,11 +168,25 @@ func (s *Service[C, M, PC, PM]) CreateContainer(ctx context.Context, c C) (C, er
 		var zero C
 		return zero, ErrSubjectMissing
 	}
+	var parentID string
+	if s.cfg.parent != nil {
+		var err error
+		if parentID, err = s.authorizeCreateInParent(ctx, subject); err != nil {
+			var zero C
+			return zero, err
+		}
+	}
 	pc := PC(&c)
 	pc.SetID(s.cfg.idgen())
 	pc.SetOwner(subject)
 	now := s.cfg.clock()
 	pc.SetTimes(now, now)
+	if parentID != "" {
+		// New has already verified a parented C provides this.
+		if n, ok := any(pc).(nestedSetter); ok {
+			n.SetParent(parentID)
+		}
+	}
 
 	err := s.store.WithTx(ctx, func(st Store[C, M]) error {
 		created, err := st.CreateContainer(ctx, c)
@@ -251,18 +307,100 @@ func (s *Service[C, M, PC, PM]) standing(ctx context.Context, containerID, userI
 		return authz{}, err
 	}
 	owner := c.ContainerOwner()
-	if s.cfg.policy.OwnerBypass && owner == userID {
-		return authz{perms: s.ac.Full(), elevated: true, ownerID: owner}, nil
+	// The type assertion costs an interface conversion, so an unparented scope
+	// — the common case — never pays for it.
+	var parentID string
+	if s.cfg.parent != nil {
+		if n, ok := any(c).(Nested); ok {
+			parentID = n.ContainerParent()
+		}
 	}
-	m, err := s.store.FindMember(ctx, containerID, userID)
+	if s.cfg.policy.OwnerBypass && owner == userID {
+		return authz{perms: s.ac.Full(), elevated: true, ownerID: owner, parentID: parentID}, nil
+	}
+
+	grants, inheritedElevation, err := s.inherited(ctx, parentID, userID)
 	if err != nil {
 		return authz{}, err
 	}
+
+	m, err := s.store.FindMember(ctx, containerID, userID)
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrNotMember):
+		// No membership of their own: the only thing left to stand on is what
+		// the parent conferred. Nothing conferred is nothing to stand on — and
+		// this is the branch that decides whether a stranger to both scopes
+		// resolves standing here or is turned away, so it fails closed.
+		if !inheritedElevation && len(grants) == 0 {
+			return authz{}, err
+		}
+		inheritedPerms, perr := s.ac.Permission(grants)
+		if perr != nil {
+			return authz{}, perr
+		}
+		return authz{
+			perms:    inheritedPerms,
+			elevated: inheritedPerms.IsFull() || inheritedElevation,
+			ownerID:  owner,
+			parentID: parentID,
+		}, nil
+	default:
+		return authz{}, err
+	}
+
 	perms, err := s.resolveRole(ctx, containerID, m.MemberRole())
 	if err != nil {
 		return authz{}, err
 	}
-	return authz{perms: perms, elevated: perms.IsFull(), ownerID: owner}, nil
+	if len(grants) > 0 {
+		// Compiled against THIS scope's Access and merged there: the parent's
+		// bitset never touches this one.
+		inheritedPerms, err := s.ac.Permission(grants)
+		if err != nil {
+			return authz{}, err
+		}
+		merged, err := s.ac.Union(perms, inheritedPerms)
+		if err != nil {
+			return authz{}, err
+		}
+		perms = merged
+	}
+	return authz{
+		perms:    perms,
+		elevated: perms.IsFull() || inheritedElevation,
+		ownerID:  owner,
+		parentID: parentID,
+	}, nil
+}
+
+// inherited resolves what a subject's standing in the parent scope confers
+// here: grants named in this scope's own vocabulary, and whether the parent
+// standing alone makes them elevated. It yields nothing at all when no parent
+// is configured or the container names none.
+//
+// A parent that does not know the user (ErrNotMember) or does not know the
+// container (ErrContainerNotFound) contributes nothing and is not an error:
+// those are answers. Anything else is the parent failing to *answer* — a store
+// outage, say — and is fatal, because degrading it to "no inherited standing"
+// would revoke every inherited permission at once and read to an operator as a
+// permission change rather than an outage.
+func (s *Service[C, M, PC, PM]) inherited(
+	ctx context.Context, parentID, userID string,
+) (map[string][]access.Action, bool, error) {
+	if s.cfg.parent == nil || parentID == "" {
+		return nil, false, nil
+	}
+	pperms, pelevated, err := s.cfg.parent.Standing(ctx, parentID, userID)
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrNotMember), errors.Is(err, ErrContainerNotFound):
+		return nil, false, nil
+	default:
+		return nil, false, err
+	}
+	grants, elevated := s.cfg.inherit(pperms, pelevated)
+	return grants, elevated, nil
 }
 
 func (s *Service[C, M, PC, PM]) authorize(ctx context.Context, containerID, userID, resource string, actions ...access.Action) (authz, error) {
@@ -280,6 +418,53 @@ func (s *Service[C, M, PC, PM]) authorize(ctx context.Context, containerID, user
 		return authz{}, ErrForbidden
 	}
 	return a, nil
+}
+
+// authorizeCreateInParent checks that subject may create a container of this
+// scope inside the parent named on the context, and returns that parent's id.
+//
+// The permission lives on the parent's surface, so the check runs against the
+// parent's own resolution — including its owner bypass and, if the parent is
+// itself nested, its own inherited standing. An unresolvable parent standing
+// (ErrNotMember, ErrContainerNotFound, a store failure) is returned as-is: on
+// create there is no membership of one's own to fall back to, so none of them
+// is a condition to swallow.
+func (s *Service[C, M, PC, PM]) authorizeCreateInParent(ctx context.Context, subject string) (string, error) {
+	parentID, ok := ScopeFrom(ctx)
+	if !ok {
+		return "", ErrScopeMissing
+	}
+	perms, elevated, err := s.cfg.parent.Standing(ctx, parentID, subject)
+	if err != nil {
+		return "", err
+	}
+	if !elevated && !perms.Allows(s.cfg.containerResource, ActionCreate) {
+		return "", ErrForbidden
+	}
+	return parentID, nil
+}
+
+// requireParentMember enforces Policy.MembersFromParent: the user being added
+// must already hold standing in the parent scope.
+//
+// A container with no parent link is unconstrained — there is no parent to
+// belong to. ErrNotMember from the parent becomes ErrNotParentMember, so a
+// caller can tell "not on this team" from "not in the organization"; every
+// other error propagates unchanged, because a parent that could not answer is
+// not a parent that answered no.
+func (s *Service[C, M, PC, PM]) requireParentMember(ctx context.Context, parentID, userID string) error {
+	if parentID == "" {
+		return nil
+	}
+	_, _, err := s.cfg.parent.Standing(ctx, parentID, userID)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrNotMember):
+		return ErrNotParentMember
+	default:
+		return err
+	}
 }
 
 func (s *Service[C, M, PC, PM]) guardEscalation(ctx context.Context, a authz, containerID, roleKey string) error {
@@ -327,6 +512,11 @@ func (s *Service[C, M, PC, PM]) requireOwner(ctx context.Context, containerID, u
 // may name a default role or a custom role of this container; an unknown key is
 // ErrRoleNotFound. Adding someone who is already a member is ErrAlreadyMember.
 //
+// On a nested scope under the default policy the target must already hold
+// standing in the parent — you cannot be put on a team without being in the
+// organization that owns it — or the call is ErrNotParentMember. See
+// [Policy.MembersFromParent] for when that does and does not apply.
+//
 // authlayer stores no user records — userID is an opaque id from your own user
 // table, and no existence check is performed on it.
 func (s *Service[C, M, PC, PM]) AddMember(ctx context.Context, userID, roleKey string) (M, error) {
@@ -341,6 +531,11 @@ func (s *Service[C, M, PC, PM]) AddMember(ctx context.Context, userID, roleKey s
 	}
 	if err := s.guardEscalation(ctx, a, containerID, roleKey); err != nil {
 		return zero, err
+	}
+	if s.cfg.parent != nil && s.cfg.policy.MembersFromParent {
+		if err := s.requireParentMember(ctx, a.parentID, userID); err != nil {
+			return zero, err
+		}
 	}
 	m, err := s.store.AddMember(ctx, s.newMember(containerID, userID, roleKey))
 	if err != nil {

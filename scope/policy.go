@@ -30,17 +30,18 @@ const (
 // Policy bundles the tunable authorization invariants.
 //
 // The zero Policy is the *most permissive* configuration reachable through
-// these fields for two of the three (no owner protection, no owner bypass) and
-// the strictest for the third, so it is not a meaningful default. Do not build
-// a Policy by zero value and set one field; start from the defaults —
-// EscalationStrict, LastOwnerLocked and OwnerBypass all on, which is what a
-// Service uses when no [WithPolicy] option is given — and change what you mean
-// to change:
+// these fields for three of the four (no owner protection, no owner bypass, no
+// parent-membership requirement) and the strictest for the fourth, so it is not
+// a meaningful default. Do not build a Policy by zero value and set one field;
+// start from the defaults — EscalationStrict, LastOwnerLocked, OwnerBypass and
+// MembersFromParent all on, which is what a Service uses when no [WithPolicy]
+// option is given — and change what you mean to change:
 //
 //	svc := org.New(ac, store, org.WithPolicy(org.Policy{
-//	    Escalation:      scope.EscalationStrict,
-//	    LastOwnerLocked: true,
-//	    OwnerBypass:     false, // the only deviation
+//	    Escalation:        scope.EscalationStrict,
+//	    LastOwnerLocked:   true,
+//	    MembersFromParent: true,
+//	    OwnerBypass:       false, // the only deviation
 //	}))
 type Policy struct {
 	// Escalation selects the privilege-escalation guard; see [EscalationMode].
@@ -52,6 +53,23 @@ type Policy struct {
 	// container to be left with no owner-membership at all, so only do so if
 	// the application enforces its own invariant.
 	LastOwnerLocked bool
+	// MembersFromParent requires a user being added to this scope to already
+	// hold standing in the parent scope, refusing them with
+	// ErrNotParentMember otherwise: you cannot be on a team without being in
+	// the organization that owns it.
+	//
+	// It is on by default, and it has effect only where there is a parent to
+	// belong to — a scope configured with no [WithParent] ignores it, as does a
+	// container whose parent link is empty. Clearing it lets a nested scope
+	// hold members the parent has never heard of, which is a legitimate model
+	// (a project with outside collaborators) but means the parent's roster is
+	// no longer a superset of the child's, so anything reasoning about the
+	// parent's members reasons about a subset.
+	//
+	// It constrains [Service.AddMember] only. The owner membership seeded by
+	// [Service.CreateContainer] is not checked separately, because creating a
+	// container in a parent already requires standing there.
+	MembersFromParent bool
 	// OwnerBypass grants the container owner the full permission set and
 	// elevated standing regardless of the role key on their membership, so the
 	// owner can always recover a container whose roles were mis-configured.
@@ -62,8 +80,9 @@ type Policy struct {
 
 func defaultPolicy() Policy {
 	return Policy{
-		Escalation:      EscalationStrict,
-		LastOwnerLocked: true,
-		OwnerBypass:     true,
+		Escalation:        EscalationStrict,
+		LastOwnerLocked:   true,
+		MembersFromParent: true,
+		OwnerBypass:       true,
 	}
 }
