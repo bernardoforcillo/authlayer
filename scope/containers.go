@@ -11,9 +11,12 @@ import (
 //
 // It resolves each membership through the same ladder [Service.Can] uses —
 // owner bypass, then a code-defined default role, then a custom role from the
-// store — so a query guard built on it can never disagree with an in-memory
-// check. Zero actions returns an empty slice: there is nothing to authorize,
-// which is the same rule [access.Permission.Allows] applies.
+// store — so the two agree for every container where the subject holds a
+// membership row. The one exception is an owner whose own membership row has
+// been removed, reachable only with LastOwnerLocked disabled: ContainersWith
+// omits that container, so a guard built on it fails closed there rather than
+// leaking access. Zero actions returns an empty slice: there is nothing to
+// authorize, which is the same rule [access.Permission.Allows] applies.
 //
 // Cost is one store round trip for the standings, plus one role lookup per
 // distinct (container, role key) pair that names a custom role; default roles
