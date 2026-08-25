@@ -10,6 +10,18 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Per-action query guards** (`authlayer/scope`) — `Service.PermissionGuard`
+  restricts a table's rows to the containers where the subject holds a specific
+  `(resource, action)` grant, rather than to those they merely belong to. The
+  container set is resolved through the same ladder `Can` uses, so a guard and
+  an in-memory check agree for every container where the subject holds a
+  membership row; an empty set renders as a false predicate and a missing
+  subject is `pg.ErrSubjectMissing`.
+- **`Service.ContainersWith`** (`authlayer/scope`) — the same answer as a plain
+  `[]string`, exported so a hot path can hoist the id set out of the guard.
+- **`MemberStanding`** (`authlayer/scope`, re-exported as `org.MemberStanding`)
+  — a flattened container/role/owner row, fetched by the drops store in a
+  single join.
 - **UUIDv7 identifiers** (`authlayer/internal/uid`) — a dependency-free RFC 9562
   generator, now the default for containers and custom roles. Time-ordered, so
   ids sort in creation order and a primary-key index stays dense.
@@ -27,6 +39,11 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Changed
 
+- **BREAKING (Store port): two new methods.** `ContainerStore` gains
+  `ListUserContainers` and `MemberStore` gains `ListUserStandings`. Both ship
+  implemented in `store/memory` and `store/drops`; a third-party Store must add
+  them. `ListUserStandings` should be one join, not a query per container — it
+  runs on every guarded query.
 - **BREAKING (schema): id columns are now `uuid`.** Every id authlayer
   generates is a UUIDv7 and its column is typed `uuid` rather than `text`.
   `CreateSchema` on a fresh database needs nothing; on an existing one the old
@@ -60,6 +77,19 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Fixed
 
+- **`Can`/`Authorize` now deny zero actions even for an elevated actor.**
+  `authorize()` only checked `Allows()` when the actor was not elevated, so
+  `Can(ctx, resource)` called with no actions returned `true` for an owner, or
+  for any role whose permissions were full — contradicting the readme's own
+  "Zero actions denies — there is nothing to authorize" and disagreeing with
+  `ContainersWith`, which already denied this case unconditionally. Zero
+  actions is now denied before the elevated short-circuit runs, so `Can`
+  returns `false` and `Authorize` returns `ErrForbidden` for an elevated actor
+  too. This aligns `Can`/`Authorize` with the documented rule and with
+  `access.Permission.Allows`, which has always treated zero actions the same
+  way. A caller that relied on the old pass-through — asking an elevated actor
+  "may you touch this resource at all?" via a zero-action call — now gets a
+  denial, and must name at least one action.
 - **`CreateSchema` now emits the composite constraints it declares.** drops'
   `CreateTableIfNotExists` writes column definitions only, so the members
   `PRIMARY KEY (container_id, user_id)` and the roles

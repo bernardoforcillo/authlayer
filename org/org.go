@@ -71,12 +71,13 @@ const (
 
 // Re-exported types so callers stay within the org package.
 type (
-	Store    = scope.Store[Organization, Member]
-	RoleView = scope.RoleView
-	Option   = scope.Option
-	Hook     = scope.Hook
-	Event    = scope.Event
-	Policy   = scope.Policy
+	Store          = scope.Store[Organization, Member]
+	RoleView       = scope.RoleView
+	MemberStanding = scope.MemberStanding
+	Option         = scope.Option
+	Hook           = scope.Hook
+	Event          = scope.Event
+	Policy         = scope.Policy
 )
 
 // Re-exported sentinel errors (organization-flavoured names).

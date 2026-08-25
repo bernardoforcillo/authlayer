@@ -362,15 +362,48 @@ guard := org.MembershipGuard(membersTbl,
 ```
 
 The subject comes from the same context as the permission checks, and a missing
-subject fails closed (`pg.ErrSubjectMissing`). This is coarse,
-membership-level filtering — per-action row filtering is a planned follow-up.
+subject fails closed (`pg.ErrSubjectMissing`).
+
+`MembershipGuard` is coarse: it asks only whether the subject is a member. To
+filter by a specific permission, use `PermissionGuard`:
+
+```go
+projects.AuthorizeWith(svc.PermissionGuard(
+    projectsTbl.Col("organization_id"), "project", org.ActionDelete))
+// WHERE "organization_id" IN ($1, $2)   -- only the orgs granting project:delete
+```
+
+It resolves the container set through the same ladder `Can` uses, so the guard
+and an in-memory check agree for every container where the subject holds a
+membership row. A subject with no qualifying containers renders as a false
+predicate — no rows, never all rows — and a missing subject is
+`pg.ErrSubjectMissing`.
+
+The cost is one round trip per guarded query, plus one lookup per distinct
+custom role involved. `svc.ContainersWith(ctx, userID, resource, actions...)`
+is the same answer as a plain `[]string`, so a hot endpoint can hoist it:
+
+```go
+ids, err := svc.ContainersWith(ctx, userID, "project", org.ActionDelete)
+```
+
+Guards compose, so "rows I created, or rows in an organization where I may
+delete projects" is:
+
+```go
+projects.AuthorizeWith(pg.AnyOf(
+    pg.OwnerGuard{Owner: projectsTbl.Col("created_by")},
+    svc.PermissionGuard(projectsTbl.Col("organization_id"), "project", org.ActionDelete),
+))
+```
 
 ## Storage
 
-`scope.Store` is the persistence port: containers, members, roles, and a
-transaction. It is composed from `ContainerStore`, `MemberStore` and `RoleStore`,
-so a backend or a decorator (caching, metrics) can override a slice of it by
-embedding the rest.
+`scope.Store` is the persistence port: containers, members, roles, a
+transaction, and the user-scoped lookups `ListUserContainers` and
+`ListUserStandings` — the latter backing `PermissionGuard`. It is composed
+from `ContainerStore`, `MemberStore` and `RoleStore`, so a backend or a
+decorator (caching, metrics) can override a slice of it by embedding the rest.
 
 A store is *pure persistence*. The engine stamps ids, owners and timestamps,
 resolves roles, and runs every authorization check before calling in; the store
@@ -519,7 +552,6 @@ Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
 
 ## Roadmap
 
-- Per-action row-level guards (today's guard filters at membership level).
 - Teams (nested scope) and invitations (email + link).
 - Authentication: credentials, revocable server-side sessions, OAuth.
 

@@ -22,8 +22,9 @@ import (
 // read from the same context the Service uses (WithSubject), and a missing
 // subject fails closed (pg.ErrSubjectMissing).
 //
-// This is coarse, membership-level filtering. Per-action row filtering is a
-// planned follow-up.
+// This is coarse, membership-level filtering: it asks only whether the
+// subject belongs to the container, not what they may do there. For
+// per-action filtering, use [Service.PermissionGuard].
 func MembershipGuard(junction *pg.Table, subjectCol, containerCol, resourceContainerCol *pg.Column) pg.Guard {
 	return pg.MembershipGuard{
 		Junction:         junction,
