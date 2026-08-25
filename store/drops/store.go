@@ -5,54 +5,56 @@ import (
 	"errors"
 	"time"
 
-	"github.com/bernardoforcillo/authlayer/org"
 	"github.com/bernardoforcillo/authlayer/scope"
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
 )
 
-// Store is a drops-backed org.Store (scope.Store[Organization, Member]). It is a
-// pure persistence layer: the engine stamps ids, owners, and timestamps before
-// calling in, so the store only writes and reads the values it is handed.
-type Store struct {
+// Store is a drops-backed scope.Store[C, M]. It is pure persistence: the engine
+// stamps ids, owners and timestamps before calling in, so the store only writes
+// and reads the values it is handed, and authorizes nothing.
+type Store[C scope.Container, M scope.Member] struct {
 	db *pg.DB
-	s  *Schema
+	s  *Schema[C, M]
 }
 
-// New returns a Store over db, building a fresh [Schema]. Pass it to org.New:
+// New returns a Store over db, building a fresh [Schema].
 //
-//	st := dropsstore.New(pg.New(stdlib.New(sqlDB)))
+//	st := dropsstore.New[org.Organization, org.Member](pg.New(stdlib.New(sqlDB)))
 //	svc := org.New(org.NewAccess(appStatements), st)
 //
 // Use [Store.Schema] to reach the tables (to build a guard, or to generate DDL).
-func New(db *pg.DB) *Store { return &Store{db: db, s: NewSchema()} }
+func New[C scope.Container, M scope.Member](db *pg.DB, opts ...Option) *Store[C, M] {
+	return &Store[C, M]{db: db, s: NewSchema[C, M](opts...)}
+}
 
 // Schema exposes the tables so callers can build query guards, join against
 // memberships, or emit their own DDL.
-func (st *Store) Schema() *Schema { return st.s }
+func (st *Store[C, M]) Schema() *Schema[C, M] { return st.s }
 
 // MembershipGuard returns a drops guard restricting a table's rows to the
-// context subject's organizations, using this store's members table — the
-// convenient form of org.MembershipGuard, with the junction and its two columns
-// already filled in.
-//
-// resourceOrgCol is the organization-id column on the table being guarded:
+// context subject's containers, using this store's members table — the
+// convenient form of scope.MembershipGuard, with the junction and its two
+// columns already filled in.
 //
 //	projects.AuthorizeWith(st.MembershipGuard(projectsTbl.Col("organization_id")))
-func (st *Store) MembershipGuard(resourceOrgCol *pg.Column) pg.Guard {
-	return org.MembershipGuard(st.s.Members, st.s.memUser.Column, st.s.memOrg.Column, resourceOrgCol)
+//
+// This is coarse, membership-level filtering. For per-action filtering use
+// scope.Service.PermissionGuard.
+func (st *Store[C, M]) MembershipGuard(resourceContainerCol *pg.Column) pg.Guard {
+	return scope.MembershipGuard(st.s.Members,
+		st.s.members.col("user_id"), st.s.members.col("container_id"), resourceContainerCol)
 }
 
-// CreateSchema issues CREATE TABLE IF NOT EXISTS for organizations,
-// organization_members and organization_roles, in that order.
+// CreateSchema issues CREATE TABLE IF NOT EXISTS for the three tables, in
+// dependency order.
 //
 // It is a convenience for development, tests, and getting started. It creates
 // tables but never alters them, so it will not migrate an existing schema
 // forward — production deployments should own these tables in their own
-// migrations and skip this call. [Store.Schema] exposes the table definitions
-// if you want to generate that DDL instead.
-func (st *Store) CreateSchema(ctx context.Context) error {
-	for _, t := range []*pg.Table{st.s.Organizations, st.s.Members, st.s.Roles} {
+// migrations and skip this call.
+func (st *Store[C, M]) CreateSchema(ctx context.Context) error {
+	for _, t := range []*pg.Table{st.s.Containers, st.s.Members, st.s.Roles} {
 		if _, err := st.db.ExecExpr(ctx, pg.CreateTableIfNotExists(t)); err != nil {
 			return err
 		}
@@ -60,165 +62,118 @@ func (st *Store) CreateSchema(ctx context.Context) error {
 	return nil
 }
 
-// ── row structs (drop-tagged for scanning) ──────────────────────────────────
+// ── Containers ──────────────────────────────────────────────────────────────
 
-type orgRow struct {
-	ID        string    `drop:"id"`
-	Name      string    `drop:"name"`
-	Slug      string    `drop:"slug"`
-	OwnerID   string    `drop:"owner_id"`
-	CreatedAt time.Time `drop:"created_at"`
-	UpdatedAt time.Time `drop:"updated_at"`
-}
-
-func (r orgRow) toOrg() org.Organization {
-	return org.Organization{
-		ContainerBase: scope.ContainerBase{ID: r.ID, OwnerID: r.OwnerID, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt},
-		Name:          r.Name,
-		Slug:          r.Slug,
-	}
-}
-
-type memberRow struct {
-	OrganizationID string    `drop:"organization_id"`
-	UserID         string    `drop:"user_id"`
-	RoleKey        string    `drop:"role_key"`
-	JoinedAt       time.Time `drop:"joined_at"`
-}
-
-func (r memberRow) toMember() org.Member {
-	return org.Member{MemberBase: scope.MemberBase{ContainerID: r.OrganizationID, UserID: r.UserID, RoleKey: r.RoleKey, JoinedAt: r.JoinedAt}}
-}
-
-type roleRow struct {
-	ID             string    `drop:"id"`
-	OrganizationID string    `drop:"organization_id"`
-	Key            string    `drop:"key"`
-	Name           string    `drop:"name"`
-	Permissions    []byte    `drop:"permissions"`
-	CreatedAt      time.Time `drop:"created_at"`
-}
-
-func (r roleRow) toRecord() scope.RoleRecord {
-	return scope.RoleRecord{ID: r.ID, ContainerID: r.OrganizationID, Key: r.Key, Name: r.Name, Permissions: r.Permissions, CreatedAt: r.CreatedAt}
-}
-
-// ── Containers (organizations) ──────────────────────────────────────────────
-
-// CreateContainer persists an organization the engine has already stamped
-// (id, owner, timestamps). A duplicate slug surfaces as org.ErrSlugTaken.
-func (st *Store) CreateContainer(ctx context.Context, o org.Organization) (org.Organization, error) {
-	_, err := st.db.Insert(st.s.Organizations).Row(
-		st.s.orgID.Val(o.ID),
-		st.s.orgName.Val(o.Name),
-		st.s.orgSlug.Val(o.Slug),
-		st.s.orgOwner.Val(o.OwnerID),
-		st.s.orgCreated.Val(o.CreatedAt),
-		st.s.orgUpdated.Val(o.UpdatedAt),
-	).Exec(ctx)
+// CreateContainer persists a container the engine has already stamped (id,
+// owner, timestamps). A unique-constraint violation on one of your own fields
+// (a slug, say) surfaces as scope.ErrConflict.
+func (st *Store[C, M]) CreateContainer(ctx context.Context, c C) (C, error) {
+	_, err := st.db.Insert(st.s.Containers).Row(st.s.containers.row(c)...).Exec(ctx)
 	if err != nil {
+		var zero C
 		if errors.Is(err, pg.ErrUniqueViolation) {
-			return org.Organization{}, org.ErrSlugTaken
+			return zero, scope.ErrConflict
 		}
-		return org.Organization{}, err
+		return zero, err
 	}
-	return o, nil
+	return c, nil
 }
 
-// FindContainer loads an organization by id, mapping drops' ErrNoRows to
-// org.ErrOrgNotFound.
-func (st *Store) FindContainer(ctx context.Context, id string) (org.Organization, error) {
-	var r orgRow
-	err := st.db.Select().From(st.s.Organizations).Where(st.s.orgID.Eq(id)).One(ctx, &r)
+// FindContainer loads a container by id, mapping drops' ErrNoRows to
+// scope.ErrContainerNotFound.
+func (st *Store[C, M]) FindContainer(ctx context.Context, id string) (C, error) {
+	var c C
+	err := st.db.Select().From(st.s.Containers).
+		Where(st.s.containers.eq("id", id)).
+		One(ctx, &c)
 	if err != nil {
-		return org.Organization{}, mapNoRows(err, org.ErrOrgNotFound)
+		var zero C
+		return zero, mapNoRows(err, scope.ErrContainerNotFound)
 	}
-	return r.toOrg(), nil
+	return c, nil
 }
 
 // UpdateContainerOwner reassigns owner_id and refreshes updated_at. This is the
 // one timestamp the store stamps itself, since the engine passes no container
 // value here; everything else is stamped upstream.
-func (st *Store) UpdateContainerOwner(ctx context.Context, id, newOwnerID string) error {
-	res, err := st.db.Update(st.s.Organizations).
-		Set(st.s.orgOwner.Val(newOwnerID), st.s.orgUpdated.Val(time.Now().UTC())).
-		Where(st.s.orgID.Eq(id)).
+func (st *Store[C, M]) UpdateContainerOwner(ctx context.Context, id, newOwnerID string) error {
+	res, err := st.db.Update(st.s.Containers).
+		Set(st.s.containers.bind("owner_id", newOwnerID),
+			st.s.containers.bind("updated_at", time.Now().UTC())).
+		Where(st.s.containers.eq("id", id)).
 		Exec(ctx)
-	return affectedOrErr(res, err, org.ErrOrgNotFound)
+	return affectedOrErr(res, err, scope.ErrContainerNotFound)
 }
 
 // ── Members ─────────────────────────────────────────────────────────────────
 
-// AddMember persists a membership the engine has already stamped (joined_at).
-func (st *Store) AddMember(ctx context.Context, m org.Member) (org.Member, error) {
-	_, err := st.db.Insert(st.s.Members).Row(
-		st.s.memOrg.Val(m.ContainerID),
-		st.s.memUser.Val(m.UserID),
-		st.s.memRole.Val(m.RoleKey),
-		st.s.memJoined.Val(m.JoinedAt),
-	).Exec(ctx)
+// AddMember persists a membership the engine has already stamped (joined_at),
+// returning scope.ErrAlreadyMember when (container, user) is taken.
+func (st *Store[C, M]) AddMember(ctx context.Context, m M) (M, error) {
+	_, err := st.db.Insert(st.s.Members).Row(st.s.members.row(m)...).Exec(ctx)
 	if err != nil {
+		var zero M
 		if errors.Is(err, pg.ErrUniqueViolation) {
-			return org.Member{}, org.ErrAlreadyMember
+			return zero, scope.ErrAlreadyMember
 		}
-		return org.Member{}, err
+		return zero, err
 	}
 	return m, nil
 }
 
 // FindMember loads one membership by composite key, mapping ErrNoRows to
-// org.ErrNotMember.
-func (st *Store) FindMember(ctx context.Context, orgID, userID string) (org.Member, error) {
-	var r memberRow
+// scope.ErrNotMember. This is the hot path: it runs on every permission check
+// for a non-owner.
+func (st *Store[C, M]) FindMember(ctx context.Context, containerID, userID string) (M, error) {
+	var m M
 	err := st.db.Select().From(st.s.Members).
-		Where(st.s.memOrg.Eq(orgID), st.s.memUser.Eq(userID)).
-		One(ctx, &r)
+		Where(st.s.members.eq("container_id", containerID), st.s.members.eq("user_id", userID)).
+		One(ctx, &m)
 	if err != nil {
-		return org.Member{}, mapNoRows(err, org.ErrNotMember)
+		var zero M
+		return zero, mapNoRows(err, scope.ErrNotMember)
 	}
-	return r.toMember(), nil
+	return m, nil
 }
 
-// ListMembers returns every membership of the organization. An organization
-// with no members yields an empty slice rather than an error — the engine has
-// already established the caller's standing before calling in.
-func (st *Store) ListMembers(ctx context.Context, orgID string) ([]org.Member, error) {
-	var rows []memberRow
-	if err := st.db.Select().From(st.s.Members).Where(st.s.memOrg.Eq(orgID)).All(ctx, &rows); err != nil {
+// ListMembers returns every membership of the container. A container with no
+// members yields an empty slice rather than an error — the engine has already
+// established the caller's standing before calling in.
+func (st *Store[C, M]) ListMembers(ctx context.Context, containerID string) ([]M, error) {
+	var out []M
+	if err := st.db.Select().From(st.s.Members).
+		Where(st.s.members.eq("container_id", containerID)).
+		All(ctx, &out); err != nil {
 		return nil, err
-	}
-	out := make([]org.Member, len(rows))
-	for i, r := range rows {
-		out[i] = r.toMember()
 	}
 	return out, nil
 }
 
-// UpdateMemberRole rewrites role_key, reporting org.ErrNotMember when the
+// UpdateMemberRole rewrites role_key, reporting scope.ErrNotMember when the
 // UPDATE matched no row.
-func (st *Store) UpdateMemberRole(ctx context.Context, orgID, userID, roleKey string) error {
+func (st *Store[C, M]) UpdateMemberRole(ctx context.Context, containerID, userID, roleKey string) error {
 	res, err := st.db.Update(st.s.Members).
-		Set(st.s.memRole.Val(roleKey)).
-		Where(st.s.memOrg.Eq(orgID), st.s.memUser.Eq(userID)).
+		Set(st.s.members.bind("role_key", roleKey)).
+		Where(st.s.members.eq("container_id", containerID), st.s.members.eq("user_id", userID)).
 		Exec(ctx)
-	return affectedOrErr(res, err, org.ErrNotMember)
+	return affectedOrErr(res, err, scope.ErrNotMember)
 }
 
-// RemoveMember deletes the membership row, reporting org.ErrNotMember when the
-// DELETE matched no row.
-func (st *Store) RemoveMember(ctx context.Context, orgID, userID string) error {
+// RemoveMember deletes the membership row, reporting scope.ErrNotMember when
+// the DELETE matched no row.
+func (st *Store[C, M]) RemoveMember(ctx context.Context, containerID, userID string) error {
 	res, err := st.db.Delete(st.s.Members).
-		Where(st.s.memOrg.Eq(orgID), st.s.memUser.Eq(userID)).
+		Where(st.s.members.eq("container_id", containerID), st.s.members.eq("user_id", userID)).
 		Exec(ctx)
-	return affectedOrErr(res, err, org.ErrNotMember)
+	return affectedOrErr(res, err, scope.ErrNotMember)
 }
 
 // CountMembersWithRole runs a COUNT over the members table. It backs the
 // ErrRoleInUse check in DeleteRole; running both inside one transaction is what
 // makes that check race-free.
-func (st *Store) CountMembersWithRole(ctx context.Context, orgID, roleKey string) (int, error) {
+func (st *Store[C, M]) CountMembersWithRole(ctx context.Context, containerID, roleKey string) (int, error) {
 	n, err := st.db.Select().From(st.s.Members).
-		Where(st.s.memOrg.Eq(orgID), st.s.memRole.Eq(roleKey)).
+		Where(st.s.members.eq("container_id", containerID), st.s.members.eq("role_key", roleKey)).
 		Count(ctx)
 	return int(n), err
 }
@@ -226,71 +181,61 @@ func (st *Store) CountMembersWithRole(ctx context.Context, orgID, roleKey string
 // ── Custom roles ────────────────────────────────────────────────────────────
 
 // CreateRole persists a custom role the engine has already stamped (id,
-// created_at). A duplicate (organization, key) surfaces as org.ErrRoleKeyTaken.
-func (st *Store) CreateRole(ctx context.Context, r scope.RoleRecord) (scope.RoleRecord, error) {
-	_, err := st.db.Insert(st.s.Roles).Row(
-		st.s.roleID.Val(r.ID),
-		st.s.roleOrg.Val(r.ContainerID),
-		st.s.roleKey.Val(r.Key),
-		st.s.roleName.Val(r.Name),
-		st.s.rolePerms.Val(r.Permissions),
-		st.s.roleCreated.Val(r.CreatedAt),
-	).Exec(ctx)
+// created_at). A duplicate (container, key) surfaces as scope.ErrRoleKeyTaken.
+func (st *Store[C, M]) CreateRole(ctx context.Context, r scope.RoleRecord) (scope.RoleRecord, error) {
+	_, err := st.db.Insert(st.s.Roles).Row(st.s.roles.row(r)...).Exec(ctx)
 	if err != nil {
 		if errors.Is(err, pg.ErrUniqueViolation) {
-			return scope.RoleRecord{}, org.ErrRoleKeyTaken
+			return scope.RoleRecord{}, scope.ErrRoleKeyTaken
 		}
 		return scope.RoleRecord{}, err
 	}
 	return r, nil
 }
 
-// FindRole loads one custom role by (organization, key), mapping ErrNoRows to
-// org.ErrRoleNotFound. The permissions column is returned as opaque bytes for
+// FindRole loads one custom role by (container, key), mapping ErrNoRows to
+// scope.ErrRoleNotFound. The permissions column is returned as opaque bytes for
 // the engine to decode.
-func (st *Store) FindRole(ctx context.Context, orgID, key string) (scope.RoleRecord, error) {
-	var r roleRow
+func (st *Store[C, M]) FindRole(ctx context.Context, containerID, key string) (scope.RoleRecord, error) {
+	var r scope.RoleRecord
 	err := st.db.Select().From(st.s.Roles).
-		Where(st.s.roleOrg.Eq(orgID), st.s.roleKey.Eq(key)).
+		Where(st.s.roles.eq("container_id", containerID), st.s.roles.eq("key", key)).
 		One(ctx, &r)
 	if err != nil {
-		return scope.RoleRecord{}, mapNoRows(err, org.ErrRoleNotFound)
+		return scope.RoleRecord{}, mapNoRows(err, scope.ErrRoleNotFound)
 	}
-	return r.toRecord(), nil
+	return r, nil
 }
 
-// ListRoles returns the organization's custom roles. The code-defined defaults
-// are not stored, so they never appear here — scope.Service.ListRoles prepends
-// them.
-func (st *Store) ListRoles(ctx context.Context, orgID string) ([]scope.RoleRecord, error) {
-	var rows []roleRow
-	if err := st.db.Select().From(st.s.Roles).Where(st.s.roleOrg.Eq(orgID)).All(ctx, &rows); err != nil {
+// ListRoles returns the container's custom roles. The code-defined defaults are
+// not stored, so they never appear here — scope.Service.ListRoles prepends them.
+func (st *Store[C, M]) ListRoles(ctx context.Context, containerID string) ([]scope.RoleRecord, error) {
+	var out []scope.RoleRecord
+	if err := st.db.Select().From(st.s.Roles).
+		Where(st.s.roles.eq("container_id", containerID)).
+		All(ctx, &out); err != nil {
 		return nil, err
-	}
-	out := make([]scope.RoleRecord, len(rows))
-	for i, r := range rows {
-		out[i] = r.toRecord()
 	}
 	return out, nil
 }
 
 // UpdateRole replaces a custom role's name and encoded permissions, reporting
-// org.ErrRoleNotFound when no row matched. The bytes are stored verbatim.
-func (st *Store) UpdateRole(ctx context.Context, orgID, key, name string, permissions []byte) error {
+// scope.ErrRoleNotFound when no row matched. The bytes are stored verbatim.
+func (st *Store[C, M]) UpdateRole(ctx context.Context, containerID, key, name string, permissions []byte) error {
 	res, err := st.db.Update(st.s.Roles).
-		Set(st.s.roleName.Val(name), st.s.rolePerms.Val(permissions)).
-		Where(st.s.roleOrg.Eq(orgID), st.s.roleKey.Eq(key)).
+		Set(st.s.roles.bind("name", name), st.s.roles.bind("permissions", permissions)).
+		Where(st.s.roles.eq("container_id", containerID), st.s.roles.eq("key", key)).
 		Exec(ctx)
-	return affectedOrErr(res, err, org.ErrRoleNotFound)
+	return affectedOrErr(res, err, scope.ErrRoleNotFound)
 }
 
-// DeleteRole removes a custom role, reporting org.ErrRoleNotFound when no row
+// DeleteRole removes a custom role, reporting scope.ErrRoleNotFound when no row
 // matched. The engine has already verified no member holds it.
-func (st *Store) DeleteRole(ctx context.Context, orgID, key string) error {
+func (st *Store[C, M]) DeleteRole(ctx context.Context, containerID, key string) error {
 	res, err := st.db.Delete(st.s.Roles).
-		Where(st.s.roleOrg.Eq(orgID), st.s.roleKey.Eq(key)).
+		Where(st.s.roles.eq("container_id", containerID), st.s.roles.eq("key", key)).
 		Exec(ctx)
-	return affectedOrErr(res, err, org.ErrRoleNotFound)
+	return affectedOrErr(res, err, scope.ErrRoleNotFound)
 }
 
 // ── Transaction ─────────────────────────────────────────────────────────────
@@ -298,9 +243,9 @@ func (st *Store) DeleteRole(ctx context.Context, orgID, key string) error {
 // WithTx runs fn inside a real PostgreSQL transaction, handing it a Store bound
 // to the transaction handle and sharing this store's schema. Returning an error
 // from fn rolls back.
-func (st *Store) WithTx(ctx context.Context, fn func(org.Store) error) error {
+func (st *Store[C, M]) WithTx(ctx context.Context, fn func(scope.Store[C, M]) error) error {
 	return st.db.InTx(ctx, func(txdb *pg.DB) error {
-		return fn(&Store{db: txdb, s: st.s})
+		return fn(&Store[C, M]{db: txdb, s: st.s})
 	})
 }
 

@@ -15,7 +15,7 @@ import (
 )
 
 // Compile-time proof the drops store satisfies the Store port.
-var _ org.Store = (*Store)(nil)
+var _ org.Store = (*Store[org.Organization, org.Member])(nil)
 
 // ── fake driver ─────────────────────────────────────────────────────────────
 
@@ -75,7 +75,9 @@ type fakeTx struct{ *fakeDriver }
 func (t *fakeTx) Commit(context.Context) error   { t.commits++; return nil }
 func (t *fakeTx) Rollback(context.Context) error { t.rollbacks++; return nil }
 
-func newStore(fd *fakeDriver) *Store { return New(pg.New(fd)) }
+func newStore(fd *fakeDriver) *Store[org.Organization, org.Member] {
+	return New[org.Organization, org.Member](pg.New(fd))
+}
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
