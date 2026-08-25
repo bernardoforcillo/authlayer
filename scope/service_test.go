@@ -261,3 +261,35 @@ func TestListMembersAndRoles(t *testing.T) {
 		}
 	}
 }
+
+func TestStandingReportsPermissionsAndElevation(t *testing.T) {
+	svc := newTestService()
+	ctx := WithSubject(context.Background(), "alice")
+	c, err := svc.CreateContainer(ctx, testContainer{})
+	if err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+
+	perms, elevated, err := svc.Standing(context.Background(), c.ContainerID(), "alice")
+	if err != nil {
+		t.Fatalf("Standing: %v", err)
+	}
+	if !elevated {
+		t.Fatal("the owner is not reported as elevated")
+	}
+	if !perms.IsFull() {
+		t.Fatal("the owner's permissions are not full")
+	}
+
+	if _, _, err := svc.Standing(context.Background(), c.ContainerID(), "stranger"); !errors.Is(err, ErrNotMember) {
+		t.Fatalf("Standing for a non-member = %v, want ErrNotMember", err)
+	}
+	if _, _, err := svc.Standing(context.Background(), "nope", "alice"); !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("Standing in a missing container = %v, want ErrContainerNotFound", err)
+	}
+}
+
+// *Service must satisfy the bridge interface, or nesting cannot be wired.
+func TestServiceSatisfiesParentScope(t *testing.T) {
+	var _ ParentScope = (*Service[testContainer, testMember, *testContainer, *testMember])(nil)
+}

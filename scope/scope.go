@@ -228,6 +228,23 @@ func (s *Service[C, M, PC, PM]) HasPermission(ctx context.Context, containerID, 
 	return true, nil
 }
 
+// Standing resolves userID's permissions within containerID and reports whether
+// they are elevated there — the same resolution [Service.Can] performs, exposed
+// so a nested scope can consult its parent through [ParentScope].
+//
+// It reads nothing from the context and performs no check that the caller is
+// entitled to ask, exactly like [Service.HasPermission]. Do not expose it
+// directly to end users.
+func (s *Service[C, M, PC, PM]) Standing(
+	ctx context.Context, containerID, userID string,
+) (access.Permission, bool, error) {
+	a, err := s.standing(ctx, containerID, userID)
+	if err != nil {
+		return access.Permission{}, false, err
+	}
+	return a.perms, a.elevated, nil
+}
+
 func (s *Service[C, M, PC, PM]) standing(ctx context.Context, containerID, userID string) (authz, error) {
 	c, err := s.store.FindContainer(ctx, containerID)
 	if err != nil {

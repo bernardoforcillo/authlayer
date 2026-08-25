@@ -52,3 +52,20 @@ func TestMemberBaseAccessorsAndSetters(t *testing.T) {
 		t.Fatal("setJoined did not populate joined_at")
 	}
 }
+
+func TestNestedBaseCarriesTheParentLink(t *testing.T) {
+	var n NestedBase
+	n.SetID("t1")
+	n.SetOwner("alice")
+	n.SetParent("acme")
+
+	if n.ContainerID() != "t1" || n.ContainerOwner() != "alice" {
+		t.Fatal("NestedBase lost the embedded ContainerBase behaviour")
+	}
+	if n.ContainerParent() != "acme" {
+		t.Fatalf("ContainerParent() = %q, want acme", n.ContainerParent())
+	}
+	// It must satisfy both interfaces, since the engine type-asserts for Nested.
+	var _ Container = n
+	var _ Nested = n
+}

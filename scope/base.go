@@ -35,6 +35,25 @@ func (b *ContainerBase) SetOwner(ownerID string) { b.OwnerID = ownerID }
 // SetTimes sets the created/updated timestamps.
 func (b *ContainerBase) SetTimes(c, u time.Time) { b.CreatedAt, b.UpdatedAt = c, u }
 
+// NestedBase is [ContainerBase] plus a link to a parent container. Embed it
+// instead of ContainerBase when the scope nests inside another — a team inside
+// an organization, a project inside a team.
+//
+// A container whose type embeds NestedBase satisfies [Nested], which is how the
+// engine discovers that a parent rung applies. See [WithParent].
+type NestedBase struct {
+	ContainerBase
+	// ParentID is the containing scope's id. It is set by the child Service on
+	// create, from the parent container on the context.
+	ParentID string `drop:"parent_id"`
+}
+
+// ContainerParent returns the id of the containing scope.
+func (b NestedBase) ContainerParent() string { return b.ParentID }
+
+// SetParent sets the containing scope's id (used by the engine on create).
+func (b *NestedBase) SetParent(id string) { b.ParentID = id }
+
 // MemberBase carries the membership key fields. Embed it in your member type.
 type MemberBase struct {
 	ContainerID string    `drop:"container_id"`
