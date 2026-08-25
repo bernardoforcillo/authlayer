@@ -275,3 +275,50 @@ type slugOrg struct {
 	Slug  slug `drop:"slug"`
 	Seats int  `drop:"seats"`
 }
+
+// No test in the branch could observe a bound value — the fake driver discards
+// its arguments — so assert the shape of the SQL instead: the INSERT's column
+// list, and the two-column predicates the members and roles reads key on. A
+// mis-declared tag would change these strings.
+func TestEmittedSQLNamesTheDerivedColumns(t *testing.T) {
+	fd := &fakeDriver{}
+	st := newStore(fd)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	if _, err := st.CreateContainer(ctx, org.Organization{
+		ContainerBase: scope.ContainerBase{ID: "o1", OwnerID: "u1", CreatedAt: now, UpdatedAt: now},
+		Name:          "Acme", Slug: "acme",
+	}); err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	wantInsert := `INSERT INTO "organizations" ` +
+		`("id", "owner_id", "created_at", "updated_at", "name", "slug")`
+	if !strings.Contains(fd.execs[0], wantInsert) {
+		t.Fatalf("INSERT = %q, want it to name %q", fd.execs[0], wantInsert)
+	}
+
+	if _, err := st.FindMember(ctx, "o1", "u1"); !errors.Is(err, org.ErrNotMember) {
+		t.Fatalf("FindMember on empty rows = %v, want ErrNotMember", err)
+	}
+	for _, want := range []string{
+		`"organization_members"."container_id" =`,
+		`"organization_members"."user_id" =`,
+	} {
+		if !strings.Contains(fd.queries[0], want) {
+			t.Fatalf("FindMember query = %q, want it to key on %q", fd.queries[0], want)
+		}
+	}
+
+	if _, err := st.FindRole(ctx, "o1", "editor"); !errors.Is(err, org.ErrRoleNotFound) {
+		t.Fatalf("FindRole on empty rows = %v, want ErrRoleNotFound", err)
+	}
+	for _, want := range []string{
+		`"organization_roles"."container_id" =`,
+		`"organization_roles"."key" =`,
+	} {
+		if !strings.Contains(fd.queries[1], want) {
+			t.Fatalf("FindRole query = %q, want it to key on %q", fd.queries[1], want)
+		}
+	}
+}

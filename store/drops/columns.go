@@ -53,7 +53,12 @@ type colSet struct {
 	ts    map[string]*pg.Col[time.Time]
 	bytes map[string]*pg.Col[[]byte]
 	i32   map[string]*pg.Col[int32]
-	order []string // declaration order, so row() is stable
+	// order lists every declared tag in declaration order. It exists because
+	// the four typed maps above cannot be ranged over as one and Go map order
+	// is not stable, so row() needs its own iteration order. It is not what
+	// makes the INSERT correct: drops re-orders the bindings by Table.Columns()
+	// and pairs them by column identity (pg/insert.go).
+	order []string
 }
 
 // newColSet builds the columns of tbl from model's drop: tags, adding them to
@@ -126,19 +131,36 @@ func typeName(t reflect.Type) string {
 	return t.String()
 }
 
+// walk declares a column per drop:-tagged field, recursing into embedded
+// structs.
+//
+// The order of the three decisions — unexported, then tag, then embedded —
+// mirrors drops' own fieldMap (drops@v0.5.0/pg/scan.go), because whatever the
+// scanner binds on the way in is what this must declare on the way out. Two
+// consequences follow from matching it rather than inventing an order:
+// an unexported field is skipped, since the scanner can never fill it and
+// reflection cannot even read it back out; and a drop:-tagged embedded struct
+// is treated as one column, which add then rejects loudly, instead of being
+// flattened here while the scanner binds it whole — a divergence that would
+// corrupt reads with no panic.
 func (c *colSet) walk(t reflect.Type, uuidUserIDs bool) {
 	for i := range t.NumField() {
 		f := t.Field(i)
-		if f.Anonymous && f.Type.Kind() == reflect.Struct {
-			c.walk(f.Type, uuidUserIDs)
+		if !f.IsExported() {
 			continue
 		}
 		tag := f.Tag.Get("drop")
-		if tag == "" || tag == "-" {
+		if tag == "-" {
 			continue
 		}
-		name, opts, _ := strings.Cut(tag, ",")
-		c.add(name, strings.Split(opts, ","), f.Type, uuidUserIDs)
+		if tag != "" {
+			name, opts, _ := strings.Cut(tag, ",")
+			c.add(name, strings.Split(opts, ","), f.Type, uuidUserIDs)
+			continue
+		}
+		if f.Anonymous && f.Type.Kind() == reflect.Struct {
+			c.walk(f.Type, uuidUserIDs)
+		}
 	}
 }
 
@@ -254,19 +276,27 @@ func (c *colSet) row(model any) []pg.ColumnValue {
 	return out
 }
 
+// flatten collects a model value's tagged fields by column name. It must make
+// the same three decisions in the same order as walk, or row would look up a
+// column walk never declared.
 func flatten(v reflect.Value, out map[string]any) {
 	t := v.Type()
 	for i := range t.NumField() {
 		f := t.Field(i)
-		if f.Anonymous && f.Type.Kind() == reflect.Struct {
-			flatten(v.Field(i), out)
+		if !f.IsExported() {
 			continue
 		}
 		tag := f.Tag.Get("drop")
-		if tag == "" || tag == "-" {
+		if tag == "-" {
 			continue
 		}
-		name, _, _ := strings.Cut(tag, ",")
-		out[name] = v.Field(i).Interface()
+		if tag != "" {
+			name, _, _ := strings.Cut(tag, ",")
+			out[name] = v.Field(i).Interface()
+			continue
+		}
+		if f.Anonymous && f.Type.Kind() == reflect.Struct {
+			flatten(v.Field(i), out)
+		}
 	}
 }

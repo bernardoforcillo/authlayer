@@ -37,6 +37,11 @@ func (st *Store[C, M]) Schema() *Schema[C, M] { return st.s }
 // convenient form of scope.MembershipGuard, with the junction and its two
 // columns already filled in.
 //
+// resourceContainerCol is the container-id column on the table being guarded —
+// one of your own columns, on your own table, whatever you happen to have named
+// it. It is not one of authlayer's, so the container_id rename does not apply
+// to it:
+//
 //	projects.AuthorizeWith(st.MembershipGuard(projectsTbl.Col("organization_id")))
 //
 // This is coarse, membership-level filtering. For per-action filtering use

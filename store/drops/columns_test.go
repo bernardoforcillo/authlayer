@@ -141,6 +141,17 @@ func TestColSetRowProducesOneBindingPerColumnInOrder(t *testing.T) {
 	if len(vals) != 6 {
 		t.Fatalf("row() produced %d bindings, want 6", len(vals))
 	}
+	// The name promises order, so assert it: row() walks c.order, and c.order
+	// is the tag order the walker declared.
+	want := []string{"id", "owner_id", "created_at", "updated_at", "name", "slug"}
+	if len(cs.order) != len(want) {
+		t.Fatalf("order = %v, want %v", cs.order, want)
+	}
+	for i := range want {
+		if cs.order[i] != want[i] {
+			t.Fatalf("order = %v, want %v", cs.order, want)
+		}
+	}
 }
 
 func TestColSetRowPanicsOnUnsupportedFieldType(t *testing.T) {
@@ -216,4 +227,44 @@ func TestColSetBindReportsAnUnknownColumn(t *testing.T) {
 		}
 	}()
 	cs.bind("nope", "x")
+}
+
+// drops' scanner skips unexported fields, so a column declared for one could
+// never be filled — and flatten's Field(i).Interface() would panic reading it
+// back out. walk must skip them for the same reason.
+func TestColSetSkipsUnexportedFields(t *testing.T) {
+	type model struct {
+		ID     string `drop:"id"`
+		hidden string `drop:"hidden"`
+	}
+	cs := newColSet(pg.NewTable("t"), model{ID: "i", hidden: "x"}, true)
+	if cs.col("hidden") != nil {
+		t.Fatal("declared a column for an unexported field")
+	}
+	if len(cs.order) != 1 {
+		t.Fatalf("order = %v, want just id", cs.order)
+	}
+	// row() must not trip over it either.
+	if vals := cs.row(model{ID: "i", hidden: "x"}); len(vals) != 1 {
+		t.Fatalf("row() produced %d bindings, want 1", len(vals))
+	}
+}
+
+// drops binds a drop:-tagged embedded struct to a single column. Flattening it
+// here instead would declare inner columns the scanner never fills, corrupting
+// reads with no panic — so it is passed to add, which rejects it loudly.
+func TestColSetRejectsATaggedEmbeddedStruct(t *testing.T) {
+	type model struct {
+		scope.ContainerBase `drop:"base"`
+	}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("a drop:-tagged embedded struct was silently flattened")
+		}
+		if msg := fmt.Sprint(r); !strings.Contains(msg, "unsupported Go type") {
+			t.Fatalf("panic %q is not the unsupported-type message", msg)
+		}
+	}()
+	newColSet(pg.NewTable("t"), model{}, true)
 }
