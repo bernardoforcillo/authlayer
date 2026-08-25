@@ -344,15 +344,38 @@ func TestListUserStandingsJoinsMembersToContainers(t *testing.T) {
 		t.Fatalf("issued %d queries, want exactly 1 — this must be a join, not a query per container", len(fd.queries))
 	}
 	sql := fd.queries[0]
-	for _, want := range []string{
-		`"organization_members"`,
-		`"organizations"`,
-		"JOIN",
-		`"user_id"`,
-	} {
-		if !strings.Contains(sql, want) {
-			t.Fatalf("query missing %q:\n%s", want, sql)
-		}
+	// Pin the SELECT list itself, not just that the two table names appear
+	// somewhere: owner_id must come from "organizations", not
+	// "organization_members" — the equality assertion above can't catch that
+	// swap because the fake driver ignores this string and scans positionally
+	// off the test's own declared columns.
+	wantSelect := `SELECT "organization_members"."container_id", "organization_members"."role_key", "organizations"."owner_id"`
+	if !strings.Contains(sql, wantSelect) {
+		t.Fatalf("query does not select %q:\n%s", wantSelect, sql)
+	}
+	// Pin the join condition's exact qualified form, so a reversed or
+	// mis-columned join (e.g. onto owner_id, or onto members.user_id) fails
+	// here instead of passing every other assertion unchanged.
+	wantOn := `ON ("organizations"."id" = "organization_members"."container_id")`
+	if !strings.Contains(sql, wantOn) {
+		t.Fatalf("query does not join on %q:\n%s", wantOn, sql)
+	}
+	wantWhere := `WHERE ("organization_members"."user_id" = $1)`
+	if !strings.Contains(sql, wantWhere) {
+		t.Fatalf("query does not filter %q:\n%s", wantWhere, sql)
+	}
+}
+
+// A user with no memberships is not an error — same contract as
+// store/memory's TestListUserStandingsUnknownUserIsEmptyNotError.
+func TestListUserStandingsUnknownUserIsEmptyNotError(t *testing.T) {
+	st := newStore(&fakeDriver{}) // Query returns empty rows
+	got, err := st.ListUserStandings(context.Background(), "nobody")
+	if err != nil {
+		t.Fatalf("ListUserStandings: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d standings for an unknown user, want 0", len(got))
 	}
 }
 
@@ -373,7 +396,35 @@ func TestListUserContainersJoinsThroughMembership(t *testing.T) {
 	if len(fd.queries) != 1 {
 		t.Fatalf("issued %d queries, want exactly 1", len(fd.queries))
 	}
-	if !strings.Contains(fd.queries[0], "JOIN") {
-		t.Fatalf("query is not a join:\n%s", fd.queries[0])
+	sql := fd.queries[0]
+	// Pin the SELECT list to the containers table's own columns, not the
+	// join's full column set (which would include organization_members'
+	// columns too and break the scan into C).
+	wantSelect := `SELECT "organizations"."id", "organizations"."owner_id", ` +
+		`"organizations"."created_at", "organizations"."updated_at", ` +
+		`"organizations"."name", "organizations"."slug"`
+	if !strings.Contains(sql, wantSelect) {
+		t.Fatalf("query does not select %q:\n%s", wantSelect, sql)
+	}
+	wantOn := `ON ("organizations"."id" = "organization_members"."container_id")`
+	if !strings.Contains(sql, wantOn) {
+		t.Fatalf("query does not join on %q:\n%s", wantOn, sql)
+	}
+	wantWhere := `WHERE ("organization_members"."user_id" = $1)`
+	if !strings.Contains(sql, wantWhere) {
+		t.Fatalf("query does not filter %q:\n%s", wantWhere, sql)
+	}
+}
+
+// A user with no memberships is not an error — same contract as
+// store/memory's TestListUserContainersReturnsTheContainersJoined companion.
+func TestListUserContainersUnknownUserIsEmptyNotError(t *testing.T) {
+	st := newStore(&fakeDriver{}) // Query returns empty rows
+	got, err := st.ListUserContainers(context.Background(), "nobody")
+	if err != nil {
+		t.Fatalf("ListUserContainers: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d containers for an unknown user, want 0", len(got))
 	}
 }
