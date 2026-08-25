@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/scope"
 )
 
 func TestSchemaDefaultTableNames(t *testing.T) {
@@ -117,5 +118,27 @@ func TestSchemaRolesUniqueConstraintNameFollowsCustomNames(t *testing.T) {
 	want := []string{"container_id", "key"}
 	if got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("roles unique constraint columns = %v, want %v", got, want)
+	}
+}
+
+// A second scope instance must need only table names, not a new store.
+func TestSchemaSupportsASecondContainerType(t *testing.T) {
+	type Team struct {
+		scope.ContainerBase
+		Name     string `drop:"name"`
+		ParentID string `drop:"parent_id"`
+	}
+	type TeamMember struct {
+		scope.MemberBase
+	}
+
+	s := NewSchema[Team, TeamMember](WithNames(Names{
+		Containers: "teams", Members: "team_members", Roles: "team_roles",
+	}))
+	if got := s.Containers.Col("parent_id").Type().TypeSQL(); got != "uuid" {
+		t.Fatalf("parent_id type = %q, want uuid", got)
+	}
+	if s.Containers.Col("name") == nil {
+		t.Fatal("teams table missing the custom name column")
 	}
 }

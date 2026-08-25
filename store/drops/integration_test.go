@@ -37,7 +37,7 @@ func TestDropsStoreIntegration(t *testing.T) {
 	defer sqlDB.Close()
 
 	db := pg.New(stdlib.New(sqlDB))
-	st := dropsstore.New(db)
+	st := dropsstore.New[org.Organization, org.Member](db)
 	ctx := context.Background()
 
 	dropAll(t, db, st)
@@ -90,10 +90,10 @@ func TestDropsStoreIntegration(t *testing.T) {
 	}
 }
 
-func dropAll(t *testing.T, db *pg.DB, st *dropsstore.Store) {
+func dropAll(t *testing.T, db *pg.DB, st *dropsstore.Store[org.Organization, org.Member]) {
 	t.Helper()
 	s := st.Schema()
-	for _, tbl := range []*pg.Table{s.Members, s.Roles, s.Organizations} {
+	for _, tbl := range []*pg.Table{s.Members, s.Roles, s.Containers} {
 		if _, err := db.ExecExpr(context.Background(), pg.DropTableIfExists(tbl)); err != nil {
 			t.Fatalf("drop %s: %v", tbl.Name(), err)
 		}
