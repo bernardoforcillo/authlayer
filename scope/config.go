@@ -9,10 +9,12 @@ import (
 // config is the resolved engine configuration. Build it with the defaults and
 // mutate via Option.
 type config struct {
-	idgen  func() string
-	clock  func() time.Time
-	policy Policy
-	hooks  []Hook
+	idgen   func() string
+	clock   func() time.Time
+	policy  Policy
+	hooks   []Hook
+	parent  ParentScope
+	inherit Inheritance
 }
 
 func defaultConfig() config {
