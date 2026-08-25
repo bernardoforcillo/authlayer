@@ -169,8 +169,10 @@ Every check resolves the actor's **standing** in a container:
    if neither.
 5. The actor is **elevated** if the resolved permission set is full.
 
-An elevated actor passes every fine-grained check *and* the escalation guard.
-Everyone else must hold every requested `(resource, action)` pair.
+An elevated actor passes every fine-grained check naming at least one action,
+*and* the escalation guard. Everyone else must hold every requested
+`(resource, action)` pair. A check naming no actions denies everyone, elevated
+included — there is nothing to authorize.
 
 Nothing is cached. Every check hits the store for the container, the membership,
 and (for custom roles) the role record — so a permission change takes effect
@@ -375,17 +377,29 @@ projects.AuthorizeWith(svc.PermissionGuard(
 
 It resolves the container set through the same ladder `Can` uses, so the guard
 and an in-memory check agree for every container where the subject holds a
-membership row. A subject with no qualifying containers renders as a false
-predicate — no rows, never all rows — and a missing subject is
-`pg.ErrSubjectMissing`.
+membership whose role key resolves. Where they diverge — an unresolvable role
+key, a missing container row, an owner with no membership row of their own —
+the guard denies rather than leaks. A subject with no qualifying containers
+renders as a false predicate — no rows, never all rows — a missing subject is
+`pg.ErrSubjectMissing`, and a store failure aborts the query rather than
+narrowing it to nothing.
 
 The cost is one round trip per guarded query, plus one lookup per distinct
-custom role involved. `svc.ContainersWith(ctx, userID, resource, actions...)`
-is the same answer as a plain `[]string`, so a hot endpoint can hoist it:
+`(container, role key)` pair naming a custom role — a custom role belongs to one
+container, so the same key in two containers is two lookups. The rendered `IN`
+list also binds one parameter per qualifying container.
+`svc.ContainersWith(ctx, userID, resource, actions...)` is the same answer as a
+plain `[]string`, so a hot endpoint can hoist it:
 
 ```go
 ids, err := svc.ContainersWith(ctx, userID, "project", org.ActionDelete)
 ```
+
+`ContainersWith` takes the user id as an argument rather than from the context,
+so — like `HasPermission` — it performs no check that the *caller* is entitled
+to ask, and its answer enumerates that user's memberships and how privileged
+they are in each. Do not expose it directly to end users. `PermissionGuard` is
+the safe form: it reads the subject from the context.
 
 Guards compose, so "rows I created, or rows in an organization where I may
 delete projects" is:

@@ -144,10 +144,10 @@ func NewAccess(appStatements map[string][]access.Action) *access.Access {
 // Service is organization RBAC.
 //
 // It embeds the generic engine, so every scope.Service method is promoted and
-// callable directly — Can, Authorize, HasPermission, AddMember,
-// ChangeMemberRole, RemoveMember, LeaveContainer, ListMembers,
-// TransferOwnership, CreateRole, UpdateRole, DeleteRole, ListRoles — and their
-// documentation lives on scope.Service. Only the organization-flavoured
+// callable directly — Can, Authorize, HasPermission, ContainersWith,
+// PermissionGuard, AddMember, ChangeMemberRole, RemoveMember, LeaveContainer,
+// ListMembers, TransferOwnership, CreateRole, UpdateRole, DeleteRole,
+// ListRoles — and their documentation lives on scope.Service. Only the organization-flavoured
 // conveniences are declared here.
 //
 // A Service is safe for concurrent use if its Store is, and caches nothing:

@@ -25,9 +25,10 @@ import (
 //     decoded. Unknown key → ErrRoleNotFound.
 //  5. The actor is elevated if the resolved permission set is full.
 //
-// An elevated actor passes every fine-grained check and the
-// privilege-escalation guard. Everyone else must hold every requested
-// (resource, action) pair, or the check returns ErrForbidden.
+// An elevated actor passes every fine-grained check naming at least one action,
+// and the privilege-escalation guard. Everyone else must hold every requested
+// (resource, action) pair, or the check returns ErrForbidden. A check naming no
+// actions denies everyone, elevated included: there is nothing to authorize.
 //
 // # Context, not arguments
 //

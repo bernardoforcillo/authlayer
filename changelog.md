@@ -15,10 +15,16 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `(resource, action)` grant, rather than to those they merely belong to. The
   container set is resolved through the same ladder `Can` uses, so a guard and
   an in-memory check agree for every container where the subject holds a
-  membership row; an empty set renders as a false predicate and a missing
-  subject is `pg.ErrSubjectMissing`.
+  membership whose role key resolves, and every known divergence denies rather
+  than leaks. An empty set renders as a false predicate, a missing subject is
+  `pg.ErrSubjectMissing`, a nil column is an error rather than a panic, and a
+  store failure aborts the query instead of narrowing it to nothing.
 - **`Service.ContainersWith`** (`authlayer/scope`) — the same answer as a plain
-  `[]string`, exported so a hot path can hoist the id set out of the guard.
+  `[]string`, exported so a hot path can hoist the id set out of the guard. A
+  membership whose role key resolves to nothing denies its own container only,
+  not the whole call. Like `HasPermission` it takes the user id as an argument
+  and checks nothing about the caller, so do not expose it directly to end
+  users.
 - **`MemberStanding`** (`authlayer/scope`, re-exported as `org.MemberStanding`)
   — a flattened container/role/owner row, fetched by the drops store in a
   single join.
