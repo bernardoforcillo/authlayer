@@ -46,6 +46,11 @@ func MembershipGuard(junction *pg.Table, subjectCol, containerCol, resourceConta
 //	    projectsTbl.Col("organization_id"), "project", org.ActionDelete))
 //	// WHERE "organization_id" IN ($1, $2)
 //
+// It is built on [Service.ContainersWith] and inherits that method's limits — in
+// particular, in a nested scope ([WithParent]) it sees membership-based standing
+// only, so a subject whose standing in a container comes purely from the parent
+// gets no rows for it here even though [Service.Can] admits them there.
+//
 // col is the container-id column on the table being guarded; a nil one is an
 // error from Predicate, not a panic in the builder. The subject comes
 // from the same context the Service reads ([WithSubject]); a missing subject is
