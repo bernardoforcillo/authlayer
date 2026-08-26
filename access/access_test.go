@@ -48,6 +48,49 @@ func TestPermissionUndeclaredGrantIsRejected(t *testing.T) {
 	}
 }
 
+// IsZero must answer "was anything actually granted", not "did the caller pass
+// a non-empty map". A resource named with no actions on it compiles cleanly and
+// confers nothing, and callers gating standing on a permission rely on that
+// distinction.
+func TestPermissionIsZeroTracksConferralNotGrantShape(t *testing.T) {
+	s := NewStatements(map[string][]Action{
+		"member": {"create", "delete"},
+		"doc":    {"read"},
+	})
+	ac := New(s)
+
+	if !(Permission{}).IsZero() {
+		t.Fatal("the zero Permission must be IsZero()")
+	}
+	empty, err := ac.Permission(nil)
+	if err != nil {
+		t.Fatalf("Permission(nil): %v", err)
+	}
+	if !empty.IsZero() {
+		t.Fatal("a permission built from no grants must be IsZero()")
+	}
+
+	// The case that matters: a non-empty map conferring nothing.
+	named, err := ac.Permission(map[string][]Action{"doc": nil})
+	if err != nil {
+		t.Fatalf("Permission with a resource and no actions: %v", err)
+	}
+	if !named.IsZero() {
+		t.Fatal("a resource named with no actions conferred something")
+	}
+
+	granted, err := ac.Permission(map[string][]Action{"doc": {"read"}})
+	if err != nil {
+		t.Fatalf("Permission: %v", err)
+	}
+	if granted.IsZero() {
+		t.Fatal("a permission granting doc:read reported IsZero()")
+	}
+	if ac.Full().IsZero() {
+		t.Fatal("Full() reported IsZero()")
+	}
+}
+
 func TestPermissionSubsetOf(t *testing.T) {
 	s := NewStatements(map[string][]Action{
 		"member": {"create", "delete"},

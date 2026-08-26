@@ -332,12 +332,23 @@ func (s *Service[C, M, PC, PM]) standing(ctx context.Context, containerID, userI
 		// the parent conferred. Nothing conferred is nothing to stand on — and
 		// this is the branch that decides whether a stranger to both scopes
 		// resolves standing here or is turned away, so it fails closed.
-		if !inheritedElevation && len(grants) == 0 {
-			return authz{}, err
-		}
+		//
+		// The grants are compiled BEFORE the test, for two reasons. A
+		// projection naming a capability the child never declared is still the
+		// configuration bug [Inheritance] promises to surface, so it must not
+		// be short-circuited into a silent ErrNotMember. And the test itself is
+		// on what was conferred, not on the shape of the map that carried it: a
+		// projection returning map[string][]access.Action{"doc": nil} has a
+		// non-empty map and grants nothing, so testing len(grants) here would
+		// let it resolve standing for a subject with no membership — enough for
+		// [Service.ListMembers], which requires standing and nothing more, to
+		// hand a stranger the roster.
 		inheritedPerms, perr := s.ac.Permission(grants)
 		if perr != nil {
 			return authz{}, perr
+		}
+		if !inheritedElevation && inheritedPerms.IsZero() {
+			return authz{}, err
 		}
 		return authz{
 			perms:    inheritedPerms,

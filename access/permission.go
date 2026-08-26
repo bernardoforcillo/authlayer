@@ -41,6 +41,24 @@ func (p Permission) IsFull() bool {
 	return true
 }
 
+// IsZero reports whether p grants nothing at all — the counterpart to
+// [Permission.IsFull]. The zero Permission is zero, and so is one built from
+// grants that named resources but no actions on them: [Access.Permission] with
+// map[string][]Action{"doc": nil} validates and compiles, yet confers nothing.
+//
+// The distinction matters wherever a permission decides whether a subject has
+// any standing at all, because "the caller handed me a non-empty grant map" and
+// "the subject was actually granted something" are different questions and only
+// the second one is safe to act on.
+func (p Permission) IsZero() bool {
+	for _, w := range p.bits {
+		if w != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // SubsetOf reports whether every grant in p is also granted by other — i.e. p
 // confers nothing other doesn't already have. This is the privilege-escalation
 // guard: an actor may only grant a role whose permissions SubsetOf the actor's.

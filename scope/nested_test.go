@@ -389,6 +389,48 @@ func TestNestedStrangerIsNotMember(t *testing.T) {
 	}
 }
 
+// A projection may name a resource and confer nothing on it. {resDoc: nil} is
+// a map of length one that grants nothing, so a hinge testing the map's SHAPE
+// admits a subject with no membership, while one testing what was actually
+// CONFERRED turns them away.
+//
+// The consequence is concrete rather than theoretical: ListMembers admits
+// anyone standing() does not reject, so a resolved-but-empty standing hands a
+// stranger the container's roster and breaks that method's documented non-leak
+// property. Reachable only through a custom Inheritance — InheritElevation and
+// InheritWhen never return grants — but that is a documented extension point.
+func TestNestedEmptyProjectedGrantConfersNoStanding(t *testing.T) {
+	parent := newParentScope()
+	octx, orgC := ownerCtx(t, parent, "alice")
+	if _, err := parent.AddMember(octx, "carol", RoleMember); err != nil {
+		t.Fatalf("seed org member: %v", err)
+	}
+
+	// resDoc is a resource the child DOES declare, so the grants compile
+	// cleanly and raise no error: the conferral test is the only thing between
+	// carol and standing she never earned.
+	inherit := func(_ access.Permission, _ bool) (map[string][]access.Action, bool) {
+		return map[string][]access.Action{resDoc: nil}, false
+	}
+	child, _ := newChildScope(parent, inherit)
+	team := createTeam(t, child, orgC.ContainerID(), "alice")
+
+	if _, _, err := child.Standing(context.Background(), team.ContainerID(), "carol"); !errors.Is(err, ErrNotMember) {
+		t.Fatalf("Standing = %v, want ErrNotMember", err)
+	}
+	carol := actorCtx("carol", team.ContainerID())
+	if _, err := child.ListMembers(carol); !errors.Is(err, ErrNotMember) {
+		t.Fatalf("ListMembers = %v, want ErrNotMember: the roster leaked", err)
+	}
+	// An empty request must not become a free "yes" either.
+	if ok, err := child.HasPermission(context.Background(), team.ContainerID(), "carol", nil); ok || err != nil {
+		t.Fatalf("HasPermission = %v,%v; want false,nil", ok, err)
+	}
+	if err := child.Authorize(carol, resDoc, actionRead); !errors.Is(err, ErrNotMember) {
+		t.Fatalf("Authorize = %v, want ErrNotMember", err)
+	}
+}
+
 // A parent lookup that finds nothing contributes nothing and does not fail.
 func TestNestedParentNotMemberIsNotFatal(t *testing.T) {
 	parent := newParentScope()
