@@ -554,8 +554,11 @@ child. `team` is the worked example, teams nested one level inside `org`:
 orgSvc  := org.New(org.NewAccess(team.ParentStatements()), memory.New[org.Organization, org.Member]())
 teamSvc := team.New(team.NewAccess(nil), memory.New[team.Team, team.Member](), orgSvc)
 
-ctx := org.WithOrg(org.WithSubject(context.Background(), "alice"), acme.ID)
-platform, _ := teamSvc.CreateTeam(ctx, "Platform") // alice owns the org, so she owns the team too
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := orgSvc.CreateOrganization(ctx, "Acme", "acme") // alice becomes owner
+
+alice := org.WithOrg(ctx, acme.ID)
+platform, _ := teamSvc.CreateTeam(alice, "Platform") // alice owns the org, so she owns the team too
 ```
 
 `team.ParentStatements()` — merged into `org.NewAccess`'s statements above —
