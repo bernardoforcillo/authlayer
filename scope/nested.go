@@ -69,6 +69,22 @@ func InheritWhen(resource string, actions ...access.Action) Inheritance {
 // grant meant to let them create teams is refused, with nothing in the error to
 // say the scope was never told its own name.
 //
+// Every check on a nested scope now depends on the parent's availability: a
+// non-owner check consults the parent's store before it looks at this scope's
+// own membership, so a parent-store outage denies every non-owner check here,
+// even one a local membership would otherwise have satisfied. That is the
+// correct trade-off — failing closed beats guessing — but it is a dependency
+// worth knowing you took.
+//
+// Parent chains must be acyclic. Two *Service values can't form a cycle by
+// construction, since a parent has to already exist before it can be named as
+// one — but ParentScope is an exported single-method interface, so a custom
+// implementation with a field wired up after construction (a late-bound
+// parent) can still build one. Either way the engine does not detect it:
+// configuring a cycle recurses until the goroutine's stack overflows, a
+// fail-stop crash in your own wiring rather than anything a request can
+// trigger. Each level a check climbs costs one more store round trip.
+//
 //	svc := scope.New[Team, TeamMember](ac, store,
 //	    scope.WithParent(orgSvc, scope.InheritElevation),
 //	    scope.WithContainerResource("team"))
