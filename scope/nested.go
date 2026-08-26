@@ -49,8 +49,18 @@ func InheritWhen(resource string, actions ...access.Action) Inheritance {
 // [New] panics otherwise, because a parent configured against a container that
 // has no parent link is a startup wiring bug rather than a runtime condition.
 //
+// A parented scope needs BOTH this option and [WithContainerResource]. Nesting
+// changes [Service.CreateContainer] into a permission check against the parent,
+// and the permission it looks for is <containerResource>:create — with no
+// container resource named there is no such grant to hold, so creation falls
+// back to requiring elevated standing in the parent. That fails closed rather
+// than open, but it fails silently: an organization member holding exactly the
+// grant meant to let them create teams is refused, with nothing in the error to
+// say the scope was never told its own name.
+//
 //	svc := scope.New[Team, TeamMember](ac, store,
-//	    scope.WithParent(orgSvc, scope.InheritElevation))
+//	    scope.WithParent(orgSvc, scope.InheritElevation),
+//	    scope.WithContainerResource("team"))
 func WithParent(p ParentScope, inherit Inheritance) Option {
 	return func(c *config) {
 		c.parent = p
