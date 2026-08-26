@@ -341,6 +341,8 @@ goroutine; the first error stops the chain.
 | `WithHooks(h...)` | Append lifecycle hooks (accumulates across calls). |
 | `WithClock(fn)` | Timestamp source; default `time.Now().UTC()`. Inject a fixed clock for deterministic tests. |
 | `WithIDGenerator(fn)` | Id source for containers and custom roles; default is UUIDv7 from `crypto/rand`. Swap in ULIDs or whatever your schema expects. |
+| `WithParent(p, inherit)` | [Nest](#nested-scopes) this scope inside another, resolving standing through `p` and projecting it with `inherit`. |
+| `WithContainerResource(res)` | Name this scope's own container resource, so a [nested](#nested-scopes) `CreateContainer` knows what `<res>:create` to check for in the parent. |
 
 Options apply at construction and never after, so a `Service` is immutable once
 built.
@@ -581,12 +583,23 @@ applies to it), so a plain admin inherits nothing in a team by default. To
 extend administration to whoever can manage teams — what most applications
 actually want — declare that capability on the organization's own surface
 (`team:update`, say — this is separate from, and in addition to,
-`team.ParentStatements()`'s `team:create`) and install your own projection:
+`team.ParentStatements()`'s `team:create`) and install your own projection.
+Both halves are required: the grant has to actually be on the organization's
+surface, or the projection has nothing to find and confers standing on
+nobody — silently, since an undeclared pair just reads as "not granted":
 
 ```go
-teamSvc := team.New(ac, store, orgSvc,
-    scope.WithParent(orgSvc, scope.InheritWhen("team", org.ActionUpdate)))
+statements := team.ParentStatements()
+statements[team.ResourceTeam] = append(statements[team.ResourceTeam], team.ActionUpdate)
+orgSvc := org.New(org.NewAccess(statements), memory.New[org.Organization, org.Member]())
+
+teamSvc := team.New(team.NewAccess(nil), memory.New[team.Team, team.Member](), orgSvc,
+    scope.WithParent(orgSvc, scope.InheritWhen(team.ResourceTeam, team.ActionUpdate)))
 ```
+
+Now any organization member holding `team:update` — an admin, by default,
+since `org.NewAccess` grants every declared pair but `organization:delete` to
+`admin` — administers every team in the organization without joining one.
 
 `Policy.MembersFromParent` (on by default) requires a user being added to the
 child to already hold standing in the parent: `AddMember` on a team refuses a
@@ -599,8 +612,20 @@ parent standing) before creating anything, where the unparented form performs
 no check at all — expect that difference the first time you wire
 `WithParent`.
 
-Parent chains must be acyclic. The engine does not detect a cycle, so
-configuring one recurses until the call stack gives out. Each level a check
+A nested check consults the parent's store before it ever looks at the
+child's own membership, so a parent-store outage denies every non-owner check
+in every nested container beneath it — even a subject whose own membership
+would otherwise have sufficed. That is the correct trade-off (failing closed
+beats guessing), but it is worth knowing before it surprises you in an
+incident.
+
+Parent chains must be acyclic. Two `*Service` values can't form one by
+construction — a parent has to already exist before it can be named as one —
+but `ParentScope` is an exported single-method interface, so a custom
+implementation with a field wired up after construction (a late-bound parent)
+can still build a cycle. Either way the engine does not detect it: configuring
+one recurses until the goroutine's stack overflows, a fail-stop crash in your
+own wiring rather than anything a request can trigger. Each level a check
 climbs — resolving the parent's own standing, and its parent's, and so on —
 costs one more store round trip.
 
