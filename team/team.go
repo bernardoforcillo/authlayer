@@ -19,7 +19,10 @@
 // [Service.CreateTeam] still works for the org owner (ownership always
 // bypasses), so the omission surfaces only as everyone else being refused —
 // exactly the silent failure [ParentStatements] exists to turn into a loud,
-// checkable one. See [New] for where the requirement is enforced.
+// checkable one. [New] cannot catch the omission for you: a [scope.ParentScope]
+// exposes only Standing, not the parent's Access, so this package has no way to
+// inspect what the organization declared. The missing declaration surfaces as
+// a plain denial at [Service.CreateTeam] time, not as an error at construction.
 //
 // # Two contexts, one key
 //
@@ -188,8 +191,10 @@ func NewAccess(appStatements map[string][]access.Action) *access.Access {
 // because this merge put it among the declared pairs in the first place —
 // without the merge there is no team:create to inherit at all.) This function
 // exists so that omission is a one-line diff to catch in review rather than a
-// support ticket. See [New] for where the requirement is enforced against the
-// organization's Access.
+// support ticket. [New] cannot enforce it: a [scope.ParentScope] exposes only
+// Standing, so this package cannot inspect the organization's Access to check
+// the merge happened. A missing merge surfaces as a denial at
+// [Service.CreateTeam] time instead of an error at construction.
 func ParentStatements() map[string][]access.Action {
 	return map[string][]access.Action{ResourceTeam: {ActionCreate}}
 }
@@ -223,7 +228,7 @@ type Service struct {
 // WithIDGenerator.
 //
 // The default projection is [scope.InheritElevation]: whichever actor is
-// truly elevated in the organization — under [org.NewAccess]'s default roles,
+// truly elevated in the organization — under org.NewAccess's default roles,
 // that is the owner alone, via ownership — administers every team in it
 // without joining one, and nothing else about their organization standing
 // crosses over. That is the right default for a library: it costs the
@@ -255,7 +260,7 @@ func New(ac *access.Access, store Store, parent scope.ParentScope, opts ...scope
 }
 
 // CreateTeam creates a team with the given name inside the organization named
-// on the context ([org.WithOrg]), owned by the ctx subject, who is also seeded
+// on the context (org.WithOrg), owned by the ctx subject, who is also seeded
 // as its first member with the owner role. Convenience over the generic
 // CreateContainer.
 //
