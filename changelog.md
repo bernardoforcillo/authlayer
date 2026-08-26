@@ -42,6 +42,61 @@ once a 1.0 is cut. Until then, minor versions may break API.
   type missing a required `drop:` tag, or carrying an unsupported field type, is
   now rejected at construction with the type and the tag named, rather than
   nil-dereferencing at the first query.
+- **Nested scopes** (`authlayer/scope`) — a container can now sit inside
+  another (a team inside an organization, a project inside a team) via
+  `WithParent(parent, inherit)` and `WithContainerResource(resource)`. The
+  container type embeds the new `NestedBase` (adds the parent link on top of
+  `ContainerBase`) and satisfies the new `Nested` interface; `ParentScope` is
+  the narrow view a child needs of its parent — `*Service` satisfies it
+  through the newly exported `Service.Standing`. An `Inheritance` function
+  projects a subject's parent standing onto the child as grant *names*,
+  recompiled against the child's own `Access` — never as bits, since a
+  `Permission` is a bitset over one `Statements` space and a parent's bits
+  mean nothing in a child's. `InheritElevation` (the default when `WithParent`
+  is given no projection) confers standing on nobody but the truly elevated —
+  the owner alone, under a default role set, since the built-in `admin` role
+  is deliberately kept short of full permission; `InheritWhen` builds a
+  projection conferring elevation on anyone whose parent standing grants a
+  named capability, for "whoever may manage teams administers each team." `New`
+  panics when `WithParent` is given a container type that does not embed
+  `NestedBase` — the same construction-time-bug treatment
+  `access.Access.NewRole` gives a mis-declared default role. **Nesting also
+  changes `Service.CreateContainer`: on a parented scope it now performs a
+  permission check against the parent (`<containerResource>:create`, or
+  elevated parent standing) before creating anything, where the unparented
+  form performs no check at all** — a caller wiring `WithParent` for the first
+  time should expect this.
+- **`Service.Standing`** (`authlayer/scope`) — exported: the same resolution
+  `Can` performs (a subject's permissions in a container, and whether they are
+  elevated there), reading nothing from the context and checking nothing about
+  the caller, like `HasPermission`. Exists so a nested scope's parent can be
+  asked through `ParentScope`; do not expose it directly to end users.
+- **`Policy.MembersFromParent`** (`authlayer/scope`) — on by default; in a
+  nested scope, refuses `AddMember` with the new `ErrNotParentMember` when the
+  target holds no standing in the parent — you cannot be on a team without
+  being in the organization that owns it. Effective only where `WithParent` is
+  configured; the owner membership `CreateContainer` seeds is not checked
+  separately, since creating a container in a parent already requires standing
+  there.
+- **`access.Access.Union`** — combines several permissions into the set
+  granting every pair any of them grants. A permission from a foreign
+  `Statements` is rejected rather than silently misread; the zero Permission is
+  accepted and contributes nothing. Backs nested scopes, where a member's own
+  role permissions merge with the grants projected from their parent standing.
+- **`access.Permission.IsZero`** — reports whether a permission grants nothing
+  at all, the counterpart to `IsFull`. Needed because a projection can return a
+  non-empty grant map that still confers nothing
+  (`map[string][]access.Action{"doc": nil}` validates and compiles) — "the map
+  is non-empty" and "something was actually granted" are different questions,
+  and standing resolution in a nested scope needs the second one.
+- **`team`** (`authlayer/team`) — a nested "team" instance of the engine, teams
+  living inside organizations. Mirrors `org`'s shape: `Team` / `Member`
+  (embedding `NestedBase` / `MemberBase`), `NewAccess`, `New` (wires
+  `WithParent`/`WithContainerResource` itself so a caller cannot forget
+  either), `CreateTeam`, `WithTeam`/`TeamFrom`, and team-flavoured error
+  aliases including `ErrNotParentMember`. `ParentStatements` names what the
+  parent organization's `Access` must declare (`team:create`) for anyone but
+  the org owner to create a team — merge it into `org.NewAccess`'s statements.
 
 ### Changed
 

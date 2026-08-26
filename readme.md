@@ -26,7 +26,8 @@ else pulls in `drops` (and `pgx/v5` for the PostgreSQL store).
 - [Privilege escalation](#the-privilege-escalation-guard) ·
   [Policy](#policy) · [Hooks & events](#hooks--events) · [Options](#options)
 - [Query-level filtering](#query-level-filtering) · [Storage](#storage) ·
-  [Custom scopes](#custom-scopes) · [Errors](#errors) · [Packages](#packages)
+  [Custom scopes](#custom-scopes) · [Nested scopes](#nested-scopes) ·
+  [Errors](#errors) · [Packages](#packages)
 
 ## The model
 
@@ -286,9 +287,10 @@ errors.Is(err, org.ErrPrivilegeEscalation) // true
 
 ```go
 svc := org.New(ac, store, org.WithPolicy(org.Policy{
-    Escalation:      scope.EscalationStrict,
-    LastOwnerLocked: true,
-    OwnerBypass:     false, // the only deviation from the defaults
+    Escalation:        scope.EscalationStrict,
+    LastOwnerLocked:   true,
+    MembersFromParent: true,
+    OwnerBypass:       false, // the only deviation from the defaults
 }))
 ```
 
@@ -296,6 +298,7 @@ svc := org.New(ac, store, org.WithPolicy(org.Policy{
 |---|---|---|
 | `Escalation` | `EscalationStrict` | `EscalationOff` disables the guard entirely. `EscalationAllowEqual` currently behaves like `Strict` — it is reserved for future "strictly-less" semantics. |
 | `LastOwnerLocked` | `true` | Owner cannot be removed, demoted, or leave. Ownership still moves via `TransferOwnership`. |
+| `MembersFromParent` | `true` | In a [nested scope](#nested-scopes), `AddMember` refuses a user with no standing in the parent (`ErrNotParentMember`). No effect without `WithParent`. |
 | `OwnerBypass` | `true` | Owner gets full permissions regardless of their role key, so a mis-configured container is always recoverable. |
 
 `WithPolicy` replaces the policy wholesale — it does not merge — so pass a fully
@@ -400,6 +403,16 @@ so — like `HasPermission` — it performs no check that the *caller* is entitl
 to ask, and its answer enumerates that user's memberships and how privileged
 they are in each. Do not expose it directly to end users. `PermissionGuard` is
 the safe form: it reads the subject from the context.
+
+**In a [nested scope](#nested-scopes), neither consults the parent.**
+`ContainersWith` resolves membership-based standing only — it does not walk
+the parent rung `Can` applies. An organization admin who can administer a team
+purely through inheritance, holding no membership row of their own in that
+team, gets no row for it here and no rows from a `PermissionGuard` built over
+it, even though `Can`, `Authorize` and `Standing` all admit them in that same
+container: `Can` says yes, the guard says no. That is a known gap, not a
+deliberate rule — do not build a nested scope's row-level filtering on the
+assumption that it mirrors `Can`.
 
 Guards compose, so "rows I created, or rows in an organization where I may
 delete projects" is:
@@ -526,6 +539,68 @@ The engine reads and stamps the base fields and leaves yours alone; drops
 flattens the embedded struct when persisting. `org`'s source is short and is the
 worked example of doing this.
 
+If a scope's own standing should also be reachable *from* a parent container's
+standing — rather than `ParentID` being just another field you happen to
+store — don't roll it by hand; embed `scope.NestedBase` instead and see
+[Nested scopes](#nested-scopes) below.
+
+## Nested scopes
+
+A scope can sit inside another — a team inside an organization, a project
+inside a team — so that standing in the parent can confer standing in the
+child. `team` is the worked example, teams nested one level inside `org`:
+
+```go
+orgSvc  := org.New(org.NewAccess(team.ParentStatements()), memory.New[org.Organization, org.Member]())
+teamSvc := team.New(team.NewAccess(nil), memory.New[team.Team, team.Member](), orgSvc)
+
+ctx := org.WithOrg(org.WithSubject(context.Background(), "alice"), acme.ID)
+platform, _ := teamSvc.CreateTeam(ctx, "Platform") // alice owns the org, so she owns the team too
+```
+
+`team.ParentStatements()` — merged into `org.NewAccess`'s statements above —
+declares `team:create` on the *organization's* surface, so an organization
+role (not only the owner) can be granted the right to create a team. Skipping
+that merge is not a startup error: `CreateTeam` still works for the org owner,
+since ownership always bypasses the check; every other member is refused with
+nothing in the error to say why.
+
+**Bits never cross a scope boundary.** An `access.Permission` is a bitset over
+one package's `Statements`, so a parent's bits mean nothing in a child's
+statement space — inheritance therefore never projects bits, only *grant
+names*, which the child recompiles against its own `Access`.
+
+The zero-config default confers standing on nobody but the truly elevated:
+under `org.NewAccess`'s default roles that is the **owner alone**, via
+ownership. The built-in `admin` role is deliberately kept short of full
+permission (it excludes `organization:delete`, so the escalation guard still
+applies to it), so a plain admin inherits nothing in a team by default. To
+extend administration to whoever can manage teams — what most applications
+actually want — declare that capability on the organization's own surface
+(`team:update`, say — this is separate from, and in addition to,
+`team.ParentStatements()`'s `team:create`) and install your own projection:
+
+```go
+teamSvc := team.New(ac, store, orgSvc,
+    scope.WithParent(orgSvc, scope.InheritWhen("team", org.ActionUpdate)))
+```
+
+`Policy.MembersFromParent` (on by default) requires a user being added to the
+child to already hold standing in the parent: `AddMember` on a team refuses a
+non-member of the organization with `ErrNotParentMember`, rather than the team
+quietly acquiring members the organization has never heard of.
+
+Nesting also changes `CreateContainer`: on a parented scope it performs a
+permission check against the parent (`<containerResource>:create`, or elevated
+parent standing) before creating anything, where the unparented form performs
+no check at all — expect that difference the first time you wire
+`WithParent`.
+
+Parent chains must be acyclic. The engine does not detect a cycle, so
+configuring one recurses until the call stack gives out. Each level a check
+climbs — resolving the parent's own standing, and its parent's, and so on —
+costs one more store round trip.
+
 ## Errors
 
 Compare with `errors.Is`, never by string. `org` re-exports these as *aliases*,
@@ -546,6 +621,7 @@ matches.
 | `ErrRoleInUse` | Role still assigned to members | 422 |
 | `ErrDefaultRole` | Default roles cannot be modified at runtime | 422 |
 | `ErrLastOwner` | Would remove or demote the owner | 422 |
+| `ErrNotParentMember` | [Nested scope](#nested-scopes): `AddMember` target has no standing in the parent | 422 |
 | `ErrSubjectMissing` | No subject on the context — a wiring bug | 500 |
 | `ErrScopeMissing` (`ErrOrgMissing`) | No container on the context — a wiring bug | 500 |
 
@@ -558,6 +634,7 @@ matches.
 | [`access`](access/) | The pure access-control engine — statements, permissions, roles. Standard library only. |
 | [`scope`](scope/) | The generic RBAC engine: `Service`, `Store` port, policy, hooks, context helpers, guard. |
 | [`org`](org/) | Organization RBAC — `scope` with the type parameters fixed and the names spelled "organization". |
+| [`team`](team/) | Team RBAC nested inside `org` via `scope.WithParent` — the worked example of [nesting](#nested-scopes). |
 | [`store/memory`](store/memory/) | In-memory `Store` for dev, tests, and examples. |
 | [`store/drops`](store/drops/) | PostgreSQL `Store` built on drops (composite-key membership). |
 | [`examples/basic`](examples/basic/) | Runnable, database-free tour. |
@@ -566,7 +643,7 @@ Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
 
 ## Roadmap
 
-- Teams (nested scope) and invitations (email + link).
+- Invitations (email + link).
 - Authentication: credentials, revocable server-side sessions, OAuth.
 
 Released versions are recorded in [changelog.md](changelog.md).

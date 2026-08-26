@@ -19,8 +19,19 @@ type Inheritance func(parent access.Permission, parentElevated bool) (
 // InheritElevation is the default projection: an actor elevated in the parent
 // is elevated in the child, and nothing else carries across.
 //
-// This is the "an organization's owner or administrator can administer any team
-// in it" rule, and it is what [WithParent] uses when given no projection.
+// "Elevated" means [access.Permission.IsFull] — the owner via OwnerBypass, or
+// any role whose permissions grant everything. Under an org.NewAccess-style
+// default role set that is the owner alone: the built-in admin role is
+// deliberately kept short of IsFull (it excludes <container>:delete, so the
+// escalation guard still applies to it), so InheritElevation confers nothing
+// on a plain admin. This is the "an organization's owner can administer any
+// team in it" rule, and it is what [WithParent] uses when given no projection.
+//
+// For "whoever may manage teams in the organization administers each team" —
+// what most applications actually want — declare that capability on the
+// parent's own surface and use [InheritWhen] instead:
+//
+//	scope.InheritWhen("team", org.ActionUpdate)
 func InheritElevation(_ access.Permission, parentElevated bool) (map[string][]access.Action, bool) {
 	return nil, parentElevated
 }
