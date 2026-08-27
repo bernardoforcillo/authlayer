@@ -167,18 +167,35 @@ func TestInviteStoreEmailInviteLifecycleLive(t *testing.T) {
 		t.Fatalf("duplicate (container,email) CreateEmailInvite err = %v, want pg.ErrUniqueViolation", err)
 	}
 
+	// A different invite entirely — different container, different email —
+	// reusing the same TokenHash must ALSO collide, on the separate
+	// UNIQUE(token_hash) constraint. This proves that constraint lands on
+	// its own, independent of (container_id, email): a hash collision (or a
+	// token-generation bug) is caught here even when nothing else about the
+	// row conflicts.
+	sameHash := invite.EmailInvite{
+		ID: uid.NewV7(), ContainerID: otherContainerID, Email: "nobody@example.com",
+		RoleKey: "member", TokenHash: "hash-abc", InvitedBy: invitedBy,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	}
+	if _, err := st.CreateEmailInvite(ctx, sameHash); !errors.Is(err, pg.ErrUniqueViolation) {
+		t.Fatalf("duplicate token_hash CreateEmailInvite err = %v, want pg.ErrUniqueViolation", err)
+	}
+
 	// A different email in the same container, and the same email in a
-	// different container, are both unaffected by that constraint.
+	// different container, are both unaffected by that constraint — each
+	// given its own TokenHash, since token_hash is now unique across the
+	// whole table too.
 	other := invite.EmailInvite{
 		ID: uid.NewV7(), ContainerID: containerID, Email: "carol@example.com",
-		RoleKey: "member", InvitedBy: invitedBy, ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+		RoleKey: "member", TokenHash: "hash-other", InvitedBy: invitedBy, ExpiresAt: now.Add(time.Hour), CreatedAt: now,
 	}
 	if _, err := st.CreateEmailInvite(ctx, other); err != nil {
 		t.Fatalf("CreateEmailInvite (different email): %v", err)
 	}
 	elsewhere := invite.EmailInvite{
 		ID: uid.NewV7(), ContainerID: otherContainerID, Email: "bob@example.com",
-		RoleKey: "member", InvitedBy: invitedBy, ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+		RoleKey: "member", TokenHash: "hash-elsewhere", InvitedBy: invitedBy, ExpiresAt: now.Add(time.Hour), CreatedAt: now,
 	}
 	if _, err := st.CreateEmailInvite(ctx, elsewhere); err != nil {
 		t.Fatalf("CreateEmailInvite (different container): %v", err)
@@ -494,8 +511,10 @@ func TestPurgeExpiredLive(t *testing.T) {
 	past := now.Add(-time.Hour)
 	future := now.Add(time.Hour)
 
-	inv1 := invite.EmailInvite{ID: uid.NewV7(), ContainerID: containerID, Email: "a@x.com", InvitedBy: invitedBy, ExpiresAt: past, CreatedAt: now}
-	inv2 := invite.EmailInvite{ID: uid.NewV7(), ContainerID: containerID, Email: "b@x.com", InvitedBy: invitedBy, ExpiresAt: future, CreatedAt: now}
+	// Distinct TokenHash values: the two invites would otherwise both carry
+	// the zero value "" and collide on the UNIQUE(token_hash) constraint.
+	inv1 := invite.EmailInvite{ID: uid.NewV7(), ContainerID: containerID, Email: "a@x.com", TokenHash: "purge-hash-1", InvitedBy: invitedBy, ExpiresAt: past, CreatedAt: now}
+	inv2 := invite.EmailInvite{ID: uid.NewV7(), ContainerID: containerID, Email: "b@x.com", TokenHash: "purge-hash-2", InvitedBy: invitedBy, ExpiresAt: future, CreatedAt: now}
 	for _, in := range []invite.EmailInvite{inv1, inv2} {
 		if _, err := st.CreateEmailInvite(ctx, in); err != nil {
 			t.Fatalf("CreateEmailInvite %s: %v", in.ID, err)
@@ -593,5 +612,81 @@ func TestConsumeLinkConcurrencyExactlyOneWinnerLive(t *testing.T) {
 	}
 	if got.UseCount != 1 {
 		t.Fatalf("final UseCount = %d, want 1", got.UseCount)
+	}
+}
+
+// TestInviteStoreCreateSchemaLandsConstraintsOnRealPostgres is the invite
+// counterpart to store/drops/schema_integration_test.go's
+// TestCreateSchemaLandsConstraintsOnRealPostgres: it proves all three UNIQUE
+// constraints (container_id+email, token_hash, code) actually reach the
+// database via CreateSchema's ALTER TABLE statements, by reading them back
+// out of pg_constraint, rather than inferring their existence indirectly
+// from a duplicate-insert error. Also re-runs CreateSchema to confirm it
+// stays idempotent against a real server.
+func TestInviteStoreCreateSchemaLandsConstraintsOnRealPostgres(t *testing.T) {
+	dsn := os.Getenv("AUTHLAYER_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set AUTHLAYER_TEST_DSN to run the drops invite store integration test")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	db := pg.New(stdlib.New(sqlDB))
+	st := dropsstore.NewInviteStore(db)
+	ctx := context.Background()
+
+	for _, tbl := range []string{"organization_invite_links", "organization_invites"} {
+		if _, err := sqlDB.ExecContext(ctx, "DROP TABLE IF EXISTS "+tbl+" CASCADE"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema: %v", err)
+	}
+	// Re-run: CreateSchema must stay idempotent on a real server.
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema (second run): %v", err)
+	}
+	t.Cleanup(func() {
+		for _, tbl := range []string{"organization_invite_links", "organization_invites"} {
+			_, _ = sqlDB.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+tbl+" CASCADE")
+		}
+	})
+
+	rows, err := sqlDB.QueryContext(ctx, `
+		SELECT c.conname, c.contype, pg_get_constraintdef(c.oid)
+		FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+		WHERE t.relname IN ('organization_invites','organization_invite_links')
+		ORDER BY t.relname, c.conname`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := map[string]string{}
+	for rows.Next() {
+		var name, typ, def string
+		if err := rows.Scan(&name, &typ, &def); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%-42s %s  %s", name, typ, def)
+		found[name] = def
+	}
+
+	for _, want := range []struct{ name, def string }{
+		{"organization_invites_container_email", "UNIQUE (container_id, email)"},
+		{"organization_invites_token_hash", "UNIQUE (token_hash)"},
+		{"organization_invite_links_code", "UNIQUE (code)"},
+	} {
+		def, ok := found[want.name]
+		if !ok {
+			t.Errorf("MISSING: %s on the invite tables", want.name)
+			continue
+		}
+		if def != want.def {
+			t.Errorf("%s definition = %q, want %q", want.name, def, want.def)
+		}
 	}
 }

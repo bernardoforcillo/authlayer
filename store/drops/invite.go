@@ -55,23 +55,31 @@ func WithInviteTextUserIDs() InviteOption {
 //
 //	<invites>       id PK, container_id, email, role_key, token_hash,
 //	                invited_by, expires_at, created_at,
-//	                UNIQUE (container_id, email)
+//	                UNIQUE (container_id, email), UNIQUE (token_hash)
 //	<invite_links>  id PK, container_id, code, role_key, created_by, max_uses,
 //	                use_count, expires_at, revoked_at, created_at,
 //	                UNIQUE (code)
 //
-// Both unique constraints are load-bearing, not decoration. (container_id,
-// email) is what turns a concurrent double-invite of the same address into a
-// unique violation instead of two ambiguous rows — DeleteEmailInvitesFor is
-// what makes an ordinary re-invite replace rather than duplicate, and this
-// constraint is the backstop for the race between two such calls. code is
-// what FindLinkByCode depends on to be an unambiguous lookup.
-// [InviteStore.CreateSchema] emits both itself — CREATE TABLE cannot carry a
-// multi-column UNIQUE, and code is registered as a one-column
-// [pg.Table.AddUnique] for the same reason (the [invite.Link] struct tag
-// carries no "unique" option, so nothing declares it inline) — following the
-// idiom [Store.CreateSchema] already uses for the composite constraints on
-// the scope tables.
+// All three unique constraints are load-bearing, not decoration.
+// (container_id, email) is what turns a concurrent double-invite of the same
+// address into a unique violation instead of two ambiguous rows —
+// DeleteEmailInvitesFor is what makes an ordinary re-invite replace rather
+// than duplicate, and this constraint is the backstop for the race between
+// two such calls. token_hash is FindEmailInviteByTokenHash's key — the
+// acceptance path every redeemed invitation runs — so the constraint does
+// two jobs at once: it gives that lookup an index instead of a sequential
+// scan, and it turns a hash collision or a token-generation bug into a loud
+// constraint violation on write rather than an ambiguous multi-row match
+// that a plain SELECT ... LIMIT 1 would silently resolve to whichever row
+// happened to come back first. code is what FindLinkByCode depends on to be
+// an unambiguous lookup, for the same two reasons.
+// [InviteStore.CreateSchema] emits all three itself — CREATE TABLE cannot
+// carry a multi-column UNIQUE, and token_hash/code are registered as
+// one-column [pg.Table.AddUnique] calls for the same reason (neither
+// [invite.EmailInvite]'s nor [invite.Link]'s struct tags carry a "unique"
+// option, so nothing declares them inline) — following the idiom
+// [Store.CreateSchema] already uses for the composite constraints on the
+// scope tables.
 //
 // [invite.EmailInvite] and [invite.Link] are fixed shapes, unlike the
 // generic scope Store, so unlike [Schema] this type is not parameterized by
@@ -106,6 +114,7 @@ func NewInviteSchema(opts ...InviteOption) *InviteSchema {
 
 	s.EmailInvites.AddUnique(names.EmailInvites+"_container_email",
 		s.emailInvites.col("container_id"), s.emailInvites.col("email"))
+	s.EmailInvites.AddUnique(names.EmailInvites+"_token_hash", s.emailInvites.col("token_hash"))
 	s.Links.AddUnique(names.Links+"_code", s.links.col("code"))
 
 	return s

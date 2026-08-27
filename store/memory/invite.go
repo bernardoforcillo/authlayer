@@ -15,9 +15,20 @@ import (
 // concurrent call.
 //
 // Unlike [Store], it is not generic — [invite.EmailInvite] and [invite.Link]
-// are fixed shapes — and it does not enforce uniqueness of TokenHash or Code;
-// that is a database concern, matching this package's stance on custom
-// container fields (see the package doc).
+// are fixed shapes — and it does not enforce uniqueness of TokenHash, Code,
+// or (ContainerID, Email) on EmailInvite; that is a database concern,
+// matching this package's stance on custom container fields (see the
+// package doc). store/drops enforces all three as UNIQUE constraints
+// (token_hash and code each on their own, container_id+email as a pair —
+// see store/drops/invite.go's InviteSchema); this store keys email invites
+// by ID alone and links by ID alone, so nothing here stops two rows sharing
+// a TokenHash, a Code, or a (ContainerID, Email) pair — CreateEmailInvite
+// and CreateLink will happily store the duplicate where store/drops would
+// reject it with a unique-violation error. That divergence is deliberately
+// deferred rather than fixed here (no sentinel in this package covers a
+// duplicate on create), but it means a test written only against this store
+// can never exercise the collision path production takes — that requires a
+// live store/drops test.
 type InviteStore struct {
 	mu           sync.Mutex
 	emailInvites map[string]invite.EmailInvite
@@ -42,7 +53,10 @@ func (s *InviteStore) CreateEmailInvite(_ context.Context, inv invite.EmailInvit
 
 // FindEmailInviteByTokenHash scans for the invite whose TokenHash matches, or
 // returns invite.ErrInviteNotFound. A linear scan is fine for a reference
-// store; store/drops indexes the column.
+// store; store/drops instead enforces a UNIQUE constraint on token_hash,
+// which both indexes this lookup — the acceptance path every redeemed
+// invitation runs — and rejects a collision on write rather than letting two
+// rows silently share a hash.
 func (s *InviteStore) FindEmailInviteByTokenHash(_ context.Context, tokenHash string) (invite.EmailInvite, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

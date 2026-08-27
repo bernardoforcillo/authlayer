@@ -88,11 +88,29 @@ func TestInviteSchemaLinksHaveCodeUnique(t *testing.T) {
 	}
 }
 
+// FindEmailInviteByTokenHash is the acceptance hot path — the lookup every
+// redeemed invitation performs — and a plain (non-unique) index would only
+// speed it up; UNIQUE additionally turns a hash collision or a
+// token-generation bug into a loud constraint violation on write instead of
+// an ambiguous multi-row match this lookup would otherwise silently resolve
+// to whichever row came back first.
+func TestInviteSchemaEmailInvitesHaveTokenHashUnique(t *testing.T) {
+	s := NewInviteSchema()
+	uniques := s.EmailInvites.CompositeUniques()
+	cols, ok := uniques["organization_invites_token_hash"]
+	if !ok {
+		t.Fatalf("email invites table missing UNIQUE(token_hash) constraint; have %v", uniques)
+	}
+	if len(cols) != 1 || cols[0].Name() != "token_hash" {
+		t.Fatalf("unique constraint columns = %v, want [token_hash]", cols)
+	}
+}
+
 // drops' CreateTableIfNotExists writes column definitions only, so a
-// multi-column (or, for code, a "unique" option the struct tag does not
-// carry) UNIQUE would never reach the database unless CreateSchema emits it
-// itself. Assert the SQL, not the registry — the registry is what was
-// already true before CreateSchema ran.
+// multi-column (or, for token_hash/code, a "unique" option the struct tag
+// does not carry) UNIQUE would never reach the database unless CreateSchema
+// emits it itself. Assert the SQL, not the registry — the registry is what
+// was already true before CreateSchema ran.
 func TestInviteStoreCreateSchemaEmitsUniqueConstraints(t *testing.T) {
 	fd := &fakeDriver{}
 	st := newInviteStore(fd)
@@ -100,9 +118,10 @@ func TestInviteStoreCreateSchemaEmitsUniqueConstraints(t *testing.T) {
 		t.Fatalf("CreateSchema: %v", err)
 	}
 
-	// 2 CREATE TABLE + 2 ALTER TABLE ADD CONSTRAINT.
-	if len(fd.execs) != 4 {
-		t.Fatalf("CreateSchema issued %d statements, want 4:\n%s",
+	// 2 CREATE TABLE + 3 ALTER TABLE ADD CONSTRAINT (container_email,
+	// token_hash on invites; code on links).
+	if len(fd.execs) != 5 {
+		t.Fatalf("CreateSchema issued %d statements, want 5:\n%s",
 			len(fd.execs), strings.Join(fd.execs, "\n--\n"))
 	}
 
@@ -110,6 +129,8 @@ func TestInviteStoreCreateSchemaEmitsUniqueConstraints(t *testing.T) {
 	want := []string{
 		`ALTER TABLE "organization_invites" ADD CONSTRAINT "organization_invites_container_email" ` +
 			`UNIQUE ("container_id", "email");`,
+		`ALTER TABLE "organization_invites" ADD CONSTRAINT "organization_invites_token_hash" ` +
+			`UNIQUE ("token_hash");`,
 		`ALTER TABLE "organization_invite_links" ADD CONSTRAINT "organization_invite_links_code" ` +
 			`UNIQUE ("code");`,
 	}
