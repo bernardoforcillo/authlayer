@@ -35,7 +35,11 @@ func TestDropsStoreIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
-	defer sqlDB.Close()
+	// Registered as a cleanup rather than deferred, and registered FIRST so it
+	// runs LAST: t.Cleanup callbacks run after the test function's defers, so a
+	// deferred Close would shut the pool before the drop-tables cleanup below
+	// could use it, failing every run with "sql: database is closed".
+	t.Cleanup(func() { _ = sqlDB.Close() })
 
 	db := pg.New(stdlib.New(sqlDB))
 	st := dropsstore.New[org.Organization, org.Member](db)
