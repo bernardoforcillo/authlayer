@@ -229,6 +229,28 @@ func TestColSetBindReportsAnUnknownColumn(t *testing.T) {
 	cs.bind("nope", "x")
 }
 
+// The *time.Time case used to call Expr/Val on c.ts[tag] directly instead of
+// going through bindOne's nil-column guard. Col[T] embeds *Column, so on an
+// unknown tag that nil-pointer-panicked instead of reporting the missing
+// column by name — exactly the failure bindOne exists to prevent for every
+// other type.
+func TestColSetBindReportsAnUnknownColumnForNullableTimestamp(t *testing.T) {
+	type withNullable struct {
+		ExpiresAt *time.Time `drop:"expires_at"`
+	}
+	cs := newColSet(pg.NewTable("links"), withNullable{}, true)
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("bind accepted a *time.Time for a tag that names no column")
+		}
+		if msg := fmt.Sprint(r); !strings.Contains(msg, "nope") {
+			t.Fatalf("panic %q does not name the column", msg)
+		}
+	}()
+	cs.bind("nope", (*time.Time)(nil))
+}
+
 // drops' scanner skips unexported fields, so a column declared for one could
 // never be filled — and flatten's Field(i).Interface() would panic reading it
 // back out. walk must skip them for the same reason.

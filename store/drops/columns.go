@@ -228,19 +228,27 @@ func (c *colSet) col(tag string) *pg.Column {
 // because the two must accept the same set. Type-switching on concrete string
 // here while add accepted any Kind String meant a model with a `type Slug
 // string` field built a schema, rendered DDL, and then panicked on its first
-// INSERT. The *time.Time case is checked before time.Time: a *time.Time value
-// does not match a `case time.Time` arm, but ordering it first keeps the two
-// nullable/non-nullable cases visibly paired.
+// INSERT. The *time.Time case is listed before time.Time for readability,
+// not correctness: a type switch dispatches each case by exact match against
+// the value's dynamic type, and *time.Time and time.Time are distinct
+// concrete types, so a given value can only ever match one of them — their
+// relative order has no effect on which arm runs. They are kept adjacent,
+// nullable form first, so the pair reads as one decision instead of two.
 func (c *colSet) bind(tag string, v any) pg.ColumnValue {
 	switch x := v.(type) {
 	case *time.Time:
+		// Route through the same nil-column guard bindOne uses: c.ts[tag] can
+		// itself be nil for an unknown tag, and Col[T] embeds *Column, so
+		// calling Expr/Val directly on a nil *Col[T] would nil-pointer-panic
+		// instead of reporting the missing column by name.
+		col := requireCol(c.ts[tag], tag, "timestamptz")
 		if x == nil {
 			// (*pg.Col[T]).Val takes a concrete T and cannot express NULL;
 			// Expr takes any drops.Expression, and drops.Raw is an exported
 			// string type whose WriteSQL emits its text verbatim.
-			return c.ts[tag].Expr(drops.Raw("NULL"))
+			return col.Expr(drops.Raw("NULL"))
 		}
-		return c.ts[tag].Val(*x)
+		return col.Val(*x)
 	case time.Time:
 		return bindOne(c.ts[tag], tag, x, "timestamptz")
 	case []byte:
@@ -268,12 +276,24 @@ func (c *colSet) bind(tag string, v any) pg.ColumnValue {
 // column rather than dereferencing nil. A nil column here means the tag names
 // no column at all, or names one of a different type.
 func bindOne[T any](col *pg.Col[T], tag string, v T, kind string) pg.ColumnValue {
+	return requireCol(col, tag, kind).Val(v)
+}
+
+// requireCol panics with the same "no such column" message as bindOne when
+// col is nil, and returns col otherwise. It exists as its own step — not
+// folded into bindOne — because the *time.Time case in bind needs the guard
+// but must call Expr for a nil value and Val for a non-nil one, so it cannot
+// go through bindOne's single Val call. Any caller that skips this and
+// dereferences col directly gets a nil-pointer panic instead of the message
+// below: Col[T] embeds *Column, so a nil *Col[T] panics on field access, not
+// on a Go nil-interface comparison.
+func requireCol[T any](col *pg.Col[T], tag, kind string) *pg.Col[T] {
 	if col == nil {
 		panic(fmt.Sprintf(
 			"authlayer/store/drops: no %s column %q; the model's drop: tags declare "+
 				"no such column, or declare it with a different type", kind, tag))
 	}
-	return col.Val(v)
+	return col
 }
 
 // eq builds a column = value predicate.
