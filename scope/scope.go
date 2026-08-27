@@ -633,6 +633,21 @@ func (s *Service[C, M, PC, PM]) AddMember(ctx context.Context, userID, roleKey s
 // Rules that are not about the actor still apply: a duplicate is
 // ErrAlreadyMember, an unresolvable role is ErrRoleNotFound, and under
 // MembersFromParent the user must already hold standing in the parent scope.
+// That last one is the refusal callers actually hit, and on an invitation
+// path it is destructive: the credential has already been claimed by the
+// time this runs, so a nested-scope invitation to someone with no parent
+// standing burns itself. See invite.Service.AcceptInvite's doc.
+//
+// It emits [MemberAdded], exactly as [Service.AddMember] does, with one
+// difference worth knowing before you write an audit hook: ActorID is the
+// ADMITTED user, equal to TargetID, because this call reads no context
+// subject and there is no actor — the person who authorized the admission
+// decided at mint time and is not here. An invitation-based admission is
+// therefore indistinguishable from a self-add on the event alone, and the
+// invitation's own InvitedBy never reaches the hook. Record that attribution
+// when the invitation is minted if your audit trail needs it. A hook
+// returning an error still aborts the call after the membership row is
+// already written (see [Hook]).
 func (s *Service[C, M, PC, PM]) GrantMembership(
 	ctx context.Context, containerID, userID, roleKey string,
 ) (M, error) {

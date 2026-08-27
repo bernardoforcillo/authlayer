@@ -171,7 +171,14 @@ once a 1.0 is cut. Until then, minor versions may break API.
   owes the same care. Rules that are not about the actor still apply: a
   duplicate is `ErrAlreadyMember`, an unresolvable role is `ErrRoleNotFound`,
   and under `Policy.MembersFromParent` the user must already hold standing in
-  the parent scope.
+  the parent scope. It emits `MemberAdded`, so that event now has two sources
+  rather than one — and on this path `Event.ActorID` is the **admitted** user,
+  equal to `TargetID`, since the call reads no ctx subject and there is no
+  actor to name (the inviter authorized it at mint time and is not present).
+  An audit hook therefore cannot distinguish an invitation-based admission
+  from a self-add on the event alone, and the invitation's `InvitedBy` never
+  reaches the hook; record that attribution when the invitation is minted if
+  you need it.
 - **`invite` control statements** (`authlayer/scope`) — `ControlStatements`
   and `NewAccess` now declare the `invite` resource (`create`, `read`,
   `delete`) on every scope's merged permission surface, for the `invite`

@@ -15,8 +15,11 @@ const (
 	// transaction that persists the container and the owner's membership.
 	// ActorID is the new owner.
 	ContainerCreated EventKind = iota
-	// MemberAdded is emitted by AddMember. TargetID is the added user and
-	// RoleKey the role they were given.
+	// MemberAdded is emitted by AddMember and by GrantMembership. TargetID is
+	// the added user and RoleKey the role they were given. On the
+	// GrantMembership path ActorID equals TargetID — see the [Event].ActorID
+	// field doc for why — so an audit hook cannot distinguish an
+	// invitation-based admission from a self-add on the event alone.
 	MemberAdded
 	// MemberRoleChanged is emitted by ChangeMemberRole. TargetID is the member
 	// and RoleKey their new role; the previous role is not reported.
@@ -46,7 +49,18 @@ type Event struct {
 	Kind EventKind
 	// ContainerID is the scope the mutation happened in.
 	ContainerID string
-	// ActorID is the user who performed it (the ctx subject).
+	// ActorID is the user who performed the mutation — the ctx subject, for
+	// every operation that resolves one.
+	//
+	// [Service.GrantMembership] is the exception: it reads nothing from the
+	// context and sets ActorID to the admitted user, the same value as
+	// TargetID. That is not an omission but the only honest answer available.
+	// GrantMembership exists for invitation acceptance, where the invitee is
+	// the one making the call and the person who authorized it — the inviter
+	// — decided at mint time and is not present. There is no actor to name.
+	// An audit trail that needs to attribute an admission to its inviter must
+	// record that at mint time, from the invitation record's own InvitedBy,
+	// rather than expecting it here.
 	ActorID string
 	// TargetID is the user the mutation was performed on, when there is one.
 	TargetID string

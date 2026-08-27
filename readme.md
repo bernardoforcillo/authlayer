@@ -329,11 +329,21 @@ svc := org.New(ac, store, org.WithHooks(scope.HookFunc(
 | Kind | Emitted by | `TargetID` / `RoleKey` |
 |---|---|---|
 | `ContainerCreated` | `CreateOrganization` | — (`ActorID` is the new owner) |
-| `MemberAdded` | `AddMember` | added user / their role |
+| `MemberAdded` | `AddMember`, `GrantMembership` | added user / their role (on `GrantMembership`, `ActorID` equals the added user — see below) |
 | `MemberRoleChanged` | `ChangeMemberRole` | member / new role |
 | `MemberRemoved` | `RemoveMember`, `LeaveContainer` | removed user (equals `ActorID` on a leave) |
 | `RoleCreated` / `RoleUpdated` / `RoleDeleted` | the role calls | — / the role key |
 | `OwnershipTransferred` | `TransferOwnership` | incoming owner (`ActorID` is the outgoing one) |
+
+`ActorID` is the ctx subject for every operation that resolves one.
+`GrantMembership` is the exception: it reads nothing from the context and sets
+`ActorID` to the *admitted* user, the same value as `TargetID`. That is the
+only honest answer available — it exists for [invitation](#invitations)
+acceptance, where the invitee is the one calling and the inviter who
+authorized it decided at mint time and is not present. So an audit hook cannot
+tell an invitation-based admission from a self-add on the event alone, and the
+invitation's `InvitedBy` never reaches the hook. Record that attribution when
+the invitation is minted if you need it.
 
 A hook returning an error **aborts the operation**. For `CreateOrganization` that
 rolls back the whole transaction — container, owner membership, and all. For the
