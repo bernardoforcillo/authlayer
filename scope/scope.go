@@ -533,6 +533,29 @@ func (s *Service[C, M, PC, PM]) RolePermissions(ctx context.Context, containerID
 	return s.resolveRole(ctx, containerID, roleKey)
 }
 
+// Container loads the container identified by id, returning
+// ErrContainerNotFound when there is none.
+//
+// It is a thin wrapper over the Store's own FindContainer — the same
+// delegating relationship [Service.RolePermissions] has to resolveRole — for
+// a caller that already knows, by its own separate reasoning, that it may
+// hand the container back to whoever it is answering. Invitation acceptance
+// is the motivating case: [scope.Service.GrantMembership] returns only the
+// new membership (M), not the container the invitee was just admitted to, and
+// there was no existing way for a caller outside this package to load one by
+// id at all — every other exported path either requires the ctx subject to
+// already have standing there ([Service.Authorize], [Service.Can]) or does
+// not return C ([Service.Standing], [Service.HasPermission]).
+//
+// It reads nothing from the context and performs no check that the caller is
+// entitled to ask, exactly like [Service.Standing] and [Service.RolePermissions].
+// Do not expose it directly to end users: nothing here consults
+// [Service.Authorize] or [Service.Can], so a caller must have already made its
+// own decision that returning this container is appropriate.
+func (s *Service[C, M, PC, PM]) Container(ctx context.Context, id string) (C, error) {
+	return s.store.FindContainer(ctx, id)
+}
+
 func (s *Service[C, M, PC, PM]) requireOwner(ctx context.Context, containerID, userID string) (C, error) {
 	c, err := s.store.FindContainer(ctx, containerID)
 	if err != nil {

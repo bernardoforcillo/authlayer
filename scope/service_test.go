@@ -436,6 +436,32 @@ func TestGrantMembershipOnUnparentedServiceDoesNotPanic(t *testing.T) {
 	}
 }
 
+// Container is the plain loader Task 6 (invitation acceptance) needs:
+// GrantMembership hands back only the new membership, not the container the
+// invitee was just admitted to, and nothing else exported took an id and
+// returned C. It must round-trip what CreateContainer stored.
+func TestContainerLoadsByID(t *testing.T) {
+	svc := newTestService()
+	_, c := ownerCtx(t, svc, "alice")
+
+	got, err := svc.Container(context.Background(), c.ContainerID())
+	if err != nil {
+		t.Fatalf("Container: %v", err)
+	}
+	if got.ContainerID() != c.ContainerID() || got.ContainerOwner() != "alice" {
+		t.Fatalf("Container = %+v, want id=%s owner=alice", got.ContainerBase, c.ContainerID())
+	}
+}
+
+// An unknown id is ErrContainerNotFound, matching every other lookup by
+// container id in this package.
+func TestContainerUnknownIDIsErrContainerNotFound(t *testing.T) {
+	svc := newTestService()
+	if _, err := svc.Container(context.Background(), "nope"); !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("err = %v, want ErrContainerNotFound", err)
+	}
+}
+
 // Adding invite:* to the control statements widens the built-in admin role,
 // which is derived from the merged surface. That widening is intended — it is
 // exactly why the invite package's ListLinks redaction exists — so it is

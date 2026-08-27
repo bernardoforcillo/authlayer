@@ -54,15 +54,17 @@ type Notifier interface {
 // config is the resolved Service configuration, built from the defaults and
 // mutated via Option — the same shape scope's own config follows.
 type config struct {
-	inviteExpiry time.Duration
-	notifier     Notifier
-	tokens       func() string
+	inviteExpiry           time.Duration
+	notifier               Notifier
+	tokens                 func() string
+	recheckInviterOnAccept bool
 }
 
 func defaultConfig() config {
 	return config{
-		inviteExpiry: 7 * 24 * time.Hour,
-		tokens:       randomToken,
+		inviteExpiry:           7 * 24 * time.Hour,
+		tokens:                 randomToken,
+		recheckInviterOnAccept: true,
 	}
 }
 
@@ -139,6 +141,38 @@ func WithTokens(gen func() string) Option {
 			c.tokens = gen
 		}
 	}
+}
+
+// WithRecheckInviterOnAccept controls whether [Service.AcceptInvite] and
+// [Service.JoinViaLink] re-run the privilege-escalation guard against the
+// inviter's CURRENT standing before admitting anyone. The default is true.
+//
+// The guard already ran once, at mint time ([Service.InviteByEmail] /
+// [Service.CreateLink]), against the inviter's standing as of that moment.
+// Nothing about a stored token or link updates afterwards, so without a
+// recheck a credential keeps paying out at the power level its inviter held
+// when they minted it — even after that inviter is demoted, or leaves the
+// container entirely. An admin who invites someone to an admin-level role and
+// is then demoted to member would otherwise leave behind a still-live
+// invitation that grants more than the admin could grant if asked again right
+// now. Enabled, that pending invitation dies the moment its inviter's own
+// standing can no longer support it: a demoted inviter fails with
+// scope.ErrPrivilegeEscalation, the same guard [Service.guardEscalation]
+// applies at mint time, reapplied here against the inviter's standing as of
+// right now rather than as of when they minted the credential. An inviter who
+// has left the container entirely fails the same way but with a different
+// sentinel — scope.ErrNotMember, surfaced from the guard's own
+// [scope.Service.Standing] call — since there is no standing left to compare
+// against at all. Both are refusals; neither admits anyone.
+//
+// Disabling it (enabled=false) trades that safety for durability: an
+// invitation survives its inviter's departure or demotion and still admits at
+// the role it was minted for. That can be the right call for an application
+// that treats "who invited me" as provenance rather than as an ongoing
+// authorization the inviter must keep backing — know that trade-off before
+// turning it off.
+func WithRecheckInviterOnAccept(enabled bool) Option {
+	return func(c *config) { c.recheckInviterOnAccept = enabled }
 }
 
 // Service mints, lists, revokes and previews invitations for one scope
@@ -532,6 +566,175 @@ func (s *Service[C, M, PC, PM]) RevokeLink(ctx context.Context, id string) error
 		return ErrLinkNotFound
 	}
 	return s.st.RevokeLink(ctx, id, time.Now().UTC())
+}
+
+// AcceptInvite redeems plainToken, admitting the ctx subject into the
+// invite's container at its invited role, and returns that container.
+//
+// Unlike every other method on Service, ctx carries only a subject
+// ([scope.WithSubject]) — no active container ([scope.WithScope]) — because
+// the invitee has no standing anywhere yet to name one. The container comes
+// back from the token itself.
+//
+// # Ordering, and why
+//
+// Acceptance spans two stores that may not share a database — the invite
+// lives in this package's own Store, the membership in [scope.Service]'s —
+// so there is no cross-store transaction, and this method is idempotent
+// rather than atomic. It grants the membership FIRST and deletes the invite
+// SECOND. If the delete fails after the grant already succeeded, the invite
+// row survives and a retry presents the same token again: the second
+// [scope.Service.GrantMembership] call reports scope.ErrAlreadyMember, which
+// this method treats as success rather than an error, and the delete is
+// attempted again. Net effect: at-least-once delivery of an operation that is
+// safe to repeat. The reverse order — delete first, grant second — would not
+// be: a delete that succeeds followed by a grant that fails leaves no invite
+// row to retry with, so the invitee is simply never admitted, with nothing
+// left telling anyone why.
+//
+// A first accept still fully consumes the invite: [Store.DeleteEmailInvite]
+// not finding the row it just deleted is impossible on a single successful
+// path, but a concurrent duplicate accept racing the delete can see
+// [ErrInviteNotFound] there too — treated the same as ErrAlreadyMember, since
+// by that point the invite has already done its job.
+//
+// # What is checked before admitting
+//
+// The presented token is hashed and looked up by hash — the plain value is
+// never stored (see [EmailInvite]) — an unknown token is [ErrInviteNotFound].
+// A token past its ExpiresAt is [ErrInviteExpired] and admits no one; this is
+// checked before anything else runs, so an expired token never reaches
+// GrantMembership at all. Unless [WithRecheckInviterOnAccept] was set to
+// false, the escalation guard then re-runs against the inviter's CURRENT
+// standing — see that option's doc for what changed and why.
+func (s *Service[C, M, PC, PM]) AcceptInvite(ctx context.Context, plainToken string) (C, error) {
+	var zero C
+	subject, ok := scope.SubjectFrom(ctx)
+	if !ok {
+		return zero, scope.ErrSubjectMissing
+	}
+
+	inv, err := s.st.FindEmailInviteByTokenHash(ctx, hashToken(plainToken))
+	if err != nil {
+		return zero, err
+	}
+	if !time.Now().UTC().Before(inv.ExpiresAt) {
+		return zero, ErrInviteExpired
+	}
+
+	if s.cfg.recheckInviterOnAccept {
+		if err := s.guardEscalation(ctx, inv.ContainerID, inv.InvitedBy, inv.RoleKey); err != nil {
+			return zero, err
+		}
+	}
+
+	if _, err := s.sc.GrantMembership(ctx, inv.ContainerID, subject, inv.RoleKey); err != nil &&
+		!errors.Is(err, scope.ErrAlreadyMember) {
+		return zero, err
+	}
+
+	// Idempotent on the way out too: a row already gone (a concurrent accept
+	// that finished first) means the goal — no invite row, subject admitted —
+	// is already achieved, so it is not surfaced as a failure of this call.
+	if err := s.st.DeleteEmailInvite(ctx, inv.ID); err != nil && !errors.Is(err, ErrInviteNotFound) {
+		return zero, err
+	}
+
+	return s.sc.Container(ctx, inv.ContainerID)
+}
+
+// JoinViaLink redeems code, admitting the ctx subject into the link's
+// container at its role, and returns that container. Like [Service.AcceptInvite],
+// ctx carries only a subject — no active container — for the same reason.
+//
+// # Already a member
+//
+// If the ctx subject already has standing in the link's container —
+// membership, inheritance, or ownership; the same question
+// [scope.Service.Standing] answers — this returns the container immediately,
+// consuming nothing: no use is taken from the link, and no redundant
+// membership write is attempted (see spec §6.5). This is checked FIRST,
+// before the escalation recheck and before touching the link's use count at
+// all, precisely so an existing member re-clicking an invite link never costs
+// it anything.
+//
+// # Ordering, and why
+//
+// For a subject with no standing yet, the two-store idempotency argument from
+// [Service.AcceptInvite] applies here too, but the safe direction is
+// reversed: this method consumes the link's use FIRST (atomically, via
+// [Store.ConsumeLink]) and grants the membership SECOND. If the membership
+// grant then fails, one use is burned for nothing — under-admission, and
+// recoverable: the invitee can be re-invited or, MaxUses permitting, try the
+// same link again. The reverse order — grant first, consume second — would
+// let every concurrent caller of a MaxUses:1 link past GrantMembership before
+// any of them touched the use count, since GrantMembership itself enforces no
+// such limit: only one of them would then win the atomic consume, but all of
+// them would already hold a real membership. That is over-admission past a
+// use limit specifically designed to bound it, which is the one direction
+// this package must never fail open in.
+//
+// # What is checked before consuming
+//
+// An unknown code is [ErrLinkNotFound]. Unless [WithRecheckInviterOnAccept]
+// was set to false, the escalation guard re-runs against the link creator's
+// CURRENT standing next — see that option's doc — checked before consumption
+// so a link whose creator can no longer support its role does not burn a use
+// either. [Store.ConsumeLink] then reports ok=false for a revoked, expired,
+// or exhausted link without saying which; this method re-reads the link to
+// tell them apart and reports [ErrLinkRevoked], [ErrLinkExpired], or
+// [ErrLinkExhausted] accordingly.
+func (s *Service[C, M, PC, PM]) JoinViaLink(ctx context.Context, code string) (C, error) {
+	var zero C
+	subject, ok := scope.SubjectFrom(ctx)
+	if !ok {
+		return zero, scope.ErrSubjectMissing
+	}
+
+	l, err := s.st.FindLinkByCode(ctx, code)
+	if err != nil {
+		return zero, err
+	}
+
+	switch _, _, err := s.sc.Standing(ctx, l.ContainerID, subject); {
+	case err == nil:
+		// Already has standing here: hand back the container, consume nothing.
+		return s.sc.Container(ctx, l.ContainerID)
+	case !errors.Is(err, scope.ErrNotMember):
+		return zero, err
+	}
+
+	if s.cfg.recheckInviterOnAccept {
+		if err := s.guardEscalation(ctx, l.ContainerID, l.CreatedBy, l.RoleKey); err != nil {
+			return zero, err
+		}
+	}
+
+	now := time.Now().UTC()
+	ok2, err := s.st.ConsumeLink(ctx, l.ID, now)
+	if err != nil {
+		return zero, err
+	}
+	if !ok2 {
+		cur, err := s.st.FindLink(ctx, l.ID)
+		if err != nil {
+			return zero, err
+		}
+		switch {
+		case cur.RevokedAt != nil:
+			return zero, ErrLinkRevoked
+		case cur.ExpiresAt != nil && !now.Before(*cur.ExpiresAt):
+			return zero, ErrLinkExpired
+		default:
+			return zero, ErrLinkExhausted
+		}
+	}
+
+	if _, err := s.sc.GrantMembership(ctx, l.ContainerID, subject, l.RoleKey); err != nil {
+		return zero, err
+	}
+
+	return s.sc.Container(ctx, l.ContainerID)
 }
 
 // PreviewInvite resolves a plain email token to a [Preview], for an

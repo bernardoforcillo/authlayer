@@ -5,6 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -905,5 +908,394 @@ func TestPurgeExpiredDelegatesToStore(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("PurgeExpired = %d, want 1", n)
+	}
+}
+
+// ── AcceptInvite ─────────────────────────────────────────────────────────────
+
+// memberRole returns the role of userID in members, and whether it was found
+// at all — a small helper shared by the acceptance tests below, since
+// checking who got admitted and at what role is their whole point.
+func memberRole(members []org.Member, userID string) (string, bool) {
+	for _, m := range members {
+		if m.MemberUser() == userID {
+			return m.MemberRole(), true
+		}
+	}
+	return "", false
+}
+
+func TestAcceptInviteAdmitsAtInvitedRoleAndDeletesInvite(t *testing.T) {
+	f := newFixture(t)
+	inv, token, err := f.isvc.InviteByEmail(f.ctx("owner"), "alice@example.com", org.RoleMember)
+	if err != nil {
+		t.Fatalf("InviteByEmail: %v", err)
+	}
+
+	c, err := f.isvc.AcceptInvite(scope.WithSubject(context.Background(), "alice"), token)
+	if err != nil {
+		t.Fatalf("AcceptInvite: %v", err)
+	}
+	if c.ContainerID() != f.cID {
+		t.Fatalf("AcceptInvite container = %s, want %s", c.ContainerID(), f.cID)
+	}
+
+	members, err := f.sc.ListMembers(f.ctx("owner"))
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	role, ok := memberRole(members, "alice")
+	if !ok {
+		t.Fatal("alice was not admitted")
+	}
+	if role != org.RoleMember {
+		t.Fatalf("alice's role = %q, want %q", role, org.RoleMember)
+	}
+
+	if _, err := f.ist.FindEmailInvite(context.Background(), inv.ID); !errors.Is(err, invite.ErrInviteNotFound) {
+		t.Fatalf("post-accept invite lookup err = %v, want ErrInviteNotFound", err)
+	}
+}
+
+// leakyInviteStore wraps a real Store but makes DeleteEmailInvite silently
+// report success without actually removing the row. It simulates the exact
+// partial failure AcceptInvite's ordering (grant the membership first, delete
+// the invite second) is built to survive: the membership lands, but the
+// invite's own deletion does not take effect, so the row is still there for a
+// retry to find.
+type leakyInviteStore struct {
+	invite.Store
+}
+
+func (leakyInviteStore) DeleteEmailInvite(context.Context, string) error { return nil }
+
+// TestAcceptInviteSecondCallAfterALeakedDeleteIsANoOpNotAnError pins the
+// idempotency the two-store split depends on. Because a successful
+// AcceptInvite normally deletes the invite row, presenting the same token
+// twice against a fully-working Store cannot demonstrate the idempotency
+// path at all — the second call would simply see ErrInviteNotFound. The only
+// way to exercise "accepting twice" the way the plan actually means it is to
+// simulate the delete half of the ordering failing (here, via
+// leakyInviteStore) so the row survives for a second AcceptInvite call to
+// find. That second call must re-run GrantMembership, get
+// scope.ErrAlreadyMember, treat it as success, and return the container with
+// no error — not fail, and not admit alice a second time.
+func TestAcceptInviteSecondCallAfterALeakedDeleteIsANoOpNotAnError(t *testing.T) {
+	ac := org.NewAccess(nil)
+	sst := memory.New[org.Organization, org.Member]()
+	sc := scope.New[org.Organization, org.Member](ac, sst)
+	isvc := invite.New(sc, leakyInviteStore{memory.NewInviteStore()})
+
+	octx := scope.WithSubject(context.Background(), "owner")
+	c, err := sc.CreateContainer(octx, org.Organization{Name: "Acme", Slug: "acme-leaky"})
+	if err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	cctx := scope.WithScope(octx, c.ContainerID())
+
+	_, token, err := isvc.InviteByEmail(cctx, "alice@example.com", org.RoleMember)
+	if err != nil {
+		t.Fatalf("InviteByEmail: %v", err)
+	}
+
+	aliceCtx := scope.WithSubject(context.Background(), "alice")
+	got1, err := isvc.AcceptInvite(aliceCtx, token)
+	if err != nil {
+		t.Fatalf("first AcceptInvite: %v", err)
+	}
+
+	got2, err := isvc.AcceptInvite(aliceCtx, token)
+	if err != nil {
+		t.Fatalf("second AcceptInvite (retry after a leaked delete) = %v, want a no-op success", err)
+	}
+	if got2.ContainerID() != got1.ContainerID() {
+		t.Fatalf("second AcceptInvite container = %s, want %s", got2.ContainerID(), got1.ContainerID())
+	}
+
+	members, err := sc.ListMembers(cctx)
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	n := 0
+	for _, m := range members {
+		if m.MemberUser() == "alice" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("alice has %d membership rows after two AcceptInvite calls, want exactly 1", n)
+	}
+}
+
+func TestAcceptInviteExpiredTokenDoesNotAdmit(t *testing.T) {
+	f := newFixture(t, invite.WithInviteExpiry(time.Nanosecond))
+	_, token, err := f.isvc.InviteByEmail(f.ctx("owner"), "alice@example.com", org.RoleMember)
+	if err != nil {
+		t.Fatalf("InviteByEmail: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+
+	if _, err := f.isvc.AcceptInvite(scope.WithSubject(context.Background(), "alice"), token); !errors.Is(err, invite.ErrInviteExpired) {
+		t.Fatalf("AcceptInvite err = %v, want ErrInviteExpired", err)
+	}
+	if _, _, err := f.sc.Standing(context.Background(), f.cID, "alice"); !errors.Is(err, scope.ErrNotMember) {
+		t.Fatalf("alice was admitted despite an expired token: Standing err = %v, want ErrNotMember", err)
+	}
+}
+
+// TestAcceptInviteRecheckInviterOnAcceptRefusesADemotedInviter pins the
+// default (true) behaviour of WithRecheckInviterOnAccept: admin1 mints an
+// admin-level invite while still an admin, is demoted to member before alice
+// ever accepts, and the still-pending invite must die with
+// scope.ErrPrivilegeEscalation rather than pay out at a role admin1 can no
+// longer grant.
+func TestAcceptInviteRecheckInviterOnAcceptRefusesADemotedInviter(t *testing.T) {
+	f := newFixture(t)
+	f.addMember("admin1", org.RoleAdmin)
+
+	_, token, err := f.isvc.InviteByEmail(f.ctx("admin1"), "alice@example.com", org.RoleAdmin)
+	if err != nil {
+		t.Fatalf("InviteByEmail: %v", err)
+	}
+
+	if err := f.sc.ChangeMemberRole(f.ctx("owner"), "admin1", org.RoleMember); err != nil {
+		t.Fatalf("ChangeMemberRole (demoting admin1): %v", err)
+	}
+
+	if _, err := f.isvc.AcceptInvite(scope.WithSubject(context.Background(), "alice"), token); !errors.Is(err, scope.ErrPrivilegeEscalation) {
+		t.Fatalf("AcceptInvite err = %v, want ErrPrivilegeEscalation", err)
+	}
+	if _, _, err := f.sc.Standing(context.Background(), f.cID, "alice"); !errors.Is(err, scope.ErrNotMember) {
+		t.Fatalf("alice was admitted despite the inviter's demotion: Standing err = %v, want ErrNotMember", err)
+	}
+}
+
+// TestAcceptInviteWithRecheckOffHonoursADemotedInvitersInvite is the mirror
+// of the test above with the knob turned off: the identical demotion must no
+// longer block acceptance, and alice is admitted at the role admin1 minted
+// the invite for, not admin1's current (lower) role.
+func TestAcceptInviteWithRecheckOffHonoursADemotedInvitersInvite(t *testing.T) {
+	f := newFixture(t, invite.WithRecheckInviterOnAccept(false))
+	f.addMember("admin1", org.RoleAdmin)
+
+	_, token, err := f.isvc.InviteByEmail(f.ctx("admin1"), "alice@example.com", org.RoleAdmin)
+	if err != nil {
+		t.Fatalf("InviteByEmail: %v", err)
+	}
+
+	if err := f.sc.ChangeMemberRole(f.ctx("owner"), "admin1", org.RoleMember); err != nil {
+		t.Fatalf("ChangeMemberRole (demoting admin1): %v", err)
+	}
+
+	if _, err := f.isvc.AcceptInvite(scope.WithSubject(context.Background(), "alice"), token); err != nil {
+		t.Fatalf("AcceptInvite with the recheck disabled: %v", err)
+	}
+
+	members, err := f.sc.ListMembers(f.ctx("owner"))
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	role, ok := memberRole(members, "alice")
+	if !ok {
+		t.Fatal("alice was not admitted despite the recheck being disabled")
+	}
+	if role != org.RoleAdmin {
+		t.Fatalf("alice's role = %q, want %q", role, org.RoleAdmin)
+	}
+}
+
+// ── JoinViaLink ──────────────────────────────────────────────────────────────
+
+func TestJoinViaLinkAdmitsAtLinkRole(t *testing.T) {
+	f := newFixture(t)
+	_, code, err := f.isvc.CreateLink(f.ctx("owner"), org.RoleMember, 0, nil)
+	if err != nil {
+		t.Fatalf("CreateLink: %v", err)
+	}
+
+	c, err := f.isvc.JoinViaLink(scope.WithSubject(context.Background(), "alice"), code)
+	if err != nil {
+		t.Fatalf("JoinViaLink: %v", err)
+	}
+	if c.ContainerID() != f.cID {
+		t.Fatalf("JoinViaLink container = %s, want %s", c.ContainerID(), f.cID)
+	}
+
+	members, err := f.sc.ListMembers(f.ctx("owner"))
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	role, ok := memberRole(members, "alice")
+	if !ok || role != org.RoleMember {
+		t.Fatalf("alice's role = %q found=%v, want %q", role, ok, org.RoleMember)
+	}
+}
+
+func TestJoinViaLinkRefusesARevokedLink(t *testing.T) {
+	f := newFixture(t)
+	l, code, err := f.isvc.CreateLink(f.ctx("owner"), org.RoleMember, 0, nil)
+	if err != nil {
+		t.Fatalf("CreateLink: %v", err)
+	}
+	if err := f.isvc.RevokeLink(f.ctx("owner"), l.ID); err != nil {
+		t.Fatalf("RevokeLink: %v", err)
+	}
+
+	if _, err := f.isvc.JoinViaLink(scope.WithSubject(context.Background(), "alice"), code); !errors.Is(err, invite.ErrLinkRevoked) {
+		t.Fatalf("JoinViaLink err = %v, want ErrLinkRevoked", err)
+	}
+	if _, _, err := f.sc.Standing(context.Background(), f.cID, "alice"); !errors.Is(err, scope.ErrNotMember) {
+		t.Fatalf("alice was admitted via a revoked link: Standing err = %v, want ErrNotMember", err)
+	}
+}
+
+func TestJoinViaLinkRefusesAnExhaustedLink(t *testing.T) {
+	f := newFixture(t)
+	_, code, err := f.isvc.CreateLink(f.ctx("owner"), org.RoleMember, 1, nil)
+	if err != nil {
+		t.Fatalf("CreateLink: %v", err)
+	}
+	if _, err := f.isvc.JoinViaLink(scope.WithSubject(context.Background(), "alice"), code); err != nil {
+		t.Fatalf("first JoinViaLink (consuming the only use): %v", err)
+	}
+
+	if _, err := f.isvc.JoinViaLink(scope.WithSubject(context.Background(), "bob"), code); !errors.Is(err, invite.ErrLinkExhausted) {
+		t.Fatalf("JoinViaLink err = %v, want ErrLinkExhausted", err)
+	}
+	if _, _, err := f.sc.Standing(context.Background(), f.cID, "bob"); !errors.Is(err, scope.ErrNotMember) {
+		t.Fatalf("bob was admitted via an exhausted link: Standing err = %v, want ErrNotMember", err)
+	}
+}
+
+func TestJoinViaLinkRefusesAnExpiredLink(t *testing.T) {
+	f := newFixture(t)
+	at := time.Now().UTC().Add(time.Nanosecond)
+	_, code, err := f.isvc.CreateLink(f.ctx("owner"), org.RoleMember, 0, &at)
+	if err != nil {
+		t.Fatalf("CreateLink: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+
+	if _, err := f.isvc.JoinViaLink(scope.WithSubject(context.Background(), "alice"), code); !errors.Is(err, invite.ErrLinkExpired) {
+		t.Fatalf("JoinViaLink err = %v, want ErrLinkExpired", err)
+	}
+	if _, _, err := f.sc.Standing(context.Background(), f.cID, "alice"); !errors.Is(err, scope.ErrNotMember) {
+		t.Fatalf("alice was admitted via an expired link: Standing err = %v, want ErrNotMember", err)
+	}
+}
+
+// TestJoinViaLinkForExistingMemberConsumesNoUse pins spec §6.5: rejoining via
+// a link you already have standing in returns the container but takes
+// nothing from MaxUses. Proven two ways: UseCount stays 0 after alice's
+// call, and the MaxUses:1 link is still fully available afterwards for bob,
+// who is not yet a member.
+func TestJoinViaLinkForExistingMemberConsumesNoUse(t *testing.T) {
+	f := newFixture(t)
+	f.addMember("alice", org.RoleMember)
+	l, code, err := f.isvc.CreateLink(f.ctx("owner"), org.RoleMember, 1, nil)
+	if err != nil {
+		t.Fatalf("CreateLink: %v", err)
+	}
+
+	c, err := f.isvc.JoinViaLink(scope.WithSubject(context.Background(), "alice"), code)
+	if err != nil {
+		t.Fatalf("JoinViaLink: %v", err)
+	}
+	if c.ContainerID() != f.cID {
+		t.Fatalf("container = %s, want %s", c.ContainerID(), f.cID)
+	}
+
+	got, err := f.ist.FindLink(context.Background(), l.ID)
+	if err != nil {
+		t.Fatalf("FindLink: %v", err)
+	}
+	if got.UseCount != 0 {
+		t.Fatalf("UseCount = %d, want 0 — rejoining an existing member must not consume a use", got.UseCount)
+	}
+
+	if _, err := f.isvc.JoinViaLink(scope.WithSubject(context.Background(), "bob"), code); err != nil {
+		t.Fatalf("bob's JoinViaLink against the still-unused MaxUses:1 link: %v", err)
+	}
+}
+
+// TestJoinViaLinkRecheckInviterOnAcceptRefusesADemotedCreator is JoinViaLink's
+// counterpart to TestAcceptInviteRecheckInviterOnAcceptRefusesADemotedInviter:
+// the same guardEscalation call backs both AcceptInvite and JoinViaLink, and
+// this pins that the link path is not somehow exempt.
+func TestJoinViaLinkRecheckInviterOnAcceptRefusesADemotedCreator(t *testing.T) {
+	f := newFixture(t)
+	f.addMember("admin1", org.RoleAdmin)
+
+	_, code, err := f.isvc.CreateLink(f.ctx("admin1"), org.RoleAdmin, 0, nil)
+	if err != nil {
+		t.Fatalf("CreateLink: %v", err)
+	}
+	if err := f.sc.ChangeMemberRole(f.ctx("owner"), "admin1", org.RoleMember); err != nil {
+		t.Fatalf("ChangeMemberRole (demoting admin1): %v", err)
+	}
+
+	if _, err := f.isvc.JoinViaLink(scope.WithSubject(context.Background(), "alice"), code); !errors.Is(err, scope.ErrPrivilegeEscalation) {
+		t.Fatalf("JoinViaLink err = %v, want ErrPrivilegeEscalation", err)
+	}
+}
+
+// TestJoinViaLinkConcurrentCallsNeverExceedMaxUses is the mandatory mutation-3
+// pin from the task brief: it must fail if JoinViaLink's ordering is reversed
+// to grant the membership before consuming the link's use.
+//
+// n distinct, previously-unseen users hit a MaxUses:1 link at once. With the
+// ordering this test is written against — consume first, grant second — the
+// atomic ConsumeLink (already proven in store/memory's own
+// TestConsumeLinkConcurrencyExactlyOneWinner) admits at most one winner
+// through to GrantMembership, so at most one of the n candidates can ever
+// become a real member.
+//
+// Reversing the order breaks that guarantee in a way this test catches
+// reliably, not by chance: every one of the n candidates is a distinct user
+// GrantMembership has never seen, so with the grant moved ahead of the
+// consume check, EVERY goroutine passes GrantMembership unconditionally —
+// there is no ErrAlreadyMember to collide on — before any of them touch the
+// link's use count at all. That is unlike store/memory's own concurrency
+// test, which pins a sub-microsecond lock-reacquisition window inside a
+// single atomic primitive and is flaky-clean under a naive read-then-write
+// mutation; here the reversal removes the gate entirely; so under the
+// mutation essentially all n candidates land as real members, not
+// occasionally more than one. The assertion below checks actual membership
+// rows, not how many calls merely reported success, precisely because a
+// reversed implementation could still return an error to the losers of the
+// consume race after already granting them a membership behind the scenes.
+func TestJoinViaLinkConcurrentCallsNeverExceedMaxUses(t *testing.T) {
+	f := newFixture(t)
+	_, code, err := f.isvc.CreateLink(f.ctx("owner"), org.RoleMember, 1, nil)
+	if err != nil {
+		t.Fatalf("CreateLink: %v", err)
+	}
+
+	const n = 300
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := range n {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, _ = f.isvc.JoinViaLink(scope.WithSubject(context.Background(), fmt.Sprintf("candidate%d", i)), code)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	members, err := f.sc.ListMembers(f.ctx("owner"))
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	joined := 0
+	for _, m := range members {
+		if strings.HasPrefix(m.MemberUser(), "candidate") {
+			joined++
+		}
+	}
+	if joined != 1 {
+		t.Fatalf("joined = %d of %d concurrent candidates against a MaxUses:1 link, want exactly 1", joined, n)
 	}
 }
