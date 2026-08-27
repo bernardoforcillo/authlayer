@@ -29,10 +29,10 @@ import (
 //
 // Email is a delivery hint and an audit record — where the token was sent,
 // and what to show on a "pending invitations" screen — not an authorization
-// check. It cannot be one here: authlayer stores no users and has no notion
-// of a subject's verified address (see the package doc's "no user table"
-// stance), so there is nothing for the library to compare the accepting
-// subject against. An application that needs the invitation bound to its
+// check. It cannot be one here: authlayer stores no users at all — a user id
+// is a value it carries, never one it validates — so it has no verified
+// address to compare the accepting subject against. An application that needs
+// the invitation bound to its
 // recipient must enforce that itself, before calling AcceptInvite — compare
 // Email against the authenticated user's own verified address, using
 // [Service.PreviewInvite] to read the invited address out of a token without
