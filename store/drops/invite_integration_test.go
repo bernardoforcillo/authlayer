@@ -615,6 +615,80 @@ func TestConsumeLinkConcurrencyExactlyOneWinnerLive(t *testing.T) {
 	}
 }
 
+// TestDeleteEmailInviteConcurrencyExactlyOneWinnerLive is the email claim's
+// counterpart to TestConsumeLinkConcurrencyExactlyOneWinnerLive above, and
+// exists because DeleteEmailInvite was promoted to a load-bearing atomic
+// claim: invite.Service.AcceptInvite now deletes the invitation FIRST and
+// grants membership SECOND, so this rows-affected gate is the only thing
+// standing between a token presented twice and two admissions. The
+// sequential case (second delete -> ErrInviteNotFound) was already covered
+// in TestInviteStoreEmailInviteLifecycleLive; sequential coverage cannot
+// distinguish "at most one caller wins" from "the second read happened to
+// come after the first commit". The unit tests cannot either — a fake
+// driver has no row locks or wire round trips to interleave.
+//
+// So: N goroutines race DeleteEmailInvite against one invitation row.
+// Exactly one must see a nil error; every loser must see
+// invite.ErrInviteNotFound and nothing else. Under PostgreSQL's default READ
+// COMMITTED, the losers block on the winner's row lock and re-evaluate the
+// predicate after it commits, finding no row and reporting 0 affected.
+func TestDeleteEmailInviteConcurrencyExactlyOneWinnerLive(t *testing.T) {
+	st := newLiveInviteStore(t)
+	ctx := context.Background()
+
+	inv, err := st.CreateEmailInvite(ctx, invite.EmailInvite{
+		ID: uid.NewV7(), ContainerID: uid.NewV7(), Email: "race@example.com",
+		RoleKey: "member", TokenHash: "race-token-hash", InvitedBy: uid.NewV7(),
+		ExpiresAt: time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond),
+		CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+	})
+	if err != nil {
+		t.Fatalf("CreateEmailInvite: %v", err)
+	}
+
+	const n = 100
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	successes, notFound := 0, 0
+	var others []error
+
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			err := st.DeleteEmailInvite(ctx, inv.ID)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				successes++
+			case errors.Is(err, invite.ErrInviteNotFound):
+				notFound++
+			default:
+				others = append(others, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if len(others) != 0 {
+		t.Fatalf("got %d unexpected errors from DeleteEmailInvite, first = %v", len(others), others[0])
+	}
+	if successes != 1 {
+		t.Fatalf("got %d successful DeleteEmailInvite calls against one invitation, want exactly 1 — the claim is not atomic", successes)
+	}
+	if notFound != n-1 {
+		t.Fatalf("got %d ErrInviteNotFound, want %d — every loser must be refused", notFound, n-1)
+	}
+
+	if _, err := st.FindEmailInvite(ctx, inv.ID); !errors.Is(err, invite.ErrInviteNotFound) {
+		t.Fatalf("FindEmailInvite after the race: err = %v, want ErrInviteNotFound — the row must be gone", err)
+	}
+}
+
 // TestInviteStoreCreateSchemaLandsConstraintsOnRealPostgres is the invite
 // counterpart to store/drops/schema_integration_test.go's
 // TestCreateSchemaLandsConstraintsOnRealPostgres: it proves all three UNIQUE
