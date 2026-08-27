@@ -761,6 +761,32 @@ and `JoinViaLink`'s own doc comments in `invite/service.go` for the full
 argument, including the narrow, deliberately-accepted boundary imprecision
 around `AcceptInvite`'s expiry check.
 
+**On a nested scope, admit to the parent first.** The post-claim failure that
+actually happens is not a store outage — it is `scope.ErrNotParentMember`.
+Under the default `Policy.MembersFromParent`, `GrantMembership` refuses anyone
+who does not *already* hold standing in the parent of a [nested](#nested-scopes)
+scope, deterministically and every time. Since the credential is claimed first,
+that burns it: a team invitation sent to someone who is not yet in the
+organization fails, the token is spent, and re-presenting it gives
+`ErrInviteNotFound`. Nothing in `invite` checks parent standing before the
+claim. So add the invitee to the parent org — directly, or via a parent-scope
+invitation they accept first — before they accept the child's, or clear
+`MembersFromParent` for that scope if the child is meant to hold members the
+parent has never heard of. It fails closed; nobody is over-admitted, the
+invitation is simply gone.
+
+**An email invite is a bearer credential.** `AcceptInvite` admits whoever
+presents the token, at the invited role; it never compares the accepting
+subject to `EmailInvite.Email`. "One-time" bounds how many times the token pays
+out, not who it pays out to, so a forwarded or intercepted invitation email
+admits whoever clicks it. That is not something authlayer can check for you:
+it stores no users and has no notion of a subject's verified address (see
+[The model](#the-model)), so `Email` is a delivery hint and an audit record
+rather than an authorization test. If your application needs the invitation
+bound to its recipient, enforce it yourself before calling `AcceptInvite` —
+`PreviewInvite` reads the invited address out of a token without consuming it,
+so compare that against the authenticated user's own verified address.
+
 **An existing member is idempotent, but not symmetrically.** If the ctx
 subject already has standing in the link's container, `JoinViaLink` returns
 the container immediately and consumes nothing — no use taken, no redundant

@@ -654,6 +654,22 @@ func (s *Service[C, M, PC, PM]) RevokeLink(ctx context.Context, id string) error
 // the invitee has no standing anywhere yet to name one. The container comes
 // back from the token itself.
 //
+// # The token is a bearer credential
+//
+// The ctx subject is admitted at the invited role and is NEVER compared to
+// the invitation's Email. Whoever holds the token can redeem it: a forwarded,
+// intercepted or shoulder-surfed invitation email admits whoever clicks it.
+// "One-time" bounds how many times the token pays out, not who it pays out
+// to.
+//
+// This is not an oversight to be patched here. authlayer stores no users and
+// has no notion of a subject's verified address, so there is nothing for it
+// to compare against; [EmailInvite].Email is a delivery hint and an audit
+// record. An application that needs the invitation bound to its recipient
+// must enforce that itself, before calling AcceptInvite — read the invited
+// address out of the token with [Service.PreviewInvite], which consumes
+// nothing, and compare it to the authenticated user's own verified address.
+//
 // # Ordering, and why
 //
 // Acceptance spans two stores that may not share a database — the invite
@@ -685,12 +701,36 @@ func (s *Service[C, M, PC, PM]) RevokeLink(ctx context.Context, id string) error
 //
 // One consequence worth stating plainly: accepting is NOT safe to retry with
 // the same token. If GrantMembership fails after the claim already succeeded
-// — a store outage, an unresolvable role — the invite is gone and cannot be
-// re-presented; the invitee must be re-invited ([Service.InviteByEmail],
-// which replaces any prior pending invite for the same address). This is the
-// same trade [Service.JoinViaLink] already makes for a link: a failure after
-// the claim under-admits (burns the credential, admits no one extra), which
-// is the safe direction, at the cost of idempotent retries.
+// the invite is gone and cannot be re-presented; the invitee must be
+// re-invited ([Service.InviteByEmail], which replaces any prior pending
+// invite for the same address). This is the same trade [Service.JoinViaLink]
+// already makes for a link: a failure after the claim under-admits (burns the
+// credential, admits no one extra), which is the safe direction, at the cost
+// of idempotent retries.
+//
+// # The post-claim failure that actually happens
+//
+// A store outage and an unresolvable role are the exceptional cases. The
+// common one is [scope.ErrNotParentMember], and it is not a race: on a NESTED
+// scope (one built with [scope.WithParent] — a team inside an organization,
+// say) under the default [scope.Policy].MembersFromParent, GrantMembership
+// refuses any invitee who does not ALREADY hold standing in the parent. That
+// is deterministic and repeatable, and it fires on the most natural flow
+// there is — "invite a new person to my team" — burning the invitation every
+// time. The invitee then cannot retry: the token is spent, and a second
+// presentation is [ErrInviteNotFound].
+//
+// So on a nested scope, admit to the parent first. Either add the invitee to
+// the parent org (with the parent's own [scope.Service.AddMember], or a
+// parent-scope invitation they accept first) before they accept the child's
+// invitation, or clear MembersFromParent for that scope if the child is meant
+// to hold members the parent has never heard of. Nothing here checks parent
+// standing before the claim — doing so would need a new exported scope
+// predicate — so the burn is real, and an application sending nested-scope
+// invitations should sequence around it rather than discover it per invitee.
+// It fails closed: nobody is over-admitted, the invitation is simply gone.
+// The same applies verbatim to [Service.JoinViaLink], which claims a use
+// before granting for the identical reason.
 //
 // scope.ErrAlreadyMember from GrantMembership is still folded to success:
 // the subject already holds the outcome the invitation exists to produce.
@@ -795,6 +835,15 @@ func (s *Service[C, M, PC, PM]) AcceptInvite(ctx context.Context, plainToken str
 // them would already hold a real membership. That is over-admission past a
 // use limit specifically designed to bound it, which is the one direction
 // this package must never fail open in.
+//
+// The post-claim failure that actually happens here is the same one
+// [Service.AcceptInvite] documents at length: on a NESTED scope under the
+// default [scope.Policy].MembersFromParent, GrantMembership returns
+// [scope.ErrNotParentMember] for any redeemer who does not already hold
+// standing in the parent, deterministically, burning a use each time. Admit
+// people to the parent first, or clear MembersFromParent for that scope. A
+// link with uses left can at least be retried once they qualify, which is why
+// this is milder here than for a single-use token.
 //
 // # What is checked before consuming
 //

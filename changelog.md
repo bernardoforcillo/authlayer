@@ -99,8 +99,14 @@ once a 1.0 is cut. Until then, minor versions may break API.
   the org owner to create a team — merge it into `org.NewAccess`'s statements.
 - **`invite`** (`authlayer/invite`) — a new package admitting a person who has
   no standing in a scope yet, by a credential rather than a direct
-  `AddMember` call. `InviteByEmail` mints a one-time, single-recipient token
-  and persists only its sha256 (`EmailInvite.TokenHash`), since the token is
+  `AddMember` call. `InviteByEmail` mints a one-time **bearer** token — it
+  pays out at most once, but to whoever presents it: acceptance never compares
+  the accepting subject to `EmailInvite.Email`, which is a delivery hint and
+  an audit record, since authlayer stores no users and has no notion of a
+  subject's verified address. Bind an invitation to its recipient in your own
+  application if you need that, using `PreviewInvite` to read the invited
+  address without consuming the token. Only the token's sha256 is persisted
+  (`EmailInvite.TokenHash`), since the token is
   emailed once and never redisplayed to anyone, including the inviter — a
   database leak of the row cannot be replayed into admission. `CreateLink`
   mints a reusable link bounded by an explicit `MaxUses` (0 meaning
@@ -115,7 +121,13 @@ once a 1.0 is cut. Until then, minor versions may break API.
   atomic `Store.ConsumeLink` — and admit SECOND, so a failure after the claim
   burns the credential and admits no one (under-admission) rather than
   risking a credential paying out twice (over-admission); accepting is
-  therefore not safe to retry with the same token. Delivery is entirely the
+  therefore not safe to retry with the same token. On a **nested** scope that
+  matters more than it sounds: under the default `Policy.MembersFromParent`,
+  `GrantMembership` returns `scope.ErrNotParentMember` for an invitee who does
+  not already hold standing in the parent, deterministically — so a team
+  invitation sent to someone not yet in the organization burns itself every
+  time. Admit people to the parent first, or clear `MembersFromParent` for
+  that scope. Delivery is entirely the
   caller's own responsibility: `InviteByEmail` returns the plain token
   exactly once, and authlayer knows no base URL and owns no transport;
   `WithNotifier` is optional sugar over calling a `Notifier` yourself right

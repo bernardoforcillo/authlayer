@@ -17,7 +17,26 @@ import (
 	"time"
 )
 
-// EmailInvite is a one-time, single-recipient invitation delivered by email.
+// EmailInvite is a one-time invitation delivered by email.
+//
+// # The token is a bearer credential
+//
+// One-time means it pays out at most once, not that it pays out only to the
+// invited person. Whoever holds the token can redeem it:
+// [Service.AcceptInvite] admits the ctx subject at RoleKey and never compares
+// that subject to Email. A forwarded, intercepted or shoulder-surfed
+// invitation email admits whoever clicks it, at the invited role.
+//
+// Email is a delivery hint and an audit record — where the token was sent,
+// and what to show on a "pending invitations" screen — not an authorization
+// check. It cannot be one here: authlayer stores no users and has no notion
+// of a subject's verified address (see the package doc's "no user table"
+// stance), so there is nothing for the library to compare the accepting
+// subject against. An application that needs the invitation bound to its
+// recipient must enforce that itself, before calling AcceptInvite — compare
+// Email against the authenticated user's own verified address, using
+// [Service.PreviewInvite] to read the invited address out of a token without
+// consuming it.
 //
 // Only TokenHash is stored — never the plain token. The token is emailed once
 // and never redisplayed to anyone, including the inviter, so persisting just
@@ -34,7 +53,8 @@ type EmailInvite struct {
 	ID string `drop:"id"`
 	// ContainerID is the scope the invitee is admitted to on acceptance.
 	ContainerID string `drop:"container_id"`
-	// Email is the address the token was sent to.
+	// Email is the address the token was sent to. Delivery hint and audit
+	// record only — acceptance never checks it. See the type doc.
 	Email string `drop:"email"`
 	// RoleKey is the role the invitee holds once admitted.
 	RoleKey string `drop:"role_key"`
