@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -597,6 +598,78 @@ func TestMarkRotatedIgnoresExpiry(t *testing.T) {
 	}
 }
 
+// raceMarkRotated drives n goroutines to call MarkRotated(tokenHash, now) on
+// st concurrently, all released by the same closed channel to maximize
+// contention, and reports how many saw ok=true and how many saw a non-nil
+// error. It is the shared engine behind markRotatedContract (run against a
+// real auth.Store, asserting successes==1) and
+// TestSplitLockStoreProducesTwoWinners (run against the deliberately broken
+// double below, asserting successes==2): factoring the driver out means both
+// exercise identical goroutine-scheduling pressure, and it is reusable
+// verbatim by a future backend's own concurrency suite.
+func raceMarkRotated(ctx context.Context, st auth.Store, tokenHash string, now time.Time, n int) (successes, errs int) {
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			_, ok, err := st.MarkRotated(ctx, tokenHash, now)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs++
+				return
+			}
+			if ok {
+				successes++
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	return successes, errs
+}
+
+// markRotatedContract is the reusable driver behind
+// TestMarkRotatedConcurrencyExactlyOneWinner: N=500 goroutines race
+// MarkRotated against one freshly created, unrotated session, and the
+// contract is exactly one winner, no errors, and a final RotatedAt equal to
+// the shared instant every goroutine raced with. factory must return a fresh,
+// empty auth.Store each call. Task 4's live-Postgres suite is meant to call
+// this directly against its own store, so both backends assert literally the
+// same contract rather than a re-derived approximation of it.
+func markRotatedContract(t *testing.T, factory func() auth.Store) {
+	t.Helper()
+	ctx := context.Background()
+	st := factory()
+	if _, err := st.CreateSession(ctx, auth.Session{ID: "sess1", TokenHash: "hash1"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	const n = 500
+	now := time.Now()
+	successes, errs := raceMarkRotated(ctx, st, "hash1", now, n)
+
+	if errs != 0 {
+		t.Fatalf("got %d unexpected errors from MarkRotated", errs)
+	}
+	if successes != 1 {
+		t.Fatalf("got %d successful MarkRotated calls against one session, want exactly 1", successes)
+	}
+
+	got, err := st.FindSessionByHash(ctx, "hash1")
+	if err != nil {
+		t.Fatalf("FindSessionByHash: %v", err)
+	}
+	if got.RotatedAt == nil || !got.RotatedAt.Equal(now) {
+		t.Fatalf("final RotatedAt = %v, want %v", got.RotatedAt, now)
+	}
+}
+
 // TestMarkRotatedConcurrencyExactlyOneWinner pins the observable contract: N
 // goroutines race to rotate one session's token, and exactly one of them must
 // observe ok=true, the rest ok=false with no error, and the session's final
@@ -605,6 +678,8 @@ func TestMarkRotatedIgnoresExpiry(t *testing.T) {
 // enter MarkRotated at effectively the same instant once it closes,
 // maximizing contention — the same construction as
 // store/memory/invite_test.go's TestConsumeLinkConcurrencyExactlyOneWinner.
+// The driver and the assertion both live in markRotatedContract above, so
+// this test is now just "run the shared contract against memory.AuthStore".
 //
 // What this test does NOT reliably do is catch a broken, split-lock
 // (read-then-write) MarkRotated — read the session under one lock
@@ -626,7 +701,14 @@ func TestMarkRotatedIgnoresExpiry(t *testing.T) {
 //     TestConsumeLinkConcurrencyExactlyOneWinner's doc describes — most
 //     interleavings still resolve before a second goroutine's Lock() call
 //     can land in the gap, they just do so less consistently here than in
-//     ConsumeLink's simpler map lookup.
+//     ConsumeLink's simpler map lookup. An independent reviewer reproduced
+//     this on different hardware and measured 1 failure in 160 runs
+//     (~0.6%) — a different number, same conclusion: naive-window detection
+//     is real but far too unreliable to trust, and the lower rate makes
+//     refusing to call 3/70 "confirmation" look more justified, not less —
+//     a reviewer re-running the same experiment could easily have seen 0
+//     failures and called the mutation flaky-clean, exactly as happened to
+//     Plan 4's ConsumeLink.
 //   - Widened window (a temporary time.Millisecond sleep inserted between
 //     the unlocked read and the second Lock(), in the mutated copy only —
 //     never shipped): 20/20 runs failed, every single time. Per-run success
@@ -637,25 +719,40 @@ func TestMarkRotatedIgnoresExpiry(t *testing.T) {
 // Both mutation runs were done by hand against a scratch copy of
 // AuthStore.MarkRotated and are not part of this test file — see the task
 // report for the exact diff used and the raw counts. A fully deterministic
-// catch (100% on the naive window, no sleep needed) was not pursued for the
-// in-memory store: unlike store/drops' live-Postgres tests, an in-process
-// mutex has no independent contention source (no row lock, no wire round
-// trip) to interleave against from outside the method, so forcing the
-// interleaving without a timing-based delay would require adding a
-// test-only blocking hook into AuthStore.MarkRotated itself — instrumenting
-// production code purely to make a test of its ABSENCE of a bug more
-// reliable. That trade was judged not worth it here, for the same reason
-// Plan 4 ultimately answered this by adding a *_Live test against real
-// PostgreSQL (store/drops/invite_integration_test.go's
-// TestConsumeLinkConcurrencyExactlyOneWinnerLive) rather than instrumenting
-// the in-memory store: the deterministic version belongs against the real
-// contention source, in this package's store/drops counterpart, in a later
-// task. The real guarantee that MarkRotated is atomic is the implementation
-// holding one lock across the entire check-and-mark (see its doc comment in
-// auth.go), not this test — this test pins the contract and catches a
-// grossly broken implementation reliably (100% once the window is widened)
-// and a subtly broken one occasionally (~4% at the naive window), per the
-// same caveats TestConsumeLinkConcurrencyExactlyOneWinner's doc states.
+// catch on memory.AuthStore itself (100% on the naive window, no sleep
+// needed) was not pursued: unlike store/drops' live-Postgres tests, an
+// in-process mutex has no independent contention source (no row lock, no
+// wire round trip) to interleave against from outside the method — the
+// split-lock window lies inside one method's own body, between its own
+// Unlock and its next Lock, and no wrapper or double placed around
+// AuthStore.MarkRotated has a seam to park at that point. Forcing it really
+// would require a test-only blocking hook compiled into AuthStore.MarkRotated
+// itself — instrumenting production code purely to make a test of its
+// ABSENCE of a bug more reliable. That trade is still not taken here, for
+// the same reason Plan 4 ultimately answered the equivalent question
+// (ConsumeLink) with a live-Postgres test rather than instrumenting
+// store/memory: the deterministic version against memory.AuthStore itself
+// belongs against a real contention source, i.e. this package's store/drops
+// counterpart, in a later task.
+//
+// What IS pursued here, and requires no production instrumentation at all,
+// is a deterministic negative control: TestSplitLockStoreProducesTwoWinners
+// below runs the identical N-goroutine race (via raceMarkRotated) against a
+// small, standalone, deliberately-broken double that implements exactly the
+// split-lock shape, with a gate channel guaranteeing — not merely risking —
+// that a second caller completes its full cycle while the first is parked
+// mid-method. That test asserts two winners, 100% of the time, every run. It
+// does not prove memory.AuthStore is atomic — nothing outside the method can
+// force that interleaving on it — but it does prove the assertion technique
+// itself (successes != 1 fails the test) is a real detector of this exact
+// bug shape, not a tautology that happens to always pass. The real guarantee
+// that MarkRotated is atomic is the implementation holding one lock across
+// the entire check-and-mark (see its doc comment in auth.go) plus that
+// negative control, not this hand-run mutation experiment — this test pins
+// the contract and catches a grossly broken implementation reliably (100%
+// once the window is widened) and a subtly broken one occasionally (~1-4% at
+// the naive window), per the same caveats
+// TestConsumeLinkConcurrencyExactlyOneWinner's doc states.
 //
 // It is also a logical (check-then-act) race, not a memory race: every
 // individual map read and write in the broken variant is still separately
@@ -663,53 +760,157 @@ func TestMarkRotatedIgnoresExpiry(t *testing.T) {
 // not flag it either. Run -race anyway — it catches a different class of
 // mutation, such as dropping the locking altogether — just not this one.
 func TestMarkRotatedConcurrencyExactlyOneWinner(t *testing.T) {
-	st := newAuthStore()
+	markRotatedContract(t, func() auth.Store { return newAuthStore() })
+}
+
+// splitLockStore is a small, standalone, test-only auth.Store double that
+// deliberately implements MarkRotated with the exact broken shape the
+// mutation experiment above describes by hand: read the session under mu,
+// unlock, decide, then a second mu.Lock to write. It exists to turn that
+// hand-run, timing-dependent experiment into a committed, deterministic
+// check — see TestSplitLockStoreProducesTwoWinners. It only implements
+// CreateSession and MarkRotated; it is never asserted to satisfy auth.Store
+// and is never passed to markRotatedContract, which requires a real,
+// correct implementation.
+type splitLockStore struct {
+	mu       sync.Mutex
+	sessions map[string]auth.Session
+
+	// parked is CompareAndSwap'd by whichever caller reaches the gap first,
+	// so exactly one caller — not "the first Nth of them" and not
+	// "whichever wins a data race on a plain bool" — ever blocks on gate.
+	// This is deliberately NOT a sync.Once: Once.Do serializes every
+	// concurrent caller behind the first call until that first call
+	// returns, so if the chosen goroutine's body blocks on gate (as this
+	// one must, to create the window), every other caller would block on
+	// Once.Do too, and the second caller could never reach MarkRotated to
+	// complete its cycle — deadlocking the whole test instead of letting it
+	// through. atomic.Bool.CompareAndSwap elects a winner without blocking
+	// the losers at the point of election; only the winner blocks, and only
+	// on gate.
+	parked   atomic.Bool
+	parkedCh chan struct{} // closed once the first caller has parked
+	gate     chan struct{} // closed by the test to release the parked caller
+}
+
+func newSplitLockStore() *splitLockStore {
+	return &splitLockStore{
+		sessions: map[string]auth.Session{},
+		parkedCh: make(chan struct{}),
+		gate:     make(chan struct{}),
+	}
+}
+
+// CreateSession stores the session under its ID, mirroring
+// AuthStore.CreateSession's happy path (no id-collision guard — this double
+// exists to test MarkRotated, not Create semantics).
+func (s *splitLockStore) CreateSession(_ context.Context, sess auth.Session) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions[sess.ID] = sess
+	return nil
+}
+
+// MarkRotated is the deliberately broken shape: the find, under mu, is
+// unlocked before the RotatedAt decision and the write, which take a second,
+// independent acquisition. The first caller to reach the gap parks on gate
+// until the test releases it; every other caller sails through untouched, so
+// whichever of them observes the still-unrotated sess also decides ok=true
+// and also writes.
+func (s *splitLockStore) MarkRotated(_ context.Context, tokenHash string, now time.Time) (auth.Session, bool, error) {
+	s.mu.Lock()
+	var id string
+	var sess auth.Session
+	found := false
+	for i, sv := range s.sessions {
+		if sv.TokenHash == tokenHash {
+			id, sess, found = i, sv, true
+			break
+		}
+	}
+	s.mu.Unlock()
+
+	if !found {
+		return auth.Session{}, false, auth.ErrSessionNotFound
+	}
+	if sess.RotatedAt != nil {
+		return sess, false, nil
+	}
+
+	if s.parked.CompareAndSwap(false, true) {
+		close(s.parkedCh)
+		<-s.gate
+	}
+
+	s.mu.Lock()
+	sess.RotatedAt = &now
+	s.sessions[id] = sess
+	s.mu.Unlock()
+	return sess, true, nil
+}
+
+// TestSplitLockStoreProducesTwoWinners is the deterministic negative control
+// TestMarkRotatedConcurrencyExactlyOneWinner's doc comment describes: it
+// proves the "successes != 1 fails the test" assertion actually detects the
+// check-then-act bug shape, with no timing dependency and no sleep anywhere
+// — unlike the hand-run mutation experiment (3/70 or 1/160 naive, 20/20 only
+// once widened with a sleep), this test fails the intended way 100% of the
+// time, by construction, every run.
+//
+// It does not exercise memory.AuthStore at all and does not prove that type
+// is atomic — nothing outside MarkRotated's body can force this interleaving
+// on it, since the split lies inside one method between its own Unlock and
+// its next Lock, with no seam for a wrapper to park at. What it proves is
+// narrower and still useful: that this test file's race-and-count technique
+// is a real detector, not a tautology that happens to always report success.
+//
+// Construction: caller A starts and races into MarkRotated, wins the park
+// (asserted by waiting on parkedCh rather than sleeping), and blocks on
+// gate. Caller B then starts and is driven all the way to completion —
+// wg.Wait() proves it, not a timeout — while A is still parked, so B
+// necessarily also observes the unrotated session and also writes. Only
+// then is A released. Both must report ok=true.
+func TestSplitLockStoreProducesTwoWinners(t *testing.T) {
+	st := newSplitLockStore()
 	ctx := context.Background()
-	if _, err := st.CreateSession(ctx, auth.Session{ID: "sess1", TokenHash: "hash1"}); err != nil {
+	if err := st.CreateSession(ctx, auth.Session{ID: "sess1", TokenHash: "hash1"}); err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
 
-	const n = 500
 	now := time.Now()
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	successes := 0
-	errs := 0
+	var wgA sync.WaitGroup
+	var okA bool
 
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func() {
-			defer wg.Done()
-			<-start
-			_, ok, err := st.MarkRotated(ctx, "hash1", now)
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				errs++
-				return
-			}
-			if ok {
-				successes++
-			}
-		}()
-	}
-	close(start)
-	wg.Wait()
+	wgA.Add(1)
+	go func() {
+		defer wgA.Done()
+		_, ok, err := st.MarkRotated(ctx, "hash1", now)
+		if err != nil {
+			t.Errorf("caller A MarkRotated: %v", err)
+		}
+		okA = ok
+	}()
 
-	if errs != 0 {
-		t.Fatalf("got %d unexpected errors from MarkRotated", errs)
-	}
-	if successes != 1 {
-		t.Fatalf("got %d successful MarkRotated calls against one session, want exactly 1", successes)
-	}
+	<-st.parkedCh // block until A has claimed the gap and parked — no spin, no sleep
 
-	got, err := st.FindSessionByHash(ctx, "hash1")
-	if err != nil {
-		t.Fatalf("FindSessionByHash: %v", err)
-	}
-	if got.RotatedAt == nil || !got.RotatedAt.Equal(now) {
-		t.Fatalf("final RotatedAt = %v, want %v", got.RotatedAt, now)
+	var wgB sync.WaitGroup
+	var okB bool
+	wgB.Add(1)
+	go func() {
+		defer wgB.Done()
+		_, ok, err := st.MarkRotated(ctx, "hash1", now)
+		if err != nil {
+			t.Errorf("caller B MarkRotated: %v", err)
+		}
+		okB = ok
+	}()
+	wgB.Wait() // B has now run its entire read-decide-write cycle to completion
+
+	close(st.gate) // release A
+	wgA.Wait()
+
+	if !okA || !okB {
+		t.Fatalf("okA=%v okB=%v, want both true — splitLockStore's broken shape must let both callers win", okA, okB)
 	}
 }
 
