@@ -503,6 +503,36 @@ func (s *Service[C, M, PC, PM]) resolveRole(ctx context.Context, containerID, ro
 	return s.ac.Decode(rec.Permissions)
 }
 
+// RolePermissions resolves roleKey to its permission set within containerID,
+// exactly the way every permission check in this engine does: a code-defined
+// role from the access registry first, and only when roleKey names none of
+// those, a custom role loaded from the Store and decoded. It returns
+// ErrRoleNotFound when roleKey resolves through neither path.
+//
+// It is a thin wrapper over the unexported resolveRole — delegating rather
+// than reimplementing, the same relationship [Service.Standing] has to
+// standing — so a caller outside this package can ask the identical question
+// [Service.AddMember]'s own privilege-escalation guard and
+// [Service.GrantMembership] both ask, rather than reconstructing an
+// approximation from other exported calls.
+//
+// That distinction matters: [Service.ListRoles] is NOT an equivalent way to
+// answer this question for an arbitrary roleKey. It enumerates only the
+// three hardcoded default keys (owner, admin, member) plus the container's
+// stored roles — so any other code-defined role an application registered
+// with [access.Access.NewRole] (a "viewer" role, say) resolves here but does
+// not appear in ListRoles' result at all. A caller that built its own
+// registry-then-store lookup by indexing ListRoles' output would therefore
+// silently treat every such role as nonexistent. Call this method instead of
+// approximating it.
+//
+// It reads nothing from the context and performs no check that the caller is
+// entitled to ask, exactly like [Service.Standing] and
+// [Service.HasPermission]. Do not expose it directly to end users.
+func (s *Service[C, M, PC, PM]) RolePermissions(ctx context.Context, containerID, roleKey string) (access.Permission, error) {
+	return s.resolveRole(ctx, containerID, roleKey)
+}
+
 func (s *Service[C, M, PC, PM]) requireOwner(ctx context.Context, containerID, userID string) (C, error) {
 	c, err := s.store.FindContainer(ctx, containerID)
 	if err != nil {

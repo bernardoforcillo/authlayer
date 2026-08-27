@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"time"
 
 	"github.com/bernardoforcillo/authlayer/access"
@@ -208,73 +209,30 @@ func ctxActor(ctx context.Context) (subject, containerID string, err error) {
 	return subject, containerID, nil
 }
 
-// permissionsByRole calls [scope.Service.ListRoles] once and indexes the
-// result by key, so a caller that needs to check one or more role keys — in
-// [Service.ListLinks]'s case, potentially one per link — pays for a single
-// round trip rather than one lookup per key.
-//
-// A key absent from the result names a role the reader's own scope does not
-// currently resolve — a custom role deleted after the record naming it was
-// created, say. Callers MUST treat a missing key as "cannot be shown to
-// subsume anything", never as a zero access.Permission: a zero Permission is
-// vacuously SubsetOf everything, which would turn "I can't tell what this
-// role grants" into "grant access anyway" — exactly backwards for a security
-// check. That is why every caller here receives (found bool) alongside the
-// permission, rather than a bare map lookup with the zero value standing in
-// for "not found".
-//
-// FIRST write wins, deliberately — do not "simplify" this to a plain
-// last-write map. [scope.Service.ListRoles] documents that it returns the
-// three code-defined defaults FIRST, then the container's stored roles.
-// scope.Service's own unexported resolveRole checks the code-defined
-// registry BEFORE ever falling back to the store (scope/scope.go). Nothing
-// stops a stored role row from carrying a key that collides with a default
-// — scope.Service.CreateRole refuses one (ErrRoleKeyTaken), but that is a
-// courtesy of that one call path, not a constraint the RoleStore port
-// itself enforces, and neither the memory nor the drops implementation
-// rejects it independently. So a stored row keyed "owner" or "admin" is a
-// real, reachable state, and last-write-wins would let it overwrite the
-// real default's entry in this map — resolving "owner" to whatever
-// permissions that row happens to carry, in this map alone, while every
-// actual permission check (Standing, Authorize, GrantMembership) keeps
-// resolving it to the true code-defined owner. That divergence is not a
-// display quirk: a stored "owner" row with weak permissions would make
-// guardEscalation approve minting an owner-level invite for a merely-admin
-// actor, and would make ListLinks hand that actor the real owner link's
-// clear-text code — the exact escalation this package exists to prevent.
-// Keeping only the first entry per key reproduces resolveRole's
-// registry-first precedence exactly, given ListRoles' defaults-first order.
-func (s *Service[C, M, PC, PM]) permissionsByRole(ctx context.Context) (map[string]access.Permission, error) {
-	views, err := s.sc.ListRoles(ctx)
-	if err != nil {
-		return nil, err
-	}
-	byKey := make(map[string]access.Permission, len(views))
-	for _, v := range views {
-		if _, exists := byKey[v.Key]; exists {
-			continue
-		}
-		byKey[v.Key] = v.Permissions
-	}
-	return byKey, nil
-}
-
 // guardEscalation enforces, on invite and link creation, the same rule
 // scope.Service applies to AddMember: unless the actor is elevated, they may
 // not mint a credential for a role more powerful than their own standing
 // (scope.ErrPrivilegeEscalation). scope.Service's own guardEscalation is
 // unexported and unreachable from this package, so this recomputes the
 // identical answer from two exported calls — [scope.Service.Standing] for
-// the actor's own permissions and elevation, [Service.permissionsByRole]
-// (via [scope.Service.ListRoles]) for roleKey's resolved permissions.
+// the actor's own permissions and elevation, [scope.Service.RolePermissions]
+// for roleKey's resolved permissions.
 //
-// A roleKey that resolves to no role at all is scope.ErrRoleNotFound, not
-// scope.ErrPrivilegeEscalation — matching scope.Service's own resolveRole,
-// which is checked BEFORE the SubsetOf comparison in scope's guardEscalation
-// (scope/scope.go) and therefore surfaces ErrRoleNotFound for an unresolvable
-// key even on the escalation-guarded path. Conflating the two would tell a
-// caller who mistyped a role key that they lack the privilege to grant it,
-// when the real problem is that no such role exists to grant.
+// RolePermissions is a thin wrapper over scope's own unexported resolveRole
+// — the same call [scope.Service.AddMember]'s guard and
+// [scope.Service.GrantMembership] use — so this asks the engine the
+// identical question rather than reconstructing an approximation of it (see
+// that method's own doc for why building an equivalent from
+// [scope.Service.ListRoles] is NOT safe: ListRoles omits any code-defined
+// role beyond the three hardcoded defaults).
+//
+// A roleKey that resolves to no role at all is scope.ErrRoleNotFound,
+// propagated as-is from RolePermissions, not scope.ErrPrivilegeEscalation —
+// matching scope.Service's own resolveRole, which is checked BEFORE the
+// SubsetOf comparison in scope's guardEscalation (scope/scope.go).
+// Conflating the two would tell a caller who mistyped a role key that they
+// lack the privilege to grant it, when the real problem is that no such
+// role exists to grant.
 //
 // One deliberate divergence: scope's own guard also stands down when the
 // wrapped Service's Policy.Escalation is EscalationOff, but Policy is
@@ -293,13 +251,9 @@ func (s *Service[C, M, PC, PM]) guardEscalation(ctx context.Context, containerID
 	if elevated {
 		return nil
 	}
-	byKey, err := s.permissionsByRole(ctx)
+	grant, err := s.sc.RolePermissions(ctx, containerID, roleKey)
 	if err != nil {
 		return err
-	}
-	grant, ok := byKey[roleKey]
-	if !ok {
-		return scope.ErrRoleNotFound
 	}
 	if !grant.SubsetOf(perms) {
 		return scope.ErrPrivilegeEscalation
@@ -456,9 +410,18 @@ func (s *Service[C, M, PC, PM]) ListInvites(ctx context.Context) ([]EmailInvite,
 // RoleKey specifically is never redacted: the role's name is not the
 // credential, only Code is.
 //
-// A link whose RoleKey names no role [scope.Service.ListRoles] currently
-// resolves is redacted, not kept: an unresolvable role is not one the reader
-// can be shown to subsume (see [Service.permissionsByRole]).
+// Each link's RoleKey is resolved via [scope.Service.RolePermissions] —
+// scope's own registry-then-store lookup, wrapped rather than
+// reimplemented — never via [scope.Service.ListRoles], which does not
+// enumerate every code-defined role (see RolePermissions' own doc) and
+// would silently mis-redact one that only ListRoles doesn't know about. A
+// RoleKey that RolePermissions cannot resolve at all (scope.ErrRoleNotFound)
+// is redacted, not kept: an unresolvable role is not one the reader can be
+// shown to subsume. The lookup is memoized per distinct RoleKey within this
+// call — the same per-(container, role) cache
+// [scope.Service.ContainersWith] keeps for itself — so listing many links
+// naming a handful of roles costs one RolePermissions call per distinct
+// role, not one per link.
 //
 // The ctx subject needs invite:read, same as [Service.ListInvites].
 func (s *Service[C, M, PC, PM]) ListLinks(ctx context.Context) ([]Link, error) {
@@ -483,14 +446,31 @@ func (s *Service[C, M, PC, PM]) ListLinks(ctx context.Context) ([]Link, error) {
 		return links, nil
 	}
 
-	byKey, err := s.permissionsByRole(ctx)
-	if err != nil {
-		return nil, err
-	}
+	resolved := make(map[string]access.Permission, len(links))
 	out := make([]Link, len(links))
 	for i, l := range links {
-		grant, ok := byKey[l.RoleKey]
-		if !ok || !grant.SubsetOf(perms) {
+		grant, ok := resolved[l.RoleKey]
+		if !ok {
+			g, rErr := s.sc.RolePermissions(ctx, containerID, l.RoleKey)
+			switch {
+			case errors.Is(rErr, scope.ErrRoleNotFound):
+				// Unresolvable: cannot be shown to subsume anything, so
+				// redact. Deliberately NOT cached in resolved — caching a
+				// "not found" answer as anything storable here would risk
+				// the same mistake a zero access.Permission would (see
+				// scope.Service.ContainersWith's identical choice not to
+				// cache this branch): resolved must only ever hold real,
+				// resolved permissions, never a stand-in for "unknown".
+				l.Code = ""
+				out[i] = l
+				continue
+			case rErr != nil:
+				return nil, rErr
+			}
+			grant = g
+			resolved[l.RoleKey] = grant
+		}
+		if !grant.SubsetOf(perms) {
 			l.Code = ""
 		}
 		out[i] = l

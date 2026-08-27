@@ -45,7 +45,32 @@ type fixture struct {
 
 func newFixture(t *testing.T, opts ...invite.Option) *fixture {
 	t.Helper()
-	ac := org.NewAccess(nil)
+	return newFixtureFromAccess(t, org.NewAccess(nil), opts...)
+}
+
+// newFixtureWithAppRole is like newFixture but also declares an app resource
+// ("project": create/read/update/delete) and registers a code-defined
+// "viewer" role over it (project:read only) via access.Access.NewRole —
+// exactly how an application registers its own roles, per access's own doc
+// example (access/access.go). This is deliberately the shape
+// scope.Service.ListRoles does NOT enumerate: it returns only
+// owner/admin/member plus a container's stored custom roles, so "viewer"
+// here is invisible to ListRoles even though it fully resolves through
+// scope.Service.RolePermissions — and therefore through
+// scope.Service.AddMember's own escalation guard. Used to pin that
+// invite.Service treats such a role as it should: invitable, not silently
+// nonexistent, and not shadowable by a stray stored row of the same key.
+func newFixtureWithAppRole(t *testing.T, opts ...invite.Option) *fixture {
+	t.Helper()
+	ac := org.NewAccess(map[string][]access.Action{
+		"project": {"create", "read", "update", "delete"},
+	})
+	ac.NewRole("viewer", map[string][]access.Action{"project": {"read"}})
+	return newFixtureFromAccess(t, ac, opts...)
+}
+
+func newFixtureFromAccess(t *testing.T, ac *access.Access, opts ...invite.Option) *fixture {
+	t.Helper()
 	sst := memory.New[org.Organization, org.Member]()
 	sc := scope.New[org.Organization, org.Member](ac, sst)
 	ist := memory.NewInviteStore()
@@ -535,6 +560,113 @@ func TestDefaultRoleKeyResolvesFromRegistryNotAShadowingStoreRow(t *testing.T) {
 	}
 	if got.Code == ownerCode {
 		t.Fatal("redacted code must not equal the real code")
+	}
+}
+
+// TestAppRegisteredCodeDefinedRoleIsInvitableAndVisible pins the first half
+// of the round-2 review finding: guardEscalation and the ListLinks
+// redaction must resolve a code-defined role an application registered
+// itself (via access.Access.NewRole, exactly per that package's own doc
+// example) even though scope.Service.ListRoles never enumerates it —
+// ListRoles returns only owner/admin/member plus a container's stored
+// custom roles. Before the fix, permissionsByRole was built purely from
+// ListRoles' output, so "viewer" resolved to nothing and every attempt to
+// invite to it failed with ErrRoleNotFound, and any link naming it was
+// permanently redacted for every non-elevated reader regardless of their
+// own standing. Demonstrated live by the reviewer:
+// scope.Service.AddMember(admin1 -> "viewer") succeeded while
+// invite.InviteByEmail(admin1 -> "viewer") returned ErrRoleNotFound.
+func TestAppRegisteredCodeDefinedRoleIsInvitableAndVisible(t *testing.T) {
+	f := newFixtureWithAppRole(t)
+	f.addMember("admin1", org.RoleAdmin)
+
+	// admin's own standing includes every declared pair except
+	// containerResource:delete (scope.NewAccess's default admin grants),
+	// which covers the app's own "project" resource too — so "viewer"
+	// (project:read only) is a genuine SubsetOf admin's standing and both
+	// calls must succeed.
+	if _, _, err := f.isvc.InviteByEmail(f.ctx("admin1"), "x@example.com", "viewer"); err != nil {
+		t.Fatalf("InviteByEmail(admin1 -> viewer): %v, want success — viewer is an app-registered code-defined role", err)
+	}
+	l, code, err := f.isvc.CreateLink(f.ctx("admin1"), "viewer", 0, nil)
+	if err != nil {
+		t.Fatalf("CreateLink(admin1 -> viewer): %v", err)
+	}
+	if code == "" || l.Code != code {
+		t.Fatalf("link = %+v, code = %q", l, code)
+	}
+
+	links, err := f.isvc.ListLinks(f.ctx("admin1"))
+	if err != nil {
+		t.Fatalf("ListLinks: %v", err)
+	}
+	var got invite.Link
+	var found bool
+	for _, li := range links {
+		if li.ID == l.ID {
+			got, found = li, true
+		}
+	}
+	if !found {
+		t.Fatalf("link %s not found in %+v", l.ID, links)
+	}
+	if got.Code != code {
+		t.Fatalf("Code = %q, want %q kept — viewer's permissions are a SubsetOf admin's own standing", got.Code, code)
+	}
+}
+
+// TestCreateLinkIgnoresStoreRowShadowingAppRegisteredRole pins the second,
+// narrower-precondition half of the round-2 review finding: a stored role
+// row keyed with an app-registered code-defined role's key (here "viewer",
+// carrying empty permissions) must not be consulted at all, even for a role
+// outside the three hardcoded defaults. This is seeded directly against the
+// raw scope store, the same reachability premise already used for the
+// "owner"-keyed row above: scope.Service.CreateRole in fact refuses this
+// specific collision too (its isDefault check is really "is this key
+// registered in the Access at all", which covers "viewer"), but the
+// RoleStore port does not forbid it and neither store implementation
+// rejects it independently, so a row like this remains a reachable state on
+// a backend that does not defend against it.
+//
+// mallory holds a custom "recruiter" role granting invite:create/read/delete
+// but nothing on "project" — enough to reach CreateLink's authorization
+// check at all (org.RoleMember, holding zero grants, cannot even clear that
+// first gate, which is why this needs a purpose-built role rather than a
+// default one). Demonstrated live by the reviewer using an equivalent
+// non-elevated actor: scope.Service.AddMember(actor -> "viewer") is
+// correctly ErrPrivilegeEscalation (the REAL "viewer" grants project:read,
+// which such an actor does not have), while
+// invite.Service.CreateLink(actor -> "viewer") succeeded and returned a
+// live code — because the pre-fix permissionsByRole map's only entry for
+// "viewer" came from the shadowing row's empty permissions, and an empty
+// Permission is vacuously a SubsetOf anything.
+func TestCreateLinkIgnoresStoreRowShadowingAppRegisteredRole(t *testing.T) {
+	f := newFixtureWithAppRole(t)
+
+	if _, err := f.sc.CreateRole(f.ctx("owner"), "recruiter", "Recruiter", map[string][]access.Action{
+		scope.ResourceInvite: {scope.ActionCreate, scope.ActionRead, scope.ActionDelete},
+	}); err != nil {
+		t.Fatalf("CreateRole(recruiter): %v", err)
+	}
+	f.addMember("mallory", "recruiter")
+
+	emptyPerm, err := f.ac.Permission(map[string][]access.Action{})
+	if err != nil {
+		t.Fatalf("ac.Permission: %v", err)
+	}
+	if _, err := f.sst.CreateRole(context.Background(), scope.RoleRecord{
+		ID:          "shadow-viewer",
+		ContainerID: f.cID,
+		Key:         "viewer",
+		Name:        "Fake Viewer",
+		Permissions: emptyPerm.Encode(),
+		CreatedAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed shadow viewer role row: %v", err)
+	}
+
+	if _, _, err := f.isvc.CreateLink(f.ctx("mallory"), "viewer", 0, nil); !errors.Is(err, scope.ErrPrivilegeEscalation) {
+		t.Fatalf("CreateLink(mallory -> viewer) err = %v, want ErrPrivilegeEscalation despite a shadowing empty-permission stored row", err)
 	}
 }
 
