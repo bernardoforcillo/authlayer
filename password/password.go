@@ -106,10 +106,13 @@ type bcryptHasher struct {
 
 // Bcrypt returns a [Hasher] backed by golang.org/x/crypto/bcrypt at the
 // given cost. A cost of 0 uses bcrypt's own library default
-// ([bcrypt.DefaultCost], currently 10); any other value is passed through
-// to bcrypt as given, including values outside bcrypt's own valid range —
-// in that case Hash returns bcrypt's own error rather than this package
-// silently substituting a different cost.
+// ([bcrypt.DefaultCost], currently 10). Any other value is passed through
+// to bcrypt as given, and bcrypt's own rules then apply to it: a cost
+// below [bcrypt.MinCost] (4) — including 1, 2, and 3, not just 0 — is
+// silently promoted to bcrypt's default cost by the library itself,
+// while a cost above [bcrypt.MaxCost] (31) is rejected outright,
+// surfacing as an error from Hash. This package does not re-validate or
+// clamp cost itself beyond translating the cost == 0 case.
 func Bcrypt(cost int) Hasher {
 	if cost == 0 {
 		cost = bcrypt.DefaultCost
@@ -185,8 +188,12 @@ type Rules struct {
 	// RequireDigit requires at least one Unicode decimal digit.
 	RequireDigit bool
 	// RequireSpecial requires at least one character that is neither a
-	// Unicode letter nor a Unicode digit — punctuation, symbols, and
-	// whitespace all satisfy it.
+	// Unicode letter, a Unicode digit, nor Unicode whitespace —
+	// punctuation and symbols satisfy it, whitespace does not. Excluding
+	// whitespace from this class does not forbid it: a password may still
+	// contain spaces anywhere, they simply do not count toward
+	// RequireSpecial, so padding a short password with spaces alone
+	// cannot satisfy it.
 	RequireSpecial bool
 }
 
@@ -228,7 +235,12 @@ func Validate(plain string, rules Rules) []string {
 			hasLower = true
 		case unicode.IsDigit(r):
 			hasDigit = true
-		case !unicode.IsLetter(r):
+		case !unicode.IsLetter(r) && !unicode.IsSpace(r):
+			// Punctuation and symbols count as "special"; whitespace does
+			// not — see Rules.RequireSpecial. Without the IsSpace
+			// exclusion, a password like "Aa1" padded with nine spaces
+			// would satisfy RequireSpecial (and MinLength) on padding
+			// alone, certifying a near-zero-entropy password as compliant.
 			hasSpecial = true
 		}
 	}

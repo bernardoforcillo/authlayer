@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -222,6 +223,38 @@ func TestValidateCountsRunesNotBytes(t *testing.T) {
 	got := Validate(plain, Rules{MinLength: 12})
 	if len(got) != 0 {
 		t.Fatalf("Validate(12-rune multi-byte string, MinLength: 12) = %v, want no failures (got %d bytes)", got, len(plain))
+	}
+}
+
+// A near-zero-entropy password — a handful of meaningful characters padded
+// out to the minimum length with spaces — must not be certified compliant.
+// This is the exact counterexample from code review: before this fix,
+// whitespace counted as a qualifying "special" character, so "Aa1" padded
+// with nine spaces (12 runes total) satisfied MinLength, RequireUpper,
+// RequireLower, RequireDigit, *and* RequireSpecial, despite carrying only
+// three characters of real entropy. RequireSpecial must fail here.
+func TestValidateWhitespacePaddingDoesNotSatisfySpecial(t *testing.T) {
+	plain := "Aa1" + strings.Repeat(" ", 9) // 12 runes: 3 meaningful + 9 spaces
+	if n := utf8.RuneCountInString(plain); n != 12 {
+		t.Fatalf("test setup invalid: %q is %d runes, want 12", plain, n)
+	}
+
+	got := Validate(plain, DefaultRules())
+	want := []string{"special"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("Validate(%q, DefaultRules()) = %v, want %v — whitespace must not satisfy RequireSpecial", plain, got, want)
+	}
+}
+
+// Excluding whitespace from the "special" character class must not make
+// whitespace forbidden — only non-qualifying. A passphrase containing a
+// space alongside a real punctuation character must still pass every rule:
+// the space neither counts toward RequireSpecial nor blocks the password.
+func TestValidateWhitespaceAllowedButNotSpecial(t *testing.T) {
+	const plain = "Str0ng Pass@1" // contains a space AND a genuine special character
+	got := Validate(plain, DefaultRules())
+	if len(got) != 0 {
+		t.Fatalf("Validate(%q, DefaultRules()) = %v, want no failures (a space must be allowed, not forbidden)", plain, got)
 	}
 }
 
