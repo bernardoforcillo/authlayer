@@ -663,12 +663,12 @@ func TestMarkRotatedIgnoresExpiry(t *testing.T) {
 // raceMarkRotated drives n goroutines to call MarkRotated(tokenHash, now) on
 // st concurrently, all released by the same closed channel to maximize
 // contention, and reports how many saw ok=true and how many saw a non-nil
-// error. It is the shared engine behind markRotatedContract (run against a
-// real auth.Store, asserting successes==1) and
-// TestSplitLockStoreProducesTwoWinners (run against the deliberately broken
-// double below, asserting successes==2): factoring the driver out means both
-// exercise identical goroutine-scheduling pressure, and it is reusable
-// verbatim by a future backend's own concurrency suite.
+// error. It is the driver behind markRotatedContract only — NOT behind
+// TestSplitLockStoreProducesTwoWinners below, which needs a different,
+// explicitly-sequenced two-goroutine construction instead of mass
+// concurrency; see that test's own doc for why the two cannot share this
+// driver. It is reusable verbatim by a future backend's own concurrency
+// suite via markRotatedContract, which is the intended reuse seam.
 func raceMarkRotated(ctx context.Context, st auth.Store, tokenHash string, now time.Time, n int) (successes, errs int) {
 	start := make(chan struct{})
 	var wg sync.WaitGroup
@@ -696,14 +696,30 @@ func raceMarkRotated(ctx context.Context, st auth.Store, tokenHash string, now t
 	return successes, errs
 }
 
+// oneWinner reports whether (successes, errs) — a tally of MarkRotated
+// outcomes from some race — satisfies "exactly one winner, no errors". It is
+// a plain boolean predicate, not a t.Fatalf-calling assertion, specifically
+// so it can be reused with opposite polarity: markRotatedContract below
+// asserts oneWinner is true of a real auth.Store's results (its PASS
+// condition is "one winner"), while TestSplitLockStoreProducesTwoWinners
+// asserts oneWinner is false of splitLockStore's results (its PASS condition
+// is "the one-winner predicate correctly rejects two winners"). Both call
+// this identical function — not two independently-worded checks that happen
+// to agree — which is what makes the second test genuine evidence about the
+// first's assertion rather than a parallel test that merely resembles it.
+func oneWinner(successes, errs int) bool {
+	return errs == 0 && successes == 1
+}
+
 // markRotatedContract is the reusable driver behind
 // TestMarkRotatedConcurrencyExactlyOneWinner: N=500 goroutines race
 // MarkRotated against one freshly created, unrotated session, and the
-// contract is exactly one winner, no errors, and a final RotatedAt equal to
-// the shared instant every goroutine raced with. factory must return a fresh,
-// empty auth.Store each call. Task 4's live-Postgres suite is meant to call
-// this directly against its own store, so both backends assert literally the
-// same contract rather than a re-derived approximation of it.
+// contract is exactly one winner, no errors (checked via oneWinner — see its
+// doc), and a final RotatedAt equal to the shared instant every goroutine
+// raced with. factory must return a fresh, empty auth.Store each call. Task
+// 4's live-Postgres suite is meant to call this directly against its own
+// store, so both backends assert literally the same contract rather than a
+// re-derived approximation of it.
 func markRotatedContract(t *testing.T, factory func() auth.Store) {
 	t.Helper()
 	ctx := context.Background()
@@ -716,11 +732,8 @@ func markRotatedContract(t *testing.T, factory func() auth.Store) {
 	now := time.Now()
 	successes, errs := raceMarkRotated(ctx, st, "hash1", now, n)
 
-	if errs != 0 {
-		t.Fatalf("got %d unexpected errors from MarkRotated", errs)
-	}
-	if successes != 1 {
-		t.Fatalf("got %d successful MarkRotated calls against one session, want exactly 1", successes)
+	if !oneWinner(successes, errs) {
+		t.Fatalf("got successes=%d errs=%d from MarkRotated, want exactly one winner and no errors", successes, errs)
 	}
 
 	got, err := st.FindSessionByHash(ctx, "hash1")
@@ -799,21 +812,30 @@ func markRotatedContract(t *testing.T, factory func() auth.Store) {
 //
 // What IS pursued here, and requires no production instrumentation at all,
 // is a deterministic negative control: TestSplitLockStoreProducesTwoWinners
-// below runs the identical N-goroutine race (via raceMarkRotated) against a
-// small, standalone, deliberately-broken double that implements exactly the
-// split-lock shape, with a gate channel guaranteeing — not merely risking —
-// that a second caller completes its full cycle while the first is parked
-// mid-method. That test asserts two winners, 100% of the time, every run. It
+// below drives a small, standalone, deliberately-broken double that
+// implements exactly the split-lock shape, with a gate channel guaranteeing
+// — not merely risking — that a second caller completes its full cycle while
+// the first is parked mid-method, then applies the identical oneWinner
+// predicate markRotatedContract depends on (see that function's doc) and
+// asserts it is false. That control does NOT reuse raceMarkRotated's
+// N-goroutine channel-barrier driver: raceMarkRotated has no hook to release
+// a parked goroutine only after the others have finished, so driving it
+// verbatim here would either deadlock (nothing would ever close the gate) or
+// require releasing on a timer, reintroducing exactly the timing-dependence
+// this control exists to eliminate. It uses its own minimal, two-goroutine,
+// explicitly-sequenced driver instead — see its own doc for the construction
+// — and shares the assertion, not the driver, with markRotatedContract. That
+// control passes 100% of the time, every run, with no sleep anywhere. It
 // does not prove memory.AuthStore is atomic — nothing outside the method can
-// force that interleaving on it — but it does prove the assertion technique
-// itself (successes != 1 fails the test) is a real detector of this exact
-// bug shape, not a tautology that happens to always pass. The real guarantee
-// that MarkRotated is atomic is the implementation holding one lock across
-// the entire check-and-mark (see its doc comment in auth.go) plus that
-// negative control, not this hand-run mutation experiment — this test pins
-// the contract and catches a grossly broken implementation reliably (100%
-// once the window is widened) and a subtly broken one occasionally (~1-4% at
-// the naive window), per the same caveats
+// force that interleaving on it — but it does prove oneWinner itself is a
+// real detector of this exact bug shape (false when fed a genuinely broken
+// store's results), not a tautology that happens to always report success.
+// The real guarantee that MarkRotated is atomic is the implementation
+// holding one lock across the entire check-and-mark (see its doc comment in
+// auth.go) plus that negative control, not this hand-run mutation
+// experiment — this test pins the contract and catches a grossly broken
+// implementation reliably (100% once the window is widened) and a subtly
+// broken one occasionally (~1-4% at the naive window), per the same caveats
 // TestConsumeLinkConcurrencyExactlyOneWinner's doc states.
 //
 // It is also a logical (check-then-act) race, not a memory race: every
@@ -913,25 +935,47 @@ func (s *splitLockStore) MarkRotated(_ context.Context, tokenHash string, now ti
 
 // TestSplitLockStoreProducesTwoWinners is the deterministic negative control
 // TestMarkRotatedConcurrencyExactlyOneWinner's doc comment describes: it
-// proves the "successes != 1 fails the test" assertion actually detects the
-// check-then-act bug shape, with no timing dependency and no sleep anywhere
-// — unlike the hand-run mutation experiment (3/70 or 1/160 naive, 20/20 only
-// once widened with a sleep), this test fails the intended way 100% of the
-// time, by construction, every run.
+// proves oneWinner (the predicate markRotatedContract's pass condition
+// depends on) actually rejects the check-then-act bug shape, with no timing
+// dependency and no sleep anywhere — unlike the hand-run mutation experiment
+// (3/70 or 1/160 naive, 20/20 only once widened with a sleep), this test
+// gets the intended, correct verdict 100% of the time, by construction,
+// every run.
+//
+// It does NOT drive splitLockStore through raceMarkRotated's N-goroutine
+// channel-barrier driver — splitLockStore implements only CreateSession and
+// MarkRotated (with a CreateSession signature that doesn't even match
+// auth.Store's), it is never asserted to satisfy auth.Store, and is never
+// passed to markRotatedContract, which requires a real, correct
+// implementation. It also could not be, even if it did satisfy the
+// interface: raceMarkRotated's driver has no way to release the one parked
+// goroutine only after every other goroutine has already finished, so
+// launching splitLockStore's two callers through it would either deadlock
+// (nothing would ever close gate) or force releasing on a timer, which is
+// exactly the timing-dependence this control exists to eliminate. What is
+// genuinely shared with markRotatedContract is the assertion, via oneWinner:
+// this test computes its own (successes, errs) from a minimal, two-goroutine,
+// explicitly-sequenced driver below, then evaluates the identical oneWinner
+// function and asserts it is false — proving that function is a real
+// detector, not a tautology that happens to always report success.
 //
 // It does not exercise memory.AuthStore at all and does not prove that type
 // is atomic — nothing outside MarkRotated's body can force this interleaving
 // on it, since the split lies inside one method between its own Unlock and
-// its next Lock, with no seam for a wrapper to park at. What it proves is
-// narrower and still useful: that this test file's race-and-count technique
-// is a real detector, not a tautology that happens to always report success.
+// its next Lock, with no seam for a wrapper to park at. That absence of a
+// seam is exactly why splitLockStore is a standalone double rather than a
+// wrapper around AuthStore.
 //
 // Construction: caller A starts and races into MarkRotated, wins the park
 // (asserted by waiting on parkedCh rather than sleeping), and blocks on
 // gate. Caller B then starts and is driven all the way to completion —
 // wg.Wait() proves it, not a timeout — while A is still parked, so B
 // necessarily also observes the unrotated session and also writes. Only
-// then is A released. Both must report ok=true.
+// then is A released. Both must report ok=true, and both must go on to
+// report no error — a nil-error MarkRotated call with ok=false is a
+// legitimate "someone else won" outcome, not a bug, but it would mean this
+// double failed to reproduce the shape it exists to reproduce, so it is
+// checked, not assumed.
 func TestSplitLockStoreProducesTwoWinners(t *testing.T) {
 	st := newSplitLockStore()
 	ctx := context.Background()
@@ -942,37 +986,53 @@ func TestSplitLockStoreProducesTwoWinners(t *testing.T) {
 	now := time.Now()
 	var wgA sync.WaitGroup
 	var okA bool
+	var errA error
 
 	wgA.Add(1)
 	go func() {
 		defer wgA.Done()
 		_, ok, err := st.MarkRotated(ctx, "hash1", now)
-		if err != nil {
-			t.Errorf("caller A MarkRotated: %v", err)
-		}
-		okA = ok
+		okA, errA = ok, err
 	}()
 
 	<-st.parkedCh // block until A has claimed the gap and parked — no spin, no sleep
 
 	var wgB sync.WaitGroup
 	var okB bool
+	var errB error
 	wgB.Add(1)
 	go func() {
 		defer wgB.Done()
 		_, ok, err := st.MarkRotated(ctx, "hash1", now)
-		if err != nil {
-			t.Errorf("caller B MarkRotated: %v", err)
-		}
-		okB = ok
+		okB, errB = ok, err
 	}()
 	wgB.Wait() // B has now run its entire read-decide-write cycle to completion
 
 	close(st.gate) // release A
 	wgA.Wait()
 
-	if !okA || !okB {
-		t.Fatalf("okA=%v okB=%v, want both true — splitLockStore's broken shape must let both callers win", okA, okB)
+	successes, errs := 0, 0
+	for _, ok := range []bool{okA, okB} {
+		if ok {
+			successes++
+		}
+	}
+	for _, err := range []error{errA, errB} {
+		if err != nil {
+			errs++
+		}
+	}
+
+	if errs != 0 {
+		t.Fatalf("got %d unexpected errors from MarkRotated (errA=%v, errB=%v)", errs, errA, errB)
+	}
+	if successes != 2 {
+		t.Fatalf("got successes=%d, want exactly 2 — splitLockStore's broken shape must let both callers win, or it isn't reproducing the bug shape this control exists to demonstrate", successes)
+	}
+	// The genuine warrant: apply the identical predicate markRotatedContract
+	// depends on, to this double's results, and confirm it correctly says no.
+	if oneWinner(successes, errs) {
+		t.Fatalf("oneWinner(successes=%d, errs=%d) = true, want false — this predicate must reject a check-then-act MarkRotated's results, and it did not", successes, errs)
 	}
 }
 
