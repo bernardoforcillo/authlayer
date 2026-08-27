@@ -120,6 +120,17 @@ func WithNotifier(n Notifier) Option {
 // a test that wants to assert on the exact value returned. A nil gen is
 // ignored, leaving the default (or a prior option) in place.
 //
+// SECURITY WARNING: gen is the entire source of unguessability for both an
+// email invite's token and a link's code — either one, on its own, is
+// sufficient to be admitted to the container once Task 6's AcceptInvite /
+// JoinViaLink land (a token is hashed and compared, a code is looked up in
+// clear; see [EmailInvite] and [Link]). No authorization check upstream of
+// this option can compensate for a weak one: a short, predictable, or
+// deterministic generator makes every invitation this Service mints
+// guessable by anyone who can enumerate its output. This option exists ONLY
+// so a test can assert on a known plain value — never wire a non-default
+// generator in production.
+//
 //	svc := invite.New(sc, st, invite.WithTokens(func() string { return "fixed-token" }))
 func WithTokens(gen func() string) Option {
 	return func(c *config) {
@@ -211,6 +222,28 @@ func ctxActor(ctx context.Context) (subject, containerID string, err error) {
 // check. That is why every caller here receives (found bool) alongside the
 // permission, rather than a bare map lookup with the zero value standing in
 // for "not found".
+//
+// FIRST write wins, deliberately — do not "simplify" this to a plain
+// last-write map. [scope.Service.ListRoles] documents that it returns the
+// three code-defined defaults FIRST, then the container's stored roles.
+// scope.Service's own unexported resolveRole checks the code-defined
+// registry BEFORE ever falling back to the store (scope/scope.go). Nothing
+// stops a stored role row from carrying a key that collides with a default
+// — scope.Service.CreateRole refuses one (ErrRoleKeyTaken), but that is a
+// courtesy of that one call path, not a constraint the RoleStore port
+// itself enforces, and neither the memory nor the drops implementation
+// rejects it independently. So a stored row keyed "owner" or "admin" is a
+// real, reachable state, and last-write-wins would let it overwrite the
+// real default's entry in this map — resolving "owner" to whatever
+// permissions that row happens to carry, in this map alone, while every
+// actual permission check (Standing, Authorize, GrantMembership) keeps
+// resolving it to the true code-defined owner. That divergence is not a
+// display quirk: a stored "owner" row with weak permissions would make
+// guardEscalation approve minting an owner-level invite for a merely-admin
+// actor, and would make ListLinks hand that actor the real owner link's
+// clear-text code — the exact escalation this package exists to prevent.
+// Keeping only the first entry per key reproduces resolveRole's
+// registry-first precedence exactly, given ListRoles' defaults-first order.
 func (s *Service[C, M, PC, PM]) permissionsByRole(ctx context.Context) (map[string]access.Permission, error) {
 	views, err := s.sc.ListRoles(ctx)
 	if err != nil {
@@ -218,6 +251,9 @@ func (s *Service[C, M, PC, PM]) permissionsByRole(ctx context.Context) (map[stri
 	}
 	byKey := make(map[string]access.Permission, len(views))
 	for _, v := range views {
+		if _, exists := byKey[v.Key]; exists {
+			continue
+		}
 		byKey[v.Key] = v.Permissions
 	}
 	return byKey, nil
@@ -231,6 +267,14 @@ func (s *Service[C, M, PC, PM]) permissionsByRole(ctx context.Context) (map[stri
 // identical answer from two exported calls — [scope.Service.Standing] for
 // the actor's own permissions and elevation, [Service.permissionsByRole]
 // (via [scope.Service.ListRoles]) for roleKey's resolved permissions.
+//
+// A roleKey that resolves to no role at all is scope.ErrRoleNotFound, not
+// scope.ErrPrivilegeEscalation — matching scope.Service's own resolveRole,
+// which is checked BEFORE the SubsetOf comparison in scope's guardEscalation
+// (scope/scope.go) and therefore surfaces ErrRoleNotFound for an unresolvable
+// key even on the escalation-guarded path. Conflating the two would tell a
+// caller who mistyped a role key that they lack the privilege to grant it,
+// when the real problem is that no such role exists to grant.
 //
 // One deliberate divergence: scope's own guard also stands down when the
 // wrapped Service's Policy.Escalation is EscalationOff, but Policy is
@@ -254,7 +298,10 @@ func (s *Service[C, M, PC, PM]) guardEscalation(ctx context.Context, containerID
 		return err
 	}
 	grant, ok := byKey[roleKey]
-	if !ok || !grant.SubsetOf(perms) {
+	if !ok {
+		return scope.ErrRoleNotFound
+	}
+	if !grant.SubsetOf(perms) {
 		return scope.ErrPrivilegeEscalation
 	}
 	return nil
@@ -555,11 +602,22 @@ func (s *Service[C, M, PC, PM]) PreviewLink(ctx context.Context, code string) (P
 
 // PurgeExpired deletes every expired invite and link, across every container
 // this Store holds, and returns how many rows were removed — a direct pass
-// through to [Store.PurgeExpired]. Unlike every other Service method it
-// reads nothing from the context and checks no permission: it is
-// housekeeping over rows that are already unusable through the normal lookup
-// and consume paths, not an action any authenticated user should reach, so
-// gate who may call it (a cron job, a superuser console) upstream.
+// through to [Store.PurgeExpired]. It is housekeeping over rows that are
+// already unusable through the normal lookup and consume paths, not a
+// security boundary (see that method's own doc).
+//
+// This is deliberate, matching the warnings on [scope.Service.HasPermission]
+// and [scope.Service.GrantMembership]: PurgeExpired performs NO authorization
+// check and reads NEITHER a subject nor a container from the context — there
+// is no ctx container to check against in the first place, since a single
+// call spans every container the Store holds, and deleting an already-dead
+// row confers no standing on anyone. That does not make it safe to expose to
+// an end user, though: an unauthenticated or under-privileged caller who
+// could trigger it at will gets a cross-tenant denial-of-service knob
+// (hammering the Store, or deleting another tenant's rows on demand) even
+// though it cannot itself grant access. Call it only from a trusted context
+// — a cron job, a superuser console — never from a per-request handler wired
+// to caller input.
 func (s *Service[C, M, PC, PM]) PurgeExpired(ctx context.Context, before time.Time) (int, error) {
 	return s.st.PurgeExpired(ctx, before)
 }

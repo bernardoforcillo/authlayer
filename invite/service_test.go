@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bernardoforcillo/authlayer/access"
 	"github.com/bernardoforcillo/authlayer/invite"
 	"github.com/bernardoforcillo/authlayer/org"
 	"github.com/bernardoforcillo/authlayer/scope"
@@ -18,16 +19,25 @@ import (
 // package needs no bespoke container/member types of its own) and a real
 // invite.Service over an in-memory Store, exactly as an application would.
 // Every test in this file runs against store/memory: it is what
-// [memory.NewInviteStore] and [memory.New] build, and its divergence from
-// store/drops (memory silently allows what drops rejects via UNIQUE
-// constraints — see that store's own doc) is irrelevant here because the
-// Service itself never attempts to write a duplicate row; it always deletes
-// the stale one first (see InviteByEmail's doc). Nothing in this file
-// exercises the drops-only duplicate-rejection path, and none of it should
-// be read as covering that path.
+// [memory.NewInviteStore] and [memory.New] build.
+//
+// store/memory's divergence from store/drops (memory silently allows what
+// drops rejects via UNIQUE constraints — see that store's own doc) does NOT
+// make the duplicate-rejection path unreachable through the Service in
+// general: a colliding [invite.WithTokens] generator (two different
+// invitations hashing to the same token_hash) or a race between two
+// concurrent InviteByEmail calls for the same (container, email) both reach
+// it on drops. Neither is exercised in this file — the first would need a
+// deliberately colliding generator this suite doesn't construct, and the
+// second needs real concurrency, which is out of scope for a
+// store/memory-backed unit test — so nothing here should be read as
+// covering that path either, but it is a testing-scope gap, not a design
+// impossibility.
 type fixture struct {
 	t    *testing.T
+	ac   *access.Access
 	sc   *scope.Service[org.Organization, org.Member, *org.Organization, *org.Member]
+	sst  *memory.Store[org.Organization, org.Member, *org.Organization, *org.Member]
 	ist  *memory.InviteStore
 	isvc *invite.Service[org.Organization, org.Member, *org.Organization, *org.Member]
 	cID  string
@@ -36,7 +46,8 @@ type fixture struct {
 func newFixture(t *testing.T, opts ...invite.Option) *fixture {
 	t.Helper()
 	ac := org.NewAccess(nil)
-	sc := scope.New[org.Organization, org.Member](ac, memory.New[org.Organization, org.Member]())
+	sst := memory.New[org.Organization, org.Member]()
+	sc := scope.New[org.Organization, org.Member](ac, sst)
 	ist := memory.NewInviteStore()
 	isvc := invite.New(sc, ist, opts...)
 
@@ -45,7 +56,7 @@ func newFixture(t *testing.T, opts ...invite.Option) *fixture {
 	if err != nil {
 		t.Fatalf("CreateContainer: %v", err)
 	}
-	return &fixture{t: t, sc: sc, ist: ist, isvc: isvc, cID: c.ContainerID()}
+	return &fixture{t: t, ac: ac, sc: sc, sst: sst, ist: ist, isvc: isvc, cID: c.ContainerID()}
 }
 
 // ctx builds a context for userID acting within the fixture's container.
@@ -120,6 +131,20 @@ func TestInviteByEmailGuardsEscalation(t *testing.T) {
 	}
 	if _, _, err := f.isvc.InviteByEmail(f.ctx("admin1"), "x@example.com", org.RoleAdmin); err != nil {
 		t.Fatalf("admin inviting to its own role: %v", err)
+	}
+}
+
+// TestInviteByEmailUnknownRoleIsErrRoleNotFound pins the M1 review fix: a
+// roleKey that resolves to no role at all must be ErrRoleNotFound, not
+// ErrPrivilegeEscalation — matching scope.Service's own resolveRole, which
+// scope's guardEscalation checks before ever reaching the SubsetOf
+// comparison. Conflating the two would misreport "no such role" as "you
+// lack the privilege to grant it".
+func TestInviteByEmailUnknownRoleIsErrRoleNotFound(t *testing.T) {
+	f := newFixture(t)
+	f.addMember("admin1", org.RoleAdmin)
+	if _, _, err := f.isvc.InviteByEmail(f.ctx("admin1"), "x@example.com", "role-that-does-not-exist"); !errors.Is(err, scope.ErrRoleNotFound) {
+		t.Fatalf("err = %v, want ErrRoleNotFound", err)
 	}
 }
 
@@ -430,6 +455,86 @@ func TestListLinksRedactsUnknownRole(t *testing.T) {
 	}
 	if links[0].RoleKey != ghost.RoleKey {
 		t.Fatalf("RoleKey = %q, want %q", links[0].RoleKey, ghost.RoleKey)
+	}
+}
+
+// TestDefaultRoleKeyResolvesFromRegistryNotAShadowingStoreRow pins the
+// Critical finding from the Task 5 review: scope.Service.ListRoles emits the
+// three code-defined defaults FIRST, then the container's stored roles.
+// permissionsByRole indexes that slice into a map; building it last-write-
+// wins would let a stored role row keyed with a default key (e.g. "owner")
+// overwrite the real default's entry, inverting scope.Service's own
+// resolveRole precedence, which always checks the code-defined registry
+// BEFORE ever falling back to the store. scope.Service.CreateRole refuses to
+// create such a row (ErrRoleKeyTaken), but the RoleStore port does not
+// forbid it and neither store implementation rejects it independently, so
+// this is seeded directly against the raw scope store to simulate a backend
+// that allows it.
+//
+// The reviewer demonstrated the live consequence end to end against the
+// pre-fix code: scope.Service.AddMember(admin1 -> owner) was correctly
+// refused, while invite.Service.CreateLink(admin1 -> owner) succeeded, and
+// ListLinks then handed the non-elevated admin the owner's clear-text code.
+// This test pins both halves of that: the mint-time escalation guard must
+// still refuse, and the redaction must still redact, regardless of what the
+// shadowing row's own (deliberately low) permissions say.
+func TestDefaultRoleKeyResolvesFromRegistryNotAShadowingStoreRow(t *testing.T) {
+	f := newFixture(t)
+	f.addMember("admin1", org.RoleAdmin)
+
+	// Seed a stored role row keyed "owner" carrying deliberately LOW (empty)
+	// permissions, bypassing scope.Service.CreateRole's own guard against a
+	// default key.
+	lowPerm, err := f.ac.Permission(map[string][]access.Action{})
+	if err != nil {
+		t.Fatalf("ac.Permission: %v", err)
+	}
+	if _, err := f.sst.CreateRole(context.Background(), scope.RoleRecord{
+		ID:          "shadow-owner",
+		ContainerID: f.cID,
+		Key:         org.RoleOwner,
+		Name:        "Fake Owner",
+		Permissions: lowPerm.Encode(),
+		CreatedAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed shadow owner role row: %v", err)
+	}
+
+	// (1) Mint-time escalation guard. If the shadowing low-permission row
+	// won, admin's own permissions would trivially SubsetOf it and this
+	// would wrongly succeed.
+	if _, _, err := f.isvc.CreateLink(f.ctx("admin1"), org.RoleOwner, 0, nil); !errors.Is(err, scope.ErrPrivilegeEscalation) {
+		t.Fatalf("CreateLink(admin1 -> owner) err = %v, want ErrPrivilegeEscalation despite a shadowing low-permission stored row", err)
+	}
+
+	// (2) ListLinks redaction. The real owner mints a genuine owner-role
+	// link (elevated, so the guard above does not apply to them); admin must
+	// still have its Code redacted. If the shadowing row won, the fake
+	// low-permission "owner" would look like a SubsetOf admin's own standing
+	// and the real code would leak.
+	_, ownerCode, err := f.isvc.CreateLink(f.ctx("owner"), org.RoleOwner, 0, nil)
+	if err != nil {
+		t.Fatalf("CreateLink(owner -> owner): %v", err)
+	}
+	links, err := f.isvc.ListLinks(f.ctx("admin1"))
+	if err != nil {
+		t.Fatalf("ListLinks: %v", err)
+	}
+	var got invite.Link
+	var found bool
+	for _, l := range links {
+		if l.RoleKey == org.RoleOwner {
+			got, found = l, true
+		}
+	}
+	if !found {
+		t.Fatalf("no owner-role link found in %+v", links)
+	}
+	if got.Code != "" {
+		t.Fatalf("Code = %q, want redacted despite a shadowing low-permission stored row", got.Code)
+	}
+	if got.Code == ownerCode {
+		t.Fatal("redacted code must not equal the real code")
 	}
 }
 
