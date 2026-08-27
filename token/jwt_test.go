@@ -1,6 +1,7 @@
 package token
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -11,9 +12,12 @@ import (
 	"time"
 )
 
+// keyA and keyB are exactly minKeyLen (32) bytes — the RFC 7518 §3.2 floor
+// for HS256 — and built with bytes.Repeat rather than a hand-counted string
+// literal so their length is not a place a typo can hide.
 var (
-	keyA = []byte("key-a-secret-material-32-bytes!")
-	keyB = []byte("key-b-secret-material-different")
+	keyA = bytes.Repeat([]byte("A"), 32)
+	keyB = bytes.Repeat([]byte("B"), 32)
 )
 
 func sampleClaims() Claims {
@@ -158,12 +162,14 @@ func TestIssueSignsOnlyWithGivenKey(t *testing.T) {
 }
 
 // An expired token (exp in the past) must be rejected even though its
-// signature is valid.
+// signature is valid. Issue itself now refuses a negative ttl (see
+// TestIssueRejectsNonPositiveTTL), so this crafts the already-expired token
+// directly rather than going through Issue.
 func TestParseRejectsExpiredToken(t *testing.T) {
-	raw, err := Issue(sampleClaims(), keyA, -time.Minute) // already expired
-	if err != nil {
-		t.Fatalf("Issue: %v", err)
-	}
+	c := sampleClaims()
+	c.IssuedAt = time.Now().Add(-2 * time.Hour).Unix()
+	c.ExpiresAt = time.Now().Add(-time.Minute).Unix() // already expired
+	raw := craftToken(t, `{"alg":"HS256","typ":"JWT"}`, c, keyA)
 	if _, err := Parse(raw, keyA); !errors.Is(err, ErrExpiredToken) {
 		t.Fatalf("Parse(expired) err = %v, want ErrExpiredToken", err)
 	}
@@ -254,5 +260,73 @@ func TestParseRejectsNonJSONHeader(t *testing.T) {
 	raw := rawURL([]byte("not-json")) + "." + rawURL([]byte(`{"sub":"x"}`)) + "." + rawURL([]byte("sig"))
 	if _, err := Parse(raw, keyA); !errors.Is(err, ErrMalformedToken) {
 		t.Fatalf("Parse(non-JSON header) err = %v, want ErrMalformedToken", err)
+	}
+}
+
+// Issue must refuse an HMAC key shorter than minKeyLen (32 bytes). A nil key
+// is the realistic trigger — []byte(os.Getenv("JWT_SECRET")) with the
+// variable unset — and must fail loudly rather than mint a token anyone
+// could forge with an empty-key HMAC.
+func TestIssueRejectsShortKey(t *testing.T) {
+	cases := map[string][]byte{
+		"nil key":     nil,
+		"empty key":   {},
+		"31-byte key": bytes.Repeat([]byte("x"), 31),
+	}
+	for name, key := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Issue(sampleClaims(), key, time.Hour); !errors.Is(err, ErrKeyTooShort) {
+				t.Fatalf("Issue(%s) err = %v, want ErrKeyTooShort", name, err)
+			}
+		})
+	}
+}
+
+// Parse must refuse the same undersized keys when they are the only key
+// offered.
+func TestParseRejectsShortKey(t *testing.T) {
+	raw, err := Issue(sampleClaims(), keyA, time.Hour)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	cases := map[string][]byte{
+		"nil key":     nil,
+		"empty key":   {},
+		"31-byte key": bytes.Repeat([]byte("x"), 31),
+	}
+	for name, key := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse(raw, key); !errors.Is(err, ErrKeyTooShort) {
+				t.Fatalf("Parse(%s alone) err = %v, want ErrKeyTooShort", name, err)
+			}
+		})
+	}
+}
+
+// A short key anywhere in the list must reject the whole call, even when a
+// valid, correctly-sized key elsewhere in the same list would otherwise
+// verify the token — Parse must not silently skip the bad key and check the
+// rest.
+func TestParseRejectsShortKeyAmongValidKeys(t *testing.T) {
+	raw, err := Issue(sampleClaims(), keyA, time.Hour)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	short := bytes.Repeat([]byte("x"), 31)
+	if _, err := Parse(raw, keyA, short); !errors.Is(err, ErrKeyTooShort) {
+		t.Fatalf("Parse(valid, short) err = %v, want ErrKeyTooShort", err)
+	}
+	if _, err := Parse(raw, short, keyA); !errors.Is(err, ErrKeyTooShort) {
+		t.Fatalf("Parse(short, valid) err = %v, want ErrKeyTooShort", err)
+	}
+}
+
+// Issue must refuse a zero or negative ttl — it would mint a token that is
+// already expired the instant it is issued, silently.
+func TestIssueRejectsNonPositiveTTL(t *testing.T) {
+	for _, ttl := range []time.Duration{0, -time.Second, -time.Hour} {
+		if _, err := Issue(sampleClaims(), keyA, ttl); !errors.Is(err, ErrInvalidTTL) {
+			t.Fatalf("Issue(ttl=%v) err = %v, want ErrInvalidTTL", ttl, err)
+		}
 	}
 }

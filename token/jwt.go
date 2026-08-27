@@ -17,8 +17,19 @@ import (
 // hand-roll.
 const hs256Alg = "HS256"
 
-// Sentinel errors returned by [Parse]. Compare with [errors.Is], never by
-// string.
+// minKeyLen is the minimum HMAC key length this package accepts: 32 bytes
+// (256 bits), matching the SHA-256 output size and the floor RFC 7518 §3.2
+// sets for HS256 ("A key of the same size as the hash output ... MUST be
+// used"). A shorter key is only as hard to guess as its own length — and a
+// nil or empty key, the realistic case when a secret comes from an unset
+// environment variable, makes the MAC computable by anyone. That is "alg:
+// none" reached through the key parameter instead of the header: the exact
+// class of bug this package's single-algorithm design exists to rule out.
+// Issue and Parse both refuse anything shorter, loudly.
+const minKeyLen = 32
+
+// Sentinel errors returned by [Issue] and [Parse]. Compare with [errors.Is],
+// never by string.
 var (
 	// ErrMalformedToken: raw is not a syntactically valid JWS compact
 	// serialization — wrong segment count, invalid base64, or a header/payload
@@ -33,6 +44,13 @@ var (
 	// ErrExpiredToken: the signature verified, but the claims' ExpiresAt is
 	// not in the future.
 	ErrExpiredToken = errors.New("authlayer/token: token expired")
+	// ErrKeyTooShort: a key shorter than 32 bytes (256 bits) was passed to
+	// Issue, or appears anywhere in the key list passed to Parse. See
+	// [minKeyLen] for why the floor exists.
+	ErrKeyTooShort = errors.New("authlayer/token: HMAC key shorter than 32 bytes")
+	// ErrInvalidTTL: Issue was given a zero or negative ttl, which would
+	// mint a token already expired at the moment it is issued.
+	ErrInvalidTTL = errors.New("authlayer/token: ttl must be positive")
 )
 
 // jwtHeader is the JOSE header this package writes and reads. It carries
@@ -61,12 +79,25 @@ type Claims struct {
 // Issue signs c as a compact-serialized HS256 JWT using key, and returns the
 // result. IssuedAt is set to now and ExpiresAt to now+ttl, overriding
 // whatever c.IssuedAt/c.ExpiresAt already held — callers control the
-// lifetime through ttl, not by pre-populating those fields.
+// lifetime through ttl, not by pre-populating those fields. ttl must be
+// positive; Issue refuses to mint a token that is already expired, returning
+// [ErrInvalidTTL].
 //
 // key is the only key this token is ever signed with. When keys are
 // rotated, callers pass the current signing key here — conventionally
 // keys[0] of whatever list is also passed to [Parse] — never an old one.
+// key must be at least 32 bytes (see [minKeyLen]); a nil, empty, or
+// otherwise undersized key is refused with [ErrKeyTooShort] rather than
+// silently accepted — an unset environment variable must fail loudly here,
+// not mint a forgeable token.
 func Issue(c Claims, key []byte, ttl time.Duration) (string, error) {
+	if len(key) < minKeyLen {
+		return "", fmt.Errorf("%w: got %d bytes, want at least %d", ErrKeyTooShort, len(key), minKeyLen)
+	}
+	if ttl <= 0 {
+		return "", fmt.Errorf("%w: got %s", ErrInvalidTTL, ttl)
+	}
+
 	now := time.Now()
 	c.IssuedAt = now.Unix()
 	c.ExpiresAt = now.Add(ttl).Unix()
@@ -101,7 +132,18 @@ func Issue(c Claims, key []byte, ttl time.Duration) (string, error) {
 // [ErrExpiredToken] only after its signature has verified, so an attacker
 // cannot use the expiry check to probe for a valid signature on claims they
 // forged.
+//
+// Every key in keys must be at least 32 bytes (see [minKeyLen]); if any one
+// of them is shorter, Parse refuses the whole call with [ErrKeyTooShort]
+// rather than silently skipping just that key and trying the rest — a
+// caller passing a bad key wants to know, not have it quietly ignored.
 func Parse(raw string, keys ...[]byte) (Claims, error) {
+	for i, key := range keys {
+		if len(key) < minKeyLen {
+			return Claims{}, fmt.Errorf("%w: key %d is %d bytes, want at least %d", ErrKeyTooShort, i, len(key), minKeyLen)
+		}
+	}
+
 	parts := strings.Split(raw, ".")
 	if len(parts) != 3 {
 		return Claims{}, fmt.Errorf("%w: expected 3 segments, got %d", ErrMalformedToken, len(parts))

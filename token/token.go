@@ -34,6 +34,12 @@
 // which is exactly the surface both attacks need and this one refuses to
 // have. If this package is ever "generalised" to accept more than one
 // algorithm, both vulnerabilities come back — don't.
+//
+// The same reasoning extends to the key, not just the header: [Issue] and
+// [Parse] both refuse any HMAC key shorter than 32 bytes. A nil or
+// undersized key — the realistic failure mode being an unset environment
+// variable — is computable by an attacker, which is "alg: none" reached
+// through the key instead of the header. See [minKeyLen].
 package token
 
 import (
