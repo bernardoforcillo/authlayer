@@ -171,11 +171,13 @@ type Service[C scope.Container, M scope.Member,
 //
 // sc supplies every permission decision this package needs without
 // reimplementing scope's engine: [scope.Service.Authorize] for the
-// invite:create/read/delete checks, and [scope.Service.Standing] plus
-// [scope.Service.ListRoles] for the escalation guard on creation and for the
-// [Service.ListLinks] redaction — the exported equivalent of scope's own
-// unexported guardEscalation/resolveRole, which this package cannot call
-// directly. st is the invitation Store described in this package's own doc:
+// invite:create/read/delete checks, [scope.Service.Standing] for the
+// actor's own standing, and [scope.Service.RolePermissions] for a role's
+// resolved permissions — used both by the escalation guard on creation and
+// by the [Service.ListLinks] redaction. RolePermissions is the same
+// resolution every permission check in scope performs, so this package and
+// [scope.Service.GrantMembership] can never disagree about what a role
+// grants. st is the invitation Store described in this package's own doc:
 // store/memory for tests and development, store/drops for production.
 func New[C scope.Container, M scope.Member,
 	PC interface {

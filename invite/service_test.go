@@ -451,8 +451,8 @@ func TestListLinksKeepsCodeAtOrBelowReaderStanding(t *testing.T) {
 // SubsetOf anything. This is seeded directly against the Store, bypassing
 // the Service's own creation path (which cannot mint a link for a role that
 // does not exist), simulating what a custom role deleted after a link was
-// minted would leave behind: a link naming a key ListRoles no longer
-// returns.
+// minted would leave behind: a link naming a key
+// scope.Service.RolePermissions can no longer resolve.
 func TestListLinksRedactsUnknownRole(t *testing.T) {
 	f := newFixture(t)
 	f.addMember("admin1", org.RoleAdmin)
@@ -484,17 +484,23 @@ func TestListLinksRedactsUnknownRole(t *testing.T) {
 }
 
 // TestDefaultRoleKeyResolvesFromRegistryNotAShadowingStoreRow pins the
-// Critical finding from the Task 5 review: scope.Service.ListRoles emits the
-// three code-defined defaults FIRST, then the container's stored roles.
-// permissionsByRole indexes that slice into a map; building it last-write-
-// wins would let a stored role row keyed with a default key (e.g. "owner")
-// overwrite the real default's entry, inverting scope.Service's own
-// resolveRole precedence, which always checks the code-defined registry
-// BEFORE ever falling back to the store. scope.Service.CreateRole refuses to
-// create such a row (ErrRoleKeyTaken), but the RoleStore port does not
-// forbid it and neither store implementation rejects it independently, so
-// this is seeded directly against the raw scope store to simulate a backend
-// that allows it.
+// Critical finding from the Task 5 review. The pre-fix implementation
+// resolved a role's permissions by indexing scope.Service.ListRoles'
+// result — which emits the three code-defined defaults FIRST, then the
+// container's stored roles — into a last-write-wins map, so a stored role
+// row keyed with a default key (e.g. "owner") overwrote the real default's
+// entry there, inverting scope.Service's own resolveRole precedence, which
+// always checks the code-defined registry BEFORE ever falling back to the
+// store. scope.Service.CreateRole refuses to create such a row
+// (ErrRoleKeyTaken), but the RoleStore port does not forbid it and neither
+// store implementation rejects it independently, so this is seeded directly
+// against the raw scope store to simulate a backend that allows it.
+//
+// Today's implementation resolves every role through
+// scope.Service.RolePermissions — a direct delegate to scope's own
+// resolveRole, not a map built from ListRoles' output — so it can no
+// longer be inverted by ordering at all. This test remains the regression
+// pin for that class of bug.
 //
 // The reviewer demonstrated the live consequence end to end against the
 // pre-fix code: scope.Service.AddMember(admin1 -> owner) was correctly
