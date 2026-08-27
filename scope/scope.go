@@ -591,12 +591,24 @@ func (s *Service[C, M, PC, PM]) GrantMembership(
 	// no authz here (no actor is being resolved), so read the parent link off the
 	// container itself. An unparented container yields "", which the helper
 	// treats as "no parent rung" and returns nil.
-	var parentID string
-	if n, ok := any(c).(Nested); ok {
-		parentID = n.ContainerParent()
-	}
-	if err := s.requireParentMember(ctx, parentID, userID); err != nil {
-		return zero, err
+	//
+	// Both the type assertion and the call are gated on the same condition
+	// AddMember uses (:546): s.cfg.parent != nil is required before the Nested
+	// assertion is even meaningful — a Service built with no WithParent can
+	// still be handed a container type embedding NestedBase (or share a store
+	// with a parented Service), so ParentID being non-empty proves nothing about
+	// whether THIS Service has a parent to ask; asking anyway would call
+	// Standing on a nil ParentScope. s.cfg.policy.MembersFromParent gates
+	// whether the invariant is enforced at all, matching the doc comment above:
+	// the rule applies "under MembersFromParent", not unconditionally.
+	if s.cfg.parent != nil && s.cfg.policy.MembersFromParent {
+		var parentID string
+		if n, ok := any(c).(Nested); ok {
+			parentID = n.ContainerParent()
+		}
+		if err := s.requireParentMember(ctx, parentID, userID); err != nil {
+			return zero, err
+		}
 	}
 	m, err := s.store.AddMember(ctx, s.newMember(containerID, userID, roleKey))
 	if err != nil {

@@ -386,6 +386,56 @@ func TestGrantMembershipHonoursMembersFromParent(t *testing.T) {
 	}
 }
 
+// With MembersFromParent turned off, GrantMembership admits an invitee who
+// holds no standing in the parent scope. The invariant is enforced only when
+// the policy says so — matching the doc comment's "under MembersFromParent"
+// — not unconditionally whenever a parent link exists, which is what the same
+// rows refused under the default policy in
+// TestGrantMembershipHonoursMembersFromParent above.
+func TestGrantMembershipWithMembersFromParentOffAdmitsAnyone(t *testing.T) {
+	parent := newParentScope()
+	_, orgC := ownerCtx(t, parent, "alice")
+
+	child, st := newChildScope(parent, InheritElevation)
+	team := createTeam(t, child, orgC.ContainerID(), "alice")
+
+	policy := defaultPolicy()
+	policy.MembersFromParent = false
+	open := newChildScopeOn(st, parent, InheritElevation, WithPolicy(policy))
+
+	// zoe never joined the organization. Under the default policy this is
+	// ErrNotParentMember; with the flag cleared, the same call over the same
+	// rows must succeed.
+	if _, err := open.GrantMembership(context.Background(), team.ContainerID(), "zoe", RoleMember); err != nil {
+		t.Fatalf("with MembersFromParent cleared, zoe should be admitted: %v", err)
+	}
+}
+
+// On an unparented Service — built with no WithParent — whose container type
+// still embeds NestedBase and carries a non-empty ParentID (because the same
+// store also backs a parented Service, the shared-store pattern
+// TestNestedWithoutWithParentDeniesTheSameActor uses for other methods),
+// GrantMembership must succeed rather than dereferencing a nil ParentScope.
+// s.cfg.parent == nil is what has to close the gate: ParentID being non-empty
+// on the row proves nothing about whether THIS Service has a parent to ask.
+func TestGrantMembershipOnUnparentedServiceDoesNotPanic(t *testing.T) {
+	parent := newParentScope()
+	_, orgC := ownerCtx(t, parent, "alice")
+	child, st := newChildScope(parent, InheritElevation)
+	team := createTeam(t, child, orgC.ContainerID(), "alice")
+	if team.ContainerParent() == "" {
+		t.Fatal("fixture: the team has no parent link to be dangerous with")
+	}
+
+	unparented := New(NewAccess(resTeam, map[string][]access.Action{
+		resDoc: {actionRead, actionWrite},
+	}), st)
+
+	if _, err := unparented.GrantMembership(context.Background(), team.ContainerID(), "quinn", RoleMember); err != nil {
+		t.Fatalf("GrantMembership on an unparented Service: %v", err)
+	}
+}
+
 // Adding invite:* to the control statements widens the built-in admin role,
 // which is derived from the merged surface. That widening is intended — it is
 // exactly why the invite package's ListLinks redaction exists — so it is
