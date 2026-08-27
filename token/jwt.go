@@ -137,6 +137,13 @@ func Issue(c Claims, key []byte, ttl time.Duration) (string, error) {
 // of them is shorter, Parse refuses the whole call with [ErrKeyTooShort]
 // rather than silently skipping just that key and trying the rest — a
 // caller passing a bad key wants to know, not have it quietly ignored.
+//
+// Each segment is decoded with strict (canonical) base64: a segment whose
+// unused trailing bits are non-zero is rejected as malformed rather than
+// silently accepted, so a given signature has exactly one valid string
+// encoding rather than several that all decode the same. That makes the raw
+// token string usable as a canonical identifier — for a denylist or replay
+// cache, say — which a permissive decoder would quietly undermine.
 func Parse(raw string, keys ...[]byte) (Claims, error) {
 	for i, key := range keys {
 		if len(key) < minKeyLen {
@@ -150,7 +157,7 @@ func Parse(raw string, keys ...[]byte) (Claims, error) {
 	}
 	headerPart, payloadPart, sigPart := parts[0], parts[1], parts[2]
 
-	headerJSON, err := base64.RawURLEncoding.DecodeString(headerPart)
+	headerJSON, err := base64.RawURLEncoding.Strict().DecodeString(headerPart)
 	if err != nil {
 		return Claims{}, fmt.Errorf("%w: header is not valid base64: %v", ErrMalformedToken, err)
 	}
@@ -165,7 +172,7 @@ func Parse(raw string, keys ...[]byte) (Claims, error) {
 		return Claims{}, fmt.Errorf("%w: %q", ErrUnsupportedAlgorithm, h.Alg)
 	}
 
-	sig, err := base64.RawURLEncoding.DecodeString(sigPart)
+	sig, err := base64.RawURLEncoding.Strict().DecodeString(sigPart)
 	if err != nil {
 		return Claims{}, fmt.Errorf("%w: signature is not valid base64: %v", ErrMalformedToken, err)
 	}
@@ -188,7 +195,7 @@ func Parse(raw string, keys ...[]byte) (Claims, error) {
 		return Claims{}, ErrInvalidSignature
 	}
 
-	payloadJSON, err := base64.RawURLEncoding.DecodeString(payloadPart)
+	payloadJSON, err := base64.RawURLEncoding.Strict().DecodeString(payloadPart)
 	if err != nil {
 		return Claims{}, fmt.Errorf("%w: payload is not valid base64: %v", ErrMalformedToken, err)
 	}

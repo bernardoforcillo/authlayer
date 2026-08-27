@@ -330,3 +330,59 @@ func TestIssueRejectsNonPositiveTTL(t *testing.T) {
 		}
 	}
 }
+
+// A base64url segment can be non-canonical yet still decode to the exact
+// same bytes under a permissive decoder: the final character of a segment
+// whose length isn't a multiple of 4 carries a few bits that a canonical
+// encoder always sets to zero, but a decoder that doesn't check this will
+// happily accept other values there too. For a 32-byte signature this gives
+// 3 non-canonical siblings of the true last character, all decoding to an
+// identical signature — so 4 distinct token strings would all verify as
+// "the same" token under a non-strict decoder. That breaks the raw token
+// string's use as a canonical identifier (a denylist or replay cache keyed
+// on the raw string could be bypassed by presenting a sibling). Parse must
+// reject every sibling and accept only the canonical form.
+func TestParseRejectsNonCanonicalBase64Signature(t *testing.T) {
+	raw, err := Issue(sampleClaims(), keyA, time.Hour)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if _, err := Parse(raw, keyA); err != nil {
+		t.Fatalf("Parse(canonical) err = %v, want nil", err)
+	}
+
+	parts := strings.Split(raw, ".")
+	if len(parts) != 3 {
+		t.Fatalf("token has %d segments, want 3", len(parts))
+	}
+	sigPart := parts[2]
+	lastChar := sigPart[len(sigPart)-1]
+
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	siblings := 0
+	for _, c := range alphabet {
+		if byte(c) == lastChar {
+			continue
+		}
+		candidate := sigPart[:len(sigPart)-1] + string(c)
+		decoded, err := base64.RawURLEncoding.DecodeString(candidate)
+		if err != nil {
+			continue
+		}
+		canonicalDecoded, err := base64.RawURLEncoding.DecodeString(sigPart)
+		if err != nil || string(decoded) != string(canonicalDecoded) {
+			continue // not a same-value sibling, just a different signature
+		}
+		siblings++
+
+		tamperedParts := []string{parts[0], parts[1], candidate}
+		tamperedRaw := strings.Join(tamperedParts, ".")
+		if _, err := Parse(tamperedRaw, keyA); !errors.Is(err, ErrMalformedToken) {
+			t.Fatalf("Parse(non-canonical signature %q, decodes same as canonical %q) err = %v, want ErrMalformedToken",
+				candidate, sigPart, err)
+		}
+	}
+	if siblings == 0 {
+		t.Fatal("test setup found no non-canonical siblings of the signature's last character — cannot exercise the strict-decode requirement")
+	}
+}
