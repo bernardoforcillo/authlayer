@@ -166,13 +166,23 @@ func (s *InviteStore) RevokeLink(_ context.Context, id string, at time.Time) err
 	return nil
 }
 
-// ConsumeLink checks that the link is unrevoked, unexpired at now, and below
-// MaxUses, and increments UseCount if and only if all three hold — all under
-// a single acquisition of mu, so no concurrent caller can observe or act on
-// an intermediate state. See the atomicity requirement on [invite.Store];
-// splitting this into a locked read followed by a separately-locked write
-// would let two callers both pass the check before either writes, letting a
-// MaxUses:1 link admit more than one user.
+// ConsumeLink checks that the link is unrevoked, strictly unexpired at now,
+// and below MaxUses, and increments UseCount if and only if all three hold —
+// all under a single acquisition of mu, so no concurrent caller can observe
+// or act on an intermediate state. See the atomicity requirement on
+// [invite.Store]; splitting this into a locked read followed by a
+// separately-locked write would let two callers both pass the check before
+// either writes, letting a MaxUses:1 link admit more than one user.
+//
+// "Strictly unexpired" means the ExpiresAt instant itself already counts as
+// expired: consumption succeeds only while now is strictly before ExpiresAt,
+// never at or after it. That boundary is deliberately tighter than
+// PurgeExpired's, which only removes rows strictly before its cutoff — so a
+// link exactly at ExpiresAt survives one more PurgeExpired pass even though
+// ConsumeLink already refuses it. ConsumeLink is a real-time gate that must
+// never admit anyone at or past the deadline; PurgeExpired is housekeeping
+// that can afford to lag by one instant. That asymmetry is intentional, not
+// a bug to reconcile.
 //
 // A not-found id is reported as (false, invite.ErrLinkNotFound); every other
 // failure to consume is (false, nil), per the interface doc.
@@ -187,6 +197,8 @@ func (s *InviteStore) ConsumeLink(_ context.Context, id string, now time.Time) (
 	if l.RevokedAt != nil {
 		return false, nil
 	}
+	// now == ExpiresAt counts as expired: valid strictly before, never at or
+	// after (see the boundary note in the doc comment above).
 	if l.ExpiresAt != nil && !now.Before(*l.ExpiresAt) {
 		return false, nil
 	}
@@ -200,8 +212,11 @@ func (s *InviteStore) ConsumeLink(_ context.Context, id string, now time.Time) (
 }
 
 // PurgeExpired deletes every EmailInvite and Link expired strictly before
-// before, and returns how many rows were removed in total. A Link with a nil
-// ExpiresAt is never purged.
+// before, and returns how many rows were removed in total. A row whose
+// ExpiresAt equals before exactly is left alone here — it is picked up on a
+// later call once before has advanced past it — and a Link with a nil
+// ExpiresAt is never purged. See ConsumeLink's doc for why its own boundary,
+// at the expiry instant itself, is deliberately tighter than this one.
 func (s *InviteStore) PurgeExpired(_ context.Context, before time.Time) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

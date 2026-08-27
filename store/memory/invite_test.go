@@ -460,6 +460,31 @@ func TestConsumeLinkExpiredFails(t *testing.T) {
 	}
 }
 
+// TestConsumeLinkExpiresAtEqualToNowIsExpired pins ConsumeLink's boundary
+// convention at the instant of expiry: now.Before(ExpiresAt) is false when
+// the two are exactly equal, so a link is already refused at its own
+// ExpiresAt, not one tick past it. This is the opposite convention from
+// PurgeExpired, which purges only strictly before its cutoff (a row exactly
+// at the cutoff survives) — see the doc comments on both methods for why
+// that asymmetry is intentional. Nothing pinned the now == ExpiresAt case
+// before this test, so a refactor could flip the comparison operator
+// (>= vs >) without any other test noticing.
+func TestConsumeLinkExpiresAtEqualToNowIsExpired(t *testing.T) {
+	st := newInviteStore()
+	ctx := context.Background()
+	at := time.Now()
+	if _, err := st.CreateLink(ctx, invite.Link{ID: "link1", ContainerID: "acme", MaxUses: 5, ExpiresAt: &at}); err != nil {
+		t.Fatalf("CreateLink: %v", err)
+	}
+	ok, err := st.ConsumeLink(ctx, "link1", at)
+	if err != nil {
+		t.Fatalf("ConsumeLink err = %v, want nil", err)
+	}
+	if ok {
+		t.Fatal("ConsumeLink ok = true when now == ExpiresAt exactly, want false: the expiry instant itself is already expired")
+	}
+}
+
 func TestConsumeLinkUnexpiredSucceeds(t *testing.T) {
 	st := newInviteStore()
 	ctx := context.Background()
@@ -492,23 +517,46 @@ func TestConsumeLinkNilExpiresAtNeverExpires(t *testing.T) {
 	}
 }
 
-// TestConsumeLinkConcurrencyExactlyOneWinner is the mandatory atomicity
-// guard: N goroutines race to consume a MaxUses:1 link. Exactly one of them
-// must observe ok=true; the rest must see ok=false with no error. A
-// read-then-write implementation (read UseCount, decide, then write) lets
-// more than one goroutine win, because two callers can both read UseCount
-// below MaxUses before either writes.
+// TestConsumeLinkConcurrencyExactlyOneWinner pins the observable contract: N
+// goroutines race to consume a MaxUses:1 link, and exactly one of them must
+// observe ok=true, the rest ok=false with no error, and the link's final
+// UseCount must be 1. Every N goroutine is started ahead of time and blocked
+// on a channel so they all enter ConsumeLink at effectively the same instant
+// once it closes, maximizing contention.
 //
-// All N goroutines are started ahead of time and blocked on a channel so they
-// enter ConsumeLink at effectively the same instant once it closes — without
-// that barrier, goroutine-launch overhead dwarfs the tiny window a
-// read-then-write implementation leaves open, and the race under-fires.
+// What this test does NOT reliably do is catch a broken, split-lock
+// (read-then-write) ConsumeLink — read UseCount under one lock acquisition,
+// decide, then write under a second. Measured directly: with that exact
+// mutation in place, this test passed 20 times out of 20, including at 2000
+// goroutines with the same channel barrier. The window between releasing the
+// read lock and reacquiring it for the write is sub-microsecond on ordinary
+// hardware, and Go's sync.Mutex fast path lets the same goroutine barge
+// straight back onto an uncontended mutex before another goroutine's
+// independent Lock() call can win it — so the interleaving this test needs
+// essentially never happens on its own. A green run here is evidence the
+// happy path works; it is not proof a given implementation is atomic.
 //
-// Run this test with -race too: it will not itself flag the overshoot as a
-// data race (both the read and the write are individually mutex-protected in
-// the broken variant, just not as one critical section), but it is cheap
-// insurance against a mutation that removes locking altogether rather than
-// just splitting it.
+// Two consequences of that, worth knowing before you rely on this test:
+//
+//  1. It is a logical (check-then-act) race, not a memory race: every
+//     individual map read and write in the broken variant is still
+//     separately mutex-protected, so `go test -race` sees nothing
+//     unsynchronized and will not flag it either. Run -race anyway — it
+//     catches a different class of mutation, such as dropping the locking
+//     altogether — just not this one.
+//  2. To actually exercise the window by hand (e.g. when reviewing a change
+//     to ConsumeLink), widen it: insert a temporary delay — a
+//     time.Sleep(time.Millisecond) is enough — between the unlocked read and
+//     the second Lock() in the implementation under test. Never ship that
+//     delay. With it, this same test fails hard and every time: all 500
+//     goroutines observed ok=true, not merely more than one.
+//
+// The real guarantee that ConsumeLink is atomic is the implementation itself
+// holding one lock across the entire check-and-write (see its doc comment in
+// invite.go), not this test. This test still earns its place: it pins the
+// contract callers depend on and will catch a grossly broken implementation
+// (no locking, or an inverted comparison) — it just cannot be trusted alone
+// to catch every way atomicity could be lost.
 func TestConsumeLinkConcurrencyExactlyOneWinner(t *testing.T) {
 	st := newInviteStore()
 	ctx := context.Background()
