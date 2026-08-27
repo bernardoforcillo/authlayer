@@ -672,6 +672,18 @@ func (s *Service[C, M, PC, PM]) RevokeLink(ctx context.Context, id string) error
 // guard then re-runs against the inviter's CURRENT standing — see that
 // option's doc for what changed and why — before the invite is claimed, so a
 // refused recheck does not spend the credential either.
+//
+// Accepted asymmetry with [Store.ConsumeLink]: the expiry check above reads
+// ExpiresAt once, before the claim, rather than re-evaluating it atomically
+// as part of the claim itself the way ConsumeLink folds expiry into its
+// single UPDATE. An invitation that expires in the narrow window between that
+// read and the claim a few lines later can therefore be claimed and admitted
+// microseconds past its nominal deadline. This is deliberately left as-is:
+// the claim still admits at most one caller regardless, so it is a boundary
+// imprecision, not an over-admission risk, and closing it would mean adding
+// an expiry predicate to [Store.DeleteEmailInvite]'s port contract — a
+// bigger change, across every Store implementation, than the boundary is
+// worth.
 func (s *Service[C, M, PC, PM]) AcceptInvite(ctx context.Context, plainToken string) (C, error) {
 	var zero C
 	subject, ok := scope.SubjectFrom(ctx)

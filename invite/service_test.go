@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1100,7 +1101,7 @@ func TestAcceptInviteSecondPresentationOfTheSameTokenIsRefused(t *testing.T) {
 }
 
 // TestAcceptInviteConcurrentCallsAdmitExactlyOneSubject is the test the
-// review found missing, and the one that actually demonstrated the Critical:
+// review found missing, and the one that first demonstrated the Critical:
 // n distinct, previously-unseen subjects all present the SAME one-time
 // token at once. A one-time email invitation is, in effect, a MaxUses:1
 // credential; this is AcceptInvite's counterpart to
@@ -1108,6 +1109,8 @@ func TestAcceptInviteSecondPresentationOfTheSameTokenIsRefused(t *testing.T) {
 // fault injection to fail against the grant-first ordering — that ordering
 // left the token redeemable by anyone holding it for as long as the row
 // existed, with no claim step gating admission at all.
+//
+// # This is NOT the load-bearing regression net — see the deterministic test below
 //
 // Unlike TestJoinViaLinkConcurrentCallsNeverExceedMaxUses' mutation (which
 // fails 100% of runs, since the reversed link order removes GrantMembership's
@@ -1117,17 +1120,24 @@ func TestAcceptInviteSecondPresentationOfTheSameTokenIsRefused(t *testing.T) {
 // grant-first at all, and store/memory's find is a mutex-held linear scan
 // fast enough that one goroutine frequently runs the whole find-grant-delete
 // sequence before a second one is even scheduled. Measured directly against
-// the grant-first mutation at n=400: 6 of 10 runs failed (joined=2), 4 of 10
-// passed (joined=1) — a strong majority, not a rare fluke, and well above
-// what "run it a few times" would miss, but still not the 100% the link
-// test gets. Raising n to 2000 did not meaningfully improve the hit rate
-// (3 of 10 failed) — the window is bounded by scheduling, not by how many
-// candidates are waiting behind it. This is the same class of caveat
-// store/memory's own TestConsumeLinkConcurrencyExactlyOneWinner documents:
-// a green run here is evidence the happy path works, and a red run is
-// unambiguous proof of the bug, but a lone green run under a SUSPECTED
-// regression is not proof the regression is absent — rerun a handful of
-// times, or inspect the ordering directly.
+// the grant-first mutation at n=400: this implementer measured 6 of 10 runs
+// failing (joined=2), 4 of 10 passing (joined=1); an independent reviewer
+// measured 4 of 10 failing on their own run. Raising n to 2000 did not
+// meaningfully improve the hit rate (3 of 10 failed) — the window is bounded
+// by scheduling, not by how many candidates are waiting behind it. A 40-60%
+// detector is a real signal — well above what "run it a few times" would
+// miss — but the plan's single most important invariant should not rest on
+// one alone when a deterministic alternative is cheap; see
+// TestAcceptInviteInterleavedClaimIsDeterministicallyRefused, which forces
+// the exact interleaving instead of hoping the scheduler produces it. This
+// test is kept anyway because it exercises real contention at low cost and
+// is a second, independent line of evidence — but it is not what this
+// invariant's regression protection depends on. This is the same class of
+// caveat store/memory's own TestConsumeLinkConcurrencyExactlyOneWinner
+// documents for a different mutation: a green run here is evidence the
+// happy path works, and a red run is unambiguous proof of the bug, but a
+// lone green run under a SUSPECTED regression is not proof the regression is
+// absent.
 func TestAcceptInviteConcurrentCallsAdmitExactlyOneSubject(t *testing.T) {
 	f := newFixture(t)
 	_, token, err := f.isvc.InviteByEmail(f.ctx("owner"), "shared@example.com", org.RoleMember)
@@ -1161,6 +1171,116 @@ func TestAcceptInviteConcurrentCallsAdmitExactlyOneSubject(t *testing.T) {
 	}
 	if joined != 1 {
 		t.Fatalf("joined = %d of %d concurrent candidates presenting the SAME one-time token, want exactly 1", joined, n)
+	}
+}
+
+// blockingFirstFindStore wraps a real Store, embedding it so every method is
+// the genuine implementation — no fault injection anywhere — except
+// FindEmailInviteByTokenHash, which always performs the real read first and
+// then, on the FIRST call only, signals ready and blocks until released
+// before returning the answer it already fetched. Performing the real read
+// before parking is what makes the caller genuinely "hold" a valid, unclaimed
+// record while parked, rather than being paused before ever reading one — the
+// latter would let a competing claim delete the row before this call even
+// looks at it, proving nothing about the ordering under test.
+//
+// "First" is decided by an atomic counter rather than sync.Once
+// deliberately: sync.Once.Do serializes EVERY caller through the guarded
+// section, not just the one racing to be first, so a second, unrelated call
+// (alice's, below) would itself block behind the parked first caller and the
+// test would deadlock — nobody left to call release. An atomic counter lets
+// exactly one call block while every other call proceeds normally.
+type blockingFirstFindStore struct {
+	invite.Store
+	calls   atomic.Int64
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingFirstFindStore) FindEmailInviteByTokenHash(ctx context.Context, tokenHash string) (invite.EmailInvite, error) {
+	// The real read happens FIRST, so the parked caller is holding an
+	// already-fetched, valid, unclaimed record — not paused before ever
+	// reading one, which would let a competing claim delete the row out from
+	// under a find that has not happened yet and prove nothing about the
+	// ordering under test.
+	inv, err := s.Store.FindEmailInviteByTokenHash(ctx, tokenHash)
+	if s.calls.Add(1) == 1 {
+		close(s.ready)
+		<-s.release
+	}
+	return inv, err
+}
+
+// TestAcceptInviteInterleavedClaimIsDeterministicallyRefused is the
+// load-bearing regression net for the ordering fix — not
+// TestAcceptInviteConcurrentCallsAdmitExactlyOneSubject above, whose
+// grant-first detection rate measured 40-60% across two independent runs
+// (this implementer's and the reviewer's), well short of the certainty this
+// invariant deserves. This test forces the exact interleaving that
+// demonstrates the bug instead of hoping Go's scheduler produces it: bob's
+// AcceptInvite is parked, via blockingFirstFindStore, at the instant right
+// after he has read a valid, unclaimed invitation record and right before he
+// would claim it, while alice's AcceptInvite runs to completion on the main
+// goroutine. Every method other than the one find call is the real Store —
+// this is the leakyInviteStore technique from an earlier round of this task,
+// reused for the opposite purpose: pinning a specific interleaving rather
+// than faking a failure. Worth reaching for again wherever a probabilistic
+// concurrency test's detection rate is in doubt.
+//
+// Measured against the reverted (grant-first) mutation: this test fails
+// EVERY run, not most — see the mutation-check output in task-6-report.md.
+func TestAcceptInviteInterleavedClaimIsDeterministicallyRefused(t *testing.T) {
+	ac := org.NewAccess(nil)
+	sst := memory.New[org.Organization, org.Member]()
+	sc := scope.New[org.Organization, org.Member](ac, sst)
+	bs := &blockingFirstFindStore{
+		Store:   memory.NewInviteStore(),
+		ready:   make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	isvc := invite.New(sc, bs)
+
+	octx := scope.WithSubject(context.Background(), "owner")
+	c, err := sc.CreateContainer(octx, org.Organization{Name: "Acme", Slug: "acme-interleave"})
+	if err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	cctx := scope.WithScope(octx, c.ContainerID())
+
+	_, token, err := isvc.InviteByEmail(cctx, "shared@example.com", org.RoleMember)
+	if err != nil {
+		t.Fatalf("InviteByEmail: %v", err)
+	}
+
+	bobErr := make(chan error, 1)
+	go func() {
+		_, err := isvc.AcceptInvite(scope.WithSubject(context.Background(), "bob"), token)
+		bobErr <- err
+	}()
+
+	// Wait for bob to have read (and hold) the invitation record, unclaimed.
+	<-bs.ready
+
+	if _, err := isvc.AcceptInvite(scope.WithSubject(context.Background(), "alice"), token); err != nil {
+		t.Fatalf("alice's AcceptInvite: %v", err)
+	}
+
+	// Release bob only after alice has already claimed the invite.
+	close(bs.release)
+	if err := <-bobErr; !errors.Is(err, invite.ErrInviteNotFound) {
+		t.Fatalf("bob's AcceptInvite err = %v, want ErrInviteNotFound — alice already claimed the invite", err)
+	}
+
+	members, err := sc.ListMembers(cctx)
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	admitted := map[string]bool{}
+	for _, m := range members {
+		admitted[m.MemberUser()] = true
+	}
+	if admitted["alice"] == admitted["bob"] {
+		t.Fatalf("admitted alice=%v bob=%v, want exactly one of them admitted", admitted["alice"], admitted["bob"])
 	}
 }
 
