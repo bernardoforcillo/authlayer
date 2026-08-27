@@ -268,3 +268,80 @@ func TestColSetRejectsATaggedEmbeddedStruct(t *testing.T) {
 	}()
 	newColSet(pg.NewTable("t"), model{}, true)
 }
+
+// renderColumnValue returns the SQL and args a ColumnValue contributes, by
+// rendering a one-row INSERT through drops' own builder (InsertBuilder.ToSQL,
+// which itself just drives a drops.Builder). pg.ColumnValue's methods are
+// unexported, so a value built outside the pg package cannot be asked for its
+// own column; the table comes from the colSet under test instead.
+func renderColumnValue(t *testing.T, cs *colSet, v pg.ColumnValue) (string, []any) {
+	t.Helper()
+	return pg.New(nil).Insert(cs.tbl).Row(v).ToSQL()
+}
+
+func TestColSetTypesPointerTimestampAsNullable(t *testing.T) {
+	type withNullable struct {
+		ID        string     `drop:"id"`
+		ExpiresAt *time.Time `drop:"expires_at"`
+	}
+	cs := newColSet(pg.NewTable("links"), withNullable{}, true)
+
+	c := cs.col("expires_at")
+	if c == nil {
+		t.Fatal("expires_at column missing")
+	}
+	if got := c.Type().TypeSQL(); got != "timestamptz" {
+		t.Fatalf("expires_at type = %q, want timestamptz", got)
+	}
+	if c.IsNotNull() {
+		t.Fatal("a *time.Time column was declared NOT NULL — it can never hold nil")
+	}
+	// A non-pointer time.Time must stay NOT NULL.
+	if !cs.col("id").IsNotNull() {
+		t.Fatal("id lost its NOT NULL")
+	}
+}
+
+func TestColSetBindsNilPointerAsSQLNull(t *testing.T) {
+	type withNullable struct {
+		ExpiresAt *time.Time `drop:"expires_at"`
+	}
+	cs := newColSet(pg.NewTable("links"), withNullable{}, true)
+
+	sql, args := renderColumnValue(t, cs, cs.bind("expires_at", (*time.Time)(nil)))
+	if !strings.Contains(strings.ToUpper(sql), "NULL") {
+		t.Fatalf("nil *time.Time did not render as NULL: %q", sql)
+	}
+	if len(args) != 0 {
+		t.Fatalf("NULL bound %d args (%v), want none", len(args), args)
+	}
+}
+
+func TestColSetBindsNonNilPointerAsAValue(t *testing.T) {
+	type withNullable struct {
+		ExpiresAt *time.Time `drop:"expires_at"`
+	}
+	cs := newColSet(pg.NewTable("links"), withNullable{}, true)
+	at := time.Date(2026, 8, 27, 0, 0, 0, 0, time.UTC)
+
+	sql, args := renderColumnValue(t, cs, cs.bind("expires_at", &at))
+	if strings.Contains(strings.ToUpper(sql), "NULL") {
+		t.Fatalf("a non-nil *time.Time rendered as NULL: %q", sql)
+	}
+	if len(args) != 1 || args[0] != at {
+		t.Fatalf("args = %v, want [%v]", args, at)
+	}
+}
+
+func TestColSetRowRoundTripsANilPointer(t *testing.T) {
+	type withNullable struct {
+		ID        string     `drop:"id"`
+		ExpiresAt *time.Time `drop:"expires_at"`
+	}
+	cs := newColSet(pg.NewTable("links"), withNullable{}, true)
+
+	vals := cs.row(withNullable{ID: "l1"})
+	if len(vals) != 2 {
+		t.Fatalf("row() produced %d bindings, want 2", len(vals))
+	}
+}

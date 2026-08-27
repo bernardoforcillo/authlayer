@@ -186,6 +186,10 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, uuidUserIDs bo
 			def = def.Unique()
 		}
 		c.str[name] = pg.Add(c.tbl, def)
+	case ft == reflect.TypeOf((*time.Time)(nil)):
+		// Nullable: no NotNull, so the column can hold SQL NULL. bind renders
+		// a nil pointer as the NULL keyword rather than a parameter.
+		c.ts[name] = pg.Add(c.tbl, pg.Timestamp(name, true))
 	case ft == reflect.TypeOf(time.Time{}):
 		c.ts[name] = pg.Add(c.tbl, pg.Timestamp(name, true).NotNull())
 	case ft == reflect.TypeOf([]byte(nil)):
@@ -195,8 +199,8 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, uuidUserIDs bo
 	default:
 		panic(fmt.Sprintf(
 			"authlayer/store/drops: column %q has unsupported Go type %s; supported: "+
-				"string, time.Time, []byte, int, int32, and named types whose "+
-				"underlying type is string, int or int32", name, ft))
+				"string, time.Time, *time.Time (nullable), []byte, int, int32, and "+
+				"named types whose underlying type is string, int or int32", name, ft))
 	}
 	c.order = append(c.order, name)
 }
@@ -220,12 +224,23 @@ func (c *colSet) col(tag string) *pg.Column {
 // bind pairs a column with a value for an INSERT row or an UPDATE assignment.
 //
 // It classifies exactly as add does — by reflect.Kind for the string and
-// integer families, by concrete type for time.Time and []byte — because the two
-// must accept the same set. Type-switching on concrete string here while add
-// accepted any Kind String meant a model with a `type Slug string` field built
-// a schema, rendered DDL, and then panicked on its first INSERT.
+// integer families, by concrete type for *time.Time, time.Time and []byte —
+// because the two must accept the same set. Type-switching on concrete string
+// here while add accepted any Kind String meant a model with a `type Slug
+// string` field built a schema, rendered DDL, and then panicked on its first
+// INSERT. The *time.Time case is checked before time.Time: a *time.Time value
+// does not match a `case time.Time` arm, but ordering it first keeps the two
+// nullable/non-nullable cases visibly paired.
 func (c *colSet) bind(tag string, v any) pg.ColumnValue {
 	switch x := v.(type) {
+	case *time.Time:
+		if x == nil {
+			// (*pg.Col[T]).Val takes a concrete T and cannot express NULL;
+			// Expr takes any drops.Expression, and drops.Raw is an exported
+			// string type whose WriteSQL emits its text verbatim.
+			return c.ts[tag].Expr(drops.Raw("NULL"))
+		}
+		return c.ts[tag].Val(*x)
 	case time.Time:
 		return bindOne(c.ts[tag], tag, x, "timestamptz")
 	case []byte:
