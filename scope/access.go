@@ -14,15 +14,31 @@ import (
 const (
 	ResourceMember = "member"
 	ResourceRole   = "role"
+	// ResourceInvite is the control resource for invitations: create (mint a
+	// link or code), read (list outstanding invitations), delete (revoke one).
+	// The engine itself checks nothing against it — [Service.GrantMembership]
+	// performs no actor check at all — but the invite package's checks
+	// (creating, listing, revoking) are declared against it, and it must be on
+	// the merged surface for those checks to resolve to anything but
+	// ErrForbidden.
+	ResourceInvite = "invite"
 )
 
 // Actions used by the control statements. Applications are free to declare
-// other verbs on their own resources; these three are the only ones the engine
-// itself checks.
+// other verbs on their own resources; ActionCreate, ActionUpdate and
+// ActionDelete are the only ones the engine's own operations (AddMember,
+// ChangeMemberRole, RemoveMember, CreateRole, UpdateRole, DeleteRole) check by
+// name.
 const (
 	ActionCreate access.Action = "create"
 	ActionUpdate access.Action = "update"
 	ActionDelete access.Action = "delete"
+	// ActionRead is the verb for listing or viewing rather than mutating. The
+	// engine checks it nowhere itself — invite:read is what the invite
+	// package's ListInvites / ListLinks check with [Service.Authorize] — but it
+	// lives here because "read" is the honest verb for listing and belongs
+	// beside the other three rather than invented per application.
+	ActionRead access.Action = "read"
 )
 
 // Default role keys seeded by [NewAccess]. These keys are reserved: a custom
@@ -34,12 +50,13 @@ const (
 	RoleMember = "member"
 )
 
-// ControlStatements returns the permission surface the engine enforces on its
-// own operations for a scope whose container resource is containerResource:
+// ControlStatements returns the reserved permission surface for a scope whose
+// container resource is containerResource:
 //
 //	containerResource: update, delete
 //	member:            create, update, delete
 //	role:              create, update, delete
+//	invite:            create, read, delete
 //
 // It is exported so an application can inspect the reserved surface — for
 // instance to render a role editor — and so a caller assembling statements by
@@ -50,11 +67,17 @@ const (
 // container itself; they exist so an application's own "rename the org" and
 // "delete the org" handlers have a permission to check with Authorize, and so
 // the admin role can be defined as "everything except deleting the container".
+// invite is the same kind of declaration: the engine's own admission path
+// ([Service.GrantMembership]) checks none of it — an invitee has no standing
+// to check — so invite:create/read/delete exist for the invite package's own
+// mint/list/revoke handlers to check with Authorize, the same way
+// containerResource:update/delete exist for an application's own handlers.
 func ControlStatements(containerResource string) map[string][]access.Action {
 	return map[string][]access.Action{
 		containerResource: {ActionUpdate, ActionDelete},
 		ResourceMember:    {ActionCreate, ActionUpdate, ActionDelete},
 		ResourceRole:      {ActionCreate, ActionUpdate, ActionDelete},
+		ResourceInvite:    {ActionCreate, ActionRead, ActionDelete},
 	}
 }
 

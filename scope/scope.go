@@ -558,6 +558,56 @@ func (s *Service[C, M, PC, PM]) AddMember(ctx context.Context, userID, roleKey s
 	return m, nil
 }
 
+// GrantMembership admits userID to containerID holding roleKey, performing no
+// check that any actor is entitled to do so.
+//
+// It exists for invitation acceptance, where the person being admitted has no
+// standing to check and the inviter is not present. Every actor-facing rule —
+// member:create, the privilege-escalation guard — was applied when the
+// invitation was created; this call deliberately re-applies none of them.
+//
+// It is therefore only as safe as the thing that decided to call it. Do not
+// expose it to end users, and do not call it from a path that a principal could
+// reach without holding a credential minted for exactly this container and
+// role. The invite package's ListLinks redaction is what makes that true there;
+// anything else calling this owes the same care.
+//
+// Rules that are not about the actor still apply: a duplicate is
+// ErrAlreadyMember, an unresolvable role is ErrRoleNotFound, and under
+// MembersFromParent the user must already hold standing in the parent scope.
+func (s *Service[C, M, PC, PM]) GrantMembership(
+	ctx context.Context, containerID, userID, roleKey string,
+) (M, error) {
+	var zero M
+	c, err := s.store.FindContainer(ctx, containerID)
+	if err != nil {
+		return zero, err
+	}
+	if _, err := s.resolveRole(ctx, containerID, roleKey); err != nil {
+		return zero, err
+	}
+	// requireParentMember takes the PARENT's id, not this container's — see its
+	// signature and AddMember's call site, which passes authz.parentID. There is
+	// no authz here (no actor is being resolved), so read the parent link off the
+	// container itself. An unparented container yields "", which the helper
+	// treats as "no parent rung" and returns nil.
+	var parentID string
+	if n, ok := any(c).(Nested); ok {
+		parentID = n.ContainerParent()
+	}
+	if err := s.requireParentMember(ctx, parentID, userID); err != nil {
+		return zero, err
+	}
+	m, err := s.store.AddMember(ctx, s.newMember(containerID, userID, roleKey))
+	if err != nil {
+		return zero, err
+	}
+	if err := s.emit(ctx, Event{Kind: MemberAdded, ContainerID: containerID, ActorID: userID, TargetID: userID, RoleKey: roleKey}); err != nil {
+		return zero, err
+	}
+	return m, nil
+}
+
 // ChangeMemberRole reassigns targetUserID to roleKey.
 //
 // The actor needs member:update. Under LastOwnerLocked the owner cannot be
