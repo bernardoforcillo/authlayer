@@ -97,6 +97,91 @@ once a 1.0 is cut. Until then, minor versions may break API.
   aliases including `ErrNotParentMember`. `ParentStatements` names what the
   parent organization's `Access` must declare (`team:create`) for anyone but
   the org owner to create a team — merge it into `org.NewAccess`'s statements.
+- **`invite`** (`authlayer/invite`) — a new package admitting a person who has
+  no standing in a scope yet, by a credential rather than a direct
+  `AddMember` call. `InviteByEmail` mints a one-time, single-recipient token
+  and persists only its sha256 (`EmailInvite.TokenHash`), since the token is
+  emailed once and never redisplayed to anyone, including the inviter — a
+  database leak of the row cannot be replayed into admission. `CreateLink`
+  mints a reusable link bounded by an explicit `MaxUses` (0 meaning
+  unlimited) and `ExpiresAt` (nil meaning never); `Link.Code` is stored in
+  clear, because a link's whole purpose is to be re-displayed on a "manage
+  invite links" screen and a hash would make that impossible — a link's
+  security instead comes from `MaxUses`, `ExpiresAt` and revocation, weighed
+  atomically by `Store.ConsumeLink`. `AcceptInvite` and `JoinViaLink` redeem
+  a credential and call the new `scope.Service.GrantMembership` (see below)
+  to admit: both claim the credential atomically FIRST — `AcceptInvite` via
+  the rows-affected-gated `Store.DeleteEmailInvite`, `JoinViaLink` via the
+  atomic `Store.ConsumeLink` — and admit SECOND, so a failure after the claim
+  burns the credential and admits no one (under-admission) rather than
+  risking a credential paying out twice (over-admission); accepting is
+  therefore not safe to retry with the same token. Delivery is entirely the
+  caller's own responsibility: `InviteByEmail` returns the plain token
+  exactly once, and authlayer knows no base URL and owns no transport;
+  `WithNotifier` is optional sugar over calling a `Notifier` yourself right
+  after. `ListLinks` blanks a link's `Code` in the result unless the caller
+  is elevated or the link's role resolves to a permission set that is a
+  `SubsetOf` their own current standing — load-bearing, not cosmetic, because
+  `invite:read` sits on the merged control-statement surface and so is
+  granted to the built-in `admin` automatically (see the next entry), and
+  `admin` is deliberately not `IsFull`; without this redaction a non-elevated
+  admin could read the owner's link code in clear, leave the container, and
+  rejoin at the owner role through `JoinViaLink`, since `GrantMembership`
+  runs no escalation check of its own. `WithRecheckInviterOnAccept` (default
+  `true`) re-runs the privilege-escalation guard against the inviter's
+  CURRENT standing before `AcceptInvite`/`JoinViaLink` admit anyone, so a
+  since-demoted or since-departed inviter's pending invitation stops paying
+  out, at the cost that a pending invitation dies when its inviter leaves the
+  container. `PurgeExpired` deletes every expired invite and link across
+  every container the `Store` holds, for a cron; it performs no
+  authorization and reads neither a subject nor a container from the
+  context. Six new sentinel errors: `ErrInviteNotFound`, `ErrInviteExpired`,
+  `ErrLinkNotFound`, `ErrLinkRevoked`, `ErrLinkExpired`, `ErrLinkExhausted`.
+  `store/memory` and `store/drops` each ship a reference `invite.Store`
+  implementation, the latter with its own `CreateSchema`.
+- **`scope.Service.GrantMembership`** (`authlayer/scope`) — admits a user to a
+  container at a role, performing NO check that any actor is entitled to do
+  so: no `member:create`, no privilege-escalation guard. It exists for
+  invitation acceptance, where the person being admitted has no standing to
+  check and the inviter is not present to have one — every actor-facing rule
+  was already applied when the credential was minted. **This is a
+  deliberately unchecked admission path**: it is only as safe as whatever
+  decided to call it, must never be exposed to end users, and must never be
+  reachable from a path a principal could reach without holding a credential
+  minted for exactly this container and role — `invite.Service.ListLinks`'s
+  redaction is what makes that true there, and anything else calling this
+  owes the same care. Rules that are not about the actor still apply: a
+  duplicate is `ErrAlreadyMember`, an unresolvable role is `ErrRoleNotFound`,
+  and under `Policy.MembersFromParent` the user must already hold standing in
+  the parent scope.
+- **`invite` control statements** (`authlayer/scope`) — `ControlStatements`
+  and `NewAccess` now declare the `invite` resource (`create`, `read`,
+  `delete`) on every scope's merged permission surface, for the `invite`
+  package's own mint/list/revoke checks; the engine itself checks none of
+  it. **This widens the built-in `admin` role automatically**: `admin` is
+  defined as "every declared pair except `<container>:delete`", so every
+  `admin` — new and previously seeded — gains `invite:create`, `invite:read`
+  and `invite:delete` the moment this version is adopted, with no code
+  change required. An application that treats `admin`'s current grant set as
+  fixed should account for that before upgrading.
+- **`scope.Service.RolePermissions`** and **`scope.Service.Container`**
+  (`authlayer/scope`) — two new exported primitives, added so `invite` (or
+  any other package built on `scope`) can ask the engine's own questions
+  instead of reconstructing an approximation of them. `RolePermissions`
+  resolves a role key to its permission set exactly the way every
+  permission check in the engine does — a code-defined role first, then a
+  custom role loaded from the store — and answers a strictly larger question
+  than `ListRoles`: `ListRoles` enumerates only the three hardcoded defaults
+  plus a container's *stored* custom roles, so a code-defined role
+  registered directly with `access.Access.NewRole` resolves through
+  `RolePermissions` but is invisible to `ListRoles`, and approximating the
+  former from the latter would silently treat such a role as nonexistent.
+  `Container` loads a container by id, returning the whole record — it
+  exists because `GrantMembership` returns only the new membership, not the
+  container the invitee was just admitted to, and invitation acceptance
+  needs to hand one back. Like `Standing` and `HasPermission`, neither reads
+  anything from the context nor checks that the caller is entitled to ask —
+  do not expose either directly to end users.
 
 ### Changed
 

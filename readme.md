@@ -27,7 +27,7 @@ else pulls in `drops` (and `pgx/v5` for the PostgreSQL store).
   [Policy](#policy) · [Hooks & events](#hooks--events) · [Options](#options)
 - [Query-level filtering](#query-level-filtering) · [Storage](#storage) ·
   [Custom scopes](#custom-scopes) · [Nested scopes](#nested-scopes) ·
-  [Errors](#errors) · [Packages](#packages)
+  [Invitations](#invitations) · [Errors](#errors) · [Packages](#packages)
 
 ## The model
 
@@ -102,6 +102,7 @@ the engine enforces on its own operations:
 | `organization` | `update`, `delete`         | your handlers (declared, not enforced) |
 | `member`       | `create`, `update`, `delete` | `AddMember`, `ChangeMemberRole`, `RemoveMember` |
 | `role`         | `create`, `update`, `delete` | `CreateRole`, `UpdateRole`, `DeleteRole` |
+| `invite`       | `create`, `read`, `delete` | the [`invite`](#invitations) package's own mint/list/revoke calls — the engine itself checks none of it |
 
 `organization:update` / `organization:delete` are declared so your own "rename
 the org" and "delete the org" handlers have something to check with `Authorize`,
@@ -303,6 +304,14 @@ svc := org.New(ac, store, org.WithPolicy(org.Policy{
 
 `WithPolicy` replaces the policy wholesale — it does not merge — so pass a fully
 populated struct. The zero `Policy` is *not* the defaults.
+
+`invite.Service` carries one policy knob of its own, configured separately
+through its own `Option` rather than through `Policy`/`WithPolicy` — an
+`invite.Service` and the `scope.Service` it wraps are configured
+independently: `invite.WithRecheckInviterOnAccept` (default `true`) controls
+whether accepting an invitation re-checks the inviter's *current* standing
+before admitting anyone. See [Invitations](#invitations) for what that trades
+away when turned off.
 
 ## Hooks & events
 
@@ -629,6 +638,172 @@ own wiring rather than anything a request can trigger. Each level a check
 climbs — resolving the parent's own standing, and its parent's, and so on —
 costs one more store round trip.
 
+## Invitations
+
+`invite` admits a person who has no standing in a scope yet, without a direct
+[`AddMember`](#managing-members) call: a one-time emailed token, or a reusable
+link. Both end the same way, at the newly exported
+`scope.Service.GrantMembership` — admitting the named user at the named role
+while performing **no actor check of its own**, not even `member:create`, let
+alone the escalation guard. Every actor-facing rule already ran when the
+credential was minted, and the person accepting it has no standing yet to
+check in the first place. `GrantMembership` is therefore only as safe as
+whatever decided to call it: it must never be reachable except by presenting a
+credential minted for exactly that container and role, which is exactly what
+`AcceptInvite`, `JoinViaLink`, and `ListLinks`'s redaction (below) exist to
+guarantee.
+
+```go
+svc := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member]())
+isvc := invite.New(svc.Service, memory.NewInviteStore()) // org.Service embeds *scope.Service as .Service
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme") // alice becomes owner
+
+owner := org.WithOrg(ctx, acme.ID)
+_, token, _ := isvc.InviteByEmail(owner, "bob@example.com", org.RoleMember)
+// deliver `token` yourself — authlayer knows no base URL and owns no transport
+
+bob := org.WithSubject(context.Background(), "bob")
+_, _ = isvc.AcceptInvite(bob, token) // bob is now a member of acme, holding org.RoleMember
+```
+
+A link works the same way, minus the email step — reusing `ctx`/`acme`/`isvc`
+above:
+
+```go
+owner := org.WithOrg(ctx, acme.ID)
+_, code, _ := isvc.CreateLink(owner, org.RoleMember, 5, nil) // up to 5 uses, never expires
+
+carol := org.WithSubject(context.Background(), "carol")
+_, _ = isvc.JoinViaLink(carol, code) // carol is now a member of acme, holding org.RoleMember
+```
+
+`store/memory`'s `NewInviteStore` is the dev/test `invite.Store`, exactly like
+`memory.New` for `scope.Store`; `store/drops` ships the production one as
+`dropsstore.NewInviteStore(db)`, with its own `CreateSchema`.
+
+**Two artifacts, one hashed, one not.** An email invite (`EmailInvite`) is
+delivered once and never redisplayed to anyone, including the inviter, so only
+its sha256 is stored (`TokenHash`) — a database leak cannot be replayed into
+admission, because an attacker who steals the row still cannot produce a token
+that hashes to it. A link (`Link`) is the opposite: its whole purpose is to be
+shown again, on a "manage invite links" screen, so `Code` is stored in clear —
+hashing it would make redisplay impossible. A link's security therefore comes
+from `MaxUses`, `ExpiresAt` and revocation rather than secrecy of storage,
+which is why `Store.ConsumeLink` must weigh all three atomically before
+admitting anyone.
+
+**Delivery is your job.** `InviteByEmail` returns the plain token exactly
+once, alongside the stored record; authlayer knows no base URL and owns no
+transport, so turning that into an actual email — which link, which template,
+which provider — is entirely the caller's own business. `WithNotifier` wires a
+`Notifier` that `InviteByEmail` calls once the invite is persisted; it is
+optional sugar over calling one yourself right after `InviteByEmail` returns,
+and the default (nil) sends nothing at all.
+
+**`ListLinks`'s redaction is the security core of this package.** `invite:read`
+sits on the merged control-statement surface every `NewAccess` builds (see
+[Statements & permissions](#statements--permissions)), so the built-in `admin`
+role acquires it automatically — and `admin` is deliberately not `IsFull` (see
+[Roles](#roles)), so it is normally subject to the privilege-escalation guard
+everywhere else in this codebase. Without redaction that guard would be
+worthless here: a non-elevated admin lists the links, reads the owner's `Code`
+in clear, leaves the container, and rejoins at the owner role through
+`JoinViaLink` — which admits via `GrantMembership`, a call that runs no
+escalation check of its own, because the whole point of a link is to admit
+someone who has no standing yet to check. Two calls, full escalation, and
+every fine-grained check elsewhere in the codebase never touched. So
+`ListLinks` blanks a link's `Code` in the result unless the caller is elevated
+or the link's role resolves to a permission set that is a `SubsetOf` the
+caller's own current standing — the same test applied when the link was
+created, reapplied here because a role's grants (or the reader's own standing)
+can change afterwards. Every other field stays populated, so a management
+screen can still list a link and let its owner revoke it, even one whose code
+it cannot show back.
+
+**Claim first, admit second — in both flows.** Acceptance spans two stores
+that may not share a database — the invite lives in `invite.Store`, the
+membership in `scope.Store` — so there is no cross-store transaction. Both
+`AcceptInvite` and `JoinViaLink` claim the credential atomically FIRST and
+admit SECOND. `AcceptInvite` deletes the invite through the rows-affected-gated
+`Store.DeleteEmailInvite`: of any two callers racing to delete the same id —
+including the same token presented twice — at most one ever sees a nil error,
+and only that caller proceeds to `GrantMembership`. `JoinViaLink` consumes a
+use through the atomic `Store.ConsumeLink`, which folds the
+revoked/expired/exhausted check and the increment into one step a concurrent
+caller cannot split. In both, a failure AFTER the claim burns the credential
+and admits no one — under-admission, the safe direction — at the cost that
+accepting is not safe to retry with the same token: the invitee has to be
+re-invited, or, for a link with uses left, try again. The reverse order — admit
+first, claim second — was an earlier version of `AcceptInvite`, and it was a
+Critical finding, not a style preference: while the invite row still existed,
+the token stayed redeemable by *anyone* holding it, not merely by the original
+caller retrying — two distinct subjects were demonstrably admitted from a
+single invitation. A one-time credential must never pay out more than once; do
+not "tidy" this ordering back during a later refactor. See `AcceptInvite`'s
+and `JoinViaLink`'s own doc comments in `invite/service.go` for the full
+argument, including the narrow, deliberately-accepted boundary imprecision
+around `AcceptInvite`'s expiry check.
+
+**An existing member is idempotent, but not symmetrically.** If the ctx
+subject already has standing in the link's container, `JoinViaLink` returns
+the container immediately and consumes nothing — no use taken, no redundant
+membership write — checked before the escalation recheck or the use count, so
+a member re-clicking an old invite link never costs it anything.
+`AcceptInvite` instead folds a duplicate's `scope.ErrAlreadyMember` into
+success after the token is already consumed: a member who already holds a
+role *below* the one the invite grants gets no error and no promotion, and
+nothing in the return value distinguishes "already had this role" from
+"already had a lesser one". This never over-privileges — folding a duplicate
+can only leave someone at or below what they already had — but it can
+silently swallow an intended promotion. Check `scope.Service.Standing` first,
+or route promotions through `ChangeMemberRole`, if your application needs to
+tell the two apart.
+
+**`RecheckInviterOnAccept`, on by default.** The privilege-escalation guard
+already ran once, at mint time, against the inviter's standing as of that
+moment — nothing about a stored token or link updates afterwards, so without a
+recheck a credential keeps paying out at the power level its inviter held when
+they minted it, even after that inviter is demoted or leaves the container
+entirely. Enabled, the guard reruns against the inviter's CURRENT standing
+before `AcceptInvite` or `JoinViaLink` admit anyone — before the claim, so a
+refusal spends nothing: a demoted inviter's pending invitation now fails with
+`scope.ErrPrivilegeEscalation`, and one from an inviter who has since left
+fails with `scope.ErrNotMember`. The cost is durability: a pending invitation
+now dies the moment its inviter's own standing can no longer support it,
+including simply leaving the container. Turn it off with
+`invite.WithRecheckInviterOnAccept(false)` if your application wants "who
+invited me" to be provenance rather than an ongoing authorization the inviter
+must keep backing.
+
+**`PurgeExpired` is for a cron.** `Service.PurgeExpired(ctx, before)` deletes
+every expired invite and link across every container the `Store` holds, and
+returns how many rows were removed. It performs NO authorization check and
+reads neither a subject nor a container from the context — there is no ctx
+container to check against, since a single call spans every container the
+store holds — so call it only from a trusted context, never from a
+per-request handler wired to caller input: an unauthenticated caller who could
+trigger it at will gets a cross-tenant denial-of-service knob even though it
+cannot itself grant access.
+
+**Two new `scope` primitives, exported to make this package possible.**
+`RolePermissions(ctx, containerID, roleKey)` resolves a role key to its
+permission set exactly the way every check in the engine does — a
+code-defined role first, then a custom role loaded from the store — and is the
+right way for another package to ask that question: `ListRoles` enumerates
+only the three defaults plus a container's *stored* custom roles, so a
+code-defined role registered directly with `access.Access.NewRole` (a
+`viewer` role, say) resolves through `RolePermissions` but is invisible to
+`ListRoles`, and approximating from the latter would silently treat such a
+role as nonexistent. `Container(ctx, id)` loads a container by id, returning
+the whole record — including any application-defined fields your container
+type carries beyond `ContainerBase` — because `GrantMembership` returns only
+the new membership, not the container the invitee was just admitted to, and
+acceptance needs to hand one back. Like `Standing` and `HasPermission`, neither
+reads anything from the context nor checks that the caller is entitled to
+ask — do not expose either directly to end users.
+
 ## Errors
 
 Compare with `errors.Is`, never by string. `org` re-exports these as *aliases*,
@@ -655,6 +830,28 @@ matches.
 
 `Can` already folds `ErrForbidden` and `ErrNotMember` into a plain `false`.
 
+`invite` adds six sentinels of its own — not exported by `scope`, and not
+aliased anywhere, since invitations are a separate package with its own
+failure modes:
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrInviteNotFound` | No email invite with that id or token hash | 404 |
+| `ErrLinkNotFound` | No link with that id or code | 404 |
+| `ErrInviteExpired` | The invite's `ExpiresAt` has passed | 410 |
+| `ErrLinkRevoked` | The link's `RevokedAt` is set | 410 |
+| `ErrLinkExpired` | The link's `ExpiresAt` has passed | 410 |
+| `ErrLinkExhausted` | The link's `UseCount` has reached its `MaxUses` | 410 |
+
+The first two are raised by the `Store` itself, on any lookup or delete that
+matches no row. The other four describe *why a redemption did not happen*
+rather than a lookup miss, and only the service layer raises them: a link's
+`Store.ConsumeLink` folds all three of its own reasons into a single
+`ok=false` — the check and the increment must be one atomic step, so asking
+that step to also report which of three conditions applied would require a
+second, separate read, which is exactly the race atomicity rules out — and
+`JoinViaLink` re-reads the link afterwards to tell them apart.
+
 ## Packages
 
 | Package | What it is |
@@ -663,6 +860,7 @@ matches.
 | [`scope`](scope/) | The generic RBAC engine: `Service`, `Store` port, policy, hooks, context helpers, guard. |
 | [`org`](org/) | Organization RBAC — `scope` with the type parameters fixed and the names spelled "organization". |
 | [`team`](team/) | Team RBAC nested inside `org` via `scope.WithParent` — the worked example of [nesting](#nested-scopes). |
+| [`invite`](invite/) | [Invitations](#invitations) — email tokens and reusable links admitting a user with no standing yet, via `scope.Service.GrantMembership`. |
 | [`store/memory`](store/memory/) | In-memory `Store` for dev, tests, and examples. |
 | [`store/drops`](store/drops/) | PostgreSQL `Store` built on drops (composite-key membership). |
 | [`examples/basic`](examples/basic/) | Runnable, database-free tour. |
@@ -671,7 +869,6 @@ Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
 
 ## Roadmap
 
-- Invitations (email + link).
 - Authentication: credentials, revocable server-side sessions, OAuth.
 
 Released versions are recorded in [changelog.md](changelog.md).
