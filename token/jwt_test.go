@@ -386,3 +386,17 @@ func TestParseRejectsNonCanonicalBase64Signature(t *testing.T) {
 		t.Fatal("test setup found no non-canonical siblings of the signature's last character — cannot exercise the strict-decode requirement")
 	}
 }
+
+// Parse must never verify a token when no keys are offered at all — the
+// zero-keys case must fail exactly as any invalid-signature case does, not
+// fall through and succeed because the verification loop had nothing to
+// reject.
+func TestParseRejectsNoKeys(t *testing.T) {
+	raw, err := Issue(sampleClaims(), keyA, time.Hour)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if _, err := Parse(raw); err == nil {
+		t.Fatal("Parse with no keys succeeded, want an error")
+	}
+}
