@@ -680,6 +680,138 @@ func TestCreateLinkIgnoresStoreRowShadowingAppRegisteredRole(t *testing.T) {
 	}
 }
 
+// TestListLinksRedactsEveryCodeForAReaderWhoCannotMint pins half one of
+// ListLinks' two-part mint test, the Critical from the whole-branch review.
+//
+// The disclosure rule used to be the escalation guard ALONE — elevated or
+// RolePermissions(RoleKey).SubsetOf(readerStanding) — which asks only how
+// HIGH the reader could have minted, never WHETHER they could have minted
+// anything. A principal granted invite:read without invite:create therefore
+// received the verbatim Code of every link whose role they subsume, even
+// though their own CreateLink is refused. That is not an escalation for the
+// reader (the codes stay within their own standing) but it is
+// read-implies-admit: they acquire the power to admit arbitrary third
+// parties, which invite:create exists to gate, and it falsifies the
+// invariant scope.Service.GrantMembership's doc, the readme and the
+// changelog all state — "nothing hands a usable credential to a principal
+// who could not have minted it".
+//
+// The reviewer reproduced it end to end against a stock org.NewAccess: an
+// "auditor" role granting only invite:read read an owner-minted code
+// verbatim while its own CreateLink was refused, and an outsider then
+// joined with that code.
+//
+// The configuration is ordinary and fully supported —
+// scope.Service.CreateRole accepts any escalation-clean grant subset, so
+// splitting invite:read from invite:create is a legal call for any admin.
+// The link here is minted at the auditor's OWN role, so SubsetOf is
+// reflexively true and half two of the test passes: the only thing that can
+// redact this code is the invite:create gate. This is the test the mandated
+// mutation check is run against.
+func TestListLinksRedactsEveryCodeForAReaderWhoCannotMint(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.sc.CreateRole(f.ctx("owner"), "auditor", "Auditor", map[string][]access.Action{
+		scope.ResourceInvite: {scope.ActionRead},
+	}); err != nil {
+		t.Fatalf("CreateRole(auditor): %v", err)
+	}
+	f.addMember("auditor1", "auditor")
+
+	// The premise: this reader provably could not have minted any link here.
+	if _, _, err := f.isvc.CreateLink(f.ctx("auditor1"), "auditor", 0, nil); !errors.Is(err, scope.ErrForbidden) {
+		t.Fatalf("CreateLink(auditor1) err = %v, want ErrForbidden — the premise of this test is that auditor cannot mint", err)
+	}
+
+	// A link at the reader's own role: SubsetOf is reflexive, so the
+	// escalation half of the test passes and only the mint capability can
+	// redact it.
+	_, ownCode, err := f.isvc.CreateLink(f.ctx("owner"), "auditor", 0, nil)
+	if err != nil {
+		t.Fatalf("CreateLink(owner -> auditor): %v", err)
+	}
+	// And one strictly above them, which both halves would redact.
+	if _, _, err := f.isvc.CreateLink(f.ctx("owner"), org.RoleOwner, 0, nil); err != nil {
+		t.Fatalf("CreateLink(owner -> owner): %v", err)
+	}
+
+	links, err := f.isvc.ListLinks(f.ctx("auditor1"))
+	if err != nil {
+		t.Fatalf("ListLinks: %v", err)
+	}
+	if len(links) != 2 {
+		t.Fatalf("len(links) = %d, want 2 — invite:read still lists every link", len(links))
+	}
+	for _, l := range links {
+		if l.Code != "" {
+			t.Fatalf("RoleKey %q Code = %q, want redacted: a reader without invite:create could not have minted ANY link, whatever the role", l.RoleKey, l.Code)
+		}
+	}
+	if ownCode == "" {
+		t.Fatal("the real code is empty; the assertion above would pass vacuously")
+	}
+	// Every other field must still survive, exactly as for the escalation
+	// half: a read-only auditor screen still lists links, it just cannot
+	// read a code back.
+	byRole := map[string]invite.Link{}
+	for _, l := range links {
+		byRole[l.RoleKey] = l
+	}
+	if got := byRole["auditor"]; got.ContainerID != f.cID || got.CreatedBy != "owner" || got.ID == "" {
+		t.Fatalf("link = %+v, want ContainerID/CreatedBy/ID still populated", got)
+	}
+}
+
+// TestListLinksKeepsCodeForAMinterOnlyWithinTheirStanding pins half two,
+// and that half one did not swallow it: a reader holding BOTH invite:read
+// and invite:create still sees a Code only for links whose role they
+// subsume. Together with the test above it fixes the conjunction — neither
+// half alone is sufficient, and adding the invite:create gate must not have
+// turned into "any minter sees everything".
+func TestListLinksKeepsCodeForAMinterOnlyWithinTheirStanding(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.sc.CreateRole(f.ctx("owner"), "auditor", "Auditor", map[string][]access.Action{
+		scope.ResourceInvite: {scope.ActionRead},
+	}); err != nil {
+		t.Fatalf("CreateRole(auditor): %v", err)
+	}
+	if _, err := f.sc.CreateRole(f.ctx("owner"), "recruiter", "Recruiter", map[string][]access.Action{
+		scope.ResourceInvite: {scope.ActionCreate, scope.ActionRead},
+	}); err != nil {
+		t.Fatalf("CreateRole(recruiter): %v", err)
+	}
+	f.addMember("recruiter1", "recruiter")
+
+	// Minted by the reader themselves, at a role strictly weaker than their
+	// own standing ({invite:read} ⊂ {invite:create, invite:read}).
+	_, belowCode, err := f.isvc.CreateLink(f.ctx("recruiter1"), "auditor", 0, nil)
+	if err != nil {
+		t.Fatalf("CreateLink(recruiter1 -> auditor): %v", err)
+	}
+	// Minted by the owner at a role far above the reader.
+	_, aboveCode, err := f.isvc.CreateLink(f.ctx("owner"), org.RoleOwner, 0, nil)
+	if err != nil {
+		t.Fatalf("CreateLink(owner -> owner): %v", err)
+	}
+
+	links, err := f.isvc.ListLinks(f.ctx("recruiter1"))
+	if err != nil {
+		t.Fatalf("ListLinks: %v", err)
+	}
+	byRole := map[string]invite.Link{}
+	for _, l := range links {
+		byRole[l.RoleKey] = l
+	}
+	if byRole["auditor"].Code != belowCode {
+		t.Fatalf("auditor-role link Code = %q, want %q kept — the reader holds invite:create and subsumes the role", byRole["auditor"].Code, belowCode)
+	}
+	if byRole[org.RoleOwner].Code != "" {
+		t.Fatalf("owner-role link Code = %q, want redacted — invite:create does not lift the escalation half", byRole[org.RoleOwner].Code)
+	}
+	if aboveCode == "" {
+		t.Fatal("the real owner code is empty; the assertion above would pass vacuously")
+	}
+}
+
 func TestListLinksRequiresInviteRead(t *testing.T) {
 	f := newFixture(t)
 	f.addMember("mallory", org.RoleMember)

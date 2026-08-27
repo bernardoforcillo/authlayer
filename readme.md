@@ -713,14 +713,29 @@ in clear, leaves the container, and rejoins at the owner role through
 `JoinViaLink` — which admits via `GrantMembership`, a call that runs no
 escalation check of its own, because the whole point of a link is to admit
 someone who has no standing yet to check. Two calls, full escalation, and
-every fine-grained check elsewhere in the codebase never touched. So
-`ListLinks` blanks a link's `Code` in the result unless the caller is elevated
-or the link's role resolves to a permission set that is a `SubsetOf` the
-caller's own current standing — the same test applied when the link was
-created, reapplied here because a role's grants (or the reader's own standing)
-can change afterwards. Every other field stays populated, so a management
-screen can still list a link and let its owner revoke it, even one whose code
-it cannot show back.
+every fine-grained check elsewhere in the codebase never touched. So a `Code`
+survives in `ListLinks`' result only when **both** halves of the mint test hold
+for the reader, because minting takes two things:
+
+1. **The capability** — the reader must hold `invite:create`, the same
+   permission `CreateLink` requires, resolved once for the whole list. A reader
+   granted `invite:read` *without* `invite:create` could not have minted any
+   link here, so they see no `Code` at all, whatever the roles involved.
+   Splitting a resource's actions across roles is the entire product, and
+   `CreateRole` will happily define an `auditor` granting only `invite:read`;
+   without this half, such a read-only reader would silently acquire the power
+   to admit arbitrary third parties, which is exactly what `invite:create`
+   exists to gate.
+2. **The standing** — the reader must be elevated, or the link's role must
+   resolve to a permission set that is a `SubsetOf` their own current standing.
+   That is the same test applied when the link was created, reapplied here
+   because a role's grants (or the reader's own standing) can change
+   afterwards.
+
+The two are independent: the first bounds *whether* this principal mints at
+all, the second bounds *how high*. Every other field stays populated, so a
+management screen can still list a link and let its owner revoke it, even one
+whose code it cannot show back.
 
 **Claim first, admit second — in both flows.** Acceptance spans two stores
 that may not share a database — the invite lives in `invite.Store`, the

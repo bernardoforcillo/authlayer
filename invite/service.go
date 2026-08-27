@@ -468,12 +468,34 @@ func (s *Service[C, M, PC, PM]) ListInvites(ctx context.Context) ([]EmailInvite,
 // someone who has no standing yet to check. Two calls, full escalation, and
 // every fine-grained check elsewhere in the codebase never touched.
 //
-// So: a link's Code survives in the result only when the ctx subject is
-// elevated, or the link's RoleKey resolves to a permission set that is a
-// SubsetOf the subject's own current standing — exactly the test
-// [Service.guardEscalation] applies when a link is created, reapplied here on
-// the way out, because a role's grants (or the reader's own standing) can
-// change after the link was minted. Every other field — ID, ContainerID,
+// So a Code survives in the result only when BOTH halves of the mint test
+// hold for the reader, because the invariant being defended is "nothing hands
+// a usable credential to a principal who could not have minted it", and
+// minting takes two things:
+//
+//  1. The capability. The reader must hold invite:create in the ctx container
+//     — the same permission [Service.CreateLink] requires — resolved once for
+//     the whole list via [scope.Service.Can], not per link. A reader granted
+//     invite:read WITHOUT invite:create could not have minted ANY link here,
+//     so they see no Code at all, whatever the roles involved. That
+//     configuration is ordinary and supported: splitting a resource's actions
+//     across roles is the entire product, and [scope.Service.CreateRole]
+//     accepts an "auditor" granting only invite:read. Without this half such
+//     a reader silently gains the power to admit arbitrary third parties —
+//     read-implies-admit — which is precisely the capability invite:create
+//     exists to gate. Note it does not shrink to a denial when the question
+//     cannot be answered: Can folds only ErrForbidden/ErrNotMember to false
+//     and surfaces everything else as an error.
+//
+//  2. The standing. The ctx subject must be elevated, or the link's RoleKey
+//     must resolve to a permission set that is a SubsetOf the subject's own
+//     current standing — exactly the test [Service.guardEscalation] applies
+//     when a link is created, reapplied here on the way out, because a role's
+//     grants (or the reader's own standing) can change after the link was
+//     minted.
+//
+// The two are independent and neither implies the other: (1) bounds WHETHER
+// this principal mints at all, (2) bounds HOW HIGH. Every other field — ID, ContainerID,
 // RoleKey, CreatedBy, MaxUses, UseCount, ExpiresAt, RevokedAt, CreatedAt —
 // stays populated, so a management screen can still list and let its owner
 // call [Service.RevokeLink] on a link whose Code they cannot read back.
@@ -493,7 +515,9 @@ func (s *Service[C, M, PC, PM]) ListInvites(ctx context.Context) ([]EmailInvite,
 // naming a handful of roles costs one RolePermissions call per distinct
 // role, not one per link.
 //
-// The ctx subject needs invite:read, same as [Service.ListInvites].
+// The ctx subject needs invite:read to call this at all, same as
+// [Service.ListInvites]; invite:create is not required to call it, only to
+// read any Code back.
 func (s *Service[C, M, PC, PM]) ListLinks(ctx context.Context) ([]Link, error) {
 	actor, containerID, err := ctxActor(ctx)
 	if err != nil {
@@ -508,6 +532,26 @@ func (s *Service[C, M, PC, PM]) ListLinks(ctx context.Context) ([]Link, error) {
 		return nil, err
 	}
 
+	// Half one of the mint test, asked once for the whole list rather than
+	// per link: could this reader have minted anything here at all? A
+	// reader without invite:create could not have, so every Code is blanked
+	// regardless of role — including for an elevated reader, so that the
+	// conjunction has no exception to reason about. (In practice an
+	// elevated subject holds Full permissions and so always clears this.)
+	mayMint, err := s.sc.Can(ctx, scope.ResourceInvite, scope.ActionCreate)
+	if err != nil {
+		return nil, err
+	}
+	if !mayMint {
+		out := make([]Link, len(links))
+		for i, l := range links {
+			l.Code = ""
+			out[i] = l
+		}
+		return out, nil
+	}
+
+	// Half two: how high could they have minted?
 	perms, elevated, err := s.sc.Standing(ctx, containerID, actor)
 	if err != nil {
 		return nil, err

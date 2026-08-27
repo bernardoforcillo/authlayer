@@ -119,15 +119,21 @@ once a 1.0 is cut. Until then, minor versions may break API.
   caller's own responsibility: `InviteByEmail` returns the plain token
   exactly once, and authlayer knows no base URL and owns no transport;
   `WithNotifier` is optional sugar over calling a `Notifier` yourself right
-  after. `ListLinks` blanks a link's `Code` in the result unless the caller
-  is elevated or the link's role resolves to a permission set that is a
-  `SubsetOf` their own current standing — load-bearing, not cosmetic, because
-  `invite:read` sits on the merged control-statement surface and so is
-  granted to the built-in `admin` automatically (see the next entry), and
-  `admin` is deliberately not `IsFull`; without this redaction a non-elevated
-  admin could read the owner's link code in clear, leave the container, and
-  rejoin at the owner role through `JoinViaLink`, since `GrantMembership`
-  runs no escalation check of its own. `WithRecheckInviterOnAccept` (default
+  after. `ListLinks` keeps a link's `Code` in the result only when the caller
+  holds `invite:create` — the same permission `CreateLink` requires, so a
+  reader granted `invite:read` alone sees no code at all — AND is elevated or
+  the link's role resolves to a permission set that is a `SubsetOf` their own
+  current standing; everything else is blanked. Both halves are load-bearing,
+  not cosmetic. The standing half exists because `invite:read` sits on the
+  merged control-statement surface and so is granted to the built-in `admin`
+  automatically (see the next entry), and `admin` is deliberately not
+  `IsFull`; without it a non-elevated admin could read the owner's link code
+  in clear, leave the container, and rejoin at the owner role through
+  `JoinViaLink`, since `GrantMembership` runs no escalation check of its own.
+  The capability half exists because a reader with `invite:read` and no
+  `invite:create` could not have minted *any* link, so handing them a working
+  code would make read imply admit and let them admit arbitrary third
+  parties. `WithRecheckInviterOnAccept` (default
   `true`) re-runs the privilege-escalation guard against the inviter's
   CURRENT standing before `AcceptInvite`/`JoinViaLink` admit anyone, so a
   since-demoted or since-departed inviter's pending invitation stops paying
