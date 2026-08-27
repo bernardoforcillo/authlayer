@@ -297,6 +297,40 @@ func (s *Service[C, M, PC, PM]) guardEscalation(ctx context.Context, containerID
 	return nil
 }
 
+// recheckValid reports whether the escalation guard, reapplied against
+// inviterID's CURRENT standing, would currently admit — the same question
+// [Service.AcceptInvite] and [Service.JoinViaLink] ask via [guardEscalation]
+// when [WithRecheckInviterOnAccept] is enabled, exposed here so
+// [Service.PreviewInvite] and [Service.PreviewLink] can report a Valid that
+// actually matches what acceptance will do, instead of going stale the
+// moment an inviter's standing changes.
+//
+// The knob being off short-circuits to (true, nil): the recheck plays no
+// part in acceptance, so it plays no part in the preview either.
+//
+// A refusal acceptance itself would treat as a refusal —
+// scope.ErrPrivilegeEscalation, scope.ErrRoleNotFound (the role was deleted),
+// or scope.ErrNotMember (the inviter left) — is folded into (false, nil):
+// those are answers, not failures to answer, matching how [Preview.Valid]
+// already folds an expired token or a revoked link. Anything else — a store
+// failure, typically — is returned as an error rather than silently read as
+// "not valid", the same discipline [scope.Service.Can]'s own doc describes:
+// a question that could not be answered must never be narrowed into a denial.
+func (s *Service[C, M, PC, PM]) recheckValid(ctx context.Context, containerID, inviterID, roleKey string) (bool, error) {
+	if !s.cfg.recheckInviterOnAccept {
+		return true, nil
+	}
+	err := s.guardEscalation(ctx, containerID, inviterID, roleKey)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, scope.ErrPrivilegeEscalation), errors.Is(err, scope.ErrRoleNotFound), errors.Is(err, scope.ErrNotMember):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 // InviteByEmail mints a one-time invitation for email to hold roleKey once
 // accepted, and returns the plain token alongside the stored record. The
 // plain value is returned exactly once and never again — only its sha256 is
@@ -580,33 +614,64 @@ func (s *Service[C, M, PC, PM]) RevokeLink(ctx context.Context, id string) error
 //
 // Acceptance spans two stores that may not share a database — the invite
 // lives in this package's own Store, the membership in [scope.Service]'s —
-// so there is no cross-store transaction, and this method is idempotent
-// rather than atomic. It grants the membership FIRST and deletes the invite
-// SECOND. If the delete fails after the grant already succeeded, the invite
-// row survives and a retry presents the same token again: the second
-// [scope.Service.GrantMembership] call reports scope.ErrAlreadyMember, which
-// this method treats as success rather than an error, and the delete is
-// attempted again. Net effect: at-least-once delivery of an operation that is
-// safe to repeat. The reverse order — delete first, grant second — would not
-// be: a delete that succeeds followed by a grant that fails leaves no invite
-// row to retry with, so the invitee is simply never admitted, with nothing
-// left telling anyone why.
+// so there is no cross-store transaction. This method claims the invite
+// FIRST and grants the membership SECOND — the same direction
+// [Service.JoinViaLink] uses for a link's use, and for the identical reason.
+// The claim is [Store.DeleteEmailInvite], whose contract is rows-affected
+// gated: it reports [ErrInviteNotFound] when no row matched, so of any two
+// callers racing to delete the same id — including the same token presented
+// twice — at most one can ever see a nil error. Only that caller proceeds to
+// [scope.Service.GrantMembership]; the other is refused with
+// ErrInviteNotFound, indistinguishable from the token never having existed.
+// That is the same claim-then-admit shape [Store.ConsumeLink] already gives
+// a link, just expressed through a delete's rows-affected count instead of
+// an UPDATE's — both stores already implement DeleteEmailInvite this way
+// (store/memory holds its mutex across the check-and-delete; store/drops'
+// DELETE is a single statement gated on rows affected), so no store change
+// was needed to get this property.
 //
-// A first accept still fully consumes the invite: [Store.DeleteEmailInvite]
-// not finding the row it just deleted is impossible on a single successful
-// path, but a concurrent duplicate accept racing the delete can see
-// [ErrInviteNotFound] there too — treated the same as ErrAlreadyMember, since
-// by that point the invite has already done its job.
+// The reverse order — admit first, claim second — is what an earlier version
+// of this method did, and it is a Critical: while the invite row still
+// exists, the token stays redeemable by ANYONE presenting it, not merely by
+// the original caller retrying. A one-time credential must never pay out more
+// than once; this package's own stated rule for [Service.JoinViaLink] is
+// "over-admission past a use limit... is the one direction this package must
+// never fail open in" — an email invite's MaxUses is implicitly one, and the
+// same rule applies here.
 //
-// # What is checked before admitting
+// One consequence worth stating plainly: accepting is NOT safe to retry with
+// the same token. If GrantMembership fails after the claim already succeeded
+// — a store outage, an unresolvable role — the invite is gone and cannot be
+// re-presented; the invitee must be re-invited ([Service.InviteByEmail],
+// which replaces any prior pending invite for the same address). This is the
+// same trade [Service.JoinViaLink] already makes for a link: a failure after
+// the claim under-admits (burns the credential, admits no one extra), which
+// is the safe direction, at the cost of idempotent retries.
+//
+// scope.ErrAlreadyMember from GrantMembership is still folded to success:
+// the subject already holds the outcome the invitation exists to produce.
+// One sharp edge that follows from that fold: a member who already holds a
+// LOWER role than the invitation grants gets no error and no promotion — the
+// invite is consumed, their membership is left exactly as it was, and
+// nothing in this call's return value distinguishes "already had this role"
+// from "already had a lesser one". This never over-privileges — folding a
+// duplicate can only leave someone at or below what they already had — but
+// it can silently under-deliver an intended promotion. An application that
+// needs to detect that case should check [scope.Service.Standing] before
+// calling AcceptInvite, or route promotions through
+// [scope.Service.ChangeMemberRole] rather than a fresh invitation.
+//
+// # What is checked before claiming
 //
 // The presented token is hashed and looked up by hash — the plain value is
 // never stored (see [EmailInvite]) — an unknown token is [ErrInviteNotFound].
 // A token past its ExpiresAt is [ErrInviteExpired] and admits no one; this is
-// checked before anything else runs, so an expired token never reaches
-// GrantMembership at all. Unless [WithRecheckInviterOnAccept] was set to
-// false, the escalation guard then re-runs against the inviter's CURRENT
-// standing — see that option's doc for what changed and why.
+// checked before anything else runs, so an expired token is never claimed
+// (or admitted) — [Service.PurgeExpired] remains the intended way to remove
+// it. Unless [WithRecheckInviterOnAccept] was set to false, the escalation
+// guard then re-runs against the inviter's CURRENT standing — see that
+// option's doc for what changed and why — before the invite is claimed, so a
+// refused recheck does not spend the credential either.
 func (s *Service[C, M, PC, PM]) AcceptInvite(ctx context.Context, plainToken string) (C, error) {
 	var zero C
 	subject, ok := scope.SubjectFrom(ctx)
@@ -628,15 +693,16 @@ func (s *Service[C, M, PC, PM]) AcceptInvite(ctx context.Context, plainToken str
 		}
 	}
 
-	if _, err := s.sc.GrantMembership(ctx, inv.ContainerID, subject, inv.RoleKey); err != nil &&
-		!errors.Is(err, scope.ErrAlreadyMember) {
+	// The claim: DeleteEmailInvite's rows-affected contract means at most one
+	// caller ever sees a nil error for this id. Losing the race — including a
+	// second presentation of the SAME token — is ErrInviteNotFound, exactly as
+	// if the token had never existed. Only the winner proceeds.
+	if err := s.st.DeleteEmailInvite(ctx, inv.ID); err != nil {
 		return zero, err
 	}
 
-	// Idempotent on the way out too: a row already gone (a concurrent accept
-	// that finished first) means the goal — no invite row, subject admitted —
-	// is already achieved, so it is not surfaced as a failure of this call.
-	if err := s.st.DeleteEmailInvite(ctx, inv.ID); err != nil && !errors.Is(err, ErrInviteNotFound) {
+	if _, err := s.sc.GrantMembership(ctx, inv.ContainerID, subject, inv.RoleKey); err != nil &&
+		!errors.Is(err, scope.ErrAlreadyMember) {
 		return zero, err
 	}
 
@@ -730,6 +796,16 @@ func (s *Service[C, M, PC, PM]) JoinViaLink(ctx context.Context, code string) (C
 		}
 	}
 
+	// Unlike AcceptInvite, an ErrAlreadyMember here is NOT folded to success.
+	// That is a deliberate choice but not a safety one either way: ConsumeLink
+	// above already ran and already burned the use before this call, so
+	// folding would cost zero additional uses if it were added — the
+	// candidate ordering couldn't produce it under the normal "already a
+	// member" short-circuit earlier in this method, only under the narrow
+	// same-subject race where two calls both pass that check before either
+	// writes. Left unfolded because that race is rare enough that a surfaced
+	// error (prompting a caller to just re-check their own membership) is a
+	// reasonable default, not because folding it would be unsafe.
 	if _, err := s.sc.GrantMembership(ctx, l.ContainerID, subject, l.RoleKey); err != nil {
 		return zero, err
 	}
@@ -739,34 +815,50 @@ func (s *Service[C, M, PC, PM]) JoinViaLink(ctx context.Context, code string) (C
 
 // PreviewInvite resolves a plain email token to a [Preview], for an
 // unauthenticated "you've been invited" page. It reads nothing from the
-// context and performs no permission check — there is no standing to check
-// yet, which is exactly the situation such a page is in — and it never
-// exposes the container record itself, only ContainerID, RoleKey, Email and
-// whether accepting would currently succeed.
+// context and performs no permission check of its own caller — there is no
+// standing to check yet, which is exactly the situation such a page is in —
+// and it never exposes the container record itself, only ContainerID,
+// RoleKey, Email and whether accepting would currently succeed.
 //
 // An unknown token is [ErrInviteNotFound]. A known but expired one is not an
 // error: Preview.Valid is false and the rest of the fields stay populated,
 // so the page can say "this invitation has expired" rather than a generic
-// failure.
+// failure. Unless [WithRecheckInviterOnAccept] was set to false, an
+// unexpired token whose inviter's CURRENT standing would now fail the
+// escalation guard is ALSO reported as Valid=false, via [recheckValid] — the
+// same question [Service.AcceptInvite] asks before admitting, asked here too
+// so this preview cannot tell an unauthenticated visitor their invitation is
+// good when acceptance would immediately refuse it with
+// scope.ErrPrivilegeEscalation.
 func (s *Service[C, M, PC, PM]) PreviewInvite(ctx context.Context, plainToken string) (Preview, error) {
 	inv, err := s.st.FindEmailInviteByTokenHash(ctx, hashToken(plainToken))
 	if err != nil {
 		return Preview{}, err
 	}
+	valid := time.Now().UTC().Before(inv.ExpiresAt)
+	if valid {
+		valid, err = s.recheckValid(ctx, inv.ContainerID, inv.InvitedBy, inv.RoleKey)
+		if err != nil {
+			return Preview{}, err
+		}
+	}
 	return Preview{
 		ContainerID: inv.ContainerID,
 		RoleKey:     inv.RoleKey,
 		Email:       inv.Email,
-		Valid:       time.Now().UTC().Before(inv.ExpiresAt),
+		Valid:       valid,
 	}, nil
 }
 
 // PreviewLink resolves a link code to a [Preview], the link equivalent of
 // [Service.PreviewInvite]. Email is always empty — a link has no single
 // named recipient — and Valid folds every reason redemption could currently
-// fail (revoked, expired, exhausted) into one boolean, since a preview has
-// no need to distinguish which: JoinViaLink is what will surface the
-// specific sentinel on an actual redemption attempt.
+// fail (revoked, expired, exhausted, and — unless [WithRecheckInviterOnAccept]
+// was set to false — the creator's current standing no longer supporting the
+// role, via [recheckValid], for the same reason [Service.PreviewInvite]
+// checks it) into one boolean, since a preview has no need to distinguish
+// which: [Service.JoinViaLink] is what will surface the specific sentinel on
+// an actual redemption attempt.
 //
 // It performs no check that would consume the link — computing Valid costs
 // nothing, and previewing a link must never be the thing that exhausts it.
@@ -778,6 +870,12 @@ func (s *Service[C, M, PC, PM]) PreviewLink(ctx context.Context, code string) (P
 	valid := l.RevokedAt == nil &&
 		(l.ExpiresAt == nil || time.Now().UTC().Before(*l.ExpiresAt)) &&
 		(l.MaxUses == 0 || l.UseCount < l.MaxUses)
+	if valid {
+		valid, err = s.recheckValid(ctx, l.ContainerID, l.CreatedBy, l.RoleKey)
+		if err != nil {
+			return Preview{}, err
+		}
+	}
 	return Preview{
 		ContainerID: l.ContainerID,
 		RoleKey:     l.RoleKey,

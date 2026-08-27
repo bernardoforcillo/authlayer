@@ -551,7 +551,12 @@ func (s *Service[C, M, PC, PM]) RolePermissions(ctx context.Context, containerID
 // entitled to ask, exactly like [Service.Standing] and [Service.RolePermissions].
 // Do not expose it directly to end users: nothing here consults
 // [Service.Authorize] or [Service.Can], so a caller must have already made its
-// own decision that returning this container is appropriate.
+// own decision that returning this container is appropriate. Note the
+// disclosure surface is larger than those two precedents': Standing and
+// RolePermissions each answer one narrow question, while this returns the
+// WHOLE container record — including any application-defined fields C
+// carries beyond ContainerBase — so a caller handing the result onward should
+// consider whether every field belongs in front of whoever is asking.
 func (s *Service[C, M, PC, PM]) Container(ctx context.Context, id string) (C, error) {
 	return s.store.FindContainer(ctx, id)
 }

@@ -893,6 +893,98 @@ func TestPreviewLinkUnknownCode(t *testing.T) {
 	}
 }
 
+// TestPreviewInviteReflectsRecheckInviterOnAccept pins the fix for the
+// review's I2: before this fix, Preview.Valid ignored the
+// RecheckInviterOnAccept refusal reason entirely, so an unauthenticated
+// invite page could tell a visitor their invitation was good right up until
+// AcceptInvite bounced them with scope.ErrPrivilegeEscalation. The preview
+// must now agree with what acceptance is about to do.
+func TestPreviewInviteReflectsRecheckInviterOnAccept(t *testing.T) {
+	f := newFixture(t)
+	f.addMember("admin1", org.RoleAdmin)
+
+	_, token, err := f.isvc.InviteByEmail(f.ctx("admin1"), "alice@example.com", org.RoleAdmin)
+	if err != nil {
+		t.Fatalf("InviteByEmail: %v", err)
+	}
+
+	if p, err := f.isvc.PreviewInvite(context.Background(), token); err != nil || !p.Valid {
+		t.Fatalf("PreviewInvite before demotion = %+v, %v, want Valid=true", p, err)
+	}
+
+	if err := f.sc.ChangeMemberRole(f.ctx("owner"), "admin1", org.RoleMember); err != nil {
+		t.Fatalf("ChangeMemberRole: %v", err)
+	}
+
+	p, err := f.isvc.PreviewInvite(context.Background(), token)
+	if err != nil {
+		t.Fatalf("PreviewInvite after demotion: %v", err)
+	}
+	if p.Valid {
+		t.Fatal("preview reported Valid = true for an invitation whose inviter can no longer support the role")
+	}
+	if p.RoleKey != org.RoleAdmin {
+		t.Fatalf("a not-valid preview should still report its other fields: %+v", p)
+	}
+
+	// The preview and acceptance must agree.
+	if _, err := f.isvc.AcceptInvite(scope.WithSubject(context.Background(), "alice"), token); !errors.Is(err, scope.ErrPrivilegeEscalation) {
+		t.Fatalf("AcceptInvite err = %v, want ErrPrivilegeEscalation, matching the preview", err)
+	}
+}
+
+// TestPreviewInviteWithRecheckOffIgnoresInviterDemotion is the mirror: with
+// the knob off, the same demotion must not affect the preview either, since
+// AcceptInvite itself would not check it.
+func TestPreviewInviteWithRecheckOffIgnoresInviterDemotion(t *testing.T) {
+	f := newFixture(t, invite.WithRecheckInviterOnAccept(false))
+	f.addMember("admin1", org.RoleAdmin)
+
+	_, token, err := f.isvc.InviteByEmail(f.ctx("admin1"), "alice@example.com", org.RoleAdmin)
+	if err != nil {
+		t.Fatalf("InviteByEmail: %v", err)
+	}
+	if err := f.sc.ChangeMemberRole(f.ctx("owner"), "admin1", org.RoleMember); err != nil {
+		t.Fatalf("ChangeMemberRole: %v", err)
+	}
+
+	if p, err := f.isvc.PreviewInvite(context.Background(), token); err != nil || !p.Valid {
+		t.Fatalf("PreviewInvite with the recheck disabled = %+v, %v, want Valid=true", p, err)
+	}
+}
+
+// TestPreviewLinkReflectsRecheckInviterOnAccept is PreviewLink's counterpart
+// to TestPreviewInviteReflectsRecheckInviterOnAccept.
+func TestPreviewLinkReflectsRecheckInviterOnAccept(t *testing.T) {
+	f := newFixture(t)
+	f.addMember("admin1", org.RoleAdmin)
+
+	_, code, err := f.isvc.CreateLink(f.ctx("admin1"), org.RoleAdmin, 0, nil)
+	if err != nil {
+		t.Fatalf("CreateLink: %v", err)
+	}
+
+	if p, err := f.isvc.PreviewLink(context.Background(), code); err != nil || !p.Valid {
+		t.Fatalf("PreviewLink before demotion = %+v, %v, want Valid=true", p, err)
+	}
+
+	if err := f.sc.ChangeMemberRole(f.ctx("owner"), "admin1", org.RoleMember); err != nil {
+		t.Fatalf("ChangeMemberRole: %v", err)
+	}
+
+	p, err := f.isvc.PreviewLink(context.Background(), code)
+	if err != nil {
+		t.Fatalf("PreviewLink after demotion: %v", err)
+	}
+	if p.Valid {
+		t.Fatal("preview reported Valid = true for a link whose creator can no longer support the role")
+	}
+
+	if _, err := f.isvc.JoinViaLink(scope.WithSubject(context.Background(), "alice"), code); !errors.Is(err, scope.ErrPrivilegeEscalation) {
+		t.Fatalf("JoinViaLink err = %v, want ErrPrivilegeEscalation, matching the preview", err)
+	}
+}
+
 // ── PurgeExpired ─────────────────────────────────────────────────────────────
 
 func TestPurgeExpiredDelegatesToStore(t *testing.T) {
@@ -957,62 +1049,42 @@ func TestAcceptInviteAdmitsAtInvitedRoleAndDeletesInvite(t *testing.T) {
 	}
 }
 
-// leakyInviteStore wraps a real Store but makes DeleteEmailInvite silently
-// report success without actually removing the row. It simulates the exact
-// partial failure AcceptInvite's ordering (grant the membership first, delete
-// the invite second) is built to survive: the membership lands, but the
-// invite's own deletion does not take effect, so the row is still there for a
-// retry to find.
-type leakyInviteStore struct {
-	invite.Store
-}
-
-func (leakyInviteStore) DeleteEmailInvite(context.Context, string) error { return nil }
-
-// TestAcceptInviteSecondCallAfterALeakedDeleteIsANoOpNotAnError pins the
-// idempotency the two-store split depends on. Because a successful
-// AcceptInvite normally deletes the invite row, presenting the same token
-// twice against a fully-working Store cannot demonstrate the idempotency
-// path at all — the second call would simply see ErrInviteNotFound. The only
-// way to exercise "accepting twice" the way the plan actually means it is to
-// simulate the delete half of the ordering failing (here, via
-// leakyInviteStore) so the row survives for a second AcceptInvite call to
-// find. That second call must re-run GrantMembership, get
-// scope.ErrAlreadyMember, treat it as success, and return the container with
-// no error — not fail, and not admit alice a second time.
-func TestAcceptInviteSecondCallAfterALeakedDeleteIsANoOpNotAnError(t *testing.T) {
-	ac := org.NewAccess(nil)
-	sst := memory.New[org.Organization, org.Member]()
-	sc := scope.New[org.Organization, org.Member](ac, sst)
-	isvc := invite.New(sc, leakyInviteStore{memory.NewInviteStore()})
-
-	octx := scope.WithSubject(context.Background(), "owner")
-	c, err := sc.CreateContainer(octx, org.Organization{Name: "Acme", Slug: "acme-leaky"})
-	if err != nil {
-		t.Fatalf("CreateContainer: %v", err)
-	}
-	cctx := scope.WithScope(octx, c.ContainerID())
-
-	_, token, err := isvc.InviteByEmail(cctx, "alice@example.com", org.RoleMember)
+// TestAcceptInviteSecondPresentationOfTheSameTokenIsRefused replaces an
+// earlier "accepting twice is a no-op" test that pinned the WRONG design.
+// AcceptInvite used to grant the membership first and delete the invite
+// second, on the theory that a delete failure left a retryable row behind —
+// but nothing actually claimed the invite before admitting, so while the row
+// lived, the token stayed redeemable by anyone holding it, not merely by the
+// original caller retrying (reproduced live: 14 of 400 concurrent rounds
+// admitted two distinct subjects from one invitation, no fault injection
+// needed — see TestAcceptInviteConcurrentCallsAdmitExactlyOneSubject below).
+//
+// With claim-first (delete via [Store.DeleteEmailInvite]'s rows-affected
+// contract, then grant), the invite is a genuine one-time credential: the
+// first AcceptInvite call claims and consumes it, and a second presentation
+// of the SAME token — a deliberate retry by the same subject, or anyone else
+// who obtained the token — finds nothing left to claim.
+// [invite.ErrInviteNotFound] is the sentinel chosen because it is exactly
+// what DeleteEmailInvite's own contract already returns for "no row
+// matched" (invite/invite.go), and losing the claim race is indistinguishable
+// from the token never having existed at all — the same framing
+// [Store.ConsumeLink] already uses for a link's losing callers.
+func TestAcceptInviteSecondPresentationOfTheSameTokenIsRefused(t *testing.T) {
+	f := newFixture(t)
+	_, token, err := f.isvc.InviteByEmail(f.ctx("owner"), "alice@example.com", org.RoleMember)
 	if err != nil {
 		t.Fatalf("InviteByEmail: %v", err)
 	}
 
-	aliceCtx := scope.WithSubject(context.Background(), "alice")
-	got1, err := isvc.AcceptInvite(aliceCtx, token)
-	if err != nil {
+	if _, err := f.isvc.AcceptInvite(scope.WithSubject(context.Background(), "alice"), token); err != nil {
 		t.Fatalf("first AcceptInvite: %v", err)
 	}
 
-	got2, err := isvc.AcceptInvite(aliceCtx, token)
-	if err != nil {
-		t.Fatalf("second AcceptInvite (retry after a leaked delete) = %v, want a no-op success", err)
-	}
-	if got2.ContainerID() != got1.ContainerID() {
-		t.Fatalf("second AcceptInvite container = %s, want %s", got2.ContainerID(), got1.ContainerID())
+	if _, err := f.isvc.AcceptInvite(scope.WithSubject(context.Background(), "alice"), token); !errors.Is(err, invite.ErrInviteNotFound) {
+		t.Fatalf("second AcceptInvite with the same token err = %v, want ErrInviteNotFound", err)
 	}
 
-	members, err := sc.ListMembers(cctx)
+	members, err := f.sc.ListMembers(f.ctx("owner"))
 	if err != nil {
 		t.Fatalf("ListMembers: %v", err)
 	}
@@ -1023,7 +1095,112 @@ func TestAcceptInviteSecondCallAfterALeakedDeleteIsANoOpNotAnError(t *testing.T)
 		}
 	}
 	if n != 1 {
-		t.Fatalf("alice has %d membership rows after two AcceptInvite calls, want exactly 1", n)
+		t.Fatalf("alice has %d membership rows, want exactly 1 — the refused retry must not admit her again", n)
+	}
+}
+
+// TestAcceptInviteConcurrentCallsAdmitExactlyOneSubject is the test the
+// review found missing, and the one that actually demonstrated the Critical:
+// n distinct, previously-unseen subjects all present the SAME one-time
+// token at once. A one-time email invitation is, in effect, a MaxUses:1
+// credential; this is AcceptInvite's counterpart to
+// TestJoinViaLinkConcurrentCallsNeverExceedMaxUses, and it does not need any
+// fault injection to fail against the grant-first ordering — that ordering
+// left the token redeemable by anyone holding it for as long as the row
+// existed, with no claim step gating admission at all.
+//
+// Unlike TestJoinViaLinkConcurrentCallsNeverExceedMaxUses' mutation (which
+// fails 100% of runs, since the reversed link order removes GrantMembership's
+// gate entirely), this one is a genuine race and is NOT deterministic per
+// run: only a candidate whose own FindEmailInviteByTokenHash executes before
+// the eventual winner's delete removes the row gets far enough to exploit
+// grant-first at all, and store/memory's find is a mutex-held linear scan
+// fast enough that one goroutine frequently runs the whole find-grant-delete
+// sequence before a second one is even scheduled. Measured directly against
+// the grant-first mutation at n=400: 6 of 10 runs failed (joined=2), 4 of 10
+// passed (joined=1) — a strong majority, not a rare fluke, and well above
+// what "run it a few times" would miss, but still not the 100% the link
+// test gets. Raising n to 2000 did not meaningfully improve the hit rate
+// (3 of 10 failed) — the window is bounded by scheduling, not by how many
+// candidates are waiting behind it. This is the same class of caveat
+// store/memory's own TestConsumeLinkConcurrencyExactlyOneWinner documents:
+// a green run here is evidence the happy path works, and a red run is
+// unambiguous proof of the bug, but a lone green run under a SUSPECTED
+// regression is not proof the regression is absent — rerun a handful of
+// times, or inspect the ordering directly.
+func TestAcceptInviteConcurrentCallsAdmitExactlyOneSubject(t *testing.T) {
+	f := newFixture(t)
+	_, token, err := f.isvc.InviteByEmail(f.ctx("owner"), "shared@example.com", org.RoleMember)
+	if err != nil {
+		t.Fatalf("InviteByEmail: %v", err)
+	}
+
+	const n = 400
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := range n {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, _ = f.isvc.AcceptInvite(scope.WithSubject(context.Background(), fmt.Sprintf("candidate%d", i)), token)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	members, err := f.sc.ListMembers(f.ctx("owner"))
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	joined := 0
+	for _, m := range members {
+		if strings.HasPrefix(m.MemberUser(), "candidate") {
+			joined++
+		}
+	}
+	if joined != 1 {
+		t.Fatalf("joined = %d of %d concurrent candidates presenting the SAME one-time token, want exactly 1", joined, n)
+	}
+}
+
+// TestAcceptInviteForExistingLowerRoleMemberDoesNotPromote pins the
+// documented sharp edge of folding scope.ErrAlreadyMember to success: a
+// member who already holds a role BELOW the invitation's is not promoted,
+// gets no error, and the invitation is still consumed (never over-privileges,
+// can silently under-deliver an intended promotion — see AcceptInvite's own
+// doc comment).
+func TestAcceptInviteForExistingLowerRoleMemberDoesNotPromote(t *testing.T) {
+	f := newFixture(t)
+	f.addMember("alice", org.RoleMember)
+
+	inv, token, err := f.isvc.InviteByEmail(f.ctx("owner"), "alice@example.com", org.RoleAdmin)
+	if err != nil {
+		t.Fatalf("InviteByEmail: %v", err)
+	}
+
+	c, err := f.isvc.AcceptInvite(scope.WithSubject(context.Background(), "alice"), token)
+	if err != nil {
+		t.Fatalf("AcceptInvite: %v", err)
+	}
+	if c.ContainerID() != f.cID {
+		t.Fatalf("container = %s, want %s", c.ContainerID(), f.cID)
+	}
+
+	members, err := f.sc.ListMembers(f.ctx("owner"))
+	if err != nil {
+		t.Fatalf("ListMembers: %v", err)
+	}
+	role, ok := memberRole(members, "alice")
+	if !ok {
+		t.Fatal("alice is no longer a member")
+	}
+	if role != org.RoleMember {
+		t.Fatalf("alice's role = %q, want %q (unchanged — folding ErrAlreadyMember must not promote)", role, org.RoleMember)
+	}
+
+	if _, err := f.ist.FindEmailInvite(context.Background(), inv.ID); !errors.Is(err, invite.ErrInviteNotFound) {
+		t.Fatalf("post-accept invite lookup err = %v, want ErrInviteNotFound — the invite is consumed even though it did not promote", err)
 	}
 }
 
