@@ -213,7 +213,7 @@ func NormalizeEmail(s string) string {
 // the service layer built on top. Compare with [errors.Is], never by string —
 // the messages are not part of the API.
 //
-// They fall into two groups:
+// They fall into three groups:
 //
 //   - Not found — ErrUserNotFound, ErrSessionNotFound,
 //     ErrVerificationNotFound. A Store returns these itself whenever a
@@ -230,6 +230,10 @@ func NormalizeEmail(s string) string {
 //     comparison is always on the normalized form. CreateUser, CreateSession
 //     and CreateVerification return ErrIDTaken when the given id already
 //     identifies a row of that same kind — see each method's own doc.
+//   - Precondition — ErrEmailMismatch. [Store.MarkEmailVerified] returns
+//     this when the email the caller is certifying is not the user's
+//     current address; see that method's own doc for why this exists and
+//     what race it closes.
 var (
 	// ErrUserNotFound: no user with that id or email exists.
 	ErrUserNotFound = errors.New("authlayer/auth: user not found")
@@ -246,6 +250,11 @@ var (
 	// ErrVerificationNotFound: no verification with that id or token hash
 	// exists.
 	ErrVerificationNotFound = errors.New("authlayer/auth: verification not found")
+	// ErrEmailMismatch: [Store.MarkEmailVerified] was asked to certify an
+	// email that is not the user's current address. See that method's own
+	// doc for why it requires and checks the address rather than trusting
+	// whatever the row currently holds.
+	ErrEmailMismatch = errors.New("authlayer/auth: email does not match the user's current address")
 )
 
 // Store is the persistence port for authentication. Unlike scope.Store it is
@@ -276,14 +285,34 @@ type Store interface {
 	// there is none.
 	FindUserByEmail(ctx context.Context, email string) (UserBase, error)
 	// MarkEmailVerified stamps EmailVerifiedAt and UpdatedAt with now on the
-	// user identified by userID, returning ErrUserNotFound when there is
-	// none. Calling it again after the address is already verified simply
-	// re-stamps both timestamps to the new now — it is idempotent, not an
-	// error. This is the redemption step for a "signup"-purpose Verification,
-	// and the step an "email_change" redemption calls immediately after
-	// UpdateUserEmail — see that method's doc for why the two are separate
-	// calls rather than one.
-	MarkEmailVerified(ctx context.Context, userID string, now time.Time) error
+	// user identified by userID, but only if email (normalized — see
+	// [NormalizeEmail]) matches that user's *current* Email. Returns
+	// ErrUserNotFound when there is no such user, or ErrEmailMismatch when
+	// the user exists but its current Email is not the one the caller is
+	// certifying. Calling it again with the same, still-current email after
+	// the address is already verified simply re-stamps both timestamps to
+	// the new now — it is idempotent, not an error.
+	//
+	// email exists to close a race with UpdateUserEmail, not as a redundant
+	// double-check. A verification token is minted for one specific
+	// address, and time can pass before it is redeemed; during that window
+	// a different flow can call UpdateUserEmail and change the row's Email
+	// out from under the pending verification. A MarkEmailVerified that took
+	// only userID would certify whatever address the row happened to hold
+	// at the instant it ran — possibly an address nobody has proven control
+	// of at all, which is exactly the outcome UpdateUserEmail's
+	// clear-EmailVerifiedAt-on-change behavior exists to prevent,
+	// reintroduced silently through the gap between one flow's
+	// UpdateUserEmail call and its own following MarkEmailVerified call.
+	// Requiring and checking email turns that race into a loud
+	// ErrEmailMismatch instead of a silent false verification: this is the
+	// redemption step for a "signup"-purpose Verification, and the step an
+	// "email_change" redemption calls immediately after UpdateUserEmail —
+	// in both cases, the caller passes the exact address the Verification's
+	// token was minted for (Verification.NewEmail for email_change,
+	// UserBase.Email at issuance for signup), and the store refuses to
+	// certify anything else.
+	MarkEmailVerified(ctx context.Context, userID, email string, now time.Time) error
 	// UpdateUserPassword overwrites PasswordHash and stamps UpdatedAt with
 	// now on the user identified by userID, returning ErrUserNotFound when
 	// there is none. Passing an empty passwordHash is how a caller removes

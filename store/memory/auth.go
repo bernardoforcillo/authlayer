@@ -102,14 +102,24 @@ func (s *AuthStore) FindUserByEmail(_ context.Context, email string) (auth.UserB
 }
 
 // MarkEmailVerified stamps EmailVerifiedAt and UpdatedAt with now on the
-// user, or returns auth.ErrUserNotFound. The find and the write happen under
-// one acquisition of mu, matching every other mutating method in this store.
-func (s *AuthStore) MarkEmailVerified(_ context.Context, userID string, now time.Time) error {
+// user, but only when email (normalized) matches the user's current
+// Email — otherwise returns auth.ErrEmailMismatch without writing anything,
+// closing the race auth.Store.MarkEmailVerified's doc describes: a
+// concurrent UpdateUserEmail changing the row's address between when a
+// verification token was minted and when it is redeemed must not let the
+// redemption silently certify whatever address the row now holds. Returns
+// auth.ErrUserNotFound when userID matches no row. The find, the comparison,
+// and the write all happen under one acquisition of mu, matching every
+// other mutating method in this store.
+func (s *AuthStore) MarkEmailVerified(_ context.Context, userID, email string, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	u, ok := s.users[userID]
 	if !ok {
 		return auth.ErrUserNotFound
+	}
+	if u.Email != auth.NormalizeEmail(email) {
+		return auth.ErrEmailMismatch
 	}
 	u.EmailVerifiedAt = &now
 	u.UpdatedAt = now

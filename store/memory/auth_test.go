@@ -180,7 +180,7 @@ func TestMarkEmailVerified(t *testing.T) {
 	}
 
 	now := time.Now()
-	if err := st.MarkEmailVerified(ctx, "user1", now); err != nil {
+	if err := st.MarkEmailVerified(ctx, "user1", "bob@example.com", now); err != nil {
 		t.Fatalf("MarkEmailVerified: %v", err)
 	}
 
@@ -196,11 +196,73 @@ func TestMarkEmailVerified(t *testing.T) {
 	}
 }
 
+// TestMarkEmailVerifiedNormalizesEmail confirms the comparison between the
+// passed email and the row's current Email goes through NormalizeEmail on
+// the argument side too, so a case/whitespace variant of the current
+// address still succeeds — matching the same normalize-on-every-touch
+// discipline as CreateUser/FindUserByEmail/UpdateUserEmail, not a stricter
+// byte-exact check.
+func TestMarkEmailVerifiedNormalizesEmail(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user1", Email: "bob@example.com"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	if err := st.MarkEmailVerified(ctx, "user1", "  Bob@Example.com  ", time.Now()); err != nil {
+		t.Fatalf("MarkEmailVerified(case/whitespace variant of the current address): %v", err)
+	}
+}
+
 func TestMarkEmailVerifiedNotFound(t *testing.T) {
 	st := newAuthStore()
-	err := st.MarkEmailVerified(context.Background(), "nonesuch", time.Now())
+	err := st.MarkEmailVerified(context.Background(), "nonesuch", "bob@example.com", time.Now())
 	if !errors.Is(err, auth.ErrUserNotFound) {
 		t.Fatalf("MarkEmailVerified err = %v, want ErrUserNotFound", err)
+	}
+}
+
+// TestMarkEmailVerifiedRefusesStaleAddress is the fix's central regression
+// test, pinning the exact scenario the review named: a verification token is
+// effectively minted for one address (the caller obtains proof of control
+// for it), but before that proof is redeemed, a *different* flow changes the
+// user's address via UpdateUserEmail. Redeeming the stale proof must be
+// refused — the store must not silently certify whatever address the row
+// now holds using proof that was only ever for the old one. Without the
+// email parameter and this check, MarkEmailVerified(ctx, userID, now) would
+// have stamped EmailVerifiedAt regardless, certifying carol@example.com on
+// proof of control of bob@example.com — a false verification.
+func TestMarkEmailVerifiedRefusesStaleAddress(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user1", Email: "bob@example.com"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	// A verification token is (conceptually) minted for bob@example.com.
+	// Before it is redeemed, a concurrent/different flow changes the
+	// address — UpdateUserEmail itself already clears EmailVerifiedAt (see
+	// TestUpdateUserEmailNormalizesAndClearsVerification), but the point of
+	// this test is the *next* step: redeeming the now-stale proof.
+	if err := st.UpdateUserEmail(ctx, "user1", "carol@example.com", time.Now()); err != nil {
+		t.Fatalf("UpdateUserEmail: %v", err)
+	}
+
+	err := st.MarkEmailVerified(ctx, "user1", "bob@example.com", time.Now())
+	if !errors.Is(err, auth.ErrEmailMismatch) {
+		t.Fatalf("MarkEmailVerified(stale address) err = %v, want ErrEmailMismatch", err)
+	}
+
+	// The refused call must not have landed at all.
+	got, err := st.FindUserByID(ctx, "user1")
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if got.EmailVerifiedAt != nil {
+		t.Fatalf("EmailVerifiedAt = %v, want nil — a refused, mismatched verification must not certify anything", got.EmailVerifiedAt)
+	}
+	if got.Email != "carol@example.com" {
+		t.Fatalf("Email = %q, want it unchanged at %q — the refused call must not touch the row at all", got.Email, "carol@example.com")
 	}
 }
 
