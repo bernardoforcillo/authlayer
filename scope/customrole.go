@@ -134,9 +134,19 @@ func (s *Service[C, M, PC, PM]) DeleteRole(ctx context.Context, key string) erro
 	return s.emit(ctx, Event{Kind: RoleDeleted, ContainerID: containerID, ActorID: actor, RoleKey: key})
 }
 
-// ListRoles returns every role assignable in the ctx container: the three
-// code-defined defaults (IsDefault true) in owner, admin, member order,
-// followed by the container's custom roles in Store order.
+// ListRoles returns the three code-defined defaults (IsDefault true) in owner,
+// admin, member order, followed by the ctx container's custom roles in Store
+// order.
+//
+// That is not necessarily every role assignable in the container. A role an
+// application registers in code with [access.Access.NewRole] — a "viewer",
+// say — is fully assignable: [Service.AddMember] and
+// [Service.GrantMembership] resolve it through [Service.RolePermissions],
+// which consults the registry before the store. ListRoles does not enumerate
+// it. So treat this as "the defaults plus what this container stored", and
+// use RolePermissions when you need the engine's real answer for a given key
+// rather than a list to display. Widening ListRoles to cover app-registered
+// roles is deferred: it would change what every existing role editor renders.
 //
 // Any member may list; a non-member gets ErrNotMember. Each [RoleView] carries
 // a resolved [access.Permission], so a role editor can show exactly what a role

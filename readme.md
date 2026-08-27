@@ -261,7 +261,10 @@ roles, _ := svc.ListRoles(ctx)
 - Default roles are immutable (`ErrDefaultRole`).
 - `ListRoles` returns the three defaults (`IsDefault: true`) followed by the
   container's custom roles, each with a resolved `access.Permission` — enough to
-  drive a role editor without a second lookup.
+  drive a role editor without a second lookup. It is *not* the full set of
+  assignable roles: a role registered in code with `access.Access.NewRole` is
+  assignable but not enumerated here. Use `RolePermissions` to resolve a
+  specific key.
 
 ## The privilege-escalation guard
 
