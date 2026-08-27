@@ -350,6 +350,14 @@ func (s *Service[C, M, PC, PM]) recheckValid(ctx context.Context, containerID, i
 // If a [Notifier] is configured, it is called once the invite is persisted;
 // a Notify error is returned here, after the row is already stored (see
 // [Notifier] for what that leaves behind).
+//
+// One error this does not normalise: a Store enforcing UNIQUE(container_id,
+// email) — store/drops does — can report its own duplicate error if two
+// callers race to invite the same address, because the delete-then-insert
+// above is not one transaction. That surfaces here verbatim, as a
+// storage-layer error rather than one of this package's sentinels, so match
+// on errors.Is against your store's own duplicate error if you need to
+// distinguish it. It fails closed: the loser mints nothing and admits nobody.
 func (s *Service[C, M, PC, PM]) InviteByEmail(ctx context.Context, email, roleKey string) (EmailInvite, string, error) {
 	actor, containerID, err := ctxActor(ctx)
 	if err != nil {
@@ -405,7 +413,15 @@ func (s *Service[C, M, PC, PM]) InviteByEmail(ctx context.Context, email, roleKe
 // expires, matching [Link.ExpiresAt]'s own doc. There is no default the way
 // [WithInviteExpiry] provides one for email invites — a link's whole point is
 // to stay reusable for as long as its owner intends, which InviteByEmail's
-// single-recipient token has no equivalent of.
+// one-shot token has no equivalent of.
+//
+// A negative maxUses is [ErrInvalidMaxUses], checked after the authorization
+// and escalation guards so it discloses nothing an unauthorized caller could
+// not already learn. 0 is unlimited and any positive value is a cap, so a
+// negative one names no reachable policy: it would mint a link that can never
+// be redeemed, because [Store.ConsumeLink]'s exhaustion predicate is already
+// true at UseCount 0. Both shipped stores fail closed on it identically, so
+// this refuses an argument error rather than fixing a divergence.
 func (s *Service[C, M, PC, PM]) CreateLink(ctx context.Context, roleKey string, maxUses int, expiresAt *time.Time) (Link, string, error) {
 	actor, containerID, err := ctxActor(ctx)
 	if err != nil {
@@ -416,6 +432,9 @@ func (s *Service[C, M, PC, PM]) CreateLink(ctx context.Context, roleKey string, 
 	}
 	if err := s.guardEscalation(ctx, containerID, actor, roleKey); err != nil {
 		return Link{}, "", err
+	}
+	if maxUses < 0 {
+		return Link{}, "", ErrInvalidMaxUses
 	}
 
 	code := s.cfg.tokens()

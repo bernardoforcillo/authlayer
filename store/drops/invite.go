@@ -85,7 +85,9 @@ func WithInviteTextUserIDs() InviteOption {
 // generic scope Store, so unlike [Schema] this type is not parameterized by
 // C, M.
 type InviteSchema struct {
-	// EmailInvites is the one-time, single-recipient invitation table.
+	// EmailInvites is the one-time email invitation table. See
+	// [invite.EmailInvite] — the token is a bearer credential; the email
+	// column is a delivery hint, not an authorization check.
 	EmailInvites *pg.Table
 	// Links is the reusable invitation-link table.
 	Links *pg.Table
@@ -201,7 +203,8 @@ func (st *InviteStore) FindEmailInvite(ctx context.Context, id string) (invite.E
 }
 
 // ListEmailInvites returns every invite in containerID, expired or not — the
-// caller filters. A container with none yields an empty slice, not an error.
+// caller filters. A container with none yields nil, not an error — the port
+// permits either (see [invite.Store]).
 func (st *InviteStore) ListEmailInvites(ctx context.Context, containerID string) ([]invite.EmailInvite, error) {
 	var out []invite.EmailInvite
 	if err := st.db.Select().From(st.s.EmailInvites).
@@ -272,7 +275,7 @@ func (st *InviteStore) FindLink(ctx context.Context, id string) (invite.Link, er
 }
 
 // ListLinks returns every link in containerID, revoked or not, expired or
-// not — the caller filters. A container with none yields an empty slice, not
+// not — the caller filters. A container with none yields nil, not
 // an error.
 func (st *InviteStore) ListLinks(ctx context.Context, containerID string) ([]invite.Link, error) {
 	var out []invite.Link

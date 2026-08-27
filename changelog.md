@@ -153,8 +153,12 @@ once a 1.0 is cut. Until then, minor versions may break API.
   container. `PurgeExpired` deletes every expired invite and link across
   every container the `Store` holds, for a cron; it performs no
   authorization and reads neither a subject nor a container from the
-  context. Six new sentinel errors: `ErrInviteNotFound`, `ErrInviteExpired`,
-  `ErrLinkNotFound`, `ErrLinkRevoked`, `ErrLinkExpired`, `ErrLinkExhausted`.
+  context. `CreateLink` refuses a negative `maxUses` with
+  `ErrInvalidMaxUses` rather than minting a link that can never be redeemed
+  (0 still means unlimited). Seven new sentinel errors:
+  `ErrInviteNotFound`, `ErrInviteExpired`, `ErrLinkNotFound`,
+  `ErrLinkRevoked`, `ErrLinkExpired`, `ErrLinkExhausted`,
+  `ErrInvalidMaxUses`.
   `store/memory` and `store/drops` each ship a reference `invite.Store`
   implementation, the latter with its own `CreateSchema`.
 - **`scope.Service.GrantMembership`** (`authlayer/scope`) — admits a user to a
@@ -210,6 +214,17 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Changed
 
+- **BREAKING (grants): every `admin` silently gains `invite:*` on adoption.**
+  `ControlStatements` now declares the `invite` resource, and the built-in
+  `admin` role is derived from the merged surface as "every declared pair
+  except `<container>:delete`" — so every `admin`, new and previously seeded,
+  holds `invite:create`, `invite:read` and `invite:delete` the moment this
+  version is adopted, with no code change and no migration to notice. Nothing
+  in a running deployment announces it. An application that treats `admin`'s
+  grant set as fixed should account for it before upgrading; define a custom
+  role if `admin` must not mint invitations. Listed in full under **Added**
+  (`invite` control statements), and repeated here because the widening lands
+  on existing installations rather than only on new ones.
 - **BREAKING (Store port): two new methods.** `ContainerStore` gains
   `ListUserContainers` and `MemberStore` gains `ListUserStandings`. Both ship
   implemented in `store/memory` and `store/drops`; a third-party Store must add

@@ -462,6 +462,70 @@ func TestContainerUnknownIDIsErrContainerNotFound(t *testing.T) {
 	}
 }
 
+// RolePermissions is the engine's own role resolution, newly exported so
+// another package — invite — can ask the real question instead of
+// approximating it from ListRoles. Both privilege-escalation rounds on the
+// invitations branch came from that approximation, so its two contract
+// points are pinned here directly rather than only end-to-end through
+// invite: the code-defined registry is consulted BEFORE the store, and a key
+// resolving through neither path is ErrRoleNotFound.
+//
+// The shadowing row is seeded straight against the Store because that is the
+// only way to reach the state: CreateRole refuses a key already registered in
+// the Access (ErrRoleKeyTaken). But the RoleStore port does not forbid it and
+// no shipped store rejects it independently, so a backend that does not
+// defend against it can hold such a row, and resolution must be inert to it.
+func TestRolePermissionsPrefersTheRegistryOverAShadowingStoreRow(t *testing.T) {
+	ac := NewAccess(resOrg, map[string][]access.Action{"project": {"read", "write"}})
+	ac.NewRole("viewer", map[string][]access.Action{"project": {"read"}})
+	st := newMemStore[testContainer, testMember]()
+	svc := New(ac, st)
+
+	c, err := svc.CreateContainer(WithSubject(context.Background(), "alice"), testContainer{Name: "Acme"})
+	if err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+
+	// A stored row keyed "viewer" granting nothing at all. If the store won,
+	// the resolved permission would be empty — which is vacuously a SubsetOf
+	// anything, and so exactly the shape that let an escalation through.
+	empty, err := ac.Permission(map[string][]access.Action{})
+	if err != nil {
+		t.Fatalf("ac.Permission: %v", err)
+	}
+	if _, err := st.CreateRole(context.Background(), RoleRecord{
+		ID: "shadow-viewer", ContainerID: c.ContainerID(), Key: "viewer",
+		Name: "Fake Viewer", Permissions: empty.Encode(),
+	}); err != nil {
+		t.Fatalf("seed shadowing role row: %v", err)
+	}
+
+	got, err := svc.RolePermissions(context.Background(), c.ContainerID(), "viewer")
+	if err != nil {
+		t.Fatalf("RolePermissions: %v", err)
+	}
+	if !got.Allows("project", "read") {
+		t.Fatal("resolved permission does not grant project:read — the shadowing store row won")
+	}
+	// And it is the real registry role, not something broader: viewer grants
+	// read only.
+	if got.Allows("project", "write") {
+		t.Fatal("resolved permission grants project:write — that is not the registered viewer role")
+	}
+}
+
+// A key registered nowhere — neither the access registry nor the container's
+// stored roles — is ErrRoleNotFound, matching what AddMember and
+// GrantMembership report for the same key.
+func TestRolePermissionsUnknownKeyIsErrRoleNotFound(t *testing.T) {
+	svc := newTestService()
+	_, c := ownerCtx(t, svc, "alice")
+
+	if _, err := svc.RolePermissions(context.Background(), c.ContainerID(), "no-such-role"); !errors.Is(err, ErrRoleNotFound) {
+		t.Fatalf("err = %v, want ErrRoleNotFound", err)
+	}
+}
+
 // Adding invite:* to the control statements widens the built-in admin role,
 // which is derived from the merged surface. That widening is intended — it is
 // exactly why the invite package's ListLinks redaction exists — so it is

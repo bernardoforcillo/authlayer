@@ -360,6 +360,30 @@ func TestListInvitesRequiresInviteRead(t *testing.T) {
 	}
 }
 
+// A negative maxUses names no reachable policy: 0 is unlimited and any
+// positive value is a cap, so a negative one would mint a link whose
+// exhaustion predicate (MaxUses != 0 && UseCount >= MaxUses) is already true
+// at UseCount 0 — a credential that is dead the moment it is created, and
+// silently so. Both shipped stores fail closed on it identically, so this is
+// an argument error rather than a store divergence.
+func TestCreateLinkRejectsNegativeMaxUses(t *testing.T) {
+	f := newFixture(t)
+	if _, _, err := f.isvc.CreateLink(f.ctx("owner"), org.RoleMember, -1, nil); !errors.Is(err, invite.ErrInvalidMaxUses) {
+		t.Fatalf("err = %v, want ErrInvalidMaxUses", err)
+	}
+	links, err := f.isvc.ListLinks(f.ctx("owner"))
+	if err != nil {
+		t.Fatalf("ListLinks: %v", err)
+	}
+	if len(links) != 0 {
+		t.Fatalf("len(links) = %d, want 0 — a refused CreateLink must persist nothing", len(links))
+	}
+	// 0 stays unlimited, so the guard has not moved the boundary.
+	if _, _, err := f.isvc.CreateLink(f.ctx("owner"), org.RoleMember, 0, nil); err != nil {
+		t.Fatalf("CreateLink(maxUses=0): %v, want success — 0 means unlimited", err)
+	}
+}
+
 // ── ListLinks — the security core ───────────────────────────────────────────
 
 func TestListLinksElevatedSeesEveryCode(t *testing.T) {

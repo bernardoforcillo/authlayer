@@ -115,6 +115,8 @@ type Link struct {
 //   - Not found — ErrInviteNotFound, ErrLinkNotFound. A Store returns these
 //     itself: whenever a lookup or a delete by id, token hash, or code finds
 //     no row.
+//   - Caller bug — ErrInvalidMaxUses. Raised by the service layer before it
+//     touches a Store at all; a Store never returns it.
 //   - Why a redemption did not happen — ErrInviteExpired, ErrLinkRevoked,
 //     ErrLinkExpired, ErrLinkExhausted. No Store method returns these
 //     directly. [Store.ConsumeLink] reports only ok=false for all three link
@@ -143,6 +145,13 @@ var (
 	// ErrLinkExhausted: the link's UseCount has reached its (non-zero)
 	// MaxUses. See the group doc above for who is responsible for raising it.
 	ErrLinkExhausted = errors.New("authlayer/invite: link has reached its use limit")
+	// ErrInvalidMaxUses: [Service.CreateLink] was passed a negative maxUses.
+	// 0 means unlimited and any positive value is a cap, so a negative one
+	// names no reachable policy — it would mint a link that can never be
+	// redeemed at all, since ConsumeLink's own predicate (MaxUses != 0 &&
+	// UseCount >= MaxUses) is already true at UseCount 0. That is a dead
+	// credential produced silently, so it is refused instead.
+	ErrInvalidMaxUses = errors.New("authlayer/invite: maxUses must not be negative")
 )
 
 // Store is the persistence port for invitations. Unlike scope.Store it is not
@@ -168,8 +177,9 @@ type Store interface {
 	// there is none.
 	FindEmailInvite(ctx context.Context, id string) (EmailInvite, error)
 	// ListEmailInvites returns every invite in containerID, expired or not —
-	// the caller filters. A container with none yields an empty slice, not an
-	// error. Order is unspecified.
+	// the caller filters. A container with none is not an error; the result
+	// may be an empty slice or nil, which len and range treat alike, so do
+	// not distinguish them. Order is unspecified.
 	ListEmailInvites(ctx context.Context, containerID string) ([]EmailInvite, error)
 	// DeleteEmailInvite removes an invite by id, returning ErrInviteNotFound
 	// when no row matched.
@@ -190,8 +200,9 @@ type Store interface {
 	// none.
 	FindLink(ctx context.Context, id string) (Link, error)
 	// ListLinks returns every link in containerID, revoked or not, expired or
-	// not — the caller filters. A container with none yields an empty slice,
-	// not an error. Order is unspecified.
+	// not — the caller filters. A container with none is not an error; the
+	// result may be an empty slice or nil, which len and range treat alike,
+	// so do not distinguish them. Order is unspecified.
 	ListLinks(ctx context.Context, containerID string) ([]Link, error)
 	// RevokeLink stamps RevokedAt with at, returning ErrLinkNotFound when no
 	// row matched. Revoking an already-revoked link overwrites the timestamp

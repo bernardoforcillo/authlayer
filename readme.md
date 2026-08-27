@@ -308,13 +308,16 @@ svc := org.New(ac, store, org.WithPolicy(org.Policy{
 `WithPolicy` replaces the policy wholesale — it does not merge — so pass a fully
 populated struct. The zero `Policy` is *not* the defaults.
 
-`invite.Service` carries one policy knob of its own, configured separately
-through its own `Option` rather than through `Policy`/`WithPolicy` — an
-`invite.Service` and the `scope.Service` it wraps are configured
-independently: `invite.WithRecheckInviterOnAccept` (default `true`) controls
-whether accepting an invitation re-checks the inviter's *current* standing
-before admitting anyone. See [Invitations](#invitations) for what that trades
-away when turned off.
+`invite.Service` is configured separately, through its own `Option`s rather
+than through `Policy`/`WithPolicy` — an `invite.Service` and the
+`scope.Service` it wraps are configured independently. It takes four:
+
+| Option | Purpose |
+|---|---|
+| `WithRecheckInviterOnAccept(b)` | Default `true`. Re-check the inviter's *current* standing before admitting anyone. See [Invitations](#invitations) for what turning it off trades away. |
+| `WithInviteExpiry(d)` | How long a freshly minted email invite stays acceptable; default seven days. Links take their expiry per-link, at `CreateLink`. |
+| `WithNotifier(n)` | Deliver each minted invitation; default nil sends nothing. Sugar over calling a `Notifier` yourself. |
+| `WithTokens(gen)` | Override the token/code generator. **Tests only** — `gen` is the entire source of unguessability for every credential the service mints. |
 
 ## Hooks & events
 
@@ -884,7 +887,7 @@ matches.
 
 `Can` already folds `ErrForbidden` and `ErrNotMember` into a plain `false`.
 
-`invite` adds six sentinels of its own — not exported by `scope`, and not
+`invite` adds seven sentinels of its own — not exported by `scope`, and not
 aliased anywhere, since invitations are a separate package with its own
 failure modes:
 
@@ -896,9 +899,14 @@ failure modes:
 | `ErrLinkRevoked` | The link's `RevokedAt` is set | 410 |
 | `ErrLinkExpired` | The link's `ExpiresAt` has passed | 410 |
 | `ErrLinkExhausted` | The link's `UseCount` has reached its `MaxUses` | 410 |
+| `ErrInvalidMaxUses` | `CreateLink` was passed a negative `maxUses` | 400 |
 
 The first two are raised by the `Store` itself, on any lookup or delete that
-matches no row. The other four describe *why a redemption did not happen*
+matches no row — and also by the service layer, deliberately: `RevokeInvite`
+and `RevokeLink` report them for an id that exists in *another* container, so
+a cross-tenant id is indistinguishable from a missing one. `ErrInvalidMaxUses`
+is a plain argument error, raised before any store is touched. The middle four
+describe *why a redemption did not happen*
 rather than a lookup miss, and only the service layer raises them: a link's
 `Store.ConsumeLink` folds all three of its own reasons into a single
 `ok=false` — the check and the increment must be one atomic step, so asking
