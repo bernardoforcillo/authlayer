@@ -139,6 +139,213 @@ func TestCreateUserDuplicateEmailFails(t *testing.T) {
 	}
 }
 
+// TestCreateUserDuplicateIDFails pins the exact scenario the review's I-4
+// finding named: creating a second user under an ID that already identifies
+// a different row must be refused, not silently replace it. Before this fix
+// CreateUser(ctx, UserBase{ID: "user1", Email: "eve@evil.com"}) against an
+// existing user1 holding bob@example.com would pass the email scan (no other
+// row holds eve@evil.com) and overwrite Bob's row wholesale — different
+// email, same ID, no error, every Session/Verification still keyed to user1
+// now silently belonging to "Eve".
+func TestCreateUserDuplicateIDFails(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user1", Email: "bob@example.com"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	_, err := st.CreateUser(ctx, auth.UserBase{ID: "user1", Email: "eve@evil.com"})
+	if !errors.Is(err, auth.ErrIDTaken) {
+		t.Fatalf("second CreateUser (same id, different email) err = %v, want ErrIDTaken", err)
+	}
+
+	// Bob's row must be completely untouched by the rejected write.
+	got, err := st.FindUserByID(ctx, "user1")
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if got.Email != "bob@example.com" {
+		t.Fatalf("user1's Email = %q after a rejected duplicate-id CreateUser, want it unchanged at %q", got.Email, "bob@example.com")
+	}
+}
+
+// --- User mutation: MarkEmailVerified, UpdateUserPassword, UpdateUserEmail ---
+
+func TestMarkEmailVerified(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user1", Email: "bob@example.com"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	now := time.Now()
+	if err := st.MarkEmailVerified(ctx, "user1", now); err != nil {
+		t.Fatalf("MarkEmailVerified: %v", err)
+	}
+
+	got, err := st.FindUserByID(ctx, "user1")
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if got.EmailVerifiedAt == nil || !got.EmailVerifiedAt.Equal(now) {
+		t.Fatalf("EmailVerifiedAt = %v, want %v", got.EmailVerifiedAt, now)
+	}
+	if !got.UpdatedAt.Equal(now) {
+		t.Fatalf("UpdatedAt = %v, want %v", got.UpdatedAt, now)
+	}
+}
+
+func TestMarkEmailVerifiedNotFound(t *testing.T) {
+	st := newAuthStore()
+	err := st.MarkEmailVerified(context.Background(), "nonesuch", time.Now())
+	if !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("MarkEmailVerified err = %v, want ErrUserNotFound", err)
+	}
+}
+
+func TestUpdateUserPassword(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user1", Email: "bob@example.com", PasswordHash: "old-hash"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	now := time.Now()
+	if err := st.UpdateUserPassword(ctx, "user1", "new-hash", now); err != nil {
+		t.Fatalf("UpdateUserPassword: %v", err)
+	}
+
+	got, err := st.FindUserByID(ctx, "user1")
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if got.PasswordHash != "new-hash" {
+		t.Fatalf("PasswordHash = %q, want %q", got.PasswordHash, "new-hash")
+	}
+	if !got.UpdatedAt.Equal(now) {
+		t.Fatalf("UpdatedAt = %v, want %v", got.UpdatedAt, now)
+	}
+}
+
+func TestUpdateUserPasswordEmptyRemovesCredential(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user1", Email: "bob@example.com", PasswordHash: "old-hash"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	if err := st.UpdateUserPassword(ctx, "user1", "", time.Now()); err != nil {
+		t.Fatalf("UpdateUserPassword: %v", err)
+	}
+	got, err := st.FindUserByID(ctx, "user1")
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if got.PasswordHash != "" {
+		t.Fatalf("PasswordHash = %q, want empty (no password credential)", got.PasswordHash)
+	}
+}
+
+func TestUpdateUserPasswordNotFound(t *testing.T) {
+	st := newAuthStore()
+	err := st.UpdateUserPassword(context.Background(), "nonesuch", "hash", time.Now())
+	if !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("UpdateUserPassword err = %v, want ErrUserNotFound", err)
+	}
+}
+
+// TestUpdateUserEmailNormalizesAndClearsVerification pins the two contested
+// behaviours the review named for UpdateUserEmail: the new address is
+// normalized on write (I-1), and EmailVerifiedAt is unconditionally cleared
+// back to nil rather than left alone — the store has no independent proof
+// the new address was ever confirmed, only the caller's say-so.
+func TestUpdateUserEmailNormalizesAndClearsVerification(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	verifiedAt := time.Now().Add(-time.Hour)
+	if _, err := st.CreateUser(ctx, auth.UserBase{
+		ID: "user1", Email: "bob@example.com", EmailVerifiedAt: &verifiedAt,
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	now := time.Now()
+	if err := st.UpdateUserEmail(ctx, "user1", "  New@Example.com  ", now); err != nil {
+		t.Fatalf("UpdateUserEmail: %v", err)
+	}
+
+	got, err := st.FindUserByID(ctx, "user1")
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if got.Email != "new@example.com" {
+		t.Fatalf("Email = %q, want normalized %q", got.Email, "new@example.com")
+	}
+	if got.EmailVerifiedAt != nil {
+		t.Fatalf("EmailVerifiedAt = %v, want nil — changing the address must clear verification", got.EmailVerifiedAt)
+	}
+	if !got.UpdatedAt.Equal(now) {
+		t.Fatalf("UpdatedAt = %v, want %v", got.UpdatedAt, now)
+	}
+
+	// The user must still be findable by the new address, and no longer by
+	// the old one.
+	if _, err := st.FindUserByEmail(ctx, "new@example.com"); err != nil {
+		t.Fatalf("FindUserByEmail(new@example.com): %v", err)
+	}
+	if _, err := st.FindUserByEmail(ctx, "bob@example.com"); !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("FindUserByEmail(bob@example.com) err = %v, want ErrUserNotFound", err)
+	}
+}
+
+func TestUpdateUserEmailDuplicateFails(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user1", Email: "bob@example.com"}); err != nil {
+		t.Fatalf("CreateUser(user1): %v", err)
+	}
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user2", Email: "carol@example.com"}); err != nil {
+		t.Fatalf("CreateUser(user2): %v", err)
+	}
+
+	err := st.UpdateUserEmail(ctx, "user2", "  Bob@Example.com  ", time.Now())
+	if !errors.Is(err, auth.ErrEmailTaken) {
+		t.Fatalf("UpdateUserEmail err = %v, want ErrEmailTaken", err)
+	}
+
+	// The rejected write must not have landed.
+	got, err := st.FindUserByID(ctx, "user2")
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if got.Email != "carol@example.com" {
+		t.Fatalf("user2's Email = %q after a rejected UpdateUserEmail, want it unchanged at %q", got.Email, "carol@example.com")
+	}
+}
+
+// TestUpdateUserEmailToOwnAddressIsNotSelfConflict proves the uniqueness scan
+// excludes the row being updated: setting a user's email to the address it
+// already holds must not be treated as a conflict with itself.
+func TestUpdateUserEmailToOwnAddressIsNotSelfConflict(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user1", Email: "bob@example.com"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	if err := st.UpdateUserEmail(ctx, "user1", "bob@example.com", time.Now()); err != nil {
+		t.Fatalf("UpdateUserEmail(own address) err = %v, want nil", err)
+	}
+}
+
+func TestUpdateUserEmailNotFound(t *testing.T) {
+	st := newAuthStore()
+	err := st.UpdateUserEmail(context.Background(), "nonesuch", "new@example.com", time.Now())
+	if !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("UpdateUserEmail err = %v, want ErrUserNotFound", err)
+	}
+}
+
 // --- Sessions ---
 
 func TestCreateAndFindSessionByHash(t *testing.T) {
@@ -167,6 +374,31 @@ func TestCreateAndFindSessionByHash(t *testing.T) {
 	}
 	if got != sess {
 		t.Fatalf("FindSessionByHash = %+v, want %+v", got, sess)
+	}
+}
+
+func TestCreateSessionDuplicateIDFails(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateSession(ctx, auth.Session{ID: "sess1", TokenHash: "hash1"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	_, err := st.CreateSession(ctx, auth.Session{ID: "sess1", TokenHash: "hash2"})
+	if !errors.Is(err, auth.ErrIDTaken) {
+		t.Fatalf("second CreateSession (same id) err = %v, want ErrIDTaken", err)
+	}
+
+	// The original row must be completely untouched by the rejected write.
+	got, err := st.FindSessionByHash(ctx, "hash1")
+	if err != nil {
+		t.Fatalf("FindSessionByHash(hash1): %v", err)
+	}
+	if got.ID != "sess1" {
+		t.Fatalf("original session's ID = %q, want sess1", got.ID)
+	}
+	if _, err := st.FindSessionByHash(ctx, "hash2"); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("FindSessionByHash(hash2) err = %v, want ErrSessionNotFound — the rejected write must not persist", err)
 	}
 }
 
@@ -509,6 +741,50 @@ func TestCreateAndFindVerificationByHash(t *testing.T) {
 	}
 	if got != v {
 		t.Fatalf("FindVerificationByHash = %+v, want %+v", got, v)
+	}
+}
+
+// TestCreateVerificationNormalizesNewEmailOnWrite pins I-1: NewEmail — the
+// address an email_change verification eventually redeems into
+// UserBase.Email — must be normalized on write, the same as UserBase.Email
+// itself, so it can never land a non-canonical address in the users table.
+func TestCreateVerificationNormalizesNewEmailOnWrite(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+
+	if _, err := st.CreateVerification(ctx, auth.Verification{
+		ID: "ver1", TokenHash: "hash1", Purpose: "email_change", NewEmail: "  New@Example.com  ",
+	}); err != nil {
+		t.Fatalf("CreateVerification: %v", err)
+	}
+
+	got, err := st.FindVerificationByHash(ctx, "hash1")
+	if err != nil {
+		t.Fatalf("FindVerificationByHash: %v", err)
+	}
+	if got.NewEmail != "new@example.com" {
+		t.Fatalf("stored NewEmail = %q, want normalized %q", got.NewEmail, "new@example.com")
+	}
+}
+
+func TestCreateVerificationDuplicateIDFails(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateVerification(ctx, auth.Verification{ID: "ver1", TokenHash: "hash1"}); err != nil {
+		t.Fatalf("CreateVerification: %v", err)
+	}
+
+	_, err := st.CreateVerification(ctx, auth.Verification{ID: "ver1", TokenHash: "hash2"})
+	if !errors.Is(err, auth.ErrIDTaken) {
+		t.Fatalf("second CreateVerification (same id) err = %v, want ErrIDTaken", err)
+	}
+
+	// The original row must be completely untouched by the rejected write.
+	if _, err := st.FindVerificationByHash(ctx, "hash1"); err != nil {
+		t.Fatalf("FindVerificationByHash(hash1): %v", err)
+	}
+	if _, err := st.FindVerificationByHash(ctx, "hash2"); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(hash2) err = %v, want ErrVerificationNotFound — the rejected write must not persist", err)
 	}
 }
 

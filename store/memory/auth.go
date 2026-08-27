@@ -19,11 +19,20 @@ import (
 // auth.Session and auth.Verification are fixed shapes — and, matching
 // InviteStore's stance on EmailInvite.TokenHash and Link.Code (see that
 // type's package doc), it does not enforce uniqueness of Session.TokenHash or
-// Verification.TokenHash: that is a database concern, deferred to
-// store/drops. UserBase.Email is the one exception — CreateUser does check
-// for a normalized-email collision here, because "one email, one account" is
-// the property this whole package exists to guarantee, not an optional
-// application-level constraint the way a token hash collision is.
+// Verification.TokenHash here, even though [auth.Store] requires a backend to
+// — see auth.Session.TokenHash's and auth.Verification.TokenHash's doc
+// comments for why that is a MUST on the port and what breaks without it.
+// That enforcement is deferred to store/drops, exactly where InviteStore
+// defers EmailInvite.TokenHash and Link.Code. UserBase.Email is the one
+// exception — CreateUser does check for a normalized-email collision here,
+// because "one email, one account" is the property this whole package exists
+// to guarantee, not an optional application-level constraint the way a token
+// hash collision is.
+//
+// It also enforces the id-collision contract [auth.Store] documents on every
+// Create* method: CreateUser, CreateSession and CreateVerification all check
+// for an existing row under the same id before writing, and return
+// auth.ErrIDTaken rather than silently overwriting it.
 type AuthStore struct {
 	mu            sync.Mutex
 	users         map[string]auth.UserBase
@@ -43,15 +52,19 @@ func NewAuthStore() *AuthStore {
 // --- Users ---
 
 // CreateUser normalizes u.Email (see [auth.NormalizeEmail]), stores u under
-// its ID, and returns what was stored. The uniqueness check against every
-// existing user's normalized email and the write happen under one
-// acquisition of mu, so two concurrent CreateUser calls for the same address
-// cannot both succeed: the second to reach the lock sees the first's row
-// already present and returns auth.ErrEmailTaken.
+// its ID, and returns what was stored. The id check, the email uniqueness
+// check against every existing user, and the write all happen under one
+// acquisition of mu, so two concurrent CreateUser calls for the same id or
+// the same address cannot both succeed: the second to reach the lock sees
+// the first's row already present and returns auth.ErrIDTaken (checked
+// first) or auth.ErrEmailTaken (checked second), never overwriting it.
 func (s *AuthStore) CreateUser(_ context.Context, u auth.UserBase) (auth.UserBase, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if _, exists := s.users[u.ID]; exists {
+		return auth.UserBase{}, auth.ErrIDTaken
+	}
 	u.Email = auth.NormalizeEmail(u.Email)
 	for _, existing := range s.users {
 		if existing.Email == u.Email {
@@ -88,12 +101,83 @@ func (s *AuthStore) FindUserByEmail(_ context.Context, email string) (auth.UserB
 	return auth.UserBase{}, auth.ErrUserNotFound
 }
 
+// MarkEmailVerified stamps EmailVerifiedAt and UpdatedAt with now on the
+// user, or returns auth.ErrUserNotFound. The find and the write happen under
+// one acquisition of mu, matching every other mutating method in this store.
+func (s *AuthStore) MarkEmailVerified(_ context.Context, userID string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return auth.ErrUserNotFound
+	}
+	u.EmailVerifiedAt = &now
+	u.UpdatedAt = now
+	s.users[userID] = u
+	return nil
+}
+
+// UpdateUserPassword overwrites PasswordHash and stamps UpdatedAt with now
+// on the user, or returns auth.ErrUserNotFound. The find and the write
+// happen under one acquisition of mu, matching every other mutating method
+// in this store.
+func (s *AuthStore) UpdateUserPassword(_ context.Context, userID, passwordHash string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return auth.ErrUserNotFound
+	}
+	u.PasswordHash = passwordHash
+	u.UpdatedAt = now
+	s.users[userID] = u
+	return nil
+}
+
+// UpdateUserEmail normalizes email (see [auth.NormalizeEmail]), and — under
+// one acquisition of mu spanning the not-found check, the uniqueness check
+// against every *other* user, and the write — overwrites the user's Email,
+// unconditionally clears EmailVerifiedAt to nil, and stamps UpdatedAt with
+// now. Returns auth.ErrUserNotFound when userID matches no row, or
+// auth.ErrEmailTaken when a different user already holds the normalized
+// address; see [auth.Store.UpdateUserEmail]'s doc for why EmailVerifiedAt is
+// always cleared rather than conditionally preserved or set.
+//
+// The uniqueness scan excludes userID's own row, so updating a user to the
+// email it already holds is a harmless no-op-ish rewrite (it still clears
+// EmailVerifiedAt and re-stamps UpdatedAt), not a self-conflict.
+func (s *AuthStore) UpdateUserEmail(_ context.Context, userID, email string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return auth.ErrUserNotFound
+	}
+	email = auth.NormalizeEmail(email)
+	for otherID, other := range s.users {
+		if otherID != userID && other.Email == email {
+			return auth.ErrEmailTaken
+		}
+	}
+	u.Email = email
+	u.EmailVerifiedAt = nil
+	u.UpdatedAt = now
+	s.users[userID] = u
+	return nil
+}
+
 // --- Sessions ---
 
-// CreateSession stores the session under its ID and returns it unchanged.
+// CreateSession stores the session under its ID and returns it unchanged, or
+// returns auth.ErrIDTaken if a session with this ID already exists — the
+// check and the write happen under one acquisition of mu, so the row is
+// never silently overwritten.
 func (s *AuthStore) CreateSession(_ context.Context, sess auth.Session) (auth.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, exists := s.sessions[sess.ID]; exists {
+		return auth.Session{}, auth.ErrIDTaken
+	}
 	s.sessions[sess.ID] = sess
 	return sess, nil
 }
@@ -182,11 +266,18 @@ func (s *AuthStore) MarkRotated(_ context.Context, tokenHash string, now time.Ti
 
 // --- Verifications ---
 
-// CreateVerification stores the verification under its ID and returns it
-// unchanged.
+// CreateVerification normalizes v.NewEmail (see [auth.NormalizeEmail]),
+// stores the result under v's ID, and returns it, or returns
+// auth.ErrIDTaken if a verification with this ID already exists — the check,
+// the normalization, and the write happen under one acquisition of mu, so
+// the row is never silently overwritten.
 func (s *AuthStore) CreateVerification(_ context.Context, v auth.Verification) (auth.Verification, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, exists := s.verifications[v.ID]; exists {
+		return auth.Verification{}, auth.ErrIDTaken
+	}
+	v.NewEmail = auth.NormalizeEmail(v.NewEmail)
 	s.verifications[v.ID] = v
 	return v, nil
 }

@@ -76,8 +76,11 @@ type UserBase struct {
 	// ID is the record's surrogate key, stamped by the service.
 	ID string `drop:"id"`
 	// Email is the user's address, always normalized — see [NormalizeEmail].
-	// Unique across every user.
-	Email string `drop:"email"`
+	// Unique across every user; the tag's "unique" option is the inline
+	// mechanism store/drops derives a UNIQUE constraint from (see
+	// org.Organization.Slug for the precedent), though a backend remains
+	// free to declare it some other way (e.g. pg.Table.AddUnique).
+	Email string `drop:"email,unique"`
 	// EmailVerifiedAt is when the user confirmed this address via a
 	// "signup"-purpose [Verification]. nil means unverified.
 	EmailVerifiedAt *time.Time `drop:"email_verified_at"`
@@ -103,6 +106,23 @@ type Session struct {
 	// TokenHash is sha256(refresh token plaintext) — see
 	// [github.com/bernardoforcillo/authlayer/token.HashOpaque]. The plaintext
 	// itself is never stored, matching EmailInvite.TokenHash's rationale.
+	//
+	// An implementation MUST enforce that TokenHash is unique across every
+	// Session row — a UNIQUE constraint in a SQL backend. [Store.FindSessionByHash]
+	// and [Store.MarkRotated] both assume at most one row can ever match a
+	// given hash. Without that guarantee, a token-generation bug or a hash
+	// collision that lets two rows share a TokenHash breaks MarkRotated's
+	// single-winner contract with no atomicity defect at all: two concurrent
+	// callers can each independently select a different one of the colliding
+	// rows, and each correctly, atomically wins the row it happened to pick
+	// — reported as two successful rotations, exactly the undetectable
+	// parallel session this whole design exists to prevent, reached by a
+	// different path than the one MarkRotated's own doc warns about.
+	// FindSessionByHash degrades more mildly but still silently: it resolves
+	// to whichever colliding row the backend happens to return first. This
+	// project has already shipped this exact omission once — invite's
+	// EmailInvite.TokenHash had no uniqueness constraint until a later fix —
+	// so it is stated here as a MUST rather than left implicit.
 	TokenHash string `drop:"token_hash"`
 	// FamilyID groups a session with every session it was rotated from and
 	// into: the whole rotation chain traces back to one login and shares this
@@ -141,6 +161,12 @@ type Verification struct {
 	// TokenHash is sha256(token plaintext) — see
 	// [github.com/bernardoforcillo/authlayer/token.HashOpaque]. The plaintext
 	// itself is never stored, matching EmailInvite.TokenHash's rationale.
+	//
+	// An implementation MUST enforce that TokenHash is unique across every
+	// Verification row, for the same reason [Session.TokenHash]'s doc gives:
+	// [Store.FindVerificationByHash] assumes at most one row can match, and
+	// without the constraint its result silently depends on row order rather
+	// than being well-defined.
 	TokenHash string `drop:"token_hash"`
 	// Purpose is one of "signup", "email_change", or "password_reset". It is
 	// a plain string, not a typed enum, matching Session and EmailInvite's
@@ -150,6 +176,15 @@ type Verification struct {
 	Purpose string `drop:"purpose"`
 	// NewEmail is the address an "email_change" verification redeems to.
 	// Empty for every other Purpose.
+	//
+	// Always normalized — see [NormalizeEmail] — the same as UserBase.Email:
+	// [Store.CreateVerification] normalizes it on write. This matters because
+	// NewEmail's entire purpose is to become a UserBase.Email
+	// (via [Store.UpdateUserEmail]) once redeemed; a raw, non-normalized
+	// value stored here would land a non-canonical address in the users
+	// table that FindUserByEmail's normalized probe could never match again,
+	// and would let a case/whitespace variant of an existing address slip
+	// past the uniqueness check UpdateUserEmail applies at redemption.
 	NewEmail string `drop:"new_email"`
 	// ExpiresAt is when this token stops being redeemable. Always set —
 	// there is no "never expires" case for a verification token, matching
@@ -161,12 +196,15 @@ type Verification struct {
 
 // NormalizeEmail trims leading and trailing whitespace and lowercases s.
 //
-// Every Store method that reads or writes a UserBase's Email —
-// [Store.CreateUser] and [Store.FindUserByEmail] — applies it, on both the
-// write and the read side, so "Bob@Example.com ", " bob@example.com", and
-// "bob@example.com" all resolve to the exact same row: none of them can
-// create a duplicate account, and none of them can slip past CreateUser's
-// uniqueness check by varying only case or surrounding whitespace.
+// Every Store method that reads or writes an email — a UserBase's Email
+// ([Store.CreateUser], [Store.FindUserByEmail], [Store.UpdateUserEmail]) or
+// a Verification's NewEmail ([Store.CreateVerification], which is the
+// address a redeemed "email_change" Verification eventually becomes a
+// UserBase.Email) — applies it, on both the write and the read side, so
+// "Bob@Example.com ", " bob@example.com", and "bob@example.com" all resolve
+// to the exact same row: none of them can create a duplicate account, and
+// none of them can slip past a uniqueness check by varying only case or
+// surrounding whitespace.
 func NormalizeEmail(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
@@ -183,15 +221,26 @@ func NormalizeEmail(s string) string {
 //     [Store.MarkRotated] returns ErrSessionNotFound the same way when
 //     tokenHash matches no session at all — as opposed to matching one
 //     already rotated, which is (Session, false, nil): see that method's own
-//     doc for why those two outcomes are deliberately distinguished.
-//   - Conflict — ErrEmailTaken. [Store.CreateUser] returns this when the
-//     normalized email already belongs to another user; see [NormalizeEmail]
-//     for why the comparison is always on the normalized form.
+//     doc for why those two outcomes are deliberately distinguished. The
+//     three user-mutation methods (MarkEmailVerified, UpdateUserPassword,
+//     UpdateUserEmail) return it too, on the same "no such id" miss.
+//   - Conflict — ErrEmailTaken, ErrIDTaken. [Store.CreateUser] and
+//     [Store.UpdateUserEmail] return ErrEmailTaken when the normalized email
+//     already belongs to a different user; see [NormalizeEmail] for why the
+//     comparison is always on the normalized form. CreateUser, CreateSession
+//     and CreateVerification return ErrIDTaken when the given id already
+//     identifies a row of that same kind — see each method's own doc.
 var (
 	// ErrUserNotFound: no user with that id or email exists.
 	ErrUserNotFound = errors.New("authlayer/auth: user not found")
 	// ErrEmailTaken: another user already holds this normalized email.
 	ErrEmailTaken = errors.New("authlayer/auth: email already registered")
+	// ErrIDTaken: a Create* call was given an id that already identifies a
+	// row of that same kind (user, session, or verification). Ids are
+	// minted by the service (uid.NewV7()), so a collision is not expected
+	// in ordinary operation, but a backend must never silently replace the
+	// existing row on a collision — see each Create* method's own doc.
+	ErrIDTaken = errors.New("authlayer/auth: id already exists")
 	// ErrSessionNotFound: no session with that id or token hash exists.
 	ErrSessionNotFound = errors.New("authlayer/auth: session not found")
 	// ErrVerificationNotFound: no verification with that id or token hash
@@ -215,7 +264,9 @@ type Store interface {
 	// (see [NormalizeEmail]) before the uniqueness check and the write, so
 	// the caller need not normalize it first, though doing so is harmless.
 	// Returns ErrEmailTaken if another user already holds the same
-	// normalized email.
+	// normalized email, or ErrIDTaken if a user with this ID already
+	// exists — an existing row is never silently replaced by a second
+	// CreateUser call with the same ID.
 	CreateUser(ctx context.Context, u UserBase) (UserBase, error)
 	// FindUserByID loads a user by id, returning ErrUserNotFound when there
 	// is none.
@@ -224,15 +275,57 @@ type Store interface {
 	// user with that normalized address, returning ErrUserNotFound when
 	// there is none.
 	FindUserByEmail(ctx context.Context, email string) (UserBase, error)
+	// MarkEmailVerified stamps EmailVerifiedAt and UpdatedAt with now on the
+	// user identified by userID, returning ErrUserNotFound when there is
+	// none. Calling it again after the address is already verified simply
+	// re-stamps both timestamps to the new now — it is idempotent, not an
+	// error. This is the redemption step for a "signup"-purpose Verification,
+	// and the step an "email_change" redemption calls immediately after
+	// UpdateUserEmail — see that method's doc for why the two are separate
+	// calls rather than one.
+	MarkEmailVerified(ctx context.Context, userID string, now time.Time) error
+	// UpdateUserPassword overwrites PasswordHash and stamps UpdatedAt with
+	// now on the user identified by userID, returning ErrUserNotFound when
+	// there is none. Passing an empty passwordHash is how a caller removes
+	// the password credential entirely — see UserBase's doc for why that is
+	// a real, supported state rather than an error condition.
+	UpdateUserPassword(ctx context.Context, userID, passwordHash string, now time.Time) error
+	// UpdateUserEmail normalizes email (see [NormalizeEmail]), overwrites
+	// UserBase.Email, unconditionally clears EmailVerifiedAt back to nil, and
+	// stamps UpdatedAt with now, on the user identified by userID. Returns
+	// ErrUserNotFound when there is none, or ErrEmailTaken if a *different*
+	// user already holds the same normalized address — checked and written
+	// under one atomic step, the same discipline CreateUser uses, so two
+	// concurrent changes to the same address cannot both succeed.
+	//
+	// EmailVerifiedAt is always cleared, never left alone and never set from
+	// the new address: this method only records that the row's address
+	// changed, not that anyone has proven control of the new one — the store
+	// has no way to know that on its own. A caller that has independently
+	// proven control — by construction, that is exactly what redeeming an
+	// "email_change" Verification means, since its token was only ever
+	// deliverable to the new address — calls MarkEmailVerified immediately
+	// afterward to record that proof as a second, explicit step. Folding
+	// verification into this method would let any caller set Email to an
+	// address it never confirmed and have the store report it verified
+	// anyway, which is exactly the kind of silent trust this port does not
+	// extend to its callers elsewhere (see MarkRotated's doc for the same
+	// principle applied to rotation).
+	UpdateUserEmail(ctx context.Context, userID, email string, now time.Time) error
 
 	// CreateSession persists an already-stamped session and returns what was
-	// stored.
+	// stored. Returns ErrIDTaken if a session with this ID already exists —
+	// an existing row is never silently replaced. See [Session.TokenHash]'s
+	// doc for the uniqueness obligation this method's caller (and, in turn,
+	// its backend) carries for TokenHash specifically, which this method does
+	// not itself check.
 	CreateSession(ctx context.Context, s Session) (Session, error)
 	// FindSessionByHash loads the session whose TokenHash matches, returning
 	// ErrSessionNotFound when none does. This is the lookup a refresh or an
 	// access check runs: hash the presented opaque token with
 	// [github.com/bernardoforcillo/authlayer/token.HashOpaque] and look it up
 	// by hash, since the plaintext itself is never stored (see [Session]).
+	// Assumes TokenHash identifies at most one row — see that field's doc.
 	FindSessionByHash(ctx context.Context, tokenHash string) (Session, error)
 	// ListSessionsByUser returns every session belonging to userID, rotated
 	// or not, expired or not — the caller filters. A user with none is not
@@ -249,7 +342,9 @@ type Store interface {
 	DeleteSessionsByFamily(ctx context.Context, familyID string) error
 	// MarkRotated atomically marks the session identified by tokenHash as
 	// superseded, if and only if it is not already. ok reports whether THIS
-	// caller won; exactly one concurrent caller may see true.
+	// caller won; exactly one concurrent caller may see true — conditional on
+	// TokenHash actually identifying at most one Session row; see that
+	// field's doc for what breaks if a backend does not enforce that.
 	//
 	// It MUST be a single atomic step. A read-then-write lets two concurrent
 	// refreshes both observe an unrotated session and both mint a successor
@@ -279,13 +374,18 @@ type Store interface {
 	// DeleteSessionsByFamily.
 	MarkRotated(ctx context.Context, tokenHash string, now time.Time) (Session, bool, error)
 
-	// CreateVerification persists an already-stamped verification and
-	// returns what was stored.
+	// CreateVerification normalizes v.NewEmail (see [NormalizeEmail]),
+	// persists the result, and returns what was stored. Returns ErrIDTaken
+	// if a verification with this ID already exists — an existing row is
+	// never silently replaced. See [Verification.TokenHash]'s doc for the
+	// uniqueness obligation this method's caller (and, in turn, its backend)
+	// carries for TokenHash, which this method does not itself check.
 	CreateVerification(ctx context.Context, v Verification) (Verification, error)
 	// FindVerificationByHash loads the verification whose TokenHash matches,
 	// returning ErrVerificationNotFound when none does. Like
 	// FindSessionByHash, this hashes the presented plaintext token before
-	// looking it up.
+	// looking it up. Assumes TokenHash identifies at most one row — see that
+	// field's doc.
 	FindVerificationByHash(ctx context.Context, tokenHash string) (Verification, error)
 	// DeleteVerification removes a verification by id, returning
 	// ErrVerificationNotFound when no row matched. This is what redeeming a
