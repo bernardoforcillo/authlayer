@@ -141,7 +141,36 @@ var (
 	// time this error is returned, every session in the token's family has
 	// already been revoked via [Store.DeleteSessionsByFamily]. See Refresh's
 	// doc, "Why the whole family, not just the presented session".
+	//
+	// A caller inspecting an error returned by Refresh with [errors.Is]
+	// MUST check ErrTokenReuse before checking whether the error wraps a
+	// [Store] error of its own: when [Store.DeleteSessionsByFamily] itself
+	// fails while responding to a detected replay, Refresh wraps BOTH — the
+	// returned error satisfies errors.Is against ErrTokenReuse (a replay
+	// WAS detected; that fact must never be lost merely because the
+	// housekeeping response to it also failed) and against whatever the
+	// Store's own error is (so the operational failure is not hidden
+	// either). See Refresh's doc, "Fail closed".
 	ErrTokenReuse = errors.New("authlayer/auth: refresh token reuse detected; session family revoked")
+	// ErrSessionRevoked: [Service.Refresh] won [Store.MarkRotated] — this
+	// caller's presented token was genuinely current and unrotated, and
+	// nobody replayed it — but by the time it went to persist the
+	// successor, [Store.CreateSuccessorSession] reported that the
+	// predecessor session no longer existed: something else (most likely a
+	// DIFFERENT, concurrently-replayed token in the same family triggering
+	// [Store.DeleteSessionsByFamily], or an explicit [Service.LogoutAll] /
+	// [Service.RevokeSession] / [Service.Logout] racing this exact call)
+	// revoked the family out from under this rotation between those two
+	// steps. This is deliberately a THIRD, distinct outcome from
+	// ErrTokenInvalid (the presented token itself was never bad — it won
+	// the compare-and-set fair and square) and from ErrTokenReuse (nobody
+	// replayed THIS caller's token; nothing about this call was itself a
+	// replay). The presented token is already rotated away regardless — see
+	// Refresh's doc, "Fail closed" — so the caller genuinely has nothing:
+	// no successor was minted, and the old token is already superseded.
+	// Treat it the same as any other authentication failure: the caller
+	// must sign in again.
+	ErrSessionRevoked = errors.New("authlayer/auth: session family was revoked before rotation could complete")
 )
 
 // RateLimiter throttles [Service.Login] attempts by a caller-supplied key.
@@ -974,9 +1003,19 @@ func (s *Service[U, PU]) VerifyEmail(ctx context.Context, plainToken string) (U,
 //     matching step 1's miss case, not surfaced as the raw Store sentinel.
 //  4. Only a true ok from step 3 goes on to mint a successor: a fresh
 //     opaque refresh token (in the SAME FamilyID as the rotated session, so
-//     the chain still traces back to one login), a fresh access token, and
-//     a new Session row. THIS IS THE PROPERTY THE WHOLE METHOD EXISTS TO
-//     ENFORCE — see the next section for why.
+//     the chain still traces back to one login) and a fresh access token.
+//     THIS IS THE PROPERTY THE WHOLE METHOD EXISTS TO ENFORCE — see the
+//     next section for why.
+//  5. [Store.CreateSuccessorSession] persists the new Session row — but
+//     ONLY if the predecessor rotated in step 3 still exists AT THIS
+//     INSTANT. ok=false here means a DIFFERENT caller's own reuse response
+//     (or an explicit LogoutAll/RevokeSession/Logout) revoked this
+//     session's whole family in the window between step 3 and here: this
+//     caller's token was genuine and really did win step 3, but there is no
+//     family left to join. Minting nothing and returning [ErrSessionRevoked]
+//     is what step 5 exists to guarantee instead of the alternative — an
+//     unconditional insert here would silently resurrect an already-revoked
+//     family with exactly one live session. See "Why step 5 exists" below.
 //
 // # Why step 3's result, not step 1's, authorizes minting
 //
@@ -1009,32 +1048,55 @@ func (s *Service[U, PU]) VerifyEmail(ctx context.Context, plainToken string) (U,
 // sharing this login to sign in again: a deliberate, security-first
 // tradeoff, not an oversight.
 //
+// # Why step 5 exists
+//
+// Winning step 3 proves the predecessor row existed and was unrotated at
+// THAT instant — it proves nothing about whether it still exists by the
+// time this method reaches its own insert. A different caller, replaying a
+// DIFFERENT, already-superseded token from this SAME family, loses ITS OWN
+// step 3 and responds — per "Why the whole family" above — by calling
+// Store.DeleteSessionsByFamily, which can complete in the gap between this
+// caller's step 3 and step 5. An earlier version of this method called the
+// unconditional [Store.CreateSession] in that gap: the reuse alarm fired,
+// correctly revoked the entire family, and this call then silently undid
+// it, leaving one live, fully rotating session behind — the compromise the
+// alarm exists to stop survives the alarm. [Store.CreateSuccessorSession]
+// closes that window the same way step 3 closes ITS window: as one atomic
+// check-and-insert, this time gated on "does the family this session
+// belongs to still exist" rather than "did I win the compare-and-set" —
+// see that method's own doc on [Store] for the exact contract, including
+// the one narrower race it does not claim to close.
+//
 // # Fail closed
 //
-// Any Store error not itself translated into one of the two sentinels above
-// — a lookup failure that is not ErrSessionNotFound, a MarkRotated failure,
-// a DeleteSessionsByFamily failure, a FindUserByID failure for the winning
-// caller — is returned as-is. In particular, a Store error AFTER step 3 has
-// already returned ok=true (loading the user, issuing the access token,
-// persisting the successor) is surfaced as a plain error, never silently
-// downgraded to "no session" or a fabricated success: this method never
-// hands back a [LoginResult] it cannot back with every one of those steps
-// having genuinely succeeded.
+// Any Store error not itself translated into one of the sentinels above —
+// a lookup failure that is not ErrSessionNotFound, a MarkRotated failure, a
+// FindUserByID failure for the winning caller, a CreateSuccessorSession
+// failure — is returned as-is. In particular, a Store error AFTER step 3
+// has already returned ok=true (loading the user, issuing the access
+// token, persisting the successor) is surfaced as a plain error, never
+// silently downgraded to "no session" or a fabricated success: this method
+// never hands back a [LoginResult] it cannot back with every one of those
+// steps having genuinely succeeded. A DeleteSessionsByFamily failure at
+// step 3's replay branch does NOT mask that a replay was detected: the
+// returned error satisfies errors.Is against both [ErrTokenReuse] and the
+// Store's own error — see ErrTokenReuse's own doc for why losing that
+// signal would be worse than a slightly noisier one.
 //
 // One accepted, disclosed trade-off: once step 3 has returned ok=true, the
 // presented token IS already rotated away — [Store.MarkRotated] performed
-// an irreversible write. If [token.Issue] or [Store.CreateSession]
-// subsequently fails (a misconfigured signing key; a Store write outage),
-// this method returns that error, but the predecessor session cannot be
-// "un-rotated": the caller is left with neither a working old token (it is
-// rotated) nor a working new one (it was never persisted, or never
-// returned). This mirrors [Service.Login]'s own disclosed
-// orphaned-session-row trade-off, and for a related reason: this method
-// issues the access token BEFORE persisting the successor Session row
-// specifically to avoid ALSO leaving an orphaned row nothing can ever
-// reach — but it cannot avoid the token-loss window itself, since step 3
-// must run, and commit, before this method is even allowed to decide
-// whether it may mint at all.
+// an irreversible write. If [token.Issue] subsequently fails (a
+// misconfigured signing key) or step 5 reports ok=false ([ErrSessionRevoked])
+// or its own Store error, this method returns that error, but the
+// predecessor session cannot be "un-rotated": the caller is left with
+// neither a working old token (it is rotated) nor a working new one (it
+// was never persisted, or never returned). This mirrors [Service.Login]'s
+// own disclosed orphaned-session-row trade-off, and for a related reason:
+// this method issues the access token BEFORE reaching step 5 specifically
+// so a bad signing key fails before step 5 is even attempted — but it
+// cannot avoid the token-loss window itself, since step 3 must run, and
+// commit, before this method is even allowed to decide whether it may mint
+// at all.
 func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (LoginResult[U], error) {
 	var zero LoginResult[U]
 	now := s.cfg.clock()
@@ -1070,8 +1132,12 @@ func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (Logi
 	}
 	if !ok {
 		// A genuine replay. Revoke the whole family, not just this session.
+		//
+		// A DeleteSessionsByFamily failure here must not swallow the fact
+		// that a replay WAS detected — see ErrTokenReuse's own doc for why
+		// both are wrapped rather than just derr alone.
 		if derr := s.store.DeleteSessionsByFamily(ctx, rotated.FamilyID); derr != nil {
-			return zero, derr
+			return zero, fmt.Errorf("%w: %w", ErrTokenReuse, derr)
 		}
 		return zero, ErrTokenReuse
 	}
@@ -1094,10 +1160,10 @@ func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (Logi
 	if s.extender != nil {
 		extra = s.extender(wrapped)
 	}
-	// Issued BEFORE CreateSession, deliberately, matching Login's own
-	// ordering and for the same reason: a bad signing key must fail before
-	// any successor Session row is persisted, rather than leaving one
-	// behind that no refresh token can ever reach.
+	// Issued BEFORE step 5, deliberately, matching Login's own ordering and
+	// for the same reason: a bad signing key must fail before step 5 is
+	// even attempted, rather than leaving a successor Session row persisted
+	// that no refresh token can ever reach.
 	accessToken, err := token.Issue(token.Claims{
 		Subject:   rotated.UserID,
 		SessionID: successorID,
@@ -1108,7 +1174,14 @@ func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (Logi
 		return zero, err
 	}
 
-	if _, err := s.store.CreateSession(ctx, Session{
+	// Step 5: persist the successor, but ONLY if the predecessor rotated in
+	// step 3 still exists — see the method doc's "Why step 5 exists"
+	// section. ok=false here means this family was revoked in the window
+	// between step 3 and here; this caller's own token was never replayed,
+	// but there is nothing left to join, so this method mints nothing and
+	// fails closed with ErrSessionRevoked rather than silently resurrecting
+	// an already-revoked family.
+	_, ok, err = s.store.CreateSuccessorSession(ctx, rotated.ID, Session{
 		ID:        successorID,
 		UserID:    rotated.UserID,
 		TokenHash: refreshHashNew,
@@ -1125,8 +1198,12 @@ func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (Logi
 		// necessarily the device that just rotated it.
 		UserAgent: rotated.UserAgent,
 		IP:        rotated.IP,
-	}); err != nil {
+	})
+	if err != nil {
 		return zero, err
+	}
+	if !ok {
+		return zero, ErrSessionRevoked
 	}
 
 	return LoginResult[U]{User: wrapped, AccessToken: accessToken, RefreshToken: refreshPlainNew}, nil

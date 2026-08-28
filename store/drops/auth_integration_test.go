@@ -582,6 +582,164 @@ func TestMarkRotatedLive(t *testing.T) {
 	}
 }
 
+// TestCreateSuccessorSessionSucceedsWhenPredecessorExistsLive is the
+// ordinary path: the predecessor is still there, so the successor is
+// inserted and ok is true.
+func TestCreateSuccessorSessionSucceedsWhenPredecessorExistsLive(t *testing.T) {
+	st := newLiveAuthStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	userID := uid.NewV7()
+	familyID := uid.NewV7()
+
+	rotatedAt := now
+	pred, err := st.CreateSession(ctx, auth.Session{
+		ID: uid.NewV7(), UserID: userID, TokenHash: "csx-pred-1", FamilyID: familyID,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now, RotatedAt: &rotatedAt,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(predecessor): %v", err)
+	}
+
+	succ := auth.Session{
+		ID: uid.NewV7(), UserID: userID, TokenHash: "csx-succ-1", FamilyID: familyID,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	}
+	got, ok, err := st.CreateSuccessorSession(ctx, pred.ID, succ)
+	if err != nil {
+		t.Fatalf("CreateSuccessorSession: %v", err)
+	}
+	if !ok {
+		t.Fatal("CreateSuccessorSession ok = false, want true — the predecessor exists")
+	}
+	if got.ID != succ.ID {
+		t.Fatalf("CreateSuccessorSession returned id %q, want %q", got.ID, succ.ID)
+	}
+
+	stored, err := st.FindSessionByHash(ctx, "csx-succ-1")
+	if err != nil {
+		t.Fatalf("FindSessionByHash(successor): %v", err)
+	}
+	if stored.ID != succ.ID || stored.RotatedAt != nil {
+		t.Fatalf("stored successor = %+v, want ID=%q RotatedAt=nil", stored, succ.ID)
+	}
+}
+
+// TestCreateSuccessorSessionRefusesResurrectionAfterFamilyRevokedLive is the
+// live reproduction of FIX 1's Critical directly: DeleteSessionsByFamily is
+// run to COMPLETE COMPLETION first — exactly the sequencing the review
+// reproduced against the unconditional CreateSession this method replaced
+// ("family revoked down to zero sessions, the winner's insert then lands,
+// leaving one live session") — and only THEN is CreateSuccessorSession
+// attempted against the now-gone predecessor. Against the fixed
+// implementation this must refuse: ok=false, no error, and the row count
+// stays at zero — no resurrection.
+func TestCreateSuccessorSessionRefusesResurrectionAfterFamilyRevokedLive(t *testing.T) {
+	st := newLiveAuthStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	userID := uid.NewV7()
+	familyID := uid.NewV7()
+
+	rotatedAt := now
+	pred, err := st.CreateSession(ctx, auth.Session{
+		ID: uid.NewV7(), UserID: userID, TokenHash: "csx-pred-2", FamilyID: familyID,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now, RotatedAt: &rotatedAt,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(predecessor): %v", err)
+	}
+
+	// The reuse-detection response, run to completion BEFORE the winner's
+	// own successor insert is attempted — the exact sequencing the review
+	// reproduced.
+	if err := st.DeleteSessionsByFamily(ctx, familyID); err != nil {
+		t.Fatalf("DeleteSessionsByFamily: %v", err)
+	}
+	if _, err := st.FindSessionByHash(ctx, "csx-pred-2"); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("predecessor still present after DeleteSessionsByFamily: err = %v", err)
+	}
+
+	succ := auth.Session{
+		ID: uid.NewV7(), UserID: userID, TokenHash: "csx-succ-2", FamilyID: familyID,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	}
+	got, ok, err := st.CreateSuccessorSession(ctx, pred.ID, succ)
+	if err != nil {
+		t.Fatalf("CreateSuccessorSession err = %v, want nil (a lost race is not a failure)", err)
+	}
+	if ok {
+		t.Fatal("CreateSuccessorSession ok = true against an already-revoked family — this is the resurrection bug FIX 1 closes")
+	}
+	if got != (auth.Session{}) {
+		t.Fatalf("CreateSuccessorSession returned %+v, want the zero value", got)
+	}
+
+	// The critical assertion: the successor must NOT be findable — no
+	// resurrection, the family stays exactly as revoked as
+	// DeleteSessionsByFamily left it.
+	if _, err := st.FindSessionByHash(ctx, "csx-succ-2"); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("FindSessionByHash(successor) err = %v, want ErrSessionNotFound — the family was resurrected with a live session", err)
+	}
+	list, err := st.ListSessionsByUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("ListSessionsByUser returned %d session(s) after a revoked family's rotation was attempted; want 0", len(list))
+	}
+}
+
+// TestCreateSuccessorSessionDuplicateIDFailsLive pins that s.ID's own
+// uniqueness is still enforced against a real server, independent of
+// predecessorID's existence — the live counterpart to
+// store/memory/auth_test.go's TestCreateSuccessorSessionDuplicateIDFails.
+func TestCreateSuccessorSessionDuplicateIDFailsLive(t *testing.T) {
+	st := newLiveAuthStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	userID := uid.NewV7()
+	familyID := uid.NewV7()
+
+	rotatedAt := now
+	pred, err := st.CreateSession(ctx, auth.Session{
+		ID: uid.NewV7(), UserID: userID, TokenHash: "csx-pred-3", FamilyID: familyID,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now, RotatedAt: &rotatedAt,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(predecessor): %v", err)
+	}
+	existing, err := st.CreateSession(ctx, auth.Session{
+		ID: uid.NewV7(), UserID: userID, TokenHash: "csx-existing-3",
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(existing): %v", err)
+	}
+
+	_, ok, err := st.CreateSuccessorSession(ctx, pred.ID, auth.Session{
+		ID: existing.ID, UserID: userID, TokenHash: "csx-new-3",
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	})
+	if !errors.Is(err, auth.ErrIDTaken) {
+		t.Fatalf("CreateSuccessorSession(duplicate id) err = %v, want ErrIDTaken", err)
+	}
+	if ok {
+		t.Fatal("CreateSuccessorSession ok = true despite ErrIDTaken")
+	}
+
+	// The original row must be untouched, AND the predecessor must NOT have
+	// been consumed by the rolled-back transaction — it is still there for
+	// a genuine successor to be minted against later.
+	got, err := st.FindSessionByHash(ctx, "csx-existing-3")
+	if err != nil || got.ID != existing.ID {
+		t.Fatalf("original row disturbed: got=%+v err=%v", got, err)
+	}
+	if _, err := st.FindSessionByHash(ctx, "csx-pred-3"); err != nil {
+		t.Fatalf("predecessor missing after a rolled-back duplicate-id CreateSuccessorSession: %v", err)
+	}
+}
+
 // newLiveAuthStoreWarmed is newLiveAuthStore's counterpart for a
 // concurrency test that needs the connection pool already holding n live
 // connections before the race starts — see

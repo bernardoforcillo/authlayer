@@ -290,6 +290,28 @@ func (s *AuthStore) MarkRotated(_ context.Context, tokenHash string, now time.Ti
 	return auth.Session{}, false, auth.ErrSessionNotFound
 }
 
+// CreateSuccessorSession implements the second half of the rotation-race
+// fix documented on [auth.Store]: it inserts sess only if predecessorID
+// still identifies a row, checked and written under the SAME acquisition of
+// mu — a DeleteSessionsByFamily call landing between the check and the
+// insert (which, in this single-mutex store, cannot happen: DeleteSessionsByFamily
+// itself blocks on mu for its own entire body) is exactly the race this
+// method exists to close, the identical discipline [AuthStore.MarkRotated]
+// already applies to ITS OWN check-and-mark.
+func (s *AuthStore) CreateSuccessorSession(_ context.Context, predecessorID string, sess auth.Session) (auth.Session, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.sessions[sess.ID]; exists {
+		return auth.Session{}, false, auth.ErrIDTaken
+	}
+	if _, exists := s.sessions[predecessorID]; !exists {
+		return auth.Session{}, false, nil
+	}
+	s.sessions[sess.ID] = sess
+	return sess, true, nil
+}
+
 // --- Verifications ---
 
 // CreateVerification normalizes v.Email (see [auth.NormalizeEmail]) —

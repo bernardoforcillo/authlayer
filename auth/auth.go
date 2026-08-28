@@ -31,6 +31,19 @@
 // present the same refresh token at once. See its doc comment for why the
 // check and the mark must be a single atomic step, not two.
 //
+// Winning that compare-and-set is necessary but not sufficient to mint a
+// successor: the winner still has to persist the new [Session] row, and
+// that persist can itself race a DIFFERENT caller's family-wide revocation
+// of the very family this winner's predecessor belongs to — a REPLAY
+// against an OLDER token in the same chain, or an explicit
+// [Store.DeleteSessionsByFamily] call from a logout, can complete between
+// the winner's MarkRotated and its own insert. [Store.CreateSuccessorSession]
+// closes that second race the same way MarkRotated closes the first: as a
+// single atomic step, this time gated on whether the predecessor row is
+// still there to succeed FROM. See that method's own doc for the exact
+// contract and why "the predecessor still exists" is the right liveness
+// check.
+//
 // A presented refresh token whose session is already rotated (MarkRotated
 // returns ok=false with no error) is a replay: either two legitimate
 // requests raced and the loser is being retried with a now-stale token, or an
@@ -499,6 +512,62 @@ type Store interface {
 	// retry" from "replay" and to decide whether to call
 	// DeleteSessionsByFamily.
 	MarkRotated(ctx context.Context, tokenHash string, now time.Time) (Session, bool, error)
+	// CreateSuccessorSession atomically inserts s — a session a rotation is
+	// minting as the successor of the session identified by predecessorID —
+	// but ONLY if predecessorID still identifies a row at the moment of this
+	// call. ok reports whether s was actually persisted: true means
+	// predecessorID still existed and s is now stored, exactly like
+	// [Store.CreateSession]'s own success; false means predecessorID no
+	// longer identified any row, s was NOT persisted, and the caller must
+	// treat this as "the family was revoked out from under this rotation" —
+	// see the package doc's "Sessions, families, and rotation" section for
+	// why that outcome exists at all. false is not itself an error, the same
+	// stance [Store.MarkRotated]'s own ok=false takes: it is an expected
+	// outcome of a real race, not a failure this method experienced.
+	//
+	// # Why this method exists at all
+	//
+	// A caller that already knows it won [Store.MarkRotated] (ok=true) still
+	// cannot safely call the unconditional [Store.CreateSession] to persist
+	// the successor: MarkRotated's ok=true only proves the predecessor
+	// row EXISTED and was unrotated at that earlier instant, not that it
+	// still exists NOW. A concurrent caller replaying a DIFFERENT,
+	// already-superseded token from the SAME family loses its own
+	// MarkRotated race and responds by calling
+	// [Store.DeleteSessionsByFamily] — which can complete, deleting the
+	// predecessor (and everything else in the family) entirely, in the
+	// window between this caller's own MarkRotated success and its
+	// CreateSession call. An unconditional CreateSession run after that
+	// window has closed silently resurrects the family with exactly one
+	// live, fully-functional session — the reuse alarm fired and revoked
+	// everything correctly, and this call then quietly undoes it. This
+	// method is what closes that window: it does not ask "did I win
+	// MarkRotated" (already known, and not enough) but "is there still a
+	// family here to join", checked and acted on as one atomic step.
+	//
+	// It MUST be a single atomic step, the same discipline
+	// [Store.MarkRotated] requires of itself and for the identical reason: a
+	// read-then-write implementation — SELECT to check predecessorID exists,
+	// then a separate INSERT — leaves the exact window open that this method
+	// exists to close, even though each half is individually safe. A
+	// DeleteSessionsByFamily landing between the check and the insert is
+	// invisible to a caller that already finished checking, and the insert
+	// proceeds anyway. A single statement whose insert is conditioned on the
+	// existence check within one atomic operation — an
+	// `INSERT ... SELECT ... WHERE EXISTS (...)` in a SQL backend, one mutex
+	// acquisition spanning both the check and the write in an in-process
+	// one — satisfies this; a backend composing an explicit transaction with
+	// row-level locking on the predecessor for the transaction's duration
+	// (so a concurrent DELETE targeting that row blocks until this
+	// transaction resolves) satisfies it too, and is the shape
+	// [github.com/bernardoforcillo/authlayer/store/drops.AuthStore]'s
+	// implementation uses.
+	//
+	// Returns ErrIDTaken if a session with s.ID already exists, the same
+	// condition [Store.CreateSession] itself reports it under — checked as
+	// part of the same atomic step, independent of predecessorID's own
+	// existence.
+	CreateSuccessorSession(ctx context.Context, predecessorID string, s Session) (Session, bool, error)
 
 	// CreateVerification normalizes v.Email (see [NormalizeEmail]),
 	// persists the result, and returns what was stored. Returns ErrIDTaken

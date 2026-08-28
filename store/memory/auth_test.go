@@ -710,6 +710,120 @@ func TestMarkRotatedIgnoresExpiry(t *testing.T) {
 	}
 }
 
+// --- CreateSuccessorSession ---
+
+// TestCreateSuccessorSessionSucceedsWhenPredecessorExists pins the ordinary
+// path: predecessorID still identifies a row, so the successor is inserted
+// and ok is true.
+func TestCreateSuccessorSessionSucceedsWhenPredecessorExists(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	now := time.Now()
+	rotatedAt := now
+	if _, err := st.CreateSession(ctx, auth.Session{
+		ID: "pred1", FamilyID: "fam1", TokenHash: "hash-pred", RotatedAt: &rotatedAt,
+	}); err != nil {
+		t.Fatalf("CreateSession(predecessor): %v", err)
+	}
+
+	succ := auth.Session{ID: "succ1", FamilyID: "fam1", TokenHash: "hash-succ", UserID: "user1"}
+	got, ok, err := st.CreateSuccessorSession(ctx, "pred1", succ)
+	if err != nil {
+		t.Fatalf("CreateSuccessorSession: %v", err)
+	}
+	if !ok {
+		t.Fatal("CreateSuccessorSession ok = false, want true — the predecessor exists")
+	}
+	if got != succ {
+		t.Fatalf("CreateSuccessorSession returned %+v, want %+v unchanged", got, succ)
+	}
+
+	stored, err := st.FindSessionByHash(ctx, "hash-succ")
+	if err != nil {
+		t.Fatalf("FindSessionByHash(successor): %v", err)
+	}
+	if stored.ID != "succ1" {
+		t.Fatalf("stored successor ID = %q, want succ1", stored.ID)
+	}
+}
+
+// TestCreateSuccessorSessionFailsWhenPredecessorGone pins the whole reason
+// this method exists: if predecessorID no longer identifies a row — the
+// family was already revoked — the successor must NOT be inserted, ok must
+// be false, and this must NOT be reported as an error (it's an expected
+// outcome of a real race, matching MarkRotated's own ok=false stance).
+func TestCreateSuccessorSessionFailsWhenPredecessorGone(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+
+	succ := auth.Session{ID: "succ1", FamilyID: "fam1", TokenHash: "hash-succ"}
+	got, ok, err := st.CreateSuccessorSession(ctx, "nonexistent-predecessor", succ)
+	if err != nil {
+		t.Fatalf("CreateSuccessorSession err = %v, want nil (a lost race is not a failure)", err)
+	}
+	if ok {
+		t.Fatal("CreateSuccessorSession ok = true despite a nonexistent predecessor")
+	}
+	if got != (auth.Session{}) {
+		t.Fatalf("CreateSuccessorSession returned %+v, want the zero value", got)
+	}
+
+	// The critical assertion: nothing was inserted at all.
+	if _, err := st.FindSessionByHash(ctx, "hash-succ"); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("FindSessionByHash(successor) err = %v, want ErrSessionNotFound — CreateSuccessorSession must not have inserted anything", err)
+	}
+}
+
+// TestCreateSuccessorSessionDuplicateIDFails pins that s.ID's own uniqueness
+// is still enforced, matching CreateSession's own contract, independent of
+// predecessorID's existence.
+func TestCreateSuccessorSessionDuplicateIDFails(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateSession(ctx, auth.Session{ID: "pred1", TokenHash: "hash-pred"}); err != nil {
+		t.Fatalf("CreateSession(predecessor): %v", err)
+	}
+	if _, err := st.CreateSession(ctx, auth.Session{ID: "already-taken", TokenHash: "hash-existing"}); err != nil {
+		t.Fatalf("CreateSession(existing): %v", err)
+	}
+
+	_, ok, err := st.CreateSuccessorSession(ctx, "pred1", auth.Session{ID: "already-taken", TokenHash: "hash-new"})
+	if !errors.Is(err, auth.ErrIDTaken) {
+		t.Fatalf("CreateSuccessorSession(duplicate id) err = %v, want ErrIDTaken", err)
+	}
+	if ok {
+		t.Fatal("CreateSuccessorSession ok = true despite ErrIDTaken")
+	}
+
+	// The original row must be untouched.
+	got, err := st.FindSessionByHash(ctx, "hash-existing")
+	if err != nil || got.ID != "already-taken" {
+		t.Fatalf("original row disturbed: got=%+v err=%v", got, err)
+	}
+}
+
+// TestCreateSuccessorSessionIDTakenCheckedEvenWhenPredecessorGone pins the
+// precedence between the two failure conditions this method can report: an
+// id collision is reported (ErrIDTaken) even when the predecessor is ALSO
+// already gone, rather than the predecessor-gone case masking it with a
+// bare ok=false. Either failure alone is enough to refuse the insert; this
+// confirms which one the store surfaces when both are true.
+func TestCreateSuccessorSessionIDTakenCheckedEvenWhenPredecessorGone(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateSession(ctx, auth.Session{ID: "already-taken", TokenHash: "hash-existing"}); err != nil {
+		t.Fatalf("CreateSession(existing): %v", err)
+	}
+
+	_, ok, err := st.CreateSuccessorSession(ctx, "no-such-predecessor", auth.Session{ID: "already-taken", TokenHash: "hash-new"})
+	if !errors.Is(err, auth.ErrIDTaken) {
+		t.Fatalf("CreateSuccessorSession err = %v, want ErrIDTaken", err)
+	}
+	if ok {
+		t.Fatal("CreateSuccessorSession ok = true despite ErrIDTaken")
+	}
+}
+
 // raceMarkRotated drives n goroutines to call MarkRotated(tokenHash, now) on
 // st concurrently, all released by the same closed channel to maximize
 // contention, and reports how many saw ok=true and how many saw a non-nil

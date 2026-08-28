@@ -420,7 +420,18 @@ func (st *AuthStore) UpdateUserEmail(ctx context.Context, userID, email string, 
 // caller's obligation to avoid colliding, not this method's own check, per
 // [auth.Session.TokenHash]'s doc.
 func (st *AuthStore) CreateSession(ctx context.Context, sess auth.Session) (auth.Session, error) {
-	_, err := st.db.Insert(st.s.Sessions).Row(st.s.sessions.row(sess)...).Exec(ctx)
+	return st.insertSession(ctx, st.db, sess)
+}
+
+// insertSession is CreateSession's implementation, parameterized over which
+// *pg.DB to issue the INSERT against: st.db for an ordinary call, a
+// transaction-scoped DB (from [pg.DB.InTx]) for
+// [AuthStore.CreateSuccessorSession]'s composition — so both share the
+// identical column binding and unique-violation classification rather than
+// one being a hand-copied near-duplicate of the other that could silently
+// drift from it.
+func (st *AuthStore) insertSession(ctx context.Context, db *pg.DB, sess auth.Session) (auth.Session, error) {
+	_, err := db.Insert(st.s.Sessions).Row(st.s.sessions.row(sess)...).Exec(ctx)
 	if err == nil {
 		return sess, nil
 	}
@@ -539,6 +550,88 @@ func (st *AuthStore) MarkRotated(ctx context.Context, tokenHash string, now time
 		return auth.Session{}, false, ferr
 	}
 	return existing, false, nil
+}
+
+// CreateSuccessorSession implements auth.Store's rotation-race closure — see
+// that method's own doc on [auth.Store] for the full contract and why it
+// exists. The existence check for predecessorID and the insert of sess are
+// composed into one PostgreSQL transaction via [pg.DB.InTx]:
+//
+//	BEGIN;
+//	SELECT id FROM <sessions> WHERE id = $1 FOR UPDATE;  -- predecessorID
+//	-- if no row: COMMIT (nothing further; ok=false)
+//	-- if found:  INSERT INTO <sessions> (...) VALUES (...);  COMMIT; ok=true
+//
+// FOR UPDATE takes a row lock on the predecessor for as long as this
+// transaction stays open, so a concurrent [AuthStore.DeleteSessionsByFamily]
+// call also targeting that row — the reuse-triggered (or explicit
+// [github.com/bernardoforcillo/authlayer/auth.Service.LogoutAll]-triggered)
+// family revocation this method exists to not silently undo — blocks on
+// that same row until this transaction commits or rolls back, rather than
+// racing it. If the predecessor is already gone when the SELECT runs
+// ([pg.ErrNoRows]), the transaction commits having done nothing further:
+// no INSERT is attempted, ok is false, and the family is left exactly as
+// revoked as DeleteSessionsByFamily made it — the SPECIFIC defect this
+// method was written to fix: an unconditional INSERT reached after a
+// completed revocation used to resurrect the family with one live session.
+//
+// This closes that scenario — and any interleaving where
+// DeleteSessionsByFamily's own row-lock attempt on the predecessor is
+// already blocked behind, or resolves before, this transaction even
+// starts — with certainty: PostgreSQL's row lock guarantees a DELETE
+// targeting a row this transaction holds FOR UPDATE cannot proceed until
+// this transaction ends, and a DELETE that has ALREADY committed leaves
+// nothing for the SELECT to find. It does NOT close a narrower window
+// where this transaction's FOR UPDATE lock is acquired (and this
+// transaction commits, inserting sess) BEFORE a concurrent DeleteSessionsByFamily
+// statement has even taken ITS OWN read snapshot: PostgreSQL's per-statement
+// MVCC snapshot means that DELETE can still correctly remove the
+// predecessor (a row already within its snapshot, re-checked via
+// EvalPlanQual once unblocked) while never seeing sess at all, since sess
+// did not exist under a snapshot taken before this transaction committed —
+// leaving sess as the family's sole survivor. Closing that fully would need
+// a family-level lock (an advisory lock keyed by family_id, held by every
+// mutator of that family) rather than a per-row one; not implemented here,
+// because it is a materially narrower window than the one this method was
+// written to close (this call's several preceding steps — FindUserByID,
+// GenerateOpaque, token.Issue — make it, in practice, arrive well after a
+// racing replay's own near-immediate DeleteSessionsByFamily has already
+// taken its snapshot) and widening the fix to a family-level lock was not
+// requested. See this package's own integration test for the scenario this
+// DOES close deterministically.
+func (st *AuthStore) CreateSuccessorSession(ctx context.Context, predecessorID string, sess auth.Session) (auth.Session, bool, error) {
+	var created auth.Session
+	won := false
+
+	err := st.db.InTx(ctx, func(txdb *pg.DB) error {
+		var predecessor struct {
+			ID string `drop:"id"`
+		}
+		selErr := txdb.Select(st.s.sessions.col("id")).
+			From(st.s.Sessions).
+			Where(st.s.sessions.eq("id", predecessorID)).
+			ForUpdate().
+			One(ctx, &predecessor)
+		if errors.Is(selErr, pg.ErrNoRows) {
+			// The predecessor is already gone: the family was revoked out
+			// from under this rotation. Commit having done nothing further.
+			return nil
+		}
+		if selErr != nil {
+			return selErr
+		}
+
+		c, cerr := st.insertSession(ctx, txdb, sess)
+		if cerr != nil {
+			return cerr
+		}
+		created, won = c, true
+		return nil
+	})
+	if err != nil {
+		return auth.Session{}, false, err
+	}
+	return created, won, nil
 }
 
 // ── Verifications ───────────────────────────────────────────────────────

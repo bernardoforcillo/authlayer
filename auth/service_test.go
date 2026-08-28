@@ -1930,6 +1930,14 @@ type parkingStore struct {
 	calls   atomic.Int32
 	parked  chan struct{}
 	release chan struct{}
+
+	// successorInserts counts CreateSuccessorSession calls that actually
+	// won (ok=true) — see TestRefreshConcurrentSameTokenExactlyOneWinnerFamilyRevoked's
+	// direct "exactly one successor" assertion, which reads this rather
+	// than inferring the count from the final session total (a final count
+	// of zero is also what a double-mint-then-both-get-revoked bug would
+	// produce, so it cannot tell the two apart on its own).
+	successorInserts atomic.Int32
 }
 
 func newParkingStore(inner auth.Store) *parkingStore {
@@ -1953,6 +1961,16 @@ func (s *parkingStore) FindSessionByHash(ctx context.Context, tokenHash string) 
 		<-s.release
 	}
 	return sess, err
+}
+
+// CreateSuccessorSession delegates unchanged, counting only the calls that
+// actually won (ok=true) — see successorInserts' own doc.
+func (s *parkingStore) CreateSuccessorSession(ctx context.Context, predecessorID string, sess auth.Session) (auth.Session, bool, error) {
+	got, ok, err := s.Store.CreateSuccessorSession(ctx, predecessorID, sess)
+	if ok {
+		s.successorInserts.Add(1)
+	}
+	return got, ok, err
 }
 
 // TestRefreshConcurrentSameTokenExactlyOneWinnerFamilyRevoked is the
@@ -2017,6 +2035,15 @@ func TestRefreshConcurrentSameTokenExactlyOneWinnerFamilyRevoked(t *testing.T) {
 		t.Fatalf("loser's LoginResult.RefreshToken = %q, want empty (zero value) on error", first.res.RefreshToken)
 	}
 
+	// Direct assertion, not inferred from the final session count below: a
+	// double-mint bug would ALSO leave zero live sessions once both are
+	// revoked, so counting successful CreateSuccessorSession calls directly
+	// is what actually distinguishes "exactly one successor was ever
+	// minted" from "two were minted and both got swept up".
+	if n := parking.successorInserts.Load(); n != 1 {
+		t.Fatalf("CreateSuccessorSession won %d time(s), want exactly 1", n)
+	}
+
 	// Exactly one winner ever minted a successor. The loser's ErrTokenReuse
 	// additionally revokes the WHOLE family — including the successor the
 	// winner just minted moments earlier.
@@ -2026,5 +2053,257 @@ func TestRefreshConcurrentSameTokenExactlyOneWinnerFamilyRevoked(t *testing.T) {
 	}
 	if len(sessions) != 0 {
 		t.Fatalf("ListSessionsByUser returned %d session(s) after the concurrent reuse was detected; want 0", len(sessions))
+	}
+}
+
+// --- parkAfterMarkRotatedStore: wraps a real auth.Store, embedding it so
+// every method besides MarkRotated is genuine. It parks the WINNING caller
+// (the one whose own MarkRotated call returns ok=true) immediately after
+// MarkRotated returns, before Refresh can go on to call
+// CreateSuccessorSession — the exact window
+// TestRefreshFamilyRevokedBetweenMarkRotatedAndSuccessorFailsClosed and
+// TestLogoutAllReliableAgainstConcurrentRefresh both drive a full,
+// completed revocation through, deterministically, before ever releasing
+// the parked winner. Unlike parkingStore above, there is only ever one
+// caller to park here (no second racing Refresh call), so a plain "park on
+// ok=true" guard is enough — no atomic counter needed to pick "the first"
+// among several. ---
+
+type parkAfterMarkRotatedStore struct {
+	auth.Store
+	parked  chan struct{}
+	release chan struct{}
+}
+
+func newParkAfterMarkRotatedStore(inner auth.Store) *parkAfterMarkRotatedStore {
+	return &parkAfterMarkRotatedStore{
+		Store:   inner,
+		parked:  make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+// MarkRotated delegates to the real store FIRST — so the winning caller's
+// predecessor session is genuinely, atomically rotated before anything
+// parks — then, only for the call that actually won (ok=true), parks until
+// release is closed.
+func (s *parkAfterMarkRotatedStore) MarkRotated(ctx context.Context, tokenHash string, now time.Time) (auth.Session, bool, error) {
+	sess, ok, err := s.Store.MarkRotated(ctx, tokenHash, now)
+	if ok {
+		close(s.parked)
+		<-s.release
+	}
+	return sess, ok, err
+}
+
+// TestRefreshFamilyRevokedBetweenMarkRotatedAndSuccessorFailsClosed is the
+// mandatory FIX 2 deterministic test: it parks the winner strictly between
+// Store.MarkRotated and Store.CreateSuccessorSession, drives a full,
+// completed family revocation through the real store in that window (via
+// DeleteSessionsByFamily directly — exactly what a concurrent caller's own
+// reuse-detection response does, see
+// TestRefreshReuseRevokesWholeFamilyNotJustPresentedSession), and only then
+// releases the parked winner. Before FIX 1 this reproduced the resurrection
+// bug: the winner's unconditional CreateSession landed anyway, leaving one
+// live, fully-functional session behind despite the family having already
+// been revoked to zero. Against the fixed CreateSuccessorSession-gated
+// path, the winner's own attempt to persist its successor must see the
+// predecessor gone and fail closed with ErrSessionRevoked, minting nothing.
+func TestRefreshFamilyRevokedBetweenMarkRotatedAndSuccessorFailsClosed(t *testing.T) {
+	store := memory.NewAuthStore()
+	seed := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	ctx := context.Background()
+	user := mustSignUp(t, seed, "iris@example.com", validPassword)
+	_, _, refresh1, err := seed.Login(ctx, "iris@example.com", validPassword, "1.2.3.4", "seed-agent")
+	if err != nil {
+		t.Fatalf("seeding Login: %v", err)
+	}
+
+	parking := newParkAfterMarkRotatedStore(store)
+	svc := auth.New[testUser](parking,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+
+	type result struct {
+		res auth.LoginResult[testUser]
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		res, err := svc.Refresh(ctx, refresh1)
+		done <- result{res, err}
+	}()
+
+	<-parking.parked // the winner has rotated its predecessor and is now parked
+
+	// Drive a full revocation to COMPLETION, directly against the real
+	// store, in the exact window the winner is parked inside — the family
+	// must be gone before the winner is ever released.
+	sessionsBefore, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessionsBefore) != 1 {
+		t.Fatalf("len(sessionsBefore) = %d, want 1 (the rotated predecessor, not yet a successor)", len(sessionsBefore))
+	}
+	familyID := sessionsBefore[0].FamilyID
+	if err := store.DeleteSessionsByFamily(ctx, familyID); err != nil {
+		t.Fatalf("DeleteSessionsByFamily: %v", err)
+	}
+	confirmGone, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(confirmGone) != 0 {
+		t.Fatalf("len(confirmGone) = %d, want 0 — the revocation must be COMPLETE before releasing the winner", len(confirmGone))
+	}
+
+	close(parking.release) // only NOW does the winner resume
+	r := <-done
+
+	if !errors.Is(r.err, auth.ErrSessionRevoked) {
+		t.Fatalf("err = %v, want ErrSessionRevoked", r.err)
+	}
+	if r.res.RefreshToken != "" || r.res.AccessToken != "" {
+		t.Fatalf("LoginResult = %+v, want the zero value on ErrSessionRevoked", r.res)
+	}
+
+	remaining, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("ListSessionsByUser returned %d session(s) after the resurrection attempt; want 0 — the family must stay revoked", len(remaining))
+	}
+}
+
+// TestLogoutAllReliableAgainstConcurrentRefresh is FIX 3's test: it proves
+// LogoutAll specifically (not a raw DeleteSessionsByFamily call) is
+// reliable against an in-flight Refresh that already won MarkRotated
+// before LogoutAll ran. Same parking technique as the test above; the
+// revoker here is svc.LogoutAll's own real code path end to end, exercising
+// the exact scenario the review named as understated: "an ALREADY-LISTED
+// family is resurrected by a concurrent Refresh" — LogoutAll's list-then-
+// delete-per-family loop has already observed and is in the middle of
+// revoking this exact family when the parked winner is released.
+func TestLogoutAllReliableAgainstConcurrentRefresh(t *testing.T) {
+	store := memory.NewAuthStore()
+	seed := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	ctx := context.Background()
+	user := mustSignUp(t, seed, "jonas@example.com", validPassword)
+	_, _, refresh1, err := seed.Login(ctx, "jonas@example.com", validPassword, "1.2.3.4", "seed-agent")
+	if err != nil {
+		t.Fatalf("seeding Login: %v", err)
+	}
+
+	parking := newParkAfterMarkRotatedStore(store)
+	svc := auth.New[testUser](parking,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+
+	type result struct {
+		res auth.LoginResult[testUser]
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		res, err := svc.Refresh(ctx, refresh1)
+		done <- result{res, err}
+	}()
+
+	<-parking.parked // the winner has rotated its predecessor and is now parked
+
+	// LogoutAll's own real code path — list, then DeleteSessionsByFamily
+	// per distinct family — run to full completion against the real store
+	// while the winner is parked.
+	if err := svc.LogoutAll(ctx, user.ID); err != nil {
+		t.Fatalf("LogoutAll: %v", err)
+	}
+	confirmGone, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(confirmGone) != 0 {
+		t.Fatalf("len(confirmGone) = %d, want 0 — LogoutAll must have completed before releasing the winner", len(confirmGone))
+	}
+
+	close(parking.release)
+	r := <-done
+
+	if !errors.Is(r.err, auth.ErrSessionRevoked) {
+		t.Fatalf("err = %v, want ErrSessionRevoked", r.err)
+	}
+
+	remaining, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("ListSessionsByUser returned %d session(s) after LogoutAll raced a concurrent Refresh; want 0 — \"sign out everywhere\" must be reliable", len(remaining))
+	}
+}
+
+// --- deleteFamilyFailsStore: wraps a real auth.Store, forcing
+// DeleteSessionsByFamily to fail with an arbitrary, non-sentinel error —
+// used to prove Refresh's replay branch never loses the "a replay was
+// detected" signal merely because the housekeeping response to it also
+// failed. ---
+
+var errDeleteFamilyBoom = errors.New("boom: simulated DeleteSessionsByFamily outage")
+
+type deleteFamilyFailsStore struct {
+	auth.Store
+}
+
+func (s *deleteFamilyFailsStore) DeleteSessionsByFamily(context.Context, string) error {
+	return errDeleteFamilyBoom
+}
+
+// TestRefreshReplayErrorPreservesReuseSignalEvenWhenFamilyDeleteFails pins
+// the "also take" fix: a DeleteSessionsByFamily failure while responding to
+// a detected replay must not mask that a replay WAS detected. The returned
+// error must satisfy errors.Is against BOTH ErrTokenReuse (the signal) and
+// the Store's own underlying error (the operational failure) — losing
+// either one is worse than a slightly noisier error.
+func TestRefreshReplayErrorPreservesReuseSignalEvenWhenFamilyDeleteFails(t *testing.T) {
+	store := memory.NewAuthStore()
+	seed := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	ctx := context.Background()
+	mustSignUp(t, seed, "kara@example.com", validPassword)
+	_, _, refresh1, err := seed.Login(ctx, "kara@example.com", validPassword, "1.2.3.4", "")
+	if err != nil {
+		t.Fatalf("seeding Login: %v", err)
+	}
+
+	failing := &deleteFamilyFailsStore{Store: store}
+	svc := auth.New[testUser](failing,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+
+	// Rotate once for real (through the healthy underlying store, via seed)
+	// so refresh1 is genuinely superseded — the next Refresh(refresh1) is a
+	// real replay, not a fabricated one.
+	if _, err := seed.Refresh(ctx, refresh1); err != nil {
+		t.Fatalf("seeding rotation: %v", err)
+	}
+
+	_, err = svc.Refresh(ctx, refresh1)
+	if !errors.Is(err, auth.ErrTokenReuse) {
+		t.Fatalf("err = %v, want it to satisfy errors.Is(err, ErrTokenReuse) even though DeleteSessionsByFamily failed", err)
+	}
+	if !errors.Is(err, errDeleteFamilyBoom) {
+		t.Fatalf("err = %v, want it to ALSO satisfy errors.Is(err, errDeleteFamilyBoom) — the operational failure must not be hidden either", err)
 	}
 }
