@@ -74,6 +74,19 @@ type Claims struct {
 	Email     string `json:"email"`
 	IssuedAt  int64  `json:"iat"`
 	ExpiresAt int64  `json:"exp"`
+	// Extra carries additional, application-defined claims beyond the fixed
+	// set above — populated by
+	// [github.com/bernardoforcillo/authlayer/auth]'s WithClaimsExtender, nil
+	// otherwise. This package neither reads nor interprets it: Issue
+	// marshals whatever the caller set on Claims (Extra included) exactly
+	// like every other field, and Parse decodes it back the same way — this
+	// is a plain, additive data field, not a second code path, so none of
+	// the alg/key/signature checks documented on Parse are affected by its
+	// presence, absence, or contents. omitempty keeps an unset Extra out of
+	// the token entirely, so a caller that never sets it gets byte-for-byte
+	// the same payload shape this package produced before the field
+	// existed.
+	Extra map[string]any `json:"ext,omitempty"`
 }
 
 // Issue signs c as a compact-serialized HS256 JWT using key, and returns the
