@@ -534,6 +534,37 @@ func (s *Service[U, PU]) wrap(b UserBase) U {
 // the silent-degrade "no credential" failure mode this whole package
 // refuses to produce.
 //
+// # Enumeration safety depends on the Store
+//
+// Everything above proves the SEQUENCE of calls SignUp issues is
+// identical regardless of outcome — by construction, not by argument,
+// there is no `if`/`else` here that sends one outcome down a call the
+// other skips. But identical calls only guarantee identical OUTCOMES if
+// the Store answers them consistently, and two of [Store]'s own methods
+// carry an obligation this method's safety leans on:
+//
+//   - [Store.CreateUser] MUST decide ErrEmailTaken from the SAME attempt
+//     that performs the write, never from a cheaper, separately-authorized
+//     read performed first. Otherwise a condition that blocks writes but
+//     not reads makes CreateUser fail only for a genuinely new address —
+//     the one that needs the write to succeed — while a duplicate
+//     short-circuits to ErrEmailTaken from the read alone.
+//   - [Store.FindUserByEmail] MUST read-your-writes with CreateUser: the
+//     row CreateUser just returned MUST be visible to the FindUserByEmail
+//     call two lines below it. A Store answering from a lagging replica
+//     makes that immediate read fail for a brand-new address specifically
+//     — its write has not replicated yet — while a genuinely duplicate
+//     address's long-since-replicated row is unaffected.
+//
+// Either violation reopens the exact enumeration oracle this method's own
+// doc spends several sections closing, from inside the Store rather than
+// from here — see each method's own doc on [Store] for why, in detail.
+// This is a joint property: SignUp cannot single-handedly guarantee
+// enumeration safety against a Store that does not honor these two
+// obligations, no matter how carefully it is written. store/memory and
+// store/drops both honor them today (documented on their own CreateUser
+// implementations); a third-party Store implementation must too.
+//
 // SignUpResult.User never carries a live PasswordHash on either branch —
 // see that field's own doc and [UserBase.PasswordHash]'s.
 func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string) (SignUpResult[U], error) {

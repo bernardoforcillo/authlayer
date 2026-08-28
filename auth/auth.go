@@ -309,6 +309,37 @@ type Store interface {
 	// normalized email, or ErrIDTaken if a user with this ID already
 	// exists — an existing row is never silently replaced by a second
 	// CreateUser call with the same ID.
+	//
+	// It MUST decide ErrEmailTaken from the same attempt that performs the
+	// write, not from a separate, earlier existence check whose own
+	// authorization or availability can differ from the write's. A single
+	// INSERT that classifies a unique-constraint violation into
+	// ErrEmailTaken — the shape [store/drops.AuthStore.CreateUser] uses —
+	// satisfies this by construction. A preliminary SELECT followed by a
+	// conditional INSERT does NOT, unless the backend has no failure mode
+	// under which the read can succeed while the write independently
+	// cannot; an in-process map with no separate write-permission concept
+	// at all — the shape [store/memory.AuthStore.CreateUser] uses —
+	// satisfies this trivially without literally attempting a write first,
+	// precisely because that failure mode does not exist for it. See that
+	// method's own doc for why check-then-write is acceptable THERE
+	// specifically, not as a general license to check first.
+	//
+	// This is a security requirement, not an implementation-style
+	// preference: [github.com/bernardoforcillo/authlayer/auth.Service.SignUp]
+	// calls CreateUser as its ONLY signal for new-vs-duplicate, and every
+	// call it performs afterward runs identically regardless of the
+	// outcome — see that method's own doc, "Enumeration safety depends on
+	// the Store". If an implementation can decide ErrEmailTaken WITHOUT
+	// attempting the write, a condition that blocks writes but not
+	// reads — a database role granted SELECT but not INSERT, most
+	// concretely — makes CreateUser fail only for a genuinely new address
+	// (which needs the write to succeed) while a duplicate short-circuits
+	// to ErrEmailTaken from the read alone. That reopens the exact
+	// enumeration oracle this package's service layer exists to close,
+	// this time from inside a single Store method rather than from
+	// SignUp's own control flow, where no amount of care in SignUp itself
+	// can see or prevent it.
 	CreateUser(ctx context.Context, u UserBase) (UserBase, error)
 	// FindUserByID loads a user by id, returning ErrUserNotFound when there
 	// is none.
@@ -316,6 +347,25 @@ type Store interface {
 	// FindUserByEmail normalizes email (see [NormalizeEmail]) and loads the
 	// user with that normalized address, returning ErrUserNotFound when
 	// there is none.
+	//
+	// It MUST read-your-writes with CreateUser on the same Store: a row
+	// CreateUser has already returned successfully for MUST be visible to
+	// a FindUserByEmail call that follows it, including one running
+	// immediately afterward in the same request, not merely one running
+	// later. This is a security requirement, not a performance note.
+	// [github.com/bernardoforcillo/authlayer/auth.Service.SignUp] calls
+	// CreateUser, then unconditionally calls FindUserByEmail to read back
+	// what it just wrote, on every invocation regardless of new-vs-duplicate
+	// — see that method's own doc, "Enumeration safety depends on the
+	// Store". An implementation that answers reads from a lagging replica
+	// breaks this specifically for the new-address branch: CreateUser's
+	// write has not yet replicated, so the immediate FindUserByEmail
+	// returns ErrUserNotFound for an address that, moments earlier, was
+	// successfully created — while a genuinely duplicate address, whose
+	// row has existed (and so replicated) for longer, is far less likely
+	// to hit the same lag. That reopens the identical enumeration oracle
+	// from yet another place neither SignUp nor its tests can see: the
+	// Store implementation's own read/write topology.
 	FindUserByEmail(ctx context.Context, email string) (UserBase, error)
 	// MarkEmailVerified stamps EmailVerifiedAt and UpdatedAt with now on the
 	// user identified by userID, but only if email (normalized — see

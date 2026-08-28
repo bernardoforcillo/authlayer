@@ -253,6 +253,16 @@ func isPrimaryKeyViolation(err error) bool {
 // error rather than discarding it, so a caller that wants the underlying
 // pg.ErrUniqueViolation (or, via errors.As, the driver's own
 // *pgconn.PgError) back can still reach it through this error's chain.
+//
+// This is a single INSERT with no preliminary SELECT, so it satisfies
+// [auth.Store.CreateUser]'s write-before-classify obligation by
+// construction: ErrEmailTaken can only ever come from the insert attempt
+// itself failing, never from a separately-authorized read that could
+// succeed on its own under a write-denying condition. FindUserByEmail's
+// paired read-your-writes obligation holds the same way: both methods
+// read/write through the same st.db connection, so there is no replica
+// hop between a CreateUser and the FindUserByEmail authlayer/auth.Service.SignUp
+// runs immediately afterward.
 func (st *AuthStore) CreateUser(ctx context.Context, u auth.UserBase) (auth.UserBase, error) {
 	u.Email = auth.NormalizeEmail(u.Email)
 	_, err := st.db.Insert(st.s.Users).Row(st.s.users.row(u)...).Exec(ctx)

@@ -58,6 +58,22 @@ func NewAuthStore() *AuthStore {
 // the same address cannot both succeed: the second to reach the lock sees
 // the first's row already present and returns auth.ErrIDTaken (checked
 // first) or auth.ErrEmailTaken (checked second), never overwriting it.
+//
+// This checks before writing, which [auth.Store.CreateUser]'s own doc
+// says a backend generally MUST NOT do (deciding ErrEmailTaken from a
+// separate read whose authorization can differ from the write's reopens
+// authlayer/auth's enumeration oracle from inside a single Store method —
+// see that doc for the full reasoning). It is compliant here anyway,
+// deliberately, not by oversight: a Go map assignment (s.users[u.ID] = u)
+// has no failure mode of its own at all — it cannot be independently
+// denied, rejected, or rate-limited the way a database write can — so
+// there is no condition under which the map read above succeeds while
+// the map write below would independently fail. Check-then-write and
+// write-then-classify are indistinguishable outcomes against this
+// specific backend, which is exactly the carve-out the port doc allows.
+// A future change that makes this store's write path capable of failing
+// on its own (a size cap, a quota, anything with its own error) would
+// invalidate this reasoning and require restructuring to write first.
 func (s *AuthStore) CreateUser(_ context.Context, u auth.UserBase) (auth.UserBase, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
