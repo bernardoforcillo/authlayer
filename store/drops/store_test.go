@@ -42,9 +42,21 @@ func (r *fakeRows) Scan(dest ...any) error {
 }
 
 type fakeDriver struct {
-	execs, queries             []string
-	execErr                    error
-	rows                       drops.Rows
+	execs, queries []string
+	execErr        error
+	rows           drops.Rows
+	// rowsSeq, when non-empty, is popped one entry per Query call before
+	// falling back to rows — needed by auth_test.go's MarkRotated
+	// reclassification tests, where the UPDATE...RETURNING query and the
+	// follow-up FindSessionByHash query must see two different results
+	// (e.g. empty, then one already-rotated row) rather than the single
+	// shared rows value every other test in this package needs only once.
+	rowsSeq []drops.Rows
+	// queryErr, when set, is what Query returns instead of rows — no
+	// existing caller of this fake driver needed a Query-level failure
+	// (as opposed to a query that legitimately returns zero rows) until
+	// MarkRotated's propagated-error test.
+	queryErr                   error
 	affected                   int64
 	begins, commits, rollbacks int
 }
@@ -59,6 +71,14 @@ func (d *fakeDriver) Exec(_ context.Context, sql string, _ ...any) (drops.Result
 
 func (d *fakeDriver) Query(_ context.Context, sql string, _ ...any) (drops.Rows, error) {
 	d.queries = append(d.queries, sql)
+	if d.queryErr != nil {
+		return nil, d.queryErr
+	}
+	if len(d.rowsSeq) > 0 {
+		r := d.rowsSeq[0]
+		d.rowsSeq = d.rowsSeq[1:]
+		return r, nil
+	}
 	if d.rows != nil {
 		return d.rows, nil
 	}
