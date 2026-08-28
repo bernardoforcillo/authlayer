@@ -38,28 +38,37 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-// newLiveAuthStore opens a connection from AUTHLAYER_TEST_DSN, builds a
-// fresh AuthStore, and drops/recreates all three tables so each test starts
-// from an empty schema. It registers sqlDB.Close() as a cleanup BEFORE the
-// table-dropping cleanup: t.Cleanup callbacks run after a test function's
-// defers, in LIFO order, so registering Close first means it runs LAST —
-// the drop-tables cleanup still has a live connection when it runs. See
+// openLiveDB opens AUTHLAYER_TEST_DSN and wraps it in *pg.DB, skipping the
+// test if the DSN is unset. It registers sqlDB.Close() as a cleanup BEFORE
+// any table-dropping cleanup the caller registers afterward: t.Cleanup
+// callbacks run after a test function's defers, in LIFO order, so
+// registering Close here (first) means it runs LAST — a later
+// table-dropping cleanup still has a live connection when it runs. See
 // store/drops/integration_test.go's dropAll and
 // invite_integration_test.go's newLiveInviteStore for the same pattern.
-func newLiveAuthStore(t *testing.T) *dropsstore.AuthStore {
+// Returns the raw *sql.DB too, since a handful of tests need it directly —
+// connection-pool tuning ([newLiveAuthStoreWarmed]) or issuing DDL/queries
+// drops has no builder for.
+func openLiveDB(t *testing.T) (*sql.DB, *pg.DB) {
 	t.Helper()
 	dsn := os.Getenv("AUTHLAYER_TEST_DSN")
 	if dsn == "" {
 		t.Skip("set AUTHLAYER_TEST_DSN to run the drops auth store integration test")
 	}
-
 	sqlDB, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = sqlDB.Close() })
+	return sqlDB, pg.New(stdlib.New(sqlDB))
+}
 
-	db := pg.New(stdlib.New(sqlDB))
+// newLiveAuthStore builds a fresh AuthStore over a connection from
+// AUTHLAYER_TEST_DSN, and drops/recreates all three tables so each test
+// starts from an empty schema.
+func newLiveAuthStore(t *testing.T) *dropsstore.AuthStore {
+	t.Helper()
+	_, db := openLiveDB(t)
 	st := dropsstore.NewAuthStore(db)
 	ctx := context.Background()
 
@@ -199,6 +208,143 @@ func TestAuthStoreUserLifecycleLive(t *testing.T) {
 	}
 	if err := st.UpdateUserEmail(ctx, uid.NewV7(), "x@example.com", now); !errors.Is(err, auth.ErrUserNotFound) {
 		t.Fatalf("UpdateUserEmail(unknown) err = %v, want ErrUserNotFound", err)
+	}
+}
+
+// TestCreateUserDuplicateEmailInsideTxReturnsErrEmailTakenLive is FIX 1's
+// regression test: a duplicate-email CreateUser composed into a CALLER'S
+// OWN transaction (via pg.DB.InTx, the same composition [Store.WithTx] and
+// [InviteStore] callers use) must still return auth.ErrEmailTaken. An
+// earlier version of CreateUser classified a unique violation by
+// re-querying the table for the colliding id AFTER the INSERT had already
+// failed — safe standalone, but PostgreSQL aborts a transaction the
+// instant one statement inside it fails, so that follow-up read (itself
+// just another statement on the same, now-doomed transaction) always came
+// back as SQLSTATE 25P02 ("current transaction is aborted") instead of an
+// answer — and 25P02 satisfied none of ErrEmailTaken, ErrIDTaken, or even
+// the original pg.ErrUniqueViolation. See [isPrimaryKeyViolation]'s doc for
+// the fix: classification now reads the failed statement's own error
+// directly, issuing no further statement at all, so it cannot be affected
+// by the transaction's aborted state.
+func TestCreateUserDuplicateEmailInsideTxReturnsErrEmailTakenLive(t *testing.T) {
+	_, db := openLiveDB(t)
+	st := dropsstore.NewAuthStore(db)
+	ctx := context.Background()
+	dropAuthTables(t, db, st)
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema: %v", err)
+	}
+	t.Cleanup(func() { dropAuthTables(t, db, st) })
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	first := auth.UserBase{ID: uid.NewV7(), Email: "intx@example.com", CreatedAt: now, UpdatedAt: now}
+	if _, err := st.CreateUser(ctx, first); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	dup := auth.UserBase{ID: uid.NewV7(), Email: "  InTx@Example.com  ", CreatedAt: now, UpdatedAt: now}
+	txErr := db.InTx(ctx, func(txdb *pg.DB) error {
+		txSt := dropsstore.NewAuthStore(txdb)
+		_, err := txSt.CreateUser(ctx, dup)
+		return err
+	})
+	if !errors.Is(txErr, auth.ErrEmailTaken) {
+		t.Fatalf("CreateUser(duplicate email) inside InTx err = %v, want auth.ErrEmailTaken", txErr)
+	}
+
+	// InTx rolls back on a non-nil return, so the failed write must not
+	// have landed at all.
+	if _, err := st.FindUserByID(ctx, dup.ID); !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("dup user found after a rolled-back InTx: err = %v, want ErrUserNotFound", err)
+	}
+}
+
+// TestCreateUserDuplicateIDInsideTxReturnsErrIDTakenLive is
+// TestCreateUserDuplicateEmailInsideTxReturnsErrEmailTakenLive's
+// counterpart for the OTHER branch of [isPrimaryKeyViolation]: a duplicate
+// id, not a duplicate email, composed into the same caller-owned
+// transaction.
+func TestCreateUserDuplicateIDInsideTxReturnsErrIDTakenLive(t *testing.T) {
+	_, db := openLiveDB(t)
+	st := dropsstore.NewAuthStore(db)
+	ctx := context.Background()
+	dropAuthTables(t, db, st)
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema: %v", err)
+	}
+	t.Cleanup(func() { dropAuthTables(t, db, st) })
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	id := uid.NewV7()
+	first := auth.UserBase{ID: id, Email: "id-intx-1@example.com", CreatedAt: now, UpdatedAt: now}
+	if _, err := st.CreateUser(ctx, first); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	dup := auth.UserBase{ID: id, Email: "id-intx-2@example.com", CreatedAt: now, UpdatedAt: now}
+	txErr := db.InTx(ctx, func(txdb *pg.DB) error {
+		txSt := dropsstore.NewAuthStore(txdb)
+		_, err := txSt.CreateUser(ctx, dup)
+		return err
+	})
+	if !errors.Is(txErr, auth.ErrIDTaken) {
+		t.Fatalf("CreateUser(duplicate id) inside InTx err = %v, want auth.ErrIDTaken", txErr)
+	}
+
+	got, err := st.FindUserByID(ctx, id)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if got.Email != "id-intx-1@example.com" {
+		t.Fatalf("original row's Email = %q after a rolled-back duplicate-id InTx, want it unchanged", got.Email)
+	}
+}
+
+// TestAuthStoreCreateSchemaSelfHealsMissingEmailUniqueLive is FIX 2's
+// regression test. UNIQUE(email) is declared inline on a fresh table's own
+// CREATE TABLE, but CreateSchema's CREATE TABLE IF NOT EXISTS is a no-op
+// against a users table that already exists — one created by an older
+// version of this code, or by hand, before the constraint existed. Without
+// email ALSO registered as a self-healing ALTER TABLE (see [AuthSchema]'s
+// doc), such a table would silently accept duplicate addresses forever.
+// This test builds exactly that pre-existing, deliberately-incomplete
+// table by hand, runs CreateSchema, and proves the constraint landed.
+func TestAuthStoreCreateSchemaSelfHealsMissingEmailUniqueLive(t *testing.T) {
+	sqlDB, db := openLiveDB(t)
+	ctx := context.Background()
+
+	if _, err := sqlDB.ExecContext(ctx, `DROP TABLE IF EXISTS sessions, verifications, users CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	// A hand-built users table with every column CreateSchema expects, but
+	// deliberately missing UNIQUE(email) — simulating a table that predates
+	// the constraint.
+	if _, err := sqlDB.ExecContext(ctx, `CREATE TABLE users (
+		id uuid NOT NULL PRIMARY KEY,
+		email text NOT NULL,
+		email_verified_at timestamptz,
+		password_hash text NOT NULL,
+		created_at timestamptz NOT NULL,
+		updated_at timestamptz NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = sqlDB.ExecContext(context.Background(), `DROP TABLE IF EXISTS sessions, verifications, users CASCADE`)
+	})
+
+	st := dropsstore.NewAuthStore(db)
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: uid.NewV7(), Email: "heal@example.com", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	_, err := st.CreateUser(ctx, auth.UserBase{ID: uid.NewV7(), Email: "heal@example.com", CreatedAt: now, UpdatedAt: now})
+	if !errors.Is(err, auth.ErrEmailTaken) {
+		t.Fatalf("second CreateUser with the same email err = %v, want ErrEmailTaken — UNIQUE(email) did not self-heal onto the pre-existing table", err)
 	}
 }
 
@@ -436,6 +582,52 @@ func TestMarkRotatedLive(t *testing.T) {
 	}
 }
 
+// newLiveAuthStoreWarmed is newLiveAuthStore's counterpart for a
+// concurrency test that needs the connection pool already holding n live
+// connections before the race starts — see
+// TestMarkRotatedConcurrencyExactlyOneWinnerLive's doc for why an unwarmed
+// pool badly undercounts how often a broken, split-lock MarkRotated gets
+// caught. database/sql's default MaxIdleConns is 2, so SetMaxOpenConns /
+// SetMaxIdleConns must both be raised to n BEFORE warming — otherwise
+// opening n connections and returning them idle would just have the pool
+// close all but 2 of them again immediately.
+func newLiveAuthStoreWarmed(t *testing.T, n int) *dropsstore.AuthStore {
+	t.Helper()
+	sqlDB, db := openLiveDB(t)
+	sqlDB.SetMaxOpenConns(n)
+	sqlDB.SetMaxIdleConns(n)
+
+	st := dropsstore.NewAuthStore(db)
+	ctx := context.Background()
+	dropAuthTables(t, db, st)
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema: %v", err)
+	}
+	t.Cleanup(func() { dropAuthTables(t, db, st) })
+
+	// Prime the pool: n goroutines each force database/sql to hand them a
+	// connection (opening one if the pool doesn't already have an idle
+	// one), then return it to the now-larger idle pool. Once this
+	// completes, the actual race's first real query per goroutine is a
+	// pool checkout that is already satisfied, not a fresh TCP + auth
+	// round trip — see the concurrency test's own doc for why that
+	// distinction is what makes the difference.
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			var one int
+			if err := sqlDB.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
+				t.Errorf("pool warm-up query: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	return st
+}
+
 // TestMarkRotatedConcurrencyExactlyOneWinnerLive is the live-Postgres proof
 // the task exists to produce: a fake driver has no lock contention or wire
 // round trips to interleave, so it cannot demonstrate atomicity — only a
@@ -447,8 +639,34 @@ func TestMarkRotatedLive(t *testing.T) {
 // and store/memory/auth_test.go's raceMarkRotated — see this file's own
 // top-of-file doc for why that function itself could not be reused
 // directly.
+//
+// The pool is pre-warmed to N connections before the race starts (see
+// [newLiveAuthStoreWarmed]) rather than left to grow on demand. Measured
+// over 45 runs at N=100 against an UNWARMED pool, a deliberately broken
+// read-then-write MarkRotated (SELECT the session, decide, then a separate
+// UPDATE by id with no compare-and-set guard) was caught only ~40-70% of
+// the time: opening a fresh connection is comparatively slow and uneven,
+// so goroutines trickle into the actual UPDATE across a wide window instead
+// of arriving together, which sharply reduces how often two of them
+// genuinely race for the same row. Pre-warming closes that gap: 10/10 runs
+// caught the same mutation, and 10/10 runs passed clean against the real,
+// atomic implementation (see the task report for the exact mutation and
+// counts). This project has already learned twice — Plan 4's ConsumeLink,
+// and this exact MarkRotated contract's own store/memory concurrency test
+// — that a probabilistic detector on a single-winner invariant is not
+// trustworthy as a regression net; an occasional green run on a broken
+// implementation is worse than a slower test.
+//
+// shared is computed ONCE, before any goroutine starts, and every
+// goroutine's MarkRotated call races with that identical instant rather
+// than each computing its own time.Now(). The final assertion checks the
+// winning row's RotatedAt against this exact known value, not merely that
+// it is non-nil — pinning that the winner's write actually persisted the
+// instant it was asked to, not some other value a subtler bug might have
+// substituted while still leaving "successes == 1" true.
 func TestMarkRotatedConcurrencyExactlyOneWinnerLive(t *testing.T) {
-	st := newLiveAuthStore(t)
+	const n = 100
+	st := newLiveAuthStoreWarmed(t, n)
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Microsecond)
 
@@ -460,7 +678,7 @@ func TestMarkRotatedConcurrencyExactlyOneWinnerLive(t *testing.T) {
 		t.Fatalf("CreateSession: %v", err)
 	}
 
-	const n = 100
+	shared := now.Add(time.Minute)
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -471,7 +689,7 @@ func TestMarkRotatedConcurrencyExactlyOneWinnerLive(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, ok, err := st.MarkRotated(ctx, sess.TokenHash, time.Now().UTC())
+			_, ok, err := st.MarkRotated(ctx, sess.TokenHash, shared)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -497,8 +715,8 @@ func TestMarkRotatedConcurrencyExactlyOneWinnerLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindSessionByHash: %v", err)
 	}
-	if got.RotatedAt == nil {
-		t.Fatal("final RotatedAt = nil, want the winner's stamp")
+	if got.RotatedAt == nil || !got.RotatedAt.Equal(shared) {
+		t.Fatalf("final RotatedAt = %v, want the shared instant every goroutine raced with, %v", got.RotatedAt, shared)
 	}
 }
 

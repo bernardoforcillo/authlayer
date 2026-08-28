@@ -10,6 +10,7 @@ import (
 	"github.com/bernardoforcillo/authlayer/auth"
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func newAuthStore(fd *fakeDriver) *AuthStore {
@@ -55,18 +56,28 @@ func TestAuthSchemaUserIDColumnsAreAlwaysUUID(t *testing.T) {
 }
 
 // UserBase.Email carries "unique" directly on its drop: tag (see
-// auth.UserBase), so it must be declared inline on the column — the same
-// mechanism org.Organization.Slug uses — and NOT via AddUnique/
-// CompositeUniques, which is reserved for the two TokenHash columns that
-// carry no such tag option. Asserting both halves catches either the tag
-// wiring or an accidental double-declaration.
-func TestAuthSchemaUsersEmailUniqueIsDeclaredInline(t *testing.T) {
+// auth.UserBase), so it is declared inline on the column — the same
+// mechanism org.Organization.Slug uses — for a fresh table's own CREATE
+// TABLE. It is ALSO registered via AddUnique/CompositeUniques, under the
+// exact name PostgreSQL auto-assigns the inline declaration
+// ("users_email_key"), so CreateSchema's guarded ALTER TABLE self-heals a
+// pre-existing table that predates the constraint — see AuthSchema's own
+// doc for why the inline declaration alone is not sufficient (CREATE TABLE
+// IF NOT EXISTS is a no-op against an existing table) and
+// TestAuthStoreCreateSchemaSelfHealsMissingEmailUniqueLive for the live
+// proof. Asserting both halves pins that this is deliberate double
+// coverage, not an accidental gap in either direction.
+func TestAuthSchemaUsersEmailUniqueIsDeclaredBothInlineAndAsSelfHealingConstraint(t *testing.T) {
 	s := NewAuthSchema()
 	if !s.Users.Col("email").IsUnique() {
 		t.Fatal("users.email is not marked unique on the column itself")
 	}
-	if len(s.Users.CompositeUniques()) != 0 {
-		t.Fatalf("users table has composite/registered UNIQUE constraints %v, want none — email's uniqueness must be inline only", s.Users.CompositeUniques())
+	cols, ok := s.Users.CompositeUniques()["users_email_key"]
+	if !ok {
+		t.Fatalf("users table missing the registered self-healing UNIQUE(email) constraint; have %v", s.Users.CompositeUniques())
+	}
+	if len(cols) != 1 || cols[0].Name() != "email" {
+		t.Fatalf("registered unique constraint columns = %v, want [email]", cols)
 	}
 }
 
@@ -113,10 +124,11 @@ func TestAuthSchemaTokenHashConstraintNamesFollowCustomNames(t *testing.T) {
 	}
 }
 
-// drops' CreateTableIfNotExists writes column definitions only, so the two
-// TokenHash UNIQUE constraints (registered via AddUnique, not the struct
-// tag) would never reach the database unless CreateSchema emits them
-// itself. Assert the SQL, not the registry.
+// drops' CreateTableIfNotExists writes column definitions only, so the
+// three UNIQUE constraints (all now registered via AddUnique, including
+// email — see AuthSchema's doc for why the inline tag alone is not
+// sufficient) would never self-heal onto a pre-existing table unless
+// CreateSchema emits them itself. Assert the SQL, not the registry.
 func TestAuthStoreCreateSchemaEmitsUniqueConstraints(t *testing.T) {
 	fd := &fakeDriver{}
 	st := newAuthStore(fd)
@@ -124,24 +136,21 @@ func TestAuthStoreCreateSchemaEmitsUniqueConstraints(t *testing.T) {
 		t.Fatalf("CreateSchema: %v", err)
 	}
 
-	// 3 CREATE TABLE + 2 ALTER TABLE ADD CONSTRAINT (sessions, verifications).
-	if len(fd.execs) != 5 {
-		t.Fatalf("CreateSchema issued %d statements, want 5:\n%s",
+	// 3 CREATE TABLE + 3 ALTER TABLE ADD CONSTRAINT (users, sessions, verifications).
+	if len(fd.execs) != 6 {
+		t.Fatalf("CreateSchema issued %d statements, want 6:\n%s",
 			len(fd.execs), strings.Join(fd.execs, "\n--\n"))
 	}
 
 	all := strings.Join(fd.execs, "\n--\n")
 	for _, w := range []string{
+		`ALTER TABLE "users" ADD CONSTRAINT "users_email_key" UNIQUE ("email");`,
 		`ALTER TABLE "sessions" ADD CONSTRAINT "sessions_token_hash" UNIQUE ("token_hash");`,
 		`ALTER TABLE "verifications" ADD CONSTRAINT "verifications_token_hash" UNIQUE ("token_hash");`,
 	} {
 		if !strings.Contains(all, w) {
 			t.Fatalf("CreateSchema never emitted:\n%s\ngot:\n%s", w, all)
 		}
-	}
-	// users has no ALTER — its UNIQUE(email) is inline in CREATE TABLE.
-	if strings.Contains(all, `ALTER TABLE "users"`) {
-		t.Fatalf("users table has no registered composite constraint but got an ALTER:\n%s", all)
 	}
 	for _, sql := range fd.execs {
 		if strings.Contains(sql, "ALTER TABLE") && !strings.Contains(sql, "EXCEPTION") {
@@ -170,26 +179,47 @@ func TestCreateUserInsertsNormalizedUser(t *testing.T) {
 	}
 }
 
-// A unique violation whose follow-up rowExistsByID finds a row already
-// sitting under this id is classified as ErrIDTaken — see
-// [AuthStore.rowExistsByID]'s doc for why this reclassification exists
-// rather than inspecting the driver's reported constraint name. The
-// follow-up Count query goes through fd.rows, the same field the INSERT's
-// own Exec ignores, so the two are independently controllable here.
+// A unique violation whose driver-reported constraint name ends "_pkey" is
+// classified as ErrIDTaken — see [isPrimaryKeyViolation]'s doc for why this
+// reads *pgconn.PgError.ConstraintName directly rather than drops' own
+// pg.PgError.Constraint (silently always empty through this driver — see
+// that doc for why) or a follow-up database read (broken inside a
+// transaction — also see that doc, and
+// TestCreateUserDuplicateEmailInsideTxReturnsErrEmailTakenLive). The
+// original error must still be reachable through the result, not
+// discarded.
 func TestCreateUserMapsIDCollision(t *testing.T) {
-	fd := &fakeDriver{execErr: pg.ErrUniqueViolation, rows: &fakeRows{data: [][]any{{int64(1)}}}}
-	st := newAuthStore(fd)
+	execErr := &pgconn.PgError{Code: "23505", ConstraintName: "users_pkey"}
+	st := newAuthStore(&fakeDriver{execErr: execErr})
 	_, err := st.CreateUser(context.Background(), auth.UserBase{ID: "user1"})
 	if !errors.Is(err, auth.ErrIDTaken) {
 		t.Fatalf("CreateUser err = %v, want ErrIDTaken", err)
 	}
+	if !errors.Is(err, pg.ErrUniqueViolation) {
+		t.Fatalf("CreateUser err = %v, want it to still wrap pg.ErrUniqueViolation rather than discard the original error", err)
+	}
 }
 
-// A unique violation whose follow-up rowExistsByID finds no row under this
-// id must be the users table's only other unique-enforcing constraint —
-// email — and is classified as ErrEmailTaken. The default fakeDriver (no
-// rows set) already reports Count = 0, matching "no such id".
+// A unique violation whose driver-reported constraint name does NOT end
+// "_pkey" must be the users table's only other unique-enforcing
+// constraint — email — and is classified as ErrEmailTaken.
 func TestCreateUserMapsEmailCollision(t *testing.T) {
+	execErr := &pgconn.PgError{Code: "23505", ConstraintName: "users_email_key"}
+	st := newAuthStore(&fakeDriver{execErr: execErr})
+	_, err := st.CreateUser(context.Background(), auth.UserBase{ID: "user1"})
+	if !errors.Is(err, auth.ErrEmailTaken) {
+		t.Fatalf("CreateUser err = %v, want ErrEmailTaken", err)
+	}
+	if !errors.Is(err, pg.ErrUniqueViolation) {
+		t.Fatalf("CreateUser err = %v, want it to still wrap pg.ErrUniqueViolation rather than discard the original error", err)
+	}
+}
+
+// A unique violation with no constraint name reported at all (a driver
+// that doesn't expose one) cannot be identified as the primary key, so it
+// falls through to the same classification as an actual email collision —
+// matching this store's documented fallback.
+func TestCreateUserUnclassifiedUniqueViolationDefaultsToEmailTaken(t *testing.T) {
 	st := newAuthStore(&fakeDriver{execErr: pg.ErrUniqueViolation})
 	_, err := st.CreateUser(context.Background(), auth.UserBase{ID: "user1"})
 	if !errors.Is(err, auth.ErrEmailTaken) {
@@ -403,24 +433,27 @@ func TestCreateSessionInsertsStampedSession(t *testing.T) {
 	}
 }
 
-// A unique violation whose follow-up rowExistsByID finds a row already
-// under this id is classified as ErrIDTaken.
+// A unique violation whose driver-reported constraint name ends "_pkey" is
+// classified as ErrIDTaken — see [isPrimaryKeyViolation]'s doc.
 func TestCreateSessionMapsIDCollision(t *testing.T) {
-	fd := &fakeDriver{execErr: pg.ErrUniqueViolation, rows: &fakeRows{data: [][]any{{int64(1)}}}}
-	st := newAuthStore(fd)
+	execErr := &pgconn.PgError{Code: "23505", ConstraintName: "sessions_pkey"}
+	st := newAuthStore(&fakeDriver{execErr: execErr})
 	_, err := st.CreateSession(context.Background(), auth.Session{ID: "sess1"})
 	if !errors.Is(err, auth.ErrIDTaken) {
 		t.Fatalf("err = %v, want ErrIDTaken", err)
 	}
+	if !errors.Is(err, pg.ErrUniqueViolation) {
+		t.Fatalf("err = %v, want it to still wrap pg.ErrUniqueViolation rather than discard the original error", err)
+	}
 }
 
 // A TokenHash collision is this method's caller's obligation, not this
-// method's own check (see auth.Session.TokenHash's doc): rowExistsByID
-// finds no row under the given id (Count = 0, the fakeDriver's default), so
-// it must NOT be mis-reported as ErrIDTaken — it propagates as the raw
-// unique violation.
+// method's own check (see auth.Session.TokenHash's doc): its constraint
+// name does not end "_pkey", so it must NOT be mis-reported as ErrIDTaken —
+// it propagates as the raw unique violation, unwrapped.
 func TestCreateSessionPropagatesTokenHashCollisionUnmapped(t *testing.T) {
-	st := newAuthStore(&fakeDriver{execErr: pg.ErrUniqueViolation})
+	execErr := &pgconn.PgError{Code: "23505", ConstraintName: "sessions_token_hash"}
+	st := newAuthStore(&fakeDriver{execErr: execErr})
 	_, err := st.CreateSession(context.Background(), auth.Session{ID: "sess1"})
 	if errors.Is(err, auth.ErrIDTaken) {
 		t.Fatalf("err = %v, must NOT be reported as ErrIDTaken for a token_hash collision", err)
@@ -656,22 +689,26 @@ func TestCreateVerificationNormalizesEmailAndInserts(t *testing.T) {
 	}
 }
 
-// A unique violation whose follow-up rowExistsByID finds a row already
-// under this id is classified as ErrIDTaken.
+// A unique violation whose driver-reported constraint name ends "_pkey" is
+// classified as ErrIDTaken — see [isPrimaryKeyViolation]'s doc.
 func TestCreateVerificationMapsIDCollision(t *testing.T) {
-	fd := &fakeDriver{execErr: pg.ErrUniqueViolation, rows: &fakeRows{data: [][]any{{int64(1)}}}}
-	st := newAuthStore(fd)
+	execErr := &pgconn.PgError{Code: "23505", ConstraintName: "verifications_pkey"}
+	st := newAuthStore(&fakeDriver{execErr: execErr})
 	_, err := st.CreateVerification(context.Background(), auth.Verification{ID: "ver1"})
 	if !errors.Is(err, auth.ErrIDTaken) {
 		t.Fatalf("err = %v, want ErrIDTaken", err)
 	}
+	if !errors.Is(err, pg.ErrUniqueViolation) {
+		t.Fatalf("err = %v, want it to still wrap pg.ErrUniqueViolation rather than discard the original error", err)
+	}
 }
 
-// A TokenHash collision (rowExistsByID finds no row under the given id —
-// Count = 0, the fakeDriver's default) must NOT be mis-reported as
-// ErrIDTaken — it propagates as the raw unique violation.
+// A TokenHash collision — its constraint name does not end "_pkey" — must
+// NOT be mis-reported as ErrIDTaken: it propagates as the raw unique
+// violation, unwrapped.
 func TestCreateVerificationPropagatesTokenHashCollisionUnmapped(t *testing.T) {
-	st := newAuthStore(&fakeDriver{execErr: pg.ErrUniqueViolation})
+	execErr := &pgconn.PgError{Code: "23505", ConstraintName: "verifications_token_hash"}
+	st := newAuthStore(&fakeDriver{execErr: execErr})
 	_, err := st.CreateVerification(context.Background(), auth.Verification{ID: "ver1"})
 	if errors.Is(err, auth.ErrIDTaken) {
 		t.Fatalf("err = %v, must NOT be reported as ErrIDTaken for a token_hash collision", err)

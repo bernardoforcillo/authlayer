@@ -3,11 +3,14 @@ package dropsstore
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/bernardoforcillo/authlayer/auth"
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // AuthNames are the three table names an AuthStore persists to. The zero
@@ -61,14 +64,29 @@ func WithAuthNames(n AuthNames) AuthOption {
 // [auth.Verification.TokenHash]'s own doc comments for what silently
 // breaks without each. email carries the "unique" option directly on
 // [auth.UserBase]'s `drop:` tag (matching [org.Organization]'s Slug
-// precedent — see columns.go), so it is emitted inline as part of each
-// table's own CREATE TABLE and needs no further action here. Neither
-// TokenHash field carries that option — see those fields' own doc for why
-// enforcing their uniqueness is a MUST on a backend without being declared
-// inline — so both are registered as one-column [pg.Table.AddUnique] calls,
-// following the same idiom [InviteSchema] uses for EmailInvite.TokenHash
-// and Link.Code. [AuthStore.CreateSchema] emits the two ALTER TABLE
-// statements CREATE TABLE cannot carry.
+// precedent — see columns.go), so it is emitted inline as part of a fresh
+// table's own CREATE TABLE. That inline declaration is NOT sufficient by
+// itself, though: [AuthStore.CreateSchema]'s CREATE TABLE IF NOT EXISTS is
+// a no-op against a table that already exists — one created by an older
+// version of this code, or by hand — so the inline UNIQUE column
+// definition never reaches such a table at all. email is therefore ALSO
+// registered as a one-column [pg.Table.AddUnique] call, under the exact
+// name PostgreSQL auto-assigns the inline declaration on a fresh table
+// (<Users>_email_key), so [AuthStore.CreateSchema]'s guarded ALTER TABLE
+// self-heals a pre-existing table missing the constraint while silently
+// no-op'ing (via the same duplicate_object guard [compositeConstraintDDL]
+// already relies on) against a fresh one that already has it inline. Proven
+// live: before this second registration existed, CreateSchema against a
+// hand-created users table lacking UNIQUE(email) left two rows sharing one
+// address, and CreateUser returned nil for the duplicate — see
+// TestAuthStoreCreateSchemaSelfHealsMissingEmailUniqueLive. Neither
+// TokenHash field carries the tag's "unique" option at all — see those
+// fields' own doc for why enforcing their uniqueness is a MUST on a
+// backend without being declared inline — so both are registered as
+// one-column AddUnique calls the same way, following the idiom
+// [InviteSchema] uses for EmailInvite.TokenHash and Link.Code.
+// [AuthStore.CreateSchema] emits all three ALTER TABLE statements CREATE
+// TABLE cannot carry (or, for email on a fresh table, does not need to).
 //
 // user_id on sessions and verifications is always typed uuid, unlike
 // [Schema]'s or [InviteSchema]'s user-id columns: this store owns the users
@@ -122,6 +140,12 @@ func NewAuthSchema(opts ...AuthOption) *AuthSchema {
 
 	s.Sessions.AddUnique(names.Sessions+"_token_hash", s.sessions.col("token_hash"))
 	s.Verifications.AddUnique(names.Verifications+"_token_hash", s.verifications.col("token_hash"))
+	// email_key matches PostgreSQL's own default name for the inline
+	// column-level UNIQUE the "unique" tag option already declares (see
+	// [AuthSchema]'s doc): on a fresh table the ALTER below hits that same
+	// name and is swallowed as "already there"; on a pre-existing table
+	// missing the constraint entirely, it adds it.
+	s.Users.AddUnique(names.Users+"_email_key", s.users.col("email"))
 
 	return s
 }
@@ -148,10 +172,12 @@ func NewAuthStore(db *pg.DB, opts ...AuthOption) *AuthStore {
 func (st *AuthStore) Schema() *AuthSchema { return st.s }
 
 // CreateSchema issues CREATE TABLE IF NOT EXISTS for all three tables,
-// followed by the two UNIQUE(token_hash) constraints CREATE TABLE cannot
-// carry — see [AuthSchema]'s doc for why they are load-bearing and why
-// email's own UNIQUE needs no separate statement here. Every statement is
-// idempotent, so the call is safe to re-run; like [Store.CreateSchema] and
+// followed by all three UNIQUE constraints as guarded ALTER TABLE
+// statements — see [AuthSchema]'s doc for why email's is registered this
+// way too, not only the two TokenHash ones CREATE TABLE could never carry
+// in the first place. Every statement is idempotent, so the call is safe
+// to re-run and self-heals a pre-existing table missing a constraint; like
+// [Store.CreateSchema] and
 // [InviteStore.CreateSchema] it adds what is missing and never alters what
 // is already there, so production deployments that own these tables via
 // their own migrations should skip it. No foreign keys are declared between
@@ -170,43 +196,63 @@ func (st *AuthStore) CreateSchema(ctx context.Context) error {
 	return nil
 }
 
-// rowExistsByID reports whether t already has a row whose id column equals
-// id — a read-only classification helper for a Create* method's
-// unique-violation follow-up (see [AuthStore.CreateUser],
-// [AuthStore.CreateSession] and [AuthStore.CreateVerification]), not
-// exposed through auth.Store itself.
+// isPrimaryKeyViolation reports whether a unique-violation error was
+// PostgreSQL's own primary-key constraint colliding, by reading the
+// constraint name straight off the driver's own *pgconn.PgError —
+// PostgreSQL auto-names a single-column inline PRIMARY KEY "<table>_pkey"
+// (see [AuthSchema]'s doc on how id is declared), so that suffix reliably
+// distinguishes an id collision from every other UNIQUE constraint the
+// same table might carry.
 //
-// It exists because the natural-looking alternative — inspecting
-// pg.PgError.Constraint to tell which constraint a unique violation hit,
-// the way [InviteStore] never needed to but this store's CreateUser does
-// (users has two unique-enforcing constraints, unlike EmailInvite's one) —
-// does not work through this codebase's actual driver stack: pg.PgError's
-// doc says Constraint is populated "when the driver reports it", but
-// jackc/pgx/v5's pgconn.PgError carries ConstraintName as a plain struct
-// field, not the ConstraintName() METHOD drops' own classifyError looks
-// for via errors.As(err, &interface{ ConstraintName() string }). That
-// interface therefore never matches a real pgx error, so Constraint is
-// silently empty on every genuine conflict — confirmed by running this
-// store's live integration suite: a real "users_pkey" or "sessions_pkey"
-// violation was misclassified until this function replaced that approach.
-// A read-only existence check sidesteps the driver's error shape entirely.
-func (st *AuthStore) rowExistsByID(ctx context.Context, t *pg.Table, cs *colSet, id string) (bool, error) {
-	n, err := st.db.Select().From(t).Where(cs.eq("id", id)).Count(ctx)
-	if err != nil {
-		return false, err
-	}
-	return n > 0, nil
+// This reads *pgconn.PgError directly rather than drops' own
+// pg.PgError.Constraint or a follow-up database read, for two reasons
+// found the hard way against this store's live integration suite:
+//
+//   - pg.PgError.Constraint is documented as populated "when the driver
+//     reports it", but jackc/pgx/v5's pgconn.PgError carries ConstraintName
+//     as a plain struct FIELD, not the ConstraintName() string METHOD
+//     drops' own classifyError looks for via
+//     errors.As(err, &interface{ ConstraintName() string }). That
+//     interface therefore never matches a real pgx error, so
+//     pg.PgError.Constraint is silently "" on every genuine conflict.
+//     Reaching past drops' wrapper to *pgconn.PgError directly — already in
+//     the module graph via the pgx dependency this codebase already
+//     requires, so this needs no go.mod change — sidesteps that gap. The
+//     tradeoff is a direct dependency on pgx's concrete error type in a
+//     file that otherwise only depends on drops' own abstractions; that
+//     coupling is deliberate and confined to this one function.
+//   - An earlier version of this function instead re-queried the table
+//     ("does a row with this id exist") as a read-only follow-up after the
+//     INSERT failed — safe when composed on its own, but broken when the
+//     caller's INSERT runs inside its own transaction (e.g. via
+//     [pg.DB.InTx]): a failed statement aborts a PostgreSQL transaction
+//     immediately, so ANY further statement on that same transaction —
+//     including a plain read-only SELECT — fails with SQLSTATE 25P02
+//     ("current transaction is aborted"), not the row-existence answer the
+//     classifier needed. Proven live: a duplicate-email CreateUser inside
+//     InTx returned neither ErrEmailTaken, ErrIDTaken, nor even the
+//     original pg.ErrUniqueViolation — just the 25P02 from the doomed
+//     follow-up read. See TestCreateUserDuplicateEmailInsideTxReturnsErrEmailTakenLive.
+//     Reading the already-in-hand error's own constraint name needs no
+//     further statement at all, so it works identically whether the
+//     caller composed the INSERT into a transaction or not.
+func isPrimaryKeyViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && strings.HasSuffix(pgErr.ConstraintName, "_pkey")
 }
 
 // ── Users ───────────────────────────────────────────────────────────────
 
 // CreateUser normalizes u.Email (see [auth.NormalizeEmail]), inserts u, and
 // returns it unchanged. A unique violation is classified via
-// [AuthStore.rowExistsByID] — see that method's doc for why constraint-name
-// inspection was tried first and does not work through this codebase's
-// driver stack: ErrIDTaken when the row's own id already exists,
+// [isPrimaryKeyViolation] — see its doc for why this reads the driver's own
+// *pgconn.PgError rather than re-querying or trusting drops' own
+// pg.PgError.Constraint: ErrIDTaken when the row's own id already exists,
 // ErrEmailTaken otherwise (the users table's only other unique-enforcing
-// constraint — see [AuthSchema]'s doc).
+// constraint — see [AuthSchema]'s doc). Either sentinel wraps the original
+// error rather than discarding it, so a caller that wants the underlying
+// pg.ErrUniqueViolation (or, via errors.As, the driver's own
+// *pgconn.PgError) back can still reach it through this error's chain.
 func (st *AuthStore) CreateUser(ctx context.Context, u auth.UserBase) (auth.UserBase, error) {
 	u.Email = auth.NormalizeEmail(u.Email)
 	_, err := st.db.Insert(st.s.Users).Row(st.s.users.row(u)...).Exec(ctx)
@@ -216,14 +262,10 @@ func (st *AuthStore) CreateUser(ctx context.Context, u auth.UserBase) (auth.User
 	if !errors.Is(err, pg.ErrUniqueViolation) {
 		return auth.UserBase{}, err
 	}
-	idTaken, cerr := st.rowExistsByID(ctx, st.s.Users, st.s.users, u.ID)
-	if cerr != nil {
-		return auth.UserBase{}, cerr
+	if isPrimaryKeyViolation(err) {
+		return auth.UserBase{}, fmt.Errorf("%w: %w", auth.ErrIDTaken, err)
 	}
-	if idTaken {
-		return auth.UserBase{}, auth.ErrIDTaken
-	}
-	return auth.UserBase{}, auth.ErrEmailTaken
+	return auth.UserBase{}, fmt.Errorf("%w: %w", auth.ErrEmailTaken, err)
 }
 
 // FindUserByID loads a user by id, mapping drops' ErrNoRows to
@@ -361,11 +403,11 @@ func (st *AuthStore) UpdateUserEmail(ctx context.Context, userID, email string, 
 // ── Sessions ────────────────────────────────────────────────────────────
 
 // CreateSession persists an already-stamped session and returns it
-// unchanged. A unique violation is classified via
-// [AuthStore.rowExistsByID]: ErrIDTaken when the row's own id already
-// exists; otherwise it is propagated unchanged, since it must then be
-// TokenHash's own UNIQUE constraint — this method's caller's obligation to
-// avoid colliding, not this method's own check, per
+// unchanged. A unique violation is classified via [isPrimaryKeyViolation]:
+// ErrIDTaken (wrapping the original error, never discarding it) when the
+// row's own id already exists; otherwise it is propagated unchanged, since
+// it must then be TokenHash's own UNIQUE constraint — this method's
+// caller's obligation to avoid colliding, not this method's own check, per
 // [auth.Session.TokenHash]'s doc.
 func (st *AuthStore) CreateSession(ctx context.Context, sess auth.Session) (auth.Session, error) {
 	_, err := st.db.Insert(st.s.Sessions).Row(st.s.sessions.row(sess)...).Exec(ctx)
@@ -375,12 +417,8 @@ func (st *AuthStore) CreateSession(ctx context.Context, sess auth.Session) (auth
 	if !errors.Is(err, pg.ErrUniqueViolation) {
 		return auth.Session{}, err
 	}
-	idTaken, cerr := st.rowExistsByID(ctx, st.s.Sessions, st.s.sessions, sess.ID)
-	if cerr != nil {
-		return auth.Session{}, cerr
-	}
-	if idTaken {
-		return auth.Session{}, auth.ErrIDTaken
+	if isPrimaryKeyViolation(err) {
+		return auth.Session{}, fmt.Errorf("%w: %w", auth.ErrIDTaken, err)
 	}
 	return auth.Session{}, err
 }
@@ -498,10 +536,11 @@ func (st *AuthStore) MarkRotated(ctx context.Context, tokenHash string, now time
 // CreateVerification normalizes v.Email (see [auth.NormalizeEmail]) —
 // unconditionally, regardless of v.Purpose, matching store/memory — inserts
 // the result, and returns it. A unique violation is classified via
-// [AuthStore.rowExistsByID]: ErrIDTaken when the row's own id already
-// exists; otherwise it is propagated unchanged, since it must then be
-// TokenHash's own UNIQUE constraint — this method's caller's obligation,
-// per [auth.Verification.TokenHash]'s doc.
+// [isPrimaryKeyViolation]: ErrIDTaken (wrapping the original error, never
+// discarding it) when the row's own id already exists; otherwise it is
+// propagated unchanged, since it must then be TokenHash's own UNIQUE
+// constraint — this method's caller's obligation, per
+// [auth.Verification.TokenHash]'s doc.
 func (st *AuthStore) CreateVerification(ctx context.Context, v auth.Verification) (auth.Verification, error) {
 	v.Email = auth.NormalizeEmail(v.Email)
 	_, err := st.db.Insert(st.s.Verifications).Row(st.s.verifications.row(v)...).Exec(ctx)
@@ -511,12 +550,8 @@ func (st *AuthStore) CreateVerification(ctx context.Context, v auth.Verification
 	if !errors.Is(err, pg.ErrUniqueViolation) {
 		return auth.Verification{}, err
 	}
-	idTaken, cerr := st.rowExistsByID(ctx, st.s.Verifications, st.s.verifications, v.ID)
-	if cerr != nil {
-		return auth.Verification{}, cerr
-	}
-	if idTaken {
-		return auth.Verification{}, auth.ErrIDTaken
+	if isPrimaryKeyViolation(err) {
+		return auth.Verification{}, fmt.Errorf("%w: %w", auth.ErrIDTaken, err)
 	}
 	return auth.Verification{}, err
 }
