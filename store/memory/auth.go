@@ -276,18 +276,19 @@ func (s *AuthStore) MarkRotated(_ context.Context, tokenHash string, now time.Ti
 
 // --- Verifications ---
 
-// CreateVerification normalizes v.NewEmail (see [auth.NormalizeEmail]),
-// stores the result under v's ID, and returns it, or returns
-// auth.ErrIDTaken if a verification with this ID already exists — the check,
-// the normalization, and the write happen under one acquisition of mu, so
-// the row is never silently overwritten.
+// CreateVerification normalizes v.Email (see [auth.NormalizeEmail]) —
+// unconditionally, regardless of v.Purpose; see Verification.Email's doc for
+// why this must never be purpose-conditional — stores the result under v's
+// ID, and returns it, or returns auth.ErrIDTaken if a verification with this
+// ID already exists — the check, the normalization, and the write happen
+// under one acquisition of mu, so the row is never silently overwritten.
 func (s *AuthStore) CreateVerification(_ context.Context, v auth.Verification) (auth.Verification, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.verifications[v.ID]; exists {
 		return auth.Verification{}, auth.ErrIDTaken
 	}
-	v.NewEmail = auth.NormalizeEmail(v.NewEmail)
+	v.Email = auth.NormalizeEmail(v.Email)
 	s.verifications[v.ID] = v
 	return v, nil
 }

@@ -266,6 +266,56 @@ func TestMarkEmailVerifiedRefusesStaleAddress(t *testing.T) {
 	}
 }
 
+// TestMarkEmailVerifiedRefusesStaleAddressForSignup is round 3's central
+// regression test. Round 2 closed the race for "email_change" but left it
+// open for "signup": Verification.Email (then NewEmail) was documented empty
+// for every Purpose but email_change, so a signup redemption handler had
+// nothing to read except the row's own *current* Email — which is exactly
+// what MarkEmailVerified's check compares against, making the comparison
+// compare the current address to itself and always pass. This test mints a
+// real "signup" Verification (via CreateVerification, exercising the actual
+// persisted-and-retrieved Email field rather than a hand-constructed value),
+// changes the user's address before redemption, and redeems using the
+// Verification's own recorded Email — which must now be refused.
+func TestMarkEmailVerifiedRefusesStaleAddressForSignup(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user1", Email: "bob@example.com"}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	// A "signup" verification is minted for bob@example.com — the address
+	// on the row at signup time.
+	v, err := st.CreateVerification(ctx, auth.Verification{
+		ID: "ver1", UserID: "user1", TokenHash: "hash1", Purpose: "signup",
+		Email: "bob@example.com", ExpiresAt: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("CreateVerification: %v", err)
+	}
+
+	// Before the token is redeemed, a different flow changes the address.
+	if err := st.UpdateUserEmail(ctx, "user1", "carol@example.com", time.Now()); err != nil {
+		t.Fatalf("UpdateUserEmail: %v", err)
+	}
+
+	// Redeeming the stale signup token, using the address it actually
+	// recorded, must be refused — not silently certify carol@example.com on
+	// proof of control of bob@example.com.
+	err = st.MarkEmailVerified(ctx, "user1", v.Email, time.Now())
+	if !errors.Is(err, auth.ErrEmailMismatch) {
+		t.Fatalf("MarkEmailVerified(stale signup token) err = %v, want ErrEmailMismatch", err)
+	}
+
+	got, err := st.FindUserByID(ctx, "user1")
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if got.EmailVerifiedAt != nil {
+		t.Fatalf("EmailVerifiedAt = %v, want nil — a refused signup verification must not certify anything", got.EmailVerifiedAt)
+	}
+}
+
 func TestUpdateUserPassword(t *testing.T) {
 	st := newAuthStore()
 	ctx := context.Background()
@@ -1067,16 +1117,16 @@ func TestCreateAndFindVerificationByHash(t *testing.T) {
 	}
 }
 
-// TestCreateVerificationNormalizesNewEmailOnWrite pins I-1: NewEmail — the
-// address an email_change verification eventually redeems into
-// UserBase.Email — must be normalized on write, the same as UserBase.Email
-// itself, so it can never land a non-canonical address in the users table.
-func TestCreateVerificationNormalizesNewEmailOnWrite(t *testing.T) {
+// TestCreateVerificationNormalizesEmailOnWrite pins I-1: Verification.Email
+// — the address the token was minted for — must be normalized on write, the
+// same as UserBase.Email itself, so it can never land a non-canonical
+// address in the users table once redeemed (via UpdateUserEmail).
+func TestCreateVerificationNormalizesEmailOnWrite(t *testing.T) {
 	st := newAuthStore()
 	ctx := context.Background()
 
 	if _, err := st.CreateVerification(ctx, auth.Verification{
-		ID: "ver1", TokenHash: "hash1", Purpose: "email_change", NewEmail: "  New@Example.com  ",
+		ID: "ver1", TokenHash: "hash1", Purpose: "email_change", Email: "  New@Example.com  ",
 	}); err != nil {
 		t.Fatalf("CreateVerification: %v", err)
 	}
@@ -1085,8 +1135,34 @@ func TestCreateVerificationNormalizesNewEmailOnWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindVerificationByHash: %v", err)
 	}
-	if got.NewEmail != "new@example.com" {
-		t.Fatalf("stored NewEmail = %q, want normalized %q", got.NewEmail, "new@example.com")
+	if got.Email != "new@example.com" {
+		t.Fatalf("stored Email = %q, want normalized %q", got.Email, "new@example.com")
+	}
+}
+
+// TestCreateVerificationNormalizesEmailOnWriteForSignup is
+// TestCreateVerificationNormalizesEmailOnWrite's sibling for "signup" —
+// pinning round 3's fix directly: Email must be populated and normalized
+// for EVERY Purpose, not only "email_change". Before this fix the field
+// (then named NewEmail) was documented empty for every Purpose but
+// email_change, which is what made MarkEmailVerified's email-match check
+// vacuous for signup (see TestMarkEmailVerifiedRefusesStaleAddressForSignup).
+func TestCreateVerificationNormalizesEmailOnWriteForSignup(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+
+	if _, err := st.CreateVerification(ctx, auth.Verification{
+		ID: "ver1", TokenHash: "hash1", Purpose: "signup", Email: "  Bob@Example.com  ",
+	}); err != nil {
+		t.Fatalf("CreateVerification: %v", err)
+	}
+
+	got, err := st.FindVerificationByHash(ctx, "hash1")
+	if err != nil {
+		t.Fatalf("FindVerificationByHash: %v", err)
+	}
+	if got.Email != "bob@example.com" {
+		t.Fatalf("stored Email = %q, want normalized %q — a signup verification must carry its address too, not just email_change", got.Email, "bob@example.com")
 	}
 }
 

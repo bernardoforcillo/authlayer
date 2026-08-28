@@ -47,9 +47,11 @@
 // [Verification] covers three one-time flows that all share the same shape —
 // mint an opaque token, email or otherwise deliver it, redeem it once — so
 // they share one table rather than three: Purpose distinguishes "signup"
-// (issued before EmailVerifiedAt is set), "email_change" (NewEmail carries
-// the address being switched to, redeemed to overwrite UserBase.Email), and
-// "password_reset" (redeemed to overwrite UserBase.PasswordHash). Like
+// (issued before EmailVerifiedAt is set), "email_change" (redeemed to
+// overwrite UserBase.Email via [Store.UpdateUserEmail]), and
+// "password_reset" (redeemed to overwrite UserBase.PasswordHash). Email
+// carries the address the token was minted for, regardless of Purpose — see
+// that field's own doc for why it is never conditionally populated. Like
 // EmailInvite, only the token's hash is stored.
 package auth
 
@@ -174,18 +176,37 @@ type Verification struct {
 	// validates the closed set of values it accepts, a persistence port does
 	// not.
 	Purpose string `drop:"purpose"`
-	// NewEmail is the address an "email_change" verification redeems to.
-	// Empty for every other Purpose.
+	// Email is the address this verification token is bound to — always
+	// populated and always normalized (see [NormalizeEmail]), regardless of
+	// Purpose:
 	//
-	// Always normalized — see [NormalizeEmail] — the same as UserBase.Email:
-	// [Store.CreateVerification] normalizes it on write. This matters because
-	// NewEmail's entire purpose is to become a UserBase.Email
-	// (via [Store.UpdateUserEmail]) once redeemed; a raw, non-normalized
-	// value stored here would land a non-canonical address in the users
-	// table that FindUserByEmail's normalized probe could never match again,
-	// and would let a case/whitespace variant of an existing address slip
-	// past the uniqueness check UpdateUserEmail applies at redemption.
-	NewEmail string `drop:"new_email"`
+	//   - "signup": the address being confirmed as owned — the same address
+	//     that was already on UserBase.Email when the token was minted.
+	//   - "email_change": the *new* address the token was minted for, to be
+	//     switched to on redemption via [Store.UpdateUserEmail] — never the
+	//     user's old/current address.
+	//   - "password_reset": the address the token was delivered to, kept for
+	//     consistency even though a password-reset redemption calls
+	//     [Store.UpdateUserPassword], not [Store.MarkEmailVerified], and
+	//     this field plays no role in that check today.
+	//
+	// This field MUST NOT be conditionally populated by Purpose. It used to
+	// be named NewEmail and was documented empty for every Purpose but
+	// "email_change" — which meant a "signup" redemption had nothing
+	// recorded to compare against but the row's own *current* Email, making
+	// [Store.MarkEmailVerified]'s email-match check compare the current
+	// address to itself and always pass: the exact race that check exists to
+	// close, left wide open for the one flow — signup — where an attacker
+	// most wants an unproven address certified. Always populating this
+	// field, for every Purpose, is what gives that check something real to
+	// compare against.
+	//
+	// [Store.CreateVerification] normalizes it on write, the same as
+	// UserBase.Email: a raw, non-normalized value stored here would let a
+	// case/whitespace variant slip past both FindUserByEmail's normalized
+	// probe (for email_change, once redeemed via UpdateUserEmail) and
+	// MarkEmailVerified's own comparison (for every Purpose).
+	Email string `drop:"email"`
 	// ExpiresAt is when this token stops being redeemable. Always set —
 	// there is no "never expires" case for a verification token, matching
 	// EmailInvite.ExpiresAt's rationale.
@@ -198,9 +219,9 @@ type Verification struct {
 //
 // Every Store method that reads or writes an email — a UserBase's Email
 // ([Store.CreateUser], [Store.FindUserByEmail], [Store.UpdateUserEmail]) or
-// a Verification's NewEmail ([Store.CreateVerification], which is the
-// address a redeemed "email_change" Verification eventually becomes a
-// UserBase.Email) — applies it, on both the write and the read side, so
+// a Verification's Email ([Store.CreateVerification], which is the address
+// the token was minted for, regardless of Purpose — see that field's own
+// doc) — applies it, on both the write and the read side, so
 // "Bob@Example.com ", " bob@example.com", and "bob@example.com" all resolve
 // to the exact same row: none of them can create a duplicate account, and
 // none of them can slip past a uniqueness check by varying only case or
@@ -293,6 +314,19 @@ type Store interface {
 	// the address is already verified simply re-stamps both timestamps to
 	// the new now — it is idempotent, not an error.
 	//
+	// It MUST check email against the user's current Email and perform the
+	// write as a single atomic step — the same discipline
+	// [Store.UpdateUserEmail] and [Store.MarkRotated] require of themselves.
+	// A read-then-write implementation (a SELECT to compare email, followed
+	// by a separate UPDATE) does not satisfy this contract even if each half
+	// is individually safe: it only narrows the race this method exists to
+	// close, it does not eliminate it. A concurrent UpdateUserEmail can still
+	// land between the SELECT and the UPDATE, changing the row's address
+	// after this method has already decided email matches, so the UPDATE
+	// goes on to certify an address different from the one it checked — the
+	// same false verification this method exists to prevent, reached through
+	// a smaller, harder-to-notice window instead of a closed one.
+	//
 	// email exists to close a race with UpdateUserEmail, not as a redundant
 	// double-check. A verification token is minted for one specific
 	// address, and time can pass before it is redeemed; during that window
@@ -308,10 +342,11 @@ type Store interface {
 	// ErrEmailMismatch instead of a silent false verification: this is the
 	// redemption step for a "signup"-purpose Verification, and the step an
 	// "email_change" redemption calls immediately after UpdateUserEmail —
-	// in both cases, the caller passes the exact address the Verification's
-	// token was minted for (Verification.NewEmail for email_change,
-	// UserBase.Email at issuance for signup), and the store refuses to
-	// certify anything else.
+	// in both cases, the caller passes Verification.Email, the exact address
+	// the token was minted for regardless of Purpose (see that field's own
+	// doc — it is never conditionally populated, precisely so this check has
+	// something real to compare against for every Purpose, not only
+	// email_change), and the store refuses to certify anything else.
 	MarkEmailVerified(ctx context.Context, userID, email string, now time.Time) error
 	// UpdateUserPassword overwrites PasswordHash and stamps UpdatedAt with
 	// now on the user identified by userID, returning ErrUserNotFound when
@@ -403,7 +438,7 @@ type Store interface {
 	// DeleteSessionsByFamily.
 	MarkRotated(ctx context.Context, tokenHash string, now time.Time) (Session, bool, error)
 
-	// CreateVerification normalizes v.NewEmail (see [NormalizeEmail]),
+	// CreateVerification normalizes v.Email (see [NormalizeEmail]),
 	// persists the result, and returns what was stored. Returns ErrIDTaken
 	// if a verification with this ID already exists — an existing row is
 	// never silently replaced. See [Verification.TokenHash]'s doc for the
