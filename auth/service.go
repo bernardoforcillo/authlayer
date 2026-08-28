@@ -124,6 +124,24 @@ var (
 	// password-reset method. Checked before the claim, so a
 	// wrongly-presented token is not burned either.
 	ErrVerificationPurpose = errors.New("authlayer/auth: verification token is not valid for this operation")
+	// ErrTokenInvalid: [Service.Refresh] was presented a refresh token this
+	// Store has never heard of ([Store.FindSessionByHash] returning
+	// [ErrSessionNotFound]), or whose session has expired
+	// (Session.ExpiresAt <= now). Both cases are reported identically —
+	// see Refresh's doc for why an expired token does not, on its own,
+	// distinguish itself from an unknown one, and critically, why NEITHER
+	// case revokes the session's family: ordinary end-of-life is not
+	// evidence of theft.
+	ErrTokenInvalid = errors.New("authlayer/auth: refresh token is invalid or expired")
+	// ErrTokenReuse: [Service.Refresh] was presented a refresh token whose
+	// session was already rotated away — [Store.MarkRotated] returning
+	// ok=false. This package cannot distinguish a genuine attacker replaying
+	// a stolen token from a legitimate client retrying a raced request with
+	// a now-stale one, so it treats every occurrence as compromise: by the
+	// time this error is returned, every session in the token's family has
+	// already been revoked via [Store.DeleteSessionsByFamily]. See Refresh's
+	// doc, "Why the whole family, not just the presented session".
+	ErrTokenReuse = errors.New("authlayer/auth: refresh token reuse detected; session family revoked")
 )
 
 // RateLimiter throttles [Service.Login] attempts by a caller-supplied key.
@@ -361,6 +379,29 @@ type SignUpResult[U any] struct {
 	// control should ever hand you something to redeem, or touch the
 	// verification the real accountholder already has.
 	VerifyToken string
+}
+
+// LoginResult is the outcome of a successful [Service.Refresh]: the account
+// the redeemed refresh token belongs to, a freshly issued access token, and
+// the plaintext of the new refresh token minted as this rotation's
+// successor. See Refresh's own doc for the full ladder that produces one.
+type LoginResult[U any] struct {
+	// User is the account the rotated session belongs to, freshly loaded
+	// from the Store — never a cached or stale copy carried over from
+	// whatever session lookup happened earlier in the ladder. PasswordHash
+	// is always cleared to "" here, matching every other Service method
+	// that hands back U — see [UserBase.PasswordHash]'s own doc.
+	User U
+	// AccessToken is a fresh, short-lived HS256 JWT — see [WithJWT] — bound
+	// to the NEW session (its SessionID claim is the successor's, not the
+	// rotated-away predecessor's).
+	AccessToken string
+	// RefreshToken is the plaintext of the newly minted successor session's
+	// refresh token. Present this on the NEXT call to Refresh; the token
+	// just redeemed to produce this result is now rotated away and will
+	// fail with [ErrTokenReuse], revoking the whole family, if presented
+	// again.
+	RefreshToken string
 }
 
 // Service mints, authenticates, and verifies accounts for one application.
@@ -895,4 +936,296 @@ func (s *Service[U, PU]) VerifyEmail(ctx context.Context, plainToken string) (U,
 	}
 	u.PasswordHash = ""
 	return s.wrap(u), nil
+}
+
+// Refresh redeems refreshPlain — the opaque refresh token plaintext handed
+// to a caller by [Service.Login] or a prior call to Refresh — for a new
+// access token and a new refresh token, exchanging (rotating) the presented
+// [Session] for a freshly minted successor that shares its FamilyID. See
+// auth.go's package doc, "Sessions, families, and rotation", for the model
+// this method implements; this doc comment is about the ladder specifically.
+//
+// # The rotation ladder
+//
+//  1. tokenHash := [token.HashOpaque](refreshPlain); look the session up by
+//     hash. A miss ([Store.FindSessionByHash] returning
+//     [Store]'s ErrSessionNotFound) is [ErrTokenInvalid] — a refresh token
+//     this Store has never issued, or one it has already forgotten (see
+//     [Store.PurgeExpired]).
+//  2. ExpiresAt <= now is ALSO ErrTokenInvalid, but — deliberately — does
+//     NOT revoke the family: ordinary end-of-life is not evidence of theft,
+//     and revoking a family merely because one device's refresh token aged
+//     out would needlessly sign out every OTHER device sharing that login.
+//     This mirrors why [Store.MarkRotated]'s own predicate excludes expiry
+//     — see that method's doc.
+//  3. [Store.MarkRotated] atomically attempts to claim this session:
+//     ok=true means this caller — and, by MarkRotated's own single-winner
+//     contract, ONLY this caller among however many concurrently present
+//     the same token — won the transition from current to superseded.
+//     ok=false means the row was ALREADY superseded: a genuine replay,
+//     indistinguishable (see auth.go's package doc) from a legitimate
+//     request racing its own retry, so this method does not try to tell
+//     them apart. It revokes EVERY session sharing FamilyID via
+//     [Store.DeleteSessionsByFamily] — not merely the presented one — and
+//     returns [ErrTokenReuse]. See "Why the whole family" below. A
+//     tokenHash that MarkRotated itself can no longer find (the row was
+//     deleted between step 1 and here — PurgeExpired, LogoutAll, or another
+//     reuse revocation racing this one) is also reported as ErrTokenInvalid,
+//     matching step 1's miss case, not surfaced as the raw Store sentinel.
+//  4. Only a true ok from step 3 goes on to mint a successor: a fresh
+//     opaque refresh token (in the SAME FamilyID as the rotated session, so
+//     the chain still traces back to one login), a fresh access token, and
+//     a new Session row. THIS IS THE PROPERTY THE WHOLE METHOD EXISTS TO
+//     ENFORCE — see the next section for why.
+//
+// # Why step 3's result, not step 1's, authorizes minting
+//
+// The session loaded in step 1 is a stale read the instant this method
+// yields the CPU to any concurrent caller — and under Go's scheduler, it
+// can. Two callers racing the SAME refresh token can both load a session
+// with RotatedAt == nil at step 1: reading RotatedAt THERE and branching on
+// it to decide whether to mint would let both callers conclude "not yet
+// rotated, safe to mint" and both succeed, after which the original refresh
+// token is never actually replayed against a superseded row — a stolen
+// token becomes an undetectable second, parallel session, exactly the
+// failure [Store.MarkRotated]'s own doc describes. MarkRotated's ok is the
+// ONLY value this method treats as authoritative for "did I win", because
+// it is the one value computed inside the same atomic compare-and-set that
+// performs the mark — see that method's doc for why the check and the mark
+// must be one atomic step, not two.
+// TestRefreshConcurrentSameTokenExactlyOneWinnerFamilyRevoked, in this
+// package's test suite, builds a deterministic (not scheduler-dependent)
+// interleaving to pin exactly this.
+//
+// # Why the whole family, not just the presented session
+//
+// See auth.go's package doc for the policy this implements: this package
+// cannot distinguish an attacker replaying a stolen token from a client
+// retrying a raced request with a now-stale one, so it treats every replay
+// as compromise. Revoking only the ONE session whose hash was presented
+// would leave every successor already minted from this family — including,
+// worst case, one an attacker themselves rotated into moments before this
+// call — untouched and still live. Revoking the family forces every device
+// sharing this login to sign in again: a deliberate, security-first
+// tradeoff, not an oversight.
+//
+// # Fail closed
+//
+// Any Store error not itself translated into one of the two sentinels above
+// — a lookup failure that is not ErrSessionNotFound, a MarkRotated failure,
+// a DeleteSessionsByFamily failure, a FindUserByID failure for the winning
+// caller — is returned as-is. In particular, a Store error AFTER step 3 has
+// already returned ok=true (loading the user, issuing the access token,
+// persisting the successor) is surfaced as a plain error, never silently
+// downgraded to "no session" or a fabricated success: this method never
+// hands back a [LoginResult] it cannot back with every one of those steps
+// having genuinely succeeded.
+//
+// One accepted, disclosed trade-off: once step 3 has returned ok=true, the
+// presented token IS already rotated away — [Store.MarkRotated] performed
+// an irreversible write. If [token.Issue] or [Store.CreateSession]
+// subsequently fails (a misconfigured signing key; a Store write outage),
+// this method returns that error, but the predecessor session cannot be
+// "un-rotated": the caller is left with neither a working old token (it is
+// rotated) nor a working new one (it was never persisted, or never
+// returned). This mirrors [Service.Login]'s own disclosed
+// orphaned-session-row trade-off, and for a related reason: this method
+// issues the access token BEFORE persisting the successor Session row
+// specifically to avoid ALSO leaving an orphaned row nothing can ever
+// reach — but it cannot avoid the token-loss window itself, since step 3
+// must run, and commit, before this method is even allowed to decide
+// whether it may mint at all.
+func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (LoginResult[U], error) {
+	var zero LoginResult[U]
+	now := s.cfg.clock()
+	tokenHash := token.HashOpaque(refreshPlain)
+
+	// Step 1: find the session. A miss is ErrTokenInvalid.
+	sess, err := s.store.FindSessionByHash(ctx, tokenHash)
+	switch {
+	case errors.Is(err, ErrSessionNotFound):
+		return zero, ErrTokenInvalid
+	case err != nil:
+		return zero, err
+	}
+
+	// Step 2: expiry is checked here, against the step-1 read, and — unlike
+	// step 3's replay case — never revokes the family.
+	if !sess.ExpiresAt.After(now) {
+		return zero, ErrTokenInvalid
+	}
+
+	// Step 3: the compare-and-set. rotated.RotatedAt is now guaranteed
+	// non-nil regardless of ok — either this call just set it (ok=true) or
+	// an earlier winner already had (ok=false) — but this method reads only
+	// ok, never rotated.RotatedAt, to decide what happens next. See the
+	// method doc's "Why step 3's result, not step 1's" section: that
+	// distinction is the entire point of this method.
+	rotated, ok, err := s.store.MarkRotated(ctx, tokenHash, now)
+	switch {
+	case errors.Is(err, ErrSessionNotFound):
+		return zero, ErrTokenInvalid
+	case err != nil:
+		return zero, err
+	}
+	if !ok {
+		// A genuine replay. Revoke the whole family, not just this session.
+		if derr := s.store.DeleteSessionsByFamily(ctx, rotated.FamilyID); derr != nil {
+			return zero, derr
+		}
+		return zero, ErrTokenReuse
+	}
+
+	// Step 4: this caller won. Mint the successor.
+	u, err := s.store.FindUserByID(ctx, rotated.UserID)
+	if err != nil {
+		return zero, err
+	}
+	u.PasswordHash = ""
+	wrapped := s.wrap(u)
+
+	successorID := s.cfg.idGen()
+	refreshPlainNew, refreshHashNew, err := token.GenerateOpaque()
+	if err != nil {
+		return zero, err
+	}
+
+	var extra map[string]any
+	if s.extender != nil {
+		extra = s.extender(wrapped)
+	}
+	// Issued BEFORE CreateSession, deliberately, matching Login's own
+	// ordering and for the same reason: a bad signing key must fail before
+	// any successor Session row is persisted, rather than leaving one
+	// behind that no refresh token can ever reach.
+	accessToken, err := token.Issue(token.Claims{
+		Subject:   rotated.UserID,
+		SessionID: successorID,
+		Email:     u.Email,
+		Extra:     extra,
+	}, s.signingKey(), s.cfg.accessTTL)
+	if err != nil {
+		return zero, err
+	}
+
+	if _, err := s.store.CreateSession(ctx, Session{
+		ID:        successorID,
+		UserID:    rotated.UserID,
+		TokenHash: refreshHashNew,
+		// FamilyID: inherited from the rotated predecessor, not
+		// self-named — this is what keeps the whole chain traceable to
+		// one login. See auth.go's package doc.
+		FamilyID:  rotated.FamilyID,
+		ExpiresAt: now.Add(s.cfg.refreshTTL),
+		CreatedAt: now,
+		// UserAgent/IP: inherited from the predecessor. Refresh takes no
+		// ip/userAgent parameters of its own — the ladder in this method's
+		// doc has no step for updating them — so the successor's audit
+		// fields describe the login that started this family, not
+		// necessarily the device that just rotated it.
+		UserAgent: rotated.UserAgent,
+		IP:        rotated.IP,
+	}); err != nil {
+		return zero, err
+	}
+
+	return LoginResult[U]{User: wrapped, AccessToken: accessToken, RefreshToken: refreshPlainNew}, nil
+}
+
+// Logout revokes the single session identified by refreshPlain. It is
+// idempotent: a refreshPlain this Store has never issued, or one whose
+// session has already been removed (by a prior Logout, [Service.LogoutAll],
+// [Service.RevokeSession], reuse-triggered family revocation, or
+// [Store.PurgeExpired]), returns nil rather than an error — a caller
+// logging out is asking "make sure this session does not exist", and both
+// of those starting states already satisfy that, so there is nothing to
+// report as a failure.
+//
+// Unlike [Service.Refresh], Logout does not check RotatedAt or ExpiresAt:
+// whatever session [token.HashOpaque](refreshPlain) identifies, current or
+// superseded, expired or not, is removed. This is a single-session logout —
+// it does NOT revoke the rest of the session's family; see
+// [Service.LogoutAll] for that. A non-sentinel Store error is returned
+// as-is; see the package's "Fail closed" constraint.
+func (s *Service[U, PU]) Logout(ctx context.Context, refreshPlain string) error {
+	sess, err := s.store.FindSessionByHash(ctx, token.HashOpaque(refreshPlain))
+	switch {
+	case errors.Is(err, ErrSessionNotFound):
+		return nil
+	case err != nil:
+		return err
+	}
+	if err := s.store.DeleteSession(ctx, sess.ID); err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			// Raced with something else that deleted it first (another
+			// Logout call for the same token, a family revocation, ...) —
+			// still idempotent from this caller's point of view.
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// LogoutAll revokes every session belonging to userID, across every
+// family — every device and browser this user is currently signed in on.
+// A user with none is not an error.
+//
+// This is implemented as one [Store.DeleteSessionsByFamily] call per
+// DISTINCT family among the user's sessions, rather than one
+// [Store.DeleteSession] call per row returned by
+// [Store.ListSessionsByUser]: DeleteSessionsByFamily also removes that
+// family's rotated-but-unexpired predecessors (see auth.go's package doc
+// for why those rows are retained rather than deleted at rotation time),
+// not merely whichever rows happened to still exist at the instant the
+// list was read.
+func (s *Service[U, PU]) LogoutAll(ctx context.Context, userID string) error {
+	sessions, err := s.store.ListSessionsByUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	done := make(map[string]bool, len(sessions))
+	for _, sess := range sessions {
+		if done[sess.FamilyID] {
+			continue
+		}
+		done[sess.FamilyID] = true
+		if err := s.store.DeleteSessionsByFamily(ctx, sess.FamilyID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ListSessions returns every session belonging to userID — rotated or not,
+// expired or not, exactly as [Store.ListSessionsByUser] reports them — and
+// nothing belonging to any other user: it is a thin, scoped pass-through,
+// not a place this package adds cross-user visibility. A caller wanting
+// only the currently-presentable sessions filters on RotatedAt == nil and
+// ExpiresAt.After(now) itself.
+func (s *Service[U, PU]) ListSessions(ctx context.Context, userID string) ([]Session, error) {
+	return s.store.ListSessionsByUser(ctx, userID)
+}
+
+// RevokeSession deletes exactly one session, identified by sessionID, but
+// ONLY if it belongs to userID — never by sessionID alone. A sessionID that
+// exists but belongs to a DIFFERENT user is reported identically to a
+// sessionID that does not exist at all ([Store]'s ErrSessionNotFound): this
+// method authorizes the delete itself, by the id's membership in userID's
+// own [Store.ListSessionsByUser] results, rather than trusting a
+// caller-supplied (userID, sessionID) pair to already be consistent. An
+// application handler that reads userID from an authenticated caller's own
+// access token and sessionID from request input cannot use this method to
+// revoke a different user's session by guessing or enumerating ids.
+func (s *Service[U, PU]) RevokeSession(ctx context.Context, userID, sessionID string) error {
+	sessions, err := s.store.ListSessionsByUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	for _, sess := range sessions {
+		if sess.ID == sessionID {
+			return s.store.DeleteSession(ctx, sess.ID)
+		}
+	}
+	return ErrSessionNotFound
 }

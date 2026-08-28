@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -830,6 +831,20 @@ func mustSignUp(t *testing.T, svc *auth.Service[testUser, *testUser], email, pla
 	return res.User
 }
 
+// mustLogin signs the given (already-registered) email/plain in with a
+// fixed IP/UserAgent and fails the test on any error. Used throughout the
+// Refresh/Logout/session-management suite below, which cares about the
+// resulting user and refresh token, not about Login's own behaviour
+// (already pinned above).
+func mustLogin(t *testing.T, svc *auth.Service[testUser, *testUser], email, plain string) (user testUser, access, refresh string) {
+	t.Helper()
+	user, access, refresh, err := svc.Login(context.Background(), email, plain, "203.0.113.9", "test-agent")
+	if err != nil {
+		t.Fatalf("Login(%q): %v", email, err)
+	}
+	return user, access, refresh
+}
+
 func TestLoginSuccess(t *testing.T) {
 	svc, store := newTestService(t)
 	mustSignUp(t, svc, "gina@example.com", validPassword)
@@ -1540,5 +1555,476 @@ func TestVerifyEmailNeverReturnsPasswordHash(t *testing.T) {
 	}
 	if user.PasswordHash != "" {
 		t.Fatalf("VerifyEmail returned User.PasswordHash = %q, want empty", user.PasswordHash)
+	}
+}
+
+// ============================================================
+// Refresh, Logout, LogoutAll, ListSessions, RevokeSession
+// ============================================================
+
+// TestRefreshMintsWorkingSuccessorAndOldTokenThenReuse pins the required
+// property that a rotation returns a working successor, and that the OLD
+// (now-rotated) token subsequently fails with ErrTokenReuse.
+func TestRefreshMintsWorkingSuccessorAndOldTokenThenReuse(t *testing.T) {
+	svc, store := newTestService(t)
+	mustSignUp(t, svc, "amy@example.com", validPassword)
+	user, _, refresh1 := mustLogin(t, svc, "amy@example.com", validPassword)
+	ctx := context.Background()
+
+	res, err := svc.Refresh(ctx, refresh1)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if res.User.ID != user.ID {
+		t.Fatalf("LoginResult.User.ID = %q, want %q", res.User.ID, user.ID)
+	}
+	if res.AccessToken == "" {
+		t.Fatal("LoginResult.AccessToken is empty")
+	}
+	if res.RefreshToken == "" || res.RefreshToken == refresh1 {
+		t.Fatalf("LoginResult.RefreshToken = %q, want a non-empty value different from the original %q", res.RefreshToken, refresh1)
+	}
+
+	// The successor genuinely works: its own access token parses, and its
+	// session is present, current (RotatedAt nil), and in the SAME family
+	// as the original.
+	claims, err := token.Parse(res.AccessToken, testSigningKey)
+	if err != nil {
+		t.Fatalf("token.Parse(successor access token): %v", err)
+	}
+	if claims.Subject != user.ID {
+		t.Fatalf("claims.Subject = %q, want %q", claims.Subject, user.ID)
+	}
+
+	succSess, err := store.FindSessionByHash(ctx, token.HashOpaque(res.RefreshToken))
+	if err != nil {
+		t.Fatalf("FindSessionByHash(successor): %v", err)
+	}
+	if succSess.RotatedAt != nil {
+		t.Fatal("successor session's RotatedAt is non-nil, want nil (current)")
+	}
+	origSess, err := store.FindSessionByHash(ctx, token.HashOpaque(refresh1))
+	if err != nil {
+		t.Fatalf("FindSessionByHash(original, now rotated): %v", err)
+	}
+	if succSess.FamilyID != origSess.FamilyID {
+		t.Fatalf("successor FamilyID = %q, want the original's %q", succSess.FamilyID, origSess.FamilyID)
+	}
+	if origSess.RotatedAt == nil {
+		t.Fatal("original session's RotatedAt is nil after a successful rotation, want non-nil")
+	}
+
+	// The old token, presented again, is a genuine replay.
+	if _, err := svc.Refresh(ctx, refresh1); !errors.Is(err, auth.ErrTokenReuse) {
+		t.Fatalf("second Refresh(original token) err = %v, want ErrTokenReuse", err)
+	}
+}
+
+// TestRefreshReuseRevokesWholeFamilyNotJustPresentedSession pins the
+// required property that reuse revokes the WHOLE family, not merely the
+// session whose hash was presented. It builds a 3-session chain
+// (original -> successor2 -> successor3, the only currently-live one), then
+// replays the long-superseded ORIGINAL token and confirms every row in the
+// family — including the currently-live successor3, which was never itself
+// presented — is gone afterward.
+func TestRefreshReuseRevokesWholeFamilyNotJustPresentedSession(t *testing.T) {
+	svc, store := newTestService(t)
+	mustSignUp(t, svc, "beth@example.com", validPassword)
+	user, _, refresh1 := mustLogin(t, svc, "beth@example.com", validPassword)
+	ctx := context.Background()
+
+	res2, err := svc.Refresh(ctx, refresh1)
+	if err != nil {
+		t.Fatalf("first Refresh: %v", err)
+	}
+	res3, err := svc.Refresh(ctx, res2.RefreshToken)
+	if err != nil {
+		t.Fatalf("second Refresh: %v", err)
+	}
+
+	// Replay the ORIGINAL, long-superseded token — not the current one.
+	if _, err := svc.Refresh(ctx, refresh1); !errors.Is(err, auth.ErrTokenReuse) {
+		t.Fatalf("replay err = %v, want ErrTokenReuse", err)
+	}
+
+	sessions, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("ListSessionsByUser returned %d session(s) after reuse; want 0 — the whole family, not just the presented session, must be revoked", len(sessions))
+	}
+
+	// The currently-live successor (res3), never itself presented, must
+	// also now be unusable — direct proof the revocation was family-wide.
+	if _, err := svc.Refresh(ctx, res3.RefreshToken); !errors.Is(err, auth.ErrTokenInvalid) {
+		t.Fatalf("Refresh(the never-presented, currently-live successor) after family revocation err = %v, want ErrTokenInvalid (its session no longer exists)", err)
+	}
+}
+
+// TestRefreshExpiredTokenInvalidAndFamilyIntact pins that an expired token
+// is ErrTokenInvalid, and — critically — does NOT revoke the family:
+// ordinary end-of-life is not evidence of theft.
+func TestRefreshExpiredTokenInvalidAndFamilyIntact(t *testing.T) {
+	fixedNow := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	store := memory.NewAuthStore()
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+		auth.WithRefreshTTL(time.Hour),
+		auth.WithClock(func() time.Time { return fixedNow }),
+	)
+	ctx := context.Background()
+	if _, err := svc.SignUp(ctx, "cara@example.com", validPassword); err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	user, _, refresh1, err := svc.Login(ctx, "cara@example.com", validPassword, "1.2.3.4", "")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	// A second Service sharing the same Store, with the clock moved past
+	// the 1-hour refresh TTL.
+	later := fixedNow.Add(2 * time.Hour)
+	svcLater := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+		auth.WithRefreshTTL(time.Hour),
+		auth.WithClock(func() time.Time { return later }),
+	)
+
+	if _, err := svcLater.Refresh(ctx, refresh1); !errors.Is(err, auth.ErrTokenInvalid) {
+		t.Fatalf("Refresh(expired) err = %v, want ErrTokenInvalid", err)
+	}
+
+	sessions, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("ListSessionsByUser returned %d session(s) after an expired Refresh; want 1 (family untouched)", len(sessions))
+	}
+	if sessions[0].RotatedAt != nil {
+		t.Fatalf("the expired session's RotatedAt = %v, want nil — an expired-but-unpresented-for-rotation session must not become marked rotated either", sessions[0].RotatedAt)
+	}
+}
+
+// TestLogoutUnknownTokenReturnsNil pins Logout's idempotency contract for a
+// token this Store has never issued.
+func TestLogoutUnknownTokenReturnsNil(t *testing.T) {
+	svc, _ := newTestService(t)
+	if err := svc.Logout(context.Background(), "this-token-was-never-issued"); err != nil {
+		t.Fatalf("Logout(unknown token) err = %v, want nil", err)
+	}
+}
+
+// TestLogoutRevokesSessionAndIsIdempotent pins the ordinary case: Logout
+// deletes exactly the presented session, and calling it again with the same
+// (now-already-deleted) token is still nil, not an error.
+func TestLogoutRevokesSessionAndIsIdempotent(t *testing.T) {
+	svc, store := newTestService(t)
+	mustSignUp(t, svc, "dee@example.com", validPassword)
+	user, _, refresh := mustLogin(t, svc, "dee@example.com", validPassword)
+	ctx := context.Background()
+
+	if err := svc.Logout(ctx, refresh); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	sessions, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("ListSessionsByUser returned %d session(s) after Logout; want 0", len(sessions))
+	}
+
+	if err := svc.Logout(ctx, refresh); err != nil {
+		t.Fatalf("second Logout(same, now-deleted token) err = %v, want nil", err)
+	}
+}
+
+// TestLogoutAllRevokesEveryFamilyIncludingRotatedPredecessors pins
+// LogoutAll: every session across every family for the user is gone
+// afterward, including a rotated-but-unexpired predecessor row a
+// per-row-id approach could miss.
+func TestLogoutAllRevokesEveryFamilyIncludingRotatedPredecessors(t *testing.T) {
+	svc, store := newTestService(t)
+	mustSignUp(t, svc, "flynn@example.com", validPassword)
+	user, _, refreshDeviceA := mustLogin(t, svc, "flynn@example.com", validPassword)
+	ctx := context.Background()
+
+	// A second, independent login — a second device/family.
+	_, _, refreshDeviceB, err := svc.Login(ctx, "flynn@example.com", validPassword, "198.51.100.2", "device-b")
+	if err != nil {
+		t.Fatalf("second Login: %v", err)
+	}
+
+	// Rotate device A once, so its family has a rotated-but-unexpired
+	// predecessor plus a current successor.
+	if _, err := svc.Refresh(ctx, refreshDeviceA); err != nil {
+		t.Fatalf("Refresh(device A): %v", err)
+	}
+	_ = refreshDeviceB
+
+	if err := svc.LogoutAll(ctx, user.ID); err != nil {
+		t.Fatalf("LogoutAll: %v", err)
+	}
+
+	sessions, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("ListSessionsByUser returned %d session(s) after LogoutAll; want 0 (every family, every row)", len(sessions))
+	}
+}
+
+// TestListSessionsShowsOnlyOwn pins that ListSessions for one user never
+// returns another user's sessions.
+func TestListSessionsShowsOnlyOwn(t *testing.T) {
+	svc, _ := newTestService(t)
+	userA := mustSignUp(t, svc, "eddie@example.com", validPassword)
+	mustSignUp(t, svc, "fiona@example.com", validPassword)
+	ctx := context.Background()
+	mustLogin(t, svc, "eddie@example.com", validPassword)
+	mustLogin(t, svc, "fiona@example.com", validPassword)
+
+	sessions, err := svc.ListSessions(ctx, userA.ID)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("len(sessions) = %d, want 1", len(sessions))
+	}
+	if sessions[0].UserID != userA.ID {
+		t.Fatalf("session.UserID = %q, want %q (a different user's session leaked)", sessions[0].UserID, userA.ID)
+	}
+}
+
+// TestRevokeSessionRequiresOwnership pins RevokeSession's authorization
+// contract: a session id belonging to a DIFFERENT user is refused
+// (ErrSessionNotFound, identical to a nonexistent id — never leaking that
+// the id belongs to someone else), while the true owner can revoke it.
+func TestRevokeSessionRequiresOwnership(t *testing.T) {
+	svc, store := newTestService(t)
+	userA := mustSignUp(t, svc, "gale@example.com", validPassword)
+	userB := mustSignUp(t, svc, "hollis@example.com", validPassword)
+	ctx := context.Background()
+	mustLogin(t, svc, "gale@example.com", validPassword)
+	mustLogin(t, svc, "hollis@example.com", validPassword)
+
+	bSessions, err := store.ListSessionsByUser(ctx, userB.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser(B): %v", err)
+	}
+	if len(bSessions) != 1 {
+		t.Fatalf("len(bSessions) = %d, want 1", len(bSessions))
+	}
+
+	// A tries to revoke B's session.
+	if err := svc.RevokeSession(ctx, userA.ID, bSessions[0].ID); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("RevokeSession(A, B's session id) err = %v, want ErrSessionNotFound", err)
+	}
+	// B's session must still exist.
+	stillThere, err := store.ListSessionsByUser(ctx, userB.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser(B) after A's attempt: %v", err)
+	}
+	if len(stillThere) != 1 {
+		t.Fatalf("len(stillThere) = %d, want 1 — B's session must survive A's unauthorized attempt", len(stillThere))
+	}
+
+	// B revokes their own session.
+	if err := svc.RevokeSession(ctx, userB.ID, bSessions[0].ID); err != nil {
+		t.Fatalf("RevokeSession(B, B's own session id): %v", err)
+	}
+	gone, err := store.ListSessionsByUser(ctx, userB.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser(B) after B's own revoke: %v", err)
+	}
+	if len(gone) != 0 {
+		t.Fatalf("len(gone) = %d, want 0", len(gone))
+	}
+}
+
+// TestRefreshRotatedRowRetainedUntilPurgeExpired pins that a
+// rotated-but-unexpired session row is NOT deleted at rotation time — it is
+// retained (that is what makes reuse detection possible at all — see
+// auth.go's package doc) — and is swept only once PurgeExpired is called
+// past its ExpiresAt, alongside its successor.
+func TestRefreshRotatedRowRetainedUntilPurgeExpired(t *testing.T) {
+	fixedNow := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	store := memory.NewAuthStore()
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+		auth.WithRefreshTTL(24*time.Hour),
+		auth.WithClock(func() time.Time { return fixedNow }),
+	)
+	ctx := context.Background()
+	if _, err := svc.SignUp(ctx, "ivan@example.com", validPassword); err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	user, _, refresh1, err := svc.Login(ctx, "ivan@example.com", validPassword, "1.2.3.4", "")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	res, err := svc.Refresh(ctx, refresh1)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	// Both rows — the rotated predecessor and its successor — are retained
+	// immediately after rotation.
+	sessions, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("len(sessions) right after rotation = %d, want 2 (rotated predecessor retained + successor)", len(sessions))
+	}
+
+	// Neither has expired yet: PurgeExpired at "now" removes neither
+	// session row (SignUp's own 24h "signup" Verification is also not
+	// expired yet at this point, so this call removes nothing at all).
+	n, err := store.PurgeExpired(ctx, fixedNow)
+	if err != nil {
+		t.Fatalf("PurgeExpired(now): %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("PurgeExpired(now) removed %d row(s) before anything expired; want 0", n)
+	}
+
+	// Past both rows' ExpiresAt (refreshTTL is 24h): both are swept. This
+	// call also sweeps SignUp's own unrelated 24h "signup" Verification
+	// (which has now separately expired too), so rather than assert an
+	// exact total, check the two SESSION rows specifically: both must now
+	// be unfindable.
+	if _, err := store.PurgeExpired(ctx, fixedNow.Add(25*time.Hour)); err != nil {
+		t.Fatalf("PurgeExpired(+25h): %v", err)
+	}
+	if _, err := store.FindSessionByHash(ctx, token.HashOpaque(refresh1)); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("FindSessionByHash(predecessor) after PurgeExpired err = %v, want ErrSessionNotFound", err)
+	}
+	if _, err := store.FindSessionByHash(ctx, token.HashOpaque(res.RefreshToken)); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("FindSessionByHash(successor) after PurgeExpired err = %v, want ErrSessionNotFound", err)
+	}
+}
+
+// --- parkingStore: wraps a real auth.Store, embedding it so every method
+// besides the one overridden below is genuine, un-faked behaviour. It
+// overrides FindSessionByHash to park the FIRST caller only — after it has
+// already performed the real read — until release is closed, building a
+// deterministic (not scheduler-dependent) interleaving for
+// TestRefreshConcurrentSameTokenExactlyOneWinnerFamilyRevoked.
+//
+// An atomic counter decides which call is "first", not sync.Once:
+// Once.Do would block a SECOND concurrent caller reaching the same Once
+// until the first call's Do function returns — which never happens while
+// that first call is deliberately parked inside it, a guaranteed deadlock
+// rather than a controlled interleaving. ---
+
+type parkingStore struct {
+	auth.Store
+	calls   atomic.Int32
+	parked  chan struct{}
+	release chan struct{}
+}
+
+func newParkingStore(inner auth.Store) *parkingStore {
+	return &parkingStore{
+		Store:   inner,
+		parked:  make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+// FindSessionByHash delegates to the real store FIRST — read first, then
+// park — so the parked caller holds a genuine, freshly-read (unrotated)
+// session, exactly as an unparked caller would. Only THEN, if this is the
+// very first call this store has ever seen, it closes parked (signalling
+// the test driver it is safe to run the second caller to completion) and
+// blocks until release is closed.
+func (s *parkingStore) FindSessionByHash(ctx context.Context, tokenHash string) (auth.Session, error) {
+	sess, err := s.Store.FindSessionByHash(ctx, tokenHash)
+	if s.calls.Add(1) == 1 {
+		close(s.parked)
+		<-s.release
+	}
+	return sess, err
+}
+
+// TestRefreshConcurrentSameTokenExactlyOneWinnerFamilyRevoked is the
+// mandatory deterministic concurrency test: two concurrent Refresh calls
+// presenting the SAME token must yield exactly one winner. Determinism
+// comes from parkingStore, not from scheduler luck: the second (unparked)
+// caller is only ever invoked after the first has already read its session
+// and parked, so the second is GUARANTEED to reach Store.MarkRotated first
+// and win the compare-and-set — every run takes the identical path.
+func TestRefreshConcurrentSameTokenExactlyOneWinnerFamilyRevoked(t *testing.T) {
+	store := memory.NewAuthStore()
+	seed := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	ctx := context.Background()
+	user := mustSignUp(t, seed, "hank@example.com", validPassword)
+	_, _, refresh1, err := seed.Login(ctx, "hank@example.com", validPassword, "1.2.3.4", "seed-agent")
+	if err != nil {
+		t.Fatalf("seeding Login: %v", err)
+	}
+
+	parking := newParkingStore(store)
+	svc := auth.New[testUser](parking,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+
+	type result struct {
+		res auth.LoginResult[testUser]
+		err error
+	}
+	firstDone := make(chan result, 1)
+	go func() {
+		res, err := svc.Refresh(ctx, refresh1)
+		firstDone <- result{res, err}
+	}()
+
+	<-parking.parked // caller #1 has read the (unrotated) session and is now parked
+
+	// Caller #2 runs to completion, entirely unparked (this is the second
+	// call this store has seen, so parkingStore's counter != 1).
+	secondRes, secondErr := svc.Refresh(ctx, refresh1)
+
+	close(parking.release) // release caller #1 to resume past its parked read
+	first := <-firstDone
+
+	// Deterministic, not probabilistic: caller #2 ran to completion while
+	// caller #1 was still parked before ever reaching Store.MarkRotated, so
+	// caller #2 MUST be the CAS winner and caller #1 MUST be the loser —
+	// guaranteed by construction, not by scheduler timing.
+	if secondErr != nil {
+		t.Fatalf("winner (second, unparked caller) err = %v, want nil", secondErr)
+	}
+	if secondRes.RefreshToken == "" || secondRes.AccessToken == "" {
+		t.Fatal("winner's LoginResult has an empty token")
+	}
+	if !errors.Is(first.err, auth.ErrTokenReuse) {
+		t.Fatalf("loser (first, parked caller) err = %v, want ErrTokenReuse", first.err)
+	}
+	if first.res.RefreshToken != "" {
+		t.Fatalf("loser's LoginResult.RefreshToken = %q, want empty (zero value) on error", first.res.RefreshToken)
+	}
+
+	// Exactly one winner ever minted a successor. The loser's ErrTokenReuse
+	// additionally revokes the WHOLE family — including the successor the
+	// winner just minted moments earlier.
+	sessions, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("ListSessionsByUser returned %d session(s) after the concurrent reuse was detected; want 0", len(sessions))
 	}
 }
