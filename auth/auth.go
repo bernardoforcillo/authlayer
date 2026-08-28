@@ -89,7 +89,19 @@ type UserBase struct {
 	// PasswordHash is the bcrypt (or other [github.com/bernardoforcillo/authlayer/password.Hasher])
 	// output for this user's password credential. Empty means no password
 	// credential exists for this user — see the type doc.
-	PasswordHash string `drop:"password_hash"`
+	//
+	// json:"-" is deliberate, not an oversight: this is a live, active
+	// credential digest, and the ordinary way it would otherwise leak is
+	// not a careless one — a handler that JSON-encodes its own type
+	// embedding UserBase (exactly what auth/service.go's Service[U] hands
+	// back from SignUp, Login, and VerifyEmail) ships it to the client by
+	// default unless every such handler remembers to strip it by hand. A
+	// struct tag closes that for every embedding type and every call site
+	// at once, present and future, rather than depending on each one
+	// remembering to. It does not protect a non-JSON leak (a log line, a
+	// %+v, a different encoder) — see auth/service.go's own additional,
+	// explicit clearing on its returned values for that.
+	PasswordHash string `drop:"password_hash" json:"-"`
 	// CreatedAt is stamped by the service clock at signup.
 	CreatedAt time.Time `drop:"created_at"`
 	// UpdatedAt is stamped by the service clock on every write to this row.

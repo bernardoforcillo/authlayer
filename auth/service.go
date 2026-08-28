@@ -353,10 +353,13 @@ type SignUpResult[U any] struct {
 	// directly from the Store — SignUp does not hand it out.
 	User U
 	// VerifyToken is the plain "signup" verification token, present only
-	// when Created is true. Empty when Created is false — there is nothing
-	// new to verify, and this package never re-mints or re-sends a
-	// verification for an address that already has an account, successful
-	// or not.
+	// when Created is true. Empty when Created is false — SignUp DOES
+	// mint a "signup" Verification for the existing account too, on every
+	// call regardless of Created (see [Service.SignUp]'s "Fail closed, by
+	// construction"), but that token is discarded rather than surfaced
+	// here: nothing about calling SignUp again for an address you do not
+	// control should ever hand you something to redeem, or touch the
+	// verification the real accountholder already has.
 	VerifyToken string
 }
 
@@ -457,62 +460,82 @@ func (s *Service[U, PU]) wrap(b UserBase) U {
 // property is enforced up to the boundary of this function and no
 // further.
 //
-// # Fail closed, symmetrically
+// # Fail closed, by construction
 //
 // A "look the address up, then branch" implementation — an earlier version
 // of this method — closes the timing channel (both branches pay
 // comparable [password.Hasher] cost) and the error-VALUE channel (the
 // duplicate branch never returns a sentinel), but leaves a louder, simpler
-// channel wide open: every WRITE this method performs — hashing the
-// password (bcrypt enforces its own limits, e.g. 72 bytes, so hashing CAN
-// fail on ordinary input, not just on infrastructure trouble), creating
-// the user row, minting the verification token — used to happen ONLY on
-// the genuinely-new-address branch. Under a write-path outage (a full
-// disk; a database answering reads but rejecting writes), a registered
-// address sails through untouched — its branch never attempts a write at
-// all — and returns (Created:false, nil), while an unregistered address
-// hits a real write, fails, and returns a real error. Error-presence
-// itself becomes the oracle, and no amount of matching timing or matching
-// error values closes it, because the two branches were never attempting
-// the same operations to begin with.
+// channel wide open: every operation beyond the single [Store.CreateUser]
+// call used to run on only ONE branch. A first attempt at THAT gap made
+// the duplicate branch call [Store.FindUserByEmail] and mint a
+// verification too — but only on the duplicate branch, which does not
+// close the asymmetry, it relocates it: under a read outage, or a Store
+// role with INSERT but not DELETE, a NEW address (which never reached
+// either call) now sailed through while a REGISTERED one failed. Pointing
+// two single-branch operations at each other does not cancel them out.
 //
-// So SignUp always attempts the identical sequence:
+// So every operation SignUp performs after CreateUser runs on BOTH
+// branches, unconditionally, as the literal same call — not "the new
+// branch does X, the duplicate branch does an equivalent Y":
 //
 //  1. Hash the password — never [password.Hasher.Dummy]. Dummy cannot
-//     fail, by design (see its own doc): closing THIS gap needs an
-//     operation that CAN fail the same way regardless of branch, and only
-//     a real Hash call is that operation.
-//  2. Attempt [Store.CreateUser] directly, with that hash — the ONLY
-//     signal this method uses to decide new-vs-duplicate. Success means
-//     new; [ErrEmailTaken] means duplicate; anything else propagates
-//     as-is. Because both outcomes are read off the SAME store call
-//     (rather than a separate preliminary lookup, as an earlier version of
-//     this method used), a write-path outage affecting that call fails it
-//     identically whether or not the address was already taken.
-//  3. Mint a fresh "signup" [Verification]. For a genuinely new account
-//     this is the token [SignUpResult.VerifyToken] returns. For a
-//     duplicate, the SAME operation runs against the EXISTING account and
-//     its result is discarded — VerifyToken stays empty regardless (see
-//     [SignUpResult]) — purely so this write's failure surface is
-//     reachable on the duplicate branch too, not only when the address
-//     was new. It is harmless if it succeeds: the token reaches no one,
-//     and redeeming it — nobody can, since it is never returned — would
-//     only re-stamp EmailVerifiedAt, idempotent per
-//     [Store.MarkEmailVerified]'s own doc, even for an already-verified
-//     account. Any prior pending "signup" verification for that user is
-//     deleted first (mirroring
-//     [github.com/bernardoforcillo/authlayer/invite.Service.InviteByEmail]'s
-//     replace-not-accumulate stance on re-invitation), so repeated probes
-//     against the same address leave at most one such row, not one per
-//     probe.
+//     fail, by design (see its own doc): closing the write-failure gap
+//     needs an operation that CAN fail the same way regardless of branch,
+//     and only a real Hash call is that operation.
+//  2. Attempt [Store.CreateUser], with that hash — the ONLY signal this
+//     method uses to decide new-vs-duplicate. Success or [ErrEmailTaken]
+//     both fall through to step 3; anything else returns immediately.
+//  3. [Store.FindUserByEmail] the normalized address. On the new branch
+//     this reads back the row CreateUser just wrote — a real read that
+//     can genuinely fail under a read-path outage, which is the point: a
+//     read failure now fails BOTH branches the same way, not just the one
+//     that used to perform it.
+//  4. Mint a fresh "signup" [Verification] for whichever user step 3
+//     returned. On the new branch this is the token
+//     [SignUpResult.VerifyToken] returns. On the duplicate branch the
+//     SAME call runs against the EXISTING account and its result is
+//     discarded — VerifyToken stays empty regardless (see
+//     [SignUpResult]) — so this write's failure surface is reachable on
+//     both branches too. This step does not delete anything — see "What
+//     this does NOT do" below.
 //
-// A Store failure at any of these steps is returned as-is — SignUp cannot
-// honestly report Created when it does not know, and guessing would risk
-// exactly the silent-degrade "no credential" failure mode this whole
-// package refuses to produce.
+// The Store calls SignUp performs are therefore identical on every
+// invocation, branch-independent through step 4. The only place the two
+// branches diverge is the FINAL, in-process decision of what to put in
+// the return value — Created and VerifyToken, exactly the one difference
+// [SignUpResult] documents as legitimate. The enumeration property holds
+// by CONSTRUCTION — there is no Store call either branch can reach that
+// the other cannot — not by an argument about how comparable two
+// different code paths happen to be.
+//
+// # What this does NOT do to an already-registered account
+//
+// Step 4 never deletes an existing verification before minting the
+// discarded one. An earlier version did, reasoning by analogy to
+// [github.com/bernardoforcillo/authlayer/invite.Service.InviteByEmail]'s
+// replace-not-accumulate stance on re-invitation — but that analogy does
+// not hold here: an email invite's replace runs because the SAME inviter
+// is re-inviting an address they already have standing to invite, while
+// SignUp's caller has proven nothing about the address at all. Deleting
+// on that basis meant an anonymous, unauthenticated prober — the entire
+// audience this method exists to give nothing to — could permanently
+// invalidate a real accountholder's already-delivered verification link
+// merely by "signing up" with their address, locking them out of their
+// own account under [WithRequireVerifiedEmail] with no resend path this
+// package exposes. So step 4's mint is purely additive: an account's real
+// pending verification, if it has one, is left exactly as it was: an
+// extra, never-returned row that ages out on its own via
+// defaultVerificationTTL, same as any other unredeemed token, and never
+// interferes with the real one being redeemed.
+//
+// A Store failure at any step is returned as-is — SignUp cannot honestly
+// report Created when it does not know, and guessing would risk exactly
+// the silent-degrade "no credential" failure mode this whole package
+// refuses to produce.
 //
 // SignUpResult.User never carries a live PasswordHash on either branch —
-// see that field's own doc.
+// see that field's own doc and [UserBase.PasswordHash]'s.
 func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string) (SignUpResult[U], error) {
 	if failed := password.Validate(plainPassword, s.cfg.rules); len(failed) > 0 {
 		return SignUpResult[U]{}, fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
@@ -526,46 +549,44 @@ func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string
 		return SignUpResult[U]{}, err
 	}
 
-	created, err := s.store.CreateUser(ctx, UserBase{
+	_, err = s.store.CreateUser(ctx, UserBase{
 		ID:           s.cfg.idGen(),
 		Email:        normalized,
 		PasswordHash: hash,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	})
-	switch {
-	case err == nil:
-		plainToken, verr := s.mintSignupVerification(ctx, created.ID, created.Email, now)
-		if verr != nil {
-			return SignUpResult[U]{}, verr
-		}
-		created.PasswordHash = ""
-		return SignUpResult[U]{Created: true, User: s.wrap(created), VerifyToken: plainToken}, nil
-
-	case errors.Is(err, ErrEmailTaken):
-		existing, ferr := s.store.FindUserByEmail(ctx, normalized)
-		if ferr != nil {
-			return SignUpResult[U]{}, ferr
-		}
-		if derr := s.store.DeleteVerificationsByUserAndPurpose(ctx, existing.ID, PurposeSignup); derr != nil {
-			return SignUpResult[U]{}, derr
-		}
-		if _, verr := s.mintSignupVerification(ctx, existing.ID, existing.Email, now); verr != nil {
-			return SignUpResult[U]{}, verr
-		}
-		existing.PasswordHash = ""
-		return SignUpResult[U]{Created: false, User: s.wrap(existing)}, nil
-
-	default:
+	created := err == nil
+	if err != nil && !errors.Is(err, ErrEmailTaken) {
 		return SignUpResult[U]{}, err
 	}
+
+	// From here on, EVERY call is identical regardless of branch — see
+	// "Fail closed, by construction" above. created is the only thing
+	// that determines the shape of the final return.
+	user, ferr := s.store.FindUserByEmail(ctx, normalized)
+	if ferr != nil {
+		return SignUpResult[U]{}, ferr
+	}
+
+	plainToken, verr := s.mintSignupVerification(ctx, user.ID, user.Email, now)
+	if verr != nil {
+		return SignUpResult[U]{}, verr
+	}
+	user.PasswordHash = ""
+
+	if !created {
+		return SignUpResult[U]{Created: false, User: s.wrap(user)}, nil
+	}
+	return SignUpResult[U]{Created: true, User: s.wrap(user), VerifyToken: plainToken}, nil
 }
 
 // mintSignupVerification mints and persists a fresh "signup" [Verification]
-// for (userID, email) and returns its plaintext token. Used by [Service.SignUp]
-// on both its branches — see that method's "Fail closed, symmetrically"
-// section for why the duplicate branch calls this too, discarding the
-// result, rather than skipping it.
+// for (userID, email) and returns its plaintext token. Called by
+// [Service.SignUp] on every invocation regardless of branch — see that
+// method's "Fail closed, by construction" section — and never preceded by
+// deleting any prior verification; see "What this does NOT do" there for
+// why that would be a mistake.
 func (s *Service[U, PU]) mintSignupVerification(ctx context.Context, userID, email string, now time.Time) (string, error) {
 	plainToken, tokenHash, err := token.GenerateOpaque()
 	if err != nil {
@@ -686,6 +707,14 @@ func (s *Service[U, PU]) Login(ctx context.Context, email, plainPassword, ip, us
 	if err != nil {
 		return zero, "", "", err
 	}
+
+	// Cleared before wrap, not after: this way neither the claims extender
+	// (an application-supplied callback that could otherwise embed it
+	// into a JWT claim without realizing) nor this method's own return
+	// value ever sees a live credential digest — see
+	// [UserBase.PasswordHash]'s own doc for why that field carries json:"-"
+	// but is additionally cleared here rather than relying on that alone.
+	u.PasswordHash = ""
 
 	// wrapped is the ONE user value both the claims extender and this
 	// method's own return statement use — see [WithClaimsExtender]'s doc
@@ -833,5 +862,6 @@ func (s *Service[U, PU]) VerifyEmail(ctx context.Context, plainToken string) (U,
 	if err != nil {
 		return zero, err
 	}
+	u.PasswordHash = ""
 	return s.wrap(u), nil
 }

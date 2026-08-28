@@ -3,7 +3,9 @@ package auth_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -215,11 +217,11 @@ type errStore struct {
 	failCreateUser             bool
 }
 
-func (s *errStore) FindUserByEmail(_ context.Context, _ string) (auth.UserBase, error) {
+func (s *errStore) FindUserByEmail(ctx context.Context, email string) (auth.UserBase, error) {
 	if s.failFindUserByEmail {
 		return auth.UserBase{}, errStoreBoom
 	}
-	return s.AuthStore.FindUserByEmail(context.Background(), "")
+	return s.AuthStore.FindUserByEmail(ctx, email)
 }
 
 func (s *errStore) FindVerificationByHash(ctx context.Context, hash string) (auth.Verification, error) {
@@ -239,13 +241,17 @@ func (s *errStore) CreateUser(ctx context.Context, u auth.UserBase) (auth.UserBa
 // --- write-outage doubles for FIX 1: both wrap a real, healthy
 // memory.AuthStore for reads (so ErrEmailTaken/not-found decisions stay
 // correct) while making some subset of writes fail identically for every
-// caller, regardless of which address is involved. ---
+// caller, regardless of which address is involved. SignUp no longer calls
+// DeleteVerificationsByUserAndPurpose at all (see FIX 2, round 2: deleting
+// an existing account's pending verification on an unauthenticated probe
+// was itself the bug), so these doubles fail only the writes SignUp still
+// performs: CreateUser and CreateVerification. ---
 
 var errWriteBoom = errors.New("boom: simulated write-path outage")
 
 // allWritesFailStore fails every write SignUp could reach (CreateUser,
-// CreateVerification, DeleteVerificationsByUserAndPurpose) — the broadest
-// outage: e.g. a full disk affecting the whole database.
+// CreateVerification) — the broadest outage: e.g. a full disk affecting
+// the whole database.
 type allWritesFailStore struct {
 	*memory.AuthStore
 }
@@ -258,24 +264,27 @@ func (s *allWritesFailStore) CreateVerification(context.Context, auth.Verificati
 	return auth.Verification{}, errWriteBoom
 }
 
-func (s *allWritesFailStore) DeleteVerificationsByUserAndPurpose(context.Context, string, string) error {
-	return errWriteBoom
-}
-
-// verificationWritesFailStore leaves CreateUser fully healthy (delegated to
-// the real store, so ErrEmailTaken is still reported correctly) but fails
-// CreateVerification and DeleteVerificationsByUserAndPurpose — a narrower,
-// more realistic outage affecting only the verifications table/writes.
-type verificationWritesFailStore struct {
+// deleteVerificationsFailStore fails ONLY DeleteVerificationsByUserAndPurpose
+// (every read and every other write healthy) — used to prove SignUp never
+// calls it at all, not merely that it survives the call failing.
+type deleteVerificationsFailStore struct {
 	*memory.AuthStore
 }
 
-func (s *verificationWritesFailStore) CreateVerification(context.Context, auth.Verification) (auth.Verification, error) {
-	return auth.Verification{}, errWriteBoom
+func (s *deleteVerificationsFailStore) DeleteVerificationsByUserAndPurpose(context.Context, string, string) error {
+	return errWriteBoom
 }
 
-func (s *verificationWritesFailStore) DeleteVerificationsByUserAndPurpose(context.Context, string, string) error {
-	return errWriteBoom
+// verificationWriteFailStore leaves CreateUser and every read fully
+// healthy (delegated to the real store, so ErrEmailTaken is still reported
+// correctly) but fails CreateVerification — a narrower, more realistic
+// outage affecting only the verifications table's writes.
+type verificationWriteFailStore struct {
+	*memory.AuthStore
+}
+
+func (s *verificationWriteFailStore) CreateVerification(context.Context, auth.Verification) (auth.Verification, error) {
+	return auth.Verification{}, errWriteBoom
 }
 
 // usersTableWritesFailStore fails ONLY CreateUser, leaving reads and every
@@ -498,17 +507,31 @@ func TestSignUpFailsClosedOnCreateUserError(t *testing.T) {
 	}
 }
 
-// TestSignUpFailsClosedOnDuplicateFollowUpReadError proves that, on the
-// duplicate branch, a failure of the follow-up FindUserByEmail (needed to
-// load the existing account to return) is surfaced as an error too.
-func TestSignUpFailsClosedOnDuplicateFollowUpReadError(t *testing.T) {
+// TestSignUpReadFailureIndistinguishableAcrossBranches is round 2's
+// CRITICAL fix, pinned directly: FindUserByEmail now runs unconditionally
+// on every SignUp call (see the method doc's "Fail closed, by
+// construction"), so a read-path outage must fail the new-address and
+// already-registered branches identically. This is the exact gap round 1
+// reopened, mirrored: with only the delete failing, and separately with
+// only the read failing, a NEW address returned nil while a REGISTERED
+// one errored — reachable by ordinary conditions (a DB role with INSERT
+// but not DELETE, replica lag, row-lock contention), not just a total
+// outage.
+//
+// The prior version of this test (TestSignUpFailsClosedOnDuplicateFollowUpReadError)
+// only exercised the duplicate branch and, by construction of the OLD
+// code, could not have caught this: FindUserByEmail was called on that
+// branch alone. This version drives the identical read failure against
+// BOTH a brand-new address and an already-registered one from the SAME
+// store and asserts both fail with the SAME error.
+func TestSignUpReadFailureIndistinguishableAcrossBranches(t *testing.T) {
 	store := &errStore{AuthStore: memory.NewAuthStore(), failFindUserByEmail: true}
 	svc := auth.New[testUser](store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
 	// Seed directly on the underlying store, bypassing the wrapper (which
-	// only fails FindUserByEmail, not CreateUser).
+	// only fails FindUserByEmail; CreateUser is untouched).
 	now := time.Now().UTC()
 	seedHash, err := password.Bcrypt(testCost).Hash(validPassword)
 	if err != nil {
@@ -520,12 +543,17 @@ func TestSignUpFailsClosedOnDuplicateFollowUpReadError(t *testing.T) {
 		t.Fatalf("seed CreateUser: %v", err)
 	}
 
-	res, err := svc.SignUp(context.Background(), "eve@example.com", validPassword)
-	if !errors.Is(err, errStoreBoom) {
-		t.Fatalf("SignUp err = %v, want errStoreBoom", err)
+	_, errNew := svc.SignUp(context.Background(), "frankie@example.com", validPassword)
+	_, errDup := svc.SignUp(context.Background(), "eve@example.com", validPassword)
+
+	if errNew == nil {
+		t.Fatal("SignUp(new address) succeeded despite the read path being broken")
 	}
-	if res.Created {
-		t.Fatal("Created = true despite the follow-up read failing")
+	if errDup == nil {
+		t.Fatal("SignUp(existing address) succeeded despite the read path being broken — registered addresses must not sail through a read outage that fails new ones")
+	}
+	if !errors.Is(errNew, errStoreBoom) || !errors.Is(errDup, errStoreBoom) {
+		t.Fatalf("errNew=%v errDup=%v, want both to wrap errStoreBoom — the caller must not be able to tell the branches apart by error identity either", errNew, errDup)
 	}
 }
 
@@ -569,14 +597,14 @@ func TestSignUpWriteFailureIndistinguishableAcrossBranches(t *testing.T) {
 	}
 }
 
-// TestSignUpDuplicateBranchAttemptsEquivalentWriteWork isolates the SECOND
-// half of FIX 1: even when CreateUser itself behaves perfectly normally
-// (correctly distinguishing new-vs-duplicate, as it would if only the
-// verifications table's writes were broken), the duplicate branch must
-// still attempt a write of its own — the discarded, replaced "signup"
-// verification described in SignUp's doc — so THAT failure surface is
-// reachable on the duplicate branch too, not only when the address was new.
-func TestSignUpDuplicateBranchAttemptsEquivalentWriteWork(t *testing.T) {
+// TestSignUpVerificationWriteFailureIndistinguishable isolates the mint
+// step specifically: even when CreateUser and every read behave perfectly
+// normally (as they would if only the verifications table's writes were
+// broken), minting the "signup" Verification must fail identically on
+// both branches — it is the literal same CreateVerification call on
+// either branch (see SignUp's doc), not an "equivalent" one, so there is
+// nothing branch-specific left for a partial outage to distinguish.
+func TestSignUpVerificationWriteFailureIndistinguishable(t *testing.T) {
 	inner := memory.NewAuthStore()
 	seedHash, err := password.Bcrypt(testCost).Hash(validPassword)
 	if err != nil {
@@ -589,7 +617,7 @@ func TestSignUpDuplicateBranchAttemptsEquivalentWriteWork(t *testing.T) {
 		t.Fatalf("seed CreateUser: %v", err)
 	}
 
-	store := &verificationWritesFailStore{AuthStore: inner}
+	store := &verificationWriteFailStore{AuthStore: inner}
 	svc := auth.New[testUser](store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
@@ -602,7 +630,7 @@ func TestSignUpDuplicateBranchAttemptsEquivalentWriteWork(t *testing.T) {
 		t.Fatal("SignUp(new address) succeeded despite verification writes being broken")
 	}
 	if errDup == nil {
-		t.Fatal("SignUp(existing address) succeeded despite verification writes being broken — the duplicate branch skipped its equivalent write work")
+		t.Fatal("SignUp(existing address) succeeded despite verification writes being broken")
 	}
 	if !errors.Is(errNew, errWriteBoom) || !errors.Is(errDup, errWriteBoom) {
 		t.Fatalf("errNew=%v errDup=%v, want both to wrap errWriteBoom", errNew, errDup)
@@ -681,6 +709,78 @@ func TestSignUpNeverReturnsPasswordHash(t *testing.T) {
 	}
 	if dup.User.PasswordHash != "" {
 		t.Fatalf("Duplicate branch: User.PasswordHash = %q, want empty — this would leak another account's live credential digest", dup.User.PasswordHash)
+	}
+}
+
+// TestSignUpProbeDoesNotDestroyVictimsVerification pins FIX 2 directly: an
+// unauthenticated probe of an already-registered, not-yet-verified address
+// must NOT invalidate that account's real, already-issued "signup"
+// verification. An earlier version deleted it first (mirroring
+// invite.Service.InviteByEmail's replace-on-reinvite stance), which let
+// anyone destroy a stranger's verification link merely by "signing up"
+// with their address — a denial-of-service reachable by a single
+// unauthenticated request, worse under WithRequireVerifiedEmail since this
+// package exposes no resend path.
+func TestSignUpProbeDoesNotDestroyVictimsVerification(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	victim, err := svc.SignUp(ctx, "victim@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp(victim): %v", err)
+	}
+	if victim.VerifyToken == "" {
+		t.Fatal("victim's own VerifyToken is empty")
+	}
+
+	// The attacker probes the same address, learning nothing (Created is
+	// false, VerifyToken is empty — the enumeration contract holds) but,
+	// under the bug, also destroying the victim's real token as a side
+	// effect.
+	probe, err := svc.SignUp(ctx, "victim@example.com", "Attacker-Chosen-Pass1!")
+	if err != nil {
+		t.Fatalf("SignUp(probe): %v", err)
+	}
+	if probe.Created {
+		t.Fatal("probe reported Created = true for an already-registered address")
+	}
+	if probe.VerifyToken != "" {
+		t.Fatal("probe's VerifyToken is non-empty — the attacker must never receive a redeemable token")
+	}
+
+	// The victim's ORIGINAL token must still redeem successfully.
+	user, err := svc.VerifyEmail(ctx, victim.VerifyToken)
+	if err != nil {
+		t.Fatalf("VerifyEmail(victim's original token) after a probe: %v — the probe destroyed the victim's real verification", err)
+	}
+	if user.EmailVerifiedAt == nil {
+		t.Fatal("EmailVerifiedAt is nil after redeeming the victim's original token")
+	}
+}
+
+// TestSignUpNeverCallsDeleteVerifications is a lower-level companion:
+// probing an existing address must not call DeleteVerificationsByUserAndPurpose
+// at all (not merely "not destructively" — not at all), confirmed via a
+// store double that fails that one method while leaving everything else,
+// including CreateVerification, healthy. If SignUp still called it, this
+// would fail; it does not.
+func TestSignUpNeverCallsDeleteVerifications(t *testing.T) {
+	store := &deleteVerificationsFailStore{AuthStore: memory.NewAuthStore()}
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	ctx := context.Background()
+
+	if _, err := svc.SignUp(ctx, "gina2@example.com", validPassword); err != nil {
+		t.Fatalf("SignUp(new): %v", err)
+	}
+	probe, err := svc.SignUp(ctx, "gina2@example.com", "Another-Valid-Pass4!")
+	if err != nil {
+		t.Fatalf("SignUp(probe): %v — DeleteVerificationsByUserAndPurpose must never be called", err)
+	}
+	if probe.Created {
+		t.Fatal("Created = true on a duplicate address")
 	}
 }
 
@@ -1368,4 +1468,77 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// ============================================================
+// FIX 3 (round 2): UserBase.PasswordHash json:"-"
+// ============================================================
+
+// TestUserBasePasswordHashExcludedFromJSON pins the type-level fix
+// directly at the JSON layer, independent of which Service method
+// produced the value: json.Marshal of a type embedding UserBase (exactly
+// the shape SignUp/Login/VerifyEmail hand back) must never include the
+// credential digest, under its Go field name OR its lowercase JSON
+// convention, even though the field is populated and non-empty in memory.
+func TestUserBasePasswordHashExcludedFromJSON(t *testing.T) {
+	u := testUser{
+		UserBase: auth.UserBase{
+			ID:           "user-1",
+			Email:        "jill@example.com",
+			PasswordHash: "$2a$04$thisIsALiveBcryptDigestDoNotLeakMe",
+			CreatedAt:    time.Now().UTC(),
+			UpdatedAt:    time.Now().UTC(),
+		},
+		DisplayName: "Jill",
+	}
+
+	out, err := json.Marshal(u)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	s := string(out)
+	if strings.Contains(s, "thisIsALiveBcryptDigest") {
+		t.Fatalf("marshaled JSON contains the live hash value: %s", s)
+	}
+	if strings.Contains(strings.ToLower(s), "passwordhash") || strings.Contains(s, "password_hash") {
+		t.Fatalf("marshaled JSON contains a PasswordHash key at all (should be fully omitted via json:\"-\"): %s", s)
+	}
+
+	// Sanity: the OTHER fields are still there — this isn't accidentally
+	// stripping the whole embedded struct.
+	if !strings.Contains(s, "jill@example.com") {
+		t.Fatalf("marshaled JSON is missing Email entirely, want it present: %s", s)
+	}
+}
+
+// TestLoginNeverReturnsPasswordHash extends FIX 2's SignUp-only coverage
+// to Login, closing the gap round 1's report disclosed and left open.
+func TestLoginNeverReturnsPasswordHash(t *testing.T) {
+	svc, _ := newTestService(t)
+	mustSignUp(t, svc, "karl@example.com", validPassword)
+
+	user, _, _, err := svc.Login(context.Background(), "karl@example.com", validPassword, "1.2.3.4", "")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if user.PasswordHash != "" {
+		t.Fatalf("Login returned User.PasswordHash = %q, want empty", user.PasswordHash)
+	}
+}
+
+// TestVerifyEmailNeverReturnsPasswordHash is VerifyEmail's counterpart.
+func TestVerifyEmailNeverReturnsPasswordHash(t *testing.T) {
+	svc, _ := newTestService(t)
+	res, err := svc.SignUp(context.Background(), "lena@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+
+	user, err := svc.VerifyEmail(context.Background(), res.VerifyToken)
+	if err != nil {
+		t.Fatalf("VerifyEmail: %v", err)
+	}
+	if user.PasswordHash != "" {
+		t.Fatalf("VerifyEmail returned User.PasswordHash = %q, want empty", user.PasswordHash)
+	}
 }
