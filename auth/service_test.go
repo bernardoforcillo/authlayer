@@ -117,13 +117,15 @@ func (l *fakeLimiter) callCount() int {
 }
 
 // --- countingStore: wraps memory.AuthStore, counting calls to
-// FindUserByEmail — used to prove SignUp never reaches the Store on a
-// rejected (weak) password. ---
+// FindUserByEmail and CreateUser — the two operations SignUp could reach
+// before deciding new-vs-duplicate — used to prove SignUp never touches the
+// Store at all on a rejected (weak) password. ---
 
 type countingStore struct {
 	*memory.AuthStore
 	mu               sync.Mutex
 	findByEmailCalls int
+	createUserCalls  int
 }
 
 func newCountingStore() *countingStore {
@@ -137,10 +139,26 @@ func (s *countingStore) FindUserByEmail(ctx context.Context, email string) (auth
 	return s.AuthStore.FindUserByEmail(ctx, email)
 }
 
+func (s *countingStore) CreateUser(ctx context.Context, u auth.UserBase) (auth.UserBase, error) {
+	s.mu.Lock()
+	s.createUserCalls++
+	s.mu.Unlock()
+	return s.AuthStore.CreateUser(ctx, u)
+}
+
+// calls returns the total number of FindUserByEmail + CreateUser calls —
+// the two operations SignUp could reach before password validation, if
+// that check were ever moved after them.
 func (s *countingStore) calls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.findByEmailCalls
+	return s.findByEmailCalls + s.createUserCalls
+}
+
+func (s *countingStore) reset() {
+	s.mu.Lock()
+	s.findByEmailCalls, s.createUserCalls = 0, 0
+	s.mu.Unlock()
 }
 
 // --- orderStore: wraps memory.AuthStore, recording the exact sequence of
@@ -194,6 +212,7 @@ type errStore struct {
 	*memory.AuthStore
 	failFindUserByEmail        bool
 	failFindVerificationByHash bool
+	failCreateUser             bool
 }
 
 func (s *errStore) FindUserByEmail(_ context.Context, _ string) (auth.UserBase, error) {
@@ -208,6 +227,68 @@ func (s *errStore) FindVerificationByHash(ctx context.Context, hash string) (aut
 		return auth.Verification{}, errStoreBoom
 	}
 	return s.AuthStore.FindVerificationByHash(ctx, hash)
+}
+
+func (s *errStore) CreateUser(ctx context.Context, u auth.UserBase) (auth.UserBase, error) {
+	if s.failCreateUser {
+		return auth.UserBase{}, errStoreBoom
+	}
+	return s.AuthStore.CreateUser(ctx, u)
+}
+
+// --- write-outage doubles for FIX 1: both wrap a real, healthy
+// memory.AuthStore for reads (so ErrEmailTaken/not-found decisions stay
+// correct) while making some subset of writes fail identically for every
+// caller, regardless of which address is involved. ---
+
+var errWriteBoom = errors.New("boom: simulated write-path outage")
+
+// allWritesFailStore fails every write SignUp could reach (CreateUser,
+// CreateVerification, DeleteVerificationsByUserAndPurpose) — the broadest
+// outage: e.g. a full disk affecting the whole database.
+type allWritesFailStore struct {
+	*memory.AuthStore
+}
+
+func (s *allWritesFailStore) CreateUser(context.Context, auth.UserBase) (auth.UserBase, error) {
+	return auth.UserBase{}, errWriteBoom
+}
+
+func (s *allWritesFailStore) CreateVerification(context.Context, auth.Verification) (auth.Verification, error) {
+	return auth.Verification{}, errWriteBoom
+}
+
+func (s *allWritesFailStore) DeleteVerificationsByUserAndPurpose(context.Context, string, string) error {
+	return errWriteBoom
+}
+
+// verificationWritesFailStore leaves CreateUser fully healthy (delegated to
+// the real store, so ErrEmailTaken is still reported correctly) but fails
+// CreateVerification and DeleteVerificationsByUserAndPurpose — a narrower,
+// more realistic outage affecting only the verifications table/writes.
+type verificationWritesFailStore struct {
+	*memory.AuthStore
+}
+
+func (s *verificationWritesFailStore) CreateVerification(context.Context, auth.Verification) (auth.Verification, error) {
+	return auth.Verification{}, errWriteBoom
+}
+
+func (s *verificationWritesFailStore) DeleteVerificationsByUserAndPurpose(context.Context, string, string) error {
+	return errWriteBoom
+}
+
+// usersTableWritesFailStore fails ONLY CreateUser, leaving reads and every
+// verification-related write healthy — a narrower outage than
+// allWritesFailStore, isolating whether new-vs-duplicate detection itself
+// (CreateUser, not a preliminary FindUserByEmail) is what makes this
+// specific write's failure surface reachable on both branches.
+type usersTableWritesFailStore struct {
+	*memory.AuthStore
+}
+
+func (s *usersTableWritesFailStore) CreateUser(context.Context, auth.UserBase) (auth.UserBase, error) {
+	return auth.UserBase{}, errWriteBoom
 }
 
 const validPassword = "Correct-Horse-Battery-9!"
@@ -232,7 +313,7 @@ func TestSignUpValidatesPasswordBeforeLookup(t *testing.T) {
 		t.Fatalf("SignUp(weak password) err = %v, want ErrWeakPassword", err)
 	}
 	if got := store.calls(); got != 0 {
-		t.Fatalf("FindUserByEmail was called %d times for a password that should have been rejected before any lookup; want 0", got)
+		t.Fatalf("Store was touched %d times for a password that should have been rejected before any lookup or write; want 0", got)
 	}
 }
 
@@ -253,9 +334,7 @@ func TestSignUpWeakPasswordIdenticalForNewAndExistingAddress(t *testing.T) {
 	if _, err := svc.SignUp(context.Background(), "existing@example.com", validPassword); err != nil {
 		t.Fatalf("seeding SignUp: %v", err)
 	}
-	store.mu.Lock()
-	store.findByEmailCalls = 0 // reset the counter after the seed signup
-	store.mu.Unlock()
+	store.reset() // reset the counters after the seed signup
 
 	_, err1 := svc.SignUp(context.Background(), "existing@example.com", "weak")
 	_, err2 := svc.SignUp(context.Background(), "brand-new@example.com", "weak")
@@ -264,7 +343,7 @@ func TestSignUpWeakPasswordIdenticalForNewAndExistingAddress(t *testing.T) {
 		t.Fatalf("errs = %v, %v, want both ErrWeakPassword", err1, err2)
 	}
 	if got := store.calls(); got != 0 {
-		t.Fatalf("FindUserByEmail called %d times across two weak-password sign-ups; want 0 for both", got)
+		t.Fatalf("Store touched %d times across two weak-password sign-ups; want 0 for both", got)
 	}
 }
 
@@ -367,15 +446,13 @@ func TestSignUpHashesPasswordForNewAccount(t *testing.T) {
 	}
 }
 
-// TestSignUpDummyCalledOnDuplicateNotHash is the behavioural pin for the
-// brief's third mandatory mutation on this method: remove the Dummy call on
-// the duplicate branch and this must fail. Unlike a wall-clock timing
-// assertion (which the brief warns is inherently flaky), this observes a
-// plain, deterministic fact — which Hasher method was invoked — through a
-// spy double, which is possible here (unlike token's hmac.Equal-vs-==
-// case) precisely because Hasher is an interface parameter Service already
-// takes by injection, not a language operator.
-func TestSignUpDummyCalledOnDuplicateNotHash(t *testing.T) {
+// TestSignUpHashesOnBothBranchesSymmetrically is the behavioural pin for
+// FIX 1's redesign: the duplicate branch must ALSO call Hash (never Dummy,
+// which cannot fail by design and so cannot close the write-failure-surface
+// gap FIX 1 is about — see SignUp's "Fail closed, symmetrically" doc). This
+// replaces the original round's Dummy-based pin, which described a design
+// this method no longer uses.
+func TestSignUpHashesOnBothBranchesSymmetrically(t *testing.T) {
 	spy := newSpyHasher()
 	svc, _ := newTestService(t, auth.WithHasher(spy))
 	ctx := context.Background()
@@ -396,16 +473,17 @@ func TestSignUpDummyCalledOnDuplicateNotHash(t *testing.T) {
 	}
 
 	hashN, verifyN, dummyN := spy.counts()
-	if hashN != 0 || verifyN != 0 || dummyN != 1 {
-		t.Fatalf("hasher calls (hash,verify,dummy) = (%d,%d,%d), want (0,0,1) — the duplicate branch must call Dummy, not Hash", hashN, verifyN, dummyN)
+	if hashN != 1 || verifyN != 0 || dummyN != 0 {
+		t.Fatalf("hasher calls (hash,verify,dummy) = (%d,%d,%d), want (1,0,0) — the duplicate branch must hash too (and discard the result), never Dummy", hashN, verifyN, dummyN)
 	}
 }
 
-// TestSignUpFailsClosedOnLookupStoreError proves a Store failure while
-// checking for an existing address is surfaced as an error — never silently
-// folded into either a successful create or a duplicate result.
-func TestSignUpFailsClosedOnLookupStoreError(t *testing.T) {
-	store := &errStore{AuthStore: memory.NewAuthStore(), failFindUserByEmail: true}
+// TestSignUpFailsClosedOnCreateUserError proves a Store failure on the
+// PRIMARY write (CreateUser, now attempted on every call — see SignUp's
+// doc) is surfaced as an error rather than silently folded into a duplicate
+// result.
+func TestSignUpFailsClosedOnCreateUserError(t *testing.T) {
+	store := &errStore{AuthStore: memory.NewAuthStore(), failCreateUser: true}
 	svc := auth.New[testUser](store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
@@ -416,7 +494,193 @@ func TestSignUpFailsClosedOnLookupStoreError(t *testing.T) {
 		t.Fatalf("SignUp err = %v, want errStoreBoom", err)
 	}
 	if res.Created {
-		t.Fatal("Created = true despite the lookup failing")
+		t.Fatal("Created = true despite CreateUser failing")
+	}
+}
+
+// TestSignUpFailsClosedOnDuplicateFollowUpReadError proves that, on the
+// duplicate branch, a failure of the follow-up FindUserByEmail (needed to
+// load the existing account to return) is surfaced as an error too.
+func TestSignUpFailsClosedOnDuplicateFollowUpReadError(t *testing.T) {
+	store := &errStore{AuthStore: memory.NewAuthStore(), failFindUserByEmail: true}
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	// Seed directly on the underlying store, bypassing the wrapper (which
+	// only fails FindUserByEmail, not CreateUser).
+	now := time.Now().UTC()
+	seedHash, err := password.Bcrypt(testCost).Hash(validPassword)
+	if err != nil {
+		t.Fatalf("seed hash: %v", err)
+	}
+	if _, err := store.AuthStore.CreateUser(context.Background(), auth.UserBase{
+		ID: "seed-1", Email: "eve@example.com", PasswordHash: seedHash, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed CreateUser: %v", err)
+	}
+
+	res, err := svc.SignUp(context.Background(), "eve@example.com", validPassword)
+	if !errors.Is(err, errStoreBoom) {
+		t.Fatalf("SignUp err = %v, want errStoreBoom", err)
+	}
+	if res.Created {
+		t.Fatal("Created = true despite the follow-up read failing")
+	}
+}
+
+// TestSignUpWriteFailureIndistinguishableAcrossBranches is the test FIX 1
+// specifically asked for: drive a store write failure and confirm the
+// new-address and already-registered branches are indistinguishable to the
+// caller. Both must fail, and fail with the SAME error, under a store whose
+// every write method fails identically regardless of which address is
+// used — proving error-presence alone can no longer serve as an
+// enumeration oracle.
+func TestSignUpWriteFailureIndistinguishableAcrossBranches(t *testing.T) {
+	inner := memory.NewAuthStore()
+	seedHash, err := password.Bcrypt(testCost).Hash(validPassword)
+	if err != nil {
+		t.Fatalf("seed hash: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := inner.CreateUser(context.Background(), auth.UserBase{
+		ID: "seed-1", Email: "existing@example.com", PasswordHash: seedHash, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed CreateUser: %v", err)
+	}
+
+	store := &allWritesFailStore{AuthStore: inner}
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+
+	_, errNew := svc.SignUp(context.Background(), "brandnew@example.com", validPassword)
+	_, errDup := svc.SignUp(context.Background(), "existing@example.com", validPassword)
+
+	if errNew == nil {
+		t.Fatal("SignUp(new address) succeeded despite a total write outage")
+	}
+	if errDup == nil {
+		t.Fatal("SignUp(existing address) succeeded despite a total write outage — this is exactly the enumeration oracle FIX 1 closes: a registered address must not sail through untouched while an unregistered one fails")
+	}
+	if !errors.Is(errNew, errWriteBoom) || !errors.Is(errDup, errWriteBoom) {
+		t.Fatalf("errNew=%v errDup=%v, want both to wrap errWriteBoom — the caller must not be able to tell the branches apart by error identity either", errNew, errDup)
+	}
+}
+
+// TestSignUpDuplicateBranchAttemptsEquivalentWriteWork isolates the SECOND
+// half of FIX 1: even when CreateUser itself behaves perfectly normally
+// (correctly distinguishing new-vs-duplicate, as it would if only the
+// verifications table's writes were broken), the duplicate branch must
+// still attempt a write of its own — the discarded, replaced "signup"
+// verification described in SignUp's doc — so THAT failure surface is
+// reachable on the duplicate branch too, not only when the address was new.
+func TestSignUpDuplicateBranchAttemptsEquivalentWriteWork(t *testing.T) {
+	inner := memory.NewAuthStore()
+	seedHash, err := password.Bcrypt(testCost).Hash(validPassword)
+	if err != nil {
+		t.Fatalf("seed hash: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := inner.CreateUser(context.Background(), auth.UserBase{
+		ID: "seed-1", Email: "existing@example.com", PasswordHash: seedHash, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed CreateUser: %v", err)
+	}
+
+	store := &verificationWritesFailStore{AuthStore: inner}
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+
+	_, errNew := svc.SignUp(context.Background(), "brandnew2@example.com", validPassword)
+	_, errDup := svc.SignUp(context.Background(), "existing@example.com", validPassword)
+
+	if errNew == nil {
+		t.Fatal("SignUp(new address) succeeded despite verification writes being broken")
+	}
+	if errDup == nil {
+		t.Fatal("SignUp(existing address) succeeded despite verification writes being broken — the duplicate branch skipped its equivalent write work")
+	}
+	if !errors.Is(errNew, errWriteBoom) || !errors.Is(errDup, errWriteBoom) {
+		t.Fatalf("errNew=%v errDup=%v, want both to wrap errWriteBoom", errNew, errDup)
+	}
+}
+
+// TestSignUpUsersTableWriteFailureIndistinguishable isolates the FIRST half
+// of FIX 1: even with reads and every verification-related write healthy,
+// a broken CreateUser (e.g. only the users table's writes are down) must
+// fail BOTH branches identically. This is what specifically depends on
+// CreateUser being the SOLE new-vs-duplicate signal (see SignUp's doc) —
+// reverting to a preliminary FindUserByEmail lookup, with CreateUser only
+// attempted on the new-address branch, would let an existing address route
+// around this broken call entirely and succeed.
+func TestSignUpUsersTableWriteFailureIndistinguishable(t *testing.T) {
+	inner := memory.NewAuthStore()
+	seedHash, err := password.Bcrypt(testCost).Hash(validPassword)
+	if err != nil {
+		t.Fatalf("seed hash: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := inner.CreateUser(context.Background(), auth.UserBase{
+		ID: "seed-2", Email: "existing2@example.com", PasswordHash: seedHash, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed CreateUser: %v", err)
+	}
+
+	store := &usersTableWritesFailStore{AuthStore: inner}
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+
+	_, errNew := svc.SignUp(context.Background(), "brandnew3@example.com", validPassword)
+	_, errDup := svc.SignUp(context.Background(), "existing2@example.com", validPassword)
+
+	if errNew == nil {
+		t.Fatal("SignUp(new address) succeeded despite the users table's writes being broken")
+	}
+	if errDup == nil {
+		t.Fatal("SignUp(existing address) succeeded despite the users table's writes being broken — a preliminary read-only lookup let it route around CreateUser entirely")
+	}
+	if !errors.Is(errNew, errWriteBoom) || !errors.Is(errDup, errWriteBoom) {
+		t.Fatalf("errNew=%v errDup=%v, want both to wrap errWriteBoom", errNew, errDup)
+	}
+}
+
+// TestSignUpNeverReturnsPasswordHash pins FIX 2: SignUpResult.User never
+// carries a live, usable PasswordHash, on EITHER branch — even though the
+// Store itself does hold a real bcrypt digest for both users.
+func TestSignUpNeverReturnsPasswordHash(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+
+	created, err := svc.SignUp(ctx, "frank2@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp(new): %v", err)
+	}
+	if created.User.PasswordHash != "" {
+		t.Fatalf("Created branch: User.PasswordHash = %q, want empty", created.User.PasswordHash)
+	}
+	stored, err := store.FindUserByID(ctx, created.User.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.PasswordHash == "" {
+		t.Fatal("the STORE's own copy has no PasswordHash at all — seeding is broken, not just the return value")
+	}
+
+	dup, err := svc.SignUp(ctx, "frank2@example.com", "Another-Valid-Pass3!")
+	if err != nil {
+		t.Fatalf("SignUp(duplicate): %v", err)
+	}
+	if dup.Created {
+		t.Fatal("Created = true on a duplicate address")
+	}
+	if dup.User.PasswordHash != "" {
+		t.Fatalf("Duplicate branch: User.PasswordHash = %q, want empty — this would leak another account's live credential digest", dup.User.PasswordHash)
 	}
 }
 
@@ -695,13 +959,28 @@ func TestLoginDefaultAllowsUnverified(t *testing.T) {
 	}
 }
 
+// TestLoginIssuesAccessTokenWithExtraClaims is FIX 3's corrected pin. The
+// original version discarded the loaded user with `_ = u` and only checked
+// key-presence, so it could not have detected the extender receiving an
+// empty/wrong user at all. This version instead simulates exactly what a
+// real application does per WithClaimsExtender's corrected doc: look up its
+// OWN profile data keyed by the real, authenticated user's id
+// (u.Base().ID) — which requires Login to hand the extender the actual
+// user it just authenticated, not a separately (and differently)
+// constructed one — and asserts the CLAIM VALUE that lookup produced, not
+// merely that some key exists.
 func TestLoginIssuesAccessTokenWithExtraClaims(t *testing.T) {
+	// A stand-in for the application's OWN store of profile data, keyed by
+	// the real user id — exactly the pattern WithClaimsExtender's doc now
+	// recommends, since this package's own Store never persists it.
+	plans := map[string]string{}
+
 	store := memory.NewAuthStore()
 	svc := auth.New[testUser](store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 		auth.WithClaimsExtender(func(u testUser) map[string]any {
-			return map[string]any{"display_name": u.DisplayName}
+			return map[string]any{"plan": plans[u.Base().ID]}
 		}),
 	)
 
@@ -709,19 +988,19 @@ func TestLoginIssuesAccessTokenWithExtraClaims(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignUp: %v", err)
 	}
-	// Give the stored user a DisplayName directly, bypassing SignUp (which
-	// this task does not extend with profile fields), so the extender has
-	// something non-zero to surface.
-	u, err := store.FindUserByID(context.Background(), res.User.ID)
-	if err != nil {
-		t.Fatalf("FindUserByID: %v", err)
+	if res.User.ID == "" {
+		t.Fatal("SignUp returned an empty user id")
 	}
-	_ = u
+	plans[res.User.ID] = "gold-plan"
 
-	_, access, _, err := svc.Login(context.Background(), "mona@example.com", validPassword, "1.2.3.4", "")
+	loggedIn, access, _, err := svc.Login(context.Background(), "mona@example.com", validPassword, "1.2.3.4", "")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
+	if loggedIn.ID != res.User.ID {
+		t.Fatalf("Login returned user id %q, want the signed-up user's id %q", loggedIn.ID, res.User.ID)
+	}
+
 	claims, err := token.Parse(access, testSigningKey)
 	if err != nil {
 		t.Fatalf("token.Parse: %v", err)
@@ -729,19 +1008,47 @@ func TestLoginIssuesAccessTokenWithExtraClaims(t *testing.T) {
 	if claims.Extra == nil {
 		t.Fatal("claims.Extra is nil, want the extender's map")
 	}
-	if _, ok := claims.Extra["display_name"]; !ok {
-		t.Fatalf("claims.Extra = %#v, want a \"display_name\" key", claims.Extra)
+	got, ok := claims.Extra["plan"]
+	if !ok {
+		t.Fatalf("claims.Extra = %#v, want a \"plan\" key", claims.Extra)
+	}
+	if got != "gold-plan" {
+		t.Fatalf("claims.Extra[\"plan\"] = %#v, want \"gold-plan\" — the extender must have received the real, authenticated user's id to look this up, not an empty/zero one", got)
 	}
 }
 
+// TestLoginRejectsEmptyIP pins the availability-hazard fix: an empty ip
+// must never silently become a shared rate-limit bucket key.
+func TestLoginRejectsEmptyIP(t *testing.T) {
+	svc, _ := newTestService(t)
+	mustSignUp(t, svc, "pia@example.com", validPassword)
+
+	_, _, _, err := svc.Login(context.Background(), "pia@example.com", validPassword, "", "")
+	if !errors.Is(err, auth.ErrMissingIP) {
+		t.Fatalf("err = %v, want ErrMissingIP", err)
+	}
+}
+
+// TestLoginNoSigningKeyFailsClosed also pins the orphaned-session-row
+// minor fix: a misconfigured signing key must fail BEFORE any Session row
+// is persisted, not leave one behind that no refresh token can ever
+// reach — visible to Store.ListSessionsByUser regardless.
 func TestLoginNoSigningKeyFailsClosed(t *testing.T) {
 	store := memory.NewAuthStore()
 	svc := auth.New[testUser](store, auth.WithHasher(password.Bcrypt(testCost))) // no WithJWT
-	mustSignUp(t, svc, "nora@example.com", validPassword)
+	user := mustSignUp(t, svc, "nora@example.com", validPassword)
 
 	_, _, _, err := svc.Login(context.Background(), "nora@example.com", validPassword, "1.2.3.4", "")
 	if !errors.Is(err, token.ErrKeyTooShort) {
 		t.Fatalf("err = %v, want token.ErrKeyTooShort", err)
+	}
+
+	sessions, err := store.ListSessionsByUser(context.Background(), user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("ListSessionsByUser returned %d session(s), want 0 — a failed token issuance must not leave an orphaned session row", len(sessions))
 	}
 }
 

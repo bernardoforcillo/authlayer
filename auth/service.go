@@ -107,6 +107,12 @@ var (
 	// configured [RateLimiter] denied the caller's IP. Store and Hasher are
 	// never touched when this fires.
 	ErrRateLimited = errors.New("authlayer/auth: rate limit exceeded")
+	// ErrMissingIP: [Service.Login] was called with an empty ip. Refused
+	// unconditionally, whether or not a [RateLimiter] is configured — an
+	// empty ip would otherwise become one shared rate-limit bucket across
+	// every caller that omits it, an availability hazard, not a merely
+	// missing audit field. See Login's own doc.
+	ErrMissingIP = errors.New("authlayer/auth: ip must not be empty")
 	// ErrVerificationExpired: [Service.VerifyEmail] was presented a token
 	// whose ExpiresAt has passed. Checked before the token is claimed, so
 	// an expired token is never burned — it simply ages out via
@@ -187,9 +193,10 @@ func WithHasher(h password.Hasher) Option {
 }
 
 // WithRules sets the [password.Rules] [Service.SignUp] validates a new
-// password against. The default is the zero value ([password.Rules]{}),
-// which requires nothing — pass [password.DefaultRules] explicitly for
-// authlayer's baseline policy; this Option does not assume it for you.
+// password against. The default is [password.DefaultRules] — authlayer's
+// baseline policy (minimum 12 characters, all four character classes) —
+// not the permissive zero value; a caller that wants no policy at all must
+// pass password.Rules{} explicitly.
 func WithRules(r password.Rules) Option {
 	return func(c *config) { c.rules = r }
 }
@@ -279,10 +286,28 @@ func WithRequireVerifiedEmail(require bool) Option {
 	return func(c *config) { c.requireVerifiedEmail = require }
 }
 
-// WithClaimsExtender registers a callback that computes additional
-// [token.Claims].Extra entries from the just-authenticated user, merged
-// into every access token [Service.Login] issues afterward. The default is
-// nil: Login issues tokens with Extra unset.
+// WithClaimsExtender registers a callback that computes additional claims
+// from the just-authenticated user. Its result is NESTED under
+// [token.Claims].Extra as one sub-object, not merged into the token's
+// top-level fields — an extender that returns {"sub": "victim"} produces
+// {"sub":"real-subject", ..., "ext":{"sub":"victim"}} on the wire, so it
+// can never shadow Subject, SessionID, Email, or the timestamps. That
+// nesting is structural, not a denylist: there is no way for an
+// extender's map to reach the reserved keys at all. The default is nil:
+// Login issues tokens with Extra unset.
+//
+// u carries the real, freshly-loaded identity: whatever [UserBase] fields
+// this package itself manages (ID, Email, EmailVerifiedAt, ...) are
+// genuinely populated — see [Service.wrap]. Anything your own type embeds
+// BEYOND UserBase is not: [Store] only ever persists the UserBase-shaped
+// portion (see that interface's own doc), so this package has no way to
+// recover a field like Plan from storage on your behalf. Look such fields
+// up yourself, inside the callback, keyed by the real u.Base().ID:
+//
+//	auth.New[MyUser](store, auth.WithClaimsExtender(func(u MyUser) map[string]any {
+//		profile := myApp.Profiles.Lookup(u.Base().ID) // your own store, not this package's
+//		return map[string]any{"plan": profile.Plan}
+//	}))
 //
 // U here MUST be exactly the same type argument given to [New] — Go cannot
 // enforce that statically, because config (and therefore this Option) is
@@ -294,10 +319,6 @@ func WithRequireVerifiedEmail(require bool) Option {
 // func(U) map[string]any exactly once, immediately after applying every
 // Option — so a mismatched type argument here panics loudly at
 // construction time, not silently or deep inside a later Login call.
-//
-//	auth.New[MyUser](store, auth.WithClaimsExtender(func(u MyUser) map[string]any {
-//		return map[string]any{"plan": u.Plan}
-//	}))
 func WithClaimsExtender[U any](f func(U) map[string]any) Option {
 	return func(c *config) {
 		if f != nil {
@@ -321,6 +342,15 @@ type SignUpResult[U any] struct {
 	Created bool
 	// User is the newly created user when Created is true, or the existing
 	// account (loaded fresh from the Store) when Created is false.
+	// PasswordHash is always cleared to "" on this field, on BOTH branches
+	// — never the live bcrypt digest, whether it is one this call just
+	// produced (the caller already knows the plaintext it submitted, so
+	// that specific hash is not new information) or, on the duplicate
+	// branch, an existing account's real, active credential, which a
+	// caller who merely attempted to sign up with that address has no
+	// business ever seeing. If a caller genuinely needs the existing
+	// account's credential material for some other purpose, load it
+	// directly from the Store — SignUp does not hand it out.
 	User U
 	// VerifyToken is the plain "signup" verification token, present only
 	// when Created is true. Empty when Created is false — there is nothing
@@ -399,33 +429,23 @@ func (s *Service[U, PU]) wrap(b UserBase) U {
 // A library that mints tokens cannot fake "we emailed the address that's
 // already on file" the way a real mail send can, so SignUp does not try:
 // instead, EVERY code path — new address or already-registered — returns
-// (SignUpResult, nil). Created is the only field that distinguishes them.
-// Three things hold, deliberately, and each is load-bearing on its own:
+// (SignUpResult, nil) whenever the underlying operations succeed. Created
+// is the only field that distinguishes them. Several things hold,
+// deliberately, and each is load-bearing on its own:
 //
 //  1. plainPassword is validated against the configured [password.Rules]
 //     BEFORE anything else — before the address is even normalized, let
 //     alone looked up. A weak password is rejected with [ErrWeakPassword]
 //     identically whether the address exists or not, because the decision
 //     to reject it is made before SignUp has learned which case it's in.
-//     Moving this check after the lookup — even just reordering two
-//     lines — would let a weak-password rejection on an existing address
-//     look different from one on a new address, or vice versa, which is
-//     exactly the shape of leak this whole method exists to close.
-//  2. Both branches spend comparable [password.Hasher] work: the new-address
-//     branch calls Hash (to produce the stored credential); the
-//     already-registered branch calls [password.Hasher.Dummy] with the
-//     same plaintext instead of doing nothing. bcrypt is deliberately the
-//     slow, dominant cost in this method — tens to hundreds of
-//     milliseconds — against which the remaining difference (one branch
-//     performs a couple of additional Store writes the other does not) is
-//     a minor, secondary signal, not the one this method is built to
-//     close. See the mandatory mutation check on this method's test for
-//     what happens if the Dummy call is removed.
-//  3. The already-registered branch returns a nil error, never one of
-//     this package's sentinels or the Store's. An error return is itself
-//     an observable signal a caller could branch on, so "duplicate" is
-//     encoded ONLY in SignUpResult.Created, a plain bool inside an
-//     otherwise-identical success value.
+//  2. Every SignUp call attempts the SAME sequence of operations,
+//     regardless of how it turns out — see "Fail closed, symmetrically"
+//     below for why this is not merely tidy but load-bearing.
+//  3. Once an outcome IS determined, the already-registered branch returns
+//     a nil error, never one of this package's sentinels or the Store's.
+//     An error return is itself an observable signal a caller could branch
+//     on, so "duplicate" is encoded ONLY in SignUpResult.Created, a plain
+//     bool inside an otherwise-identical success value.
 //
 // None of this survives contact with an HTTP handler that inspects
 // Created and returns a different status code, a different body, or does
@@ -437,42 +457,69 @@ func (s *Service[U, PU]) wrap(b UserBase) U {
 // property is enforced up to the boundary of this function and no
 // further.
 //
-// # Fail closed
+// # Fail closed, symmetrically
 //
-// A Store failure while looking up the address is returned as-is (not
-// folded into either branch) — SignUp cannot honestly report Created
-// either way when it does not know, and guessing would risk exactly the
-// silent-degrade "no credential" failure mode this whole package refuses
-// to produce. A Store failure creating the user, minting the verification,
-// or a race lost to a concurrent SignUp for the same address (detected via
-// [ErrEmailTaken] from [Store.CreateUser] rather than the initial lookup —
-// rare, but the Store's own uniqueness constraint is the real backstop,
-// not the read-then-write lookup this method performs first) is likewise
-// returned as an error rather than silently narrowed to a duplicate
-// result.
+// A "look the address up, then branch" implementation — an earlier version
+// of this method — closes the timing channel (both branches pay
+// comparable [password.Hasher] cost) and the error-VALUE channel (the
+// duplicate branch never returns a sentinel), but leaves a louder, simpler
+// channel wide open: every WRITE this method performs — hashing the
+// password (bcrypt enforces its own limits, e.g. 72 bytes, so hashing CAN
+// fail on ordinary input, not just on infrastructure trouble), creating
+// the user row, minting the verification token — used to happen ONLY on
+// the genuinely-new-address branch. Under a write-path outage (a full
+// disk; a database answering reads but rejecting writes), a registered
+// address sails through untouched — its branch never attempts a write at
+// all — and returns (Created:false, nil), while an unregistered address
+// hits a real write, fails, and returns a real error. Error-presence
+// itself becomes the oracle, and no amount of matching timing or matching
+// error values closes it, because the two branches were never attempting
+// the same operations to begin with.
+//
+// So SignUp always attempts the identical sequence:
+//
+//  1. Hash the password — never [password.Hasher.Dummy]. Dummy cannot
+//     fail, by design (see its own doc): closing THIS gap needs an
+//     operation that CAN fail the same way regardless of branch, and only
+//     a real Hash call is that operation.
+//  2. Attempt [Store.CreateUser] directly, with that hash — the ONLY
+//     signal this method uses to decide new-vs-duplicate. Success means
+//     new; [ErrEmailTaken] means duplicate; anything else propagates
+//     as-is. Because both outcomes are read off the SAME store call
+//     (rather than a separate preliminary lookup, as an earlier version of
+//     this method used), a write-path outage affecting that call fails it
+//     identically whether or not the address was already taken.
+//  3. Mint a fresh "signup" [Verification]. For a genuinely new account
+//     this is the token [SignUpResult.VerifyToken] returns. For a
+//     duplicate, the SAME operation runs against the EXISTING account and
+//     its result is discarded — VerifyToken stays empty regardless (see
+//     [SignUpResult]) — purely so this write's failure surface is
+//     reachable on the duplicate branch too, not only when the address
+//     was new. It is harmless if it succeeds: the token reaches no one,
+//     and redeeming it — nobody can, since it is never returned — would
+//     only re-stamp EmailVerifiedAt, idempotent per
+//     [Store.MarkEmailVerified]'s own doc, even for an already-verified
+//     account. Any prior pending "signup" verification for that user is
+//     deleted first (mirroring
+//     [github.com/bernardoforcillo/authlayer/invite.Service.InviteByEmail]'s
+//     replace-not-accumulate stance on re-invitation), so repeated probes
+//     against the same address leave at most one such row, not one per
+//     probe.
+//
+// A Store failure at any of these steps is returned as-is — SignUp cannot
+// honestly report Created when it does not know, and guessing would risk
+// exactly the silent-degrade "no credential" failure mode this whole
+// package refuses to produce.
+//
+// SignUpResult.User never carries a live PasswordHash on either branch —
+// see that field's own doc.
 func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string) (SignUpResult[U], error) {
-	// (1) Validate before anything else touches the Store — see the doc.
 	if failed := password.Validate(plainPassword, s.cfg.rules); len(failed) > 0 {
 		return SignUpResult[U]{}, fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
 	}
 
 	normalized := NormalizeEmail(email)
 	now := s.cfg.clock()
-
-	existing, err := s.store.FindUserByEmail(ctx, normalized)
-	switch {
-	case err == nil:
-		// (2) + (3): dummy-hash to spend comparable work, then a nil-error
-		// duplicate result — no sentinel, no Store error, just Created:false.
-		s.cfg.hasher.Dummy(plainPassword)
-		return SignUpResult[U]{Created: false, User: s.wrap(existing)}, nil
-	case errors.Is(err, ErrUserNotFound):
-		// Proceed to real sign-up below.
-	default:
-		// Cannot determine which branch this is — fail closed rather than
-		// guessing.
-		return SignUpResult[U]{}, err
-	}
 
 	hash, err := s.cfg.hasher.Hash(plainPassword)
 	if err != nil {
@@ -486,40 +533,56 @@ func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	})
-	if err != nil {
-		if errors.Is(err, ErrEmailTaken) {
-			// Lost a race to a concurrent SignUp for the same address that
-			// landed between the lookup above and this write. hash was
-			// already computed (the same bcrypt cost as the ordinary
-			// duplicate branch's Dummy call), so no further hashing is
-			// needed here — only the follow-up read to answer with the
-			// account that won.
-			race, ferr := s.store.FindUserByEmail(ctx, normalized)
-			if ferr != nil {
-				return SignUpResult[U]{}, ferr
-			}
-			return SignUpResult[U]{Created: false, User: s.wrap(race)}, nil
+	switch {
+	case err == nil:
+		plainToken, verr := s.mintSignupVerification(ctx, created.ID, created.Email, now)
+		if verr != nil {
+			return SignUpResult[U]{}, verr
 		}
+		created.PasswordHash = ""
+		return SignUpResult[U]{Created: true, User: s.wrap(created), VerifyToken: plainToken}, nil
+
+	case errors.Is(err, ErrEmailTaken):
+		existing, ferr := s.store.FindUserByEmail(ctx, normalized)
+		if ferr != nil {
+			return SignUpResult[U]{}, ferr
+		}
+		if derr := s.store.DeleteVerificationsByUserAndPurpose(ctx, existing.ID, PurposeSignup); derr != nil {
+			return SignUpResult[U]{}, derr
+		}
+		if _, verr := s.mintSignupVerification(ctx, existing.ID, existing.Email, now); verr != nil {
+			return SignUpResult[U]{}, verr
+		}
+		existing.PasswordHash = ""
+		return SignUpResult[U]{Created: false, User: s.wrap(existing)}, nil
+
+	default:
 		return SignUpResult[U]{}, err
 	}
+}
 
+// mintSignupVerification mints and persists a fresh "signup" [Verification]
+// for (userID, email) and returns its plaintext token. Used by [Service.SignUp]
+// on both its branches — see that method's "Fail closed, symmetrically"
+// section for why the duplicate branch calls this too, discarding the
+// result, rather than skipping it.
+func (s *Service[U, PU]) mintSignupVerification(ctx context.Context, userID, email string, now time.Time) (string, error) {
 	plainToken, tokenHash, err := token.GenerateOpaque()
 	if err != nil {
-		return SignUpResult[U]{}, err
+		return "", err
 	}
 	if _, err := s.store.CreateVerification(ctx, Verification{
 		ID:        s.cfg.idGen(),
-		UserID:    created.ID,
+		UserID:    userID,
 		TokenHash: tokenHash,
 		Purpose:   PurposeSignup,
-		Email:     normalized,
+		Email:     email,
 		ExpiresAt: now.Add(defaultVerificationTTL),
 		CreatedAt: now,
 	}); err != nil {
-		return SignUpResult[U]{}, err
+		return "", err
 	}
-
-	return SignUpResult[U]{Created: true, User: s.wrap(created), VerifyToken: plainToken}, nil
+	return plainToken, nil
 }
 
 // Login authenticates email/plainPassword and, on success, mints a new
@@ -527,13 +590,22 @@ func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string
 // [WithJWT]) and a refresh token (a long-lived opaque bearer token, whose
 // hash becomes the minted [Session]'s TokenHash). ip and userAgent are
 // stamped onto that Session as audit fields (see [Session.IP] /
-// [Session.UserAgent]) and ip alone additionally keys the rate limiter, if
-// one is configured — see [RateLimiter]'s doc for why never email.
+// [Session.UserAgent]) and ip additionally keys the rate limiter, if one is
+// configured — see [RateLimiter]'s doc for why never email.
+//
+// ip must be non-empty — [ErrMissingIP] otherwise, checked before the rate
+// limiter is even consulted. A blank ip is not a harmless "unknown": every
+// caller that omits it would share ONE rate-limit bucket, so one client
+// that forgets to pass its caller's address (or an attacker who realizes
+// omitting it is accepted) can exhaust that shared bucket and lock out
+// every other client that also omits it — an availability hazard hiding
+// behind what looks like a missing-but-optional field.
 //
 // # Order of checks, and why
 //
-//  1. Rate limit, by ip. A denial is [ErrRateLimited], returned before the
-//     Store or the Hasher are touched at all.
+//  1. ip is non-empty ([ErrMissingIP]) and, if a [RateLimiter] is
+//     configured, allows this ip ([ErrRateLimited]) — both checked before
+//     the Store or the Hasher are touched at all.
 //  2. Look up email (normalized). A miss calls [password.Hasher.Dummy]
 //     with plainPassword — spending comparable bcrypt work to the
 //     wrong-password case below — and returns [ErrInvalidCredentials].
@@ -556,6 +628,13 @@ func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string
 //     [ErrEmailNotVerified] here, never earlier, so a caller who does not
 //     already know the password cannot use the verified-or-not distinction
 //     as its own enumeration channel.
+//  6. Only once every check above has passed does this touch the Store
+//     with a write ([Store.CreateSession]) — and even that is ordered
+//     LAST, after [token.Issue] has already succeeded (see the body): a
+//     misconfigured signing key ([WithJWT] never called, or too short)
+//     fails before any Session row is persisted, rather than leaving an
+//     orphaned, unreachable-by-refresh-token row behind that
+//     [Store.ListSessionsByUser] would still report.
 //
 // # Fail closed
 //
@@ -566,6 +645,9 @@ func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string
 func (s *Service[U, PU]) Login(ctx context.Context, email, plainPassword, ip, userAgent string) (U, string, string, error) {
 	var zero U
 
+	if ip == "" {
+		return zero, "", "", ErrMissingIP
+	}
 	if s.cfg.limiter != nil {
 		allowed, err := s.cfg.limiter.Allow(ctx, ip)
 		if err != nil {
@@ -604,6 +686,29 @@ func (s *Service[U, PU]) Login(ctx context.Context, email, plainPassword, ip, us
 	if err != nil {
 		return zero, "", "", err
 	}
+
+	// wrapped is the ONE user value both the claims extender and this
+	// method's own return statement use — see [WithClaimsExtender]'s doc
+	// for why the extender must see the real, just-authenticated identity
+	// rather than a separately (and identically) reconstructed one.
+	wrapped := s.wrap(u)
+	var extra map[string]any
+	if s.extender != nil {
+		extra = s.extender(wrapped)
+	}
+	// Issued BEFORE CreateSession, deliberately — see "Order of checks"
+	// point 6 above: a bad signing key must fail before any Session row
+	// exists to be orphaned.
+	accessToken, err := token.Issue(token.Claims{
+		Subject:   u.ID,
+		SessionID: sessionID,
+		Email:     u.Email,
+		Extra:     extra,
+	}, s.signingKey(), s.cfg.accessTTL)
+	if err != nil {
+		return zero, "", "", err
+	}
+
 	if _, err := s.store.CreateSession(ctx, Session{
 		ID:        sessionID,
 		UserID:    u.ID,
@@ -622,21 +727,7 @@ func (s *Service[U, PU]) Login(ctx context.Context, email, plainPassword, ip, us
 		return zero, "", "", err
 	}
 
-	var extra map[string]any
-	if s.extender != nil {
-		extra = s.extender(s.wrap(u))
-	}
-	accessToken, err := token.Issue(token.Claims{
-		Subject:   u.ID,
-		SessionID: sessionID,
-		Email:     u.Email,
-		Extra:     extra,
-	}, s.signingKey(), s.cfg.accessTTL)
-	if err != nil {
-		return zero, "", "", err
-	}
-
-	return s.wrap(u), accessToken, refreshPlain, nil
+	return wrapped, accessToken, refreshPlain, nil
 }
 
 // signingKey returns the current signing key ([WithJWT]'s keys[0]), or nil
