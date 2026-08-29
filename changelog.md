@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once a 1.0 is cut. Until then, minor versions may break API.
 
+## [Unreleased]
+
+### Added
+
+- **Continuous integration** (`.github/workflows/ci.yml`) — the gate this
+  project ran by hand through v0.1.0 now runs on GitHub Actions, on every push
+  and every pull request: `go build`, `go vet` with and without
+  `-tags integration`, a `gofmt -l` check, `golangci-lint` pinned to the
+  version the gate was last run with, and `go test ./... -count=1`. Two
+  additions beyond the hand gate. The unit tests also run under `-race`,
+  which they never had in CI — this package's correctness rests on a
+  compare-and-set session rotation and a mutex-guarded memory store. And the
+  live PostgreSQL lane runs too, against a `postgres:17-alpine` service
+  container holding a dedicated `authlayer_test` database, so the
+  drop-and-recreate the live fixtures perform has a database it exclusively
+  owns. That lane is where several of this project's Criticals were found; a
+  CI that skipped it would not protect the thing that needed protecting. The
+  Go version comes from `go.mod`'s own directive via
+  `setup-go`'s `go-version-file`, so it cannot drift from the module.
+
 ## [0.1.0] - 2026-08-29
 
 ### Added

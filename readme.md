@@ -1662,6 +1662,13 @@ go run ./examples/basic && go run ./examples/auth
 3.5k lines of the suite no static check would see. Every exclusion in it
 carries the reason it is there.
 
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs that same list on
+every push and pull request, plus two things the hand gate does not: the unit
+tests under `-race`, and the live PostgreSQL lane below against a
+`postgres:17-alpine` service container with its own `authlayer_test`
+database. The Go version comes from `go.mod`'s own directive, so it cannot
+drift from the module.
+
 `internal/uid` is not importable — it is the RFC 9562 UUIDv7 generator
 authlayer uses for every id it mints (containers, roles, users, sessions,
 verifications), written out rather than depended on so the module stays at

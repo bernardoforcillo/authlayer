@@ -1,0 +1,133 @@
+# The gate this project ran by hand through v0.1.0, run by CI instead.
+#
+# One workflow, one job, in the same order the hand gate ran: build, vet
+# (twice — the integration lane is a separate build configuration and about
+# 3.5k lines of this suite are invisible without the tag), gofmt,
+# golangci-lint, the unit tests, and finally the live PostgreSQL lane.
+# Sequential rather than a fan-out of parallel jobs on purpose: this is a
+# library whose whole gate takes about three minutes, and one job means one
+# status check that either passed or did not, with the failing step named.
+name: ci
+
+on:
+  # Both events, deliberately. A push to a branch with an open pull request
+  # therefore runs twice, which costs a couple of runner-minutes; the
+  # alternative — pull_request only — leaves a direct push to main ungated,
+  # and this is a security library. The concurrency group below cancels
+  # superseded runs, so the duplication does not compound across a rapid
+  # series of pushes.
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+
+# Nothing here writes to the repository, comments on a pull request, or
+# publishes anything.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+
+    # The live lane's own fixtures DROP the auth, RBAC and invite tables on
+    # entry and again on exit (store/drops/*_integration_test.go), so it
+    # needs a database it exclusively owns. A service container is exactly
+    # that: created for this job, thrown away with it, and named
+    # authlayer_test rather than the image's default `postgres` so that even
+    # a hand-run against a mis-set DSN would have to name a database that
+    # exists nowhere else.
+    #
+    # postgres:17-alpine matches the container this suite was developed
+    # against. The port is published to the runner because the steps below
+    # run on the runner host, not inside the job network.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: authlayer
+          POSTGRES_PASSWORD: authlayer
+          POSTGRES_DB: authlayer_test
+        ports:
+          - 5432:5432
+        # Without a health check the first step to connect races the
+        # server's startup and fails with "connection refused" perhaps one
+        # run in ten. pg_isready names the database as well as the role, so
+        # the job does not start until initdb has finished creating it.
+        options: >-
+          --health-cmd "pg_isready -U authlayer -d authlayer_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v7
+
+      # go-version-file rather than a literal, so the Go the gate runs on is
+      # go.mod's own directive by construction and cannot drift from it.
+      # go.mod says `go 1.26`, which resolves to the newest 1.26.x.
+      - name: set up go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: go version
+        run: go version
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: vet (integration lane)
+        run: go vet -tags integration ./...
+
+      # `gofmt -l` exits 0 whether or not it listed anything, so the empty
+      # check has to be made here or this step can never fail.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would rewrite these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # Pinned to the exact version the gate was last run with by hand.
+      # v2 is required — .golangci.yml carries `version: "2"` and a v1
+      # binary refuses the file — and the action's own major must be v7 or
+      # later to drive a v2 binary. The config sets `build-tags:
+      # [integration]`, so this covers the live lane's sources too.
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.1
+          args: ./...
+
+      # Both test runs are kept. The plain one is the gate as it has been
+      # run since the first commit; the race one is new, and is the point of
+      # this file for a package whose correctness rests on compare-and-set
+      # session rotation and a mutex-guarded memory store. Race
+      # instrumentation also changes timing enough that the two are not the
+      # same experiment.
+      - name: test
+        run: go test ./... -count=1
+
+      - name: test (race)
+        run: go test -race ./... -count=1
+
+      # The lane where several of this project's Criticals were actually
+      # found. A CI that stops before it would not protect the thing that
+      # needed protecting.
+      - name: test (live postgresql)
+        env:
+          AUTHLAYER_TEST_DSN: postgres://authlayer:authlayer@127.0.0.1:5432/authlayer_test?sslmode=disable
+        run: go test -tags integration ./store/drops/ -count=1
