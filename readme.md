@@ -90,10 +90,14 @@ ok, _ := svc.Can(bob, org.ResourceMember, org.ActionCreate)       // true
 ok, _  = svc.Can(bob, org.ResourceOrganization, org.ActionDelete) // false
 ```
 
-A full, database-free tour is in [`examples/basic`](examples/basic/main.go):
+A full, database-free tour is in [`examples/basic`](examples/basic/main.go);
+[`examples/auth`](examples/auth/main.go) does the same for the whole library
+wired together — sign-up through log-out, with an org and an invitation in the
+middle:
 
 ```sh
 go run ./examples/basic
+go run ./examples/auth
 ```
 
 ## Statements & permissions
@@ -996,6 +1000,19 @@ persists `auth.UserBase` and nothing else, so a `Plan` or `DisplayName` field
 of your own is yours to load and save, keyed by `UserBase.ID`
 (`WithClaimsExtender`'s doc has the worked example).
 
+[`examples/auth`](examples/auth/main.go) runs this whole section end to end
+against `store/memory` — sign up, verify, log in, verify the access token,
+create an org, invite a second user, accept, authorize, refresh, log out —
+and prints a trace of each step:
+
+```sh
+go run ./examples/auth
+```
+
+It is also the one place the `auth` + `invite` seam is written down — see
+[Wiring `auth`, `org` and `invite` together](#wiring-auth-org-and-invite-together)
+at the end of this section.
+
 ### Sign-up, verification, login
 
 ```go
@@ -1429,6 +1446,40 @@ fmt.Println(c.Extra["plan"], c.Extra["sub"]) // pro victim
 
 The extender's `"sub"` lands at `ext.sub` and the real subject is untouched.
 
+### Wiring `auth`, `org` and `invite` together
+
+The three packages share no store and no types. The only thing that connects
+them is the user id `auth` mints, which `org`/`scope` and `invite` treat as an
+opaque subject.
+
+One seam is worth writing down, because every `auth` + `invite` integration
+hits it: `invite.New` takes the **generic `*scope.Service`**, not the
+`org.Service` wrapper. `org.Service` embeds
+`*scope.Service[Organization, Member, *Organization, *Member]`, so the field
+is reached by the embedded type's own name — `orgSvc.Service`.
+
+```go
+orgSvc := org.New(
+    org.NewAccess(map[string][]access.Action{"project": {"create"}}),
+    memory.New[org.Organization, org.Member]())
+inviteSvc := invite.New(orgSvc.Service, memory.NewInviteStore())
+
+// login.User.ID, from the Login above, is what org and invite see as the
+// subject. Nothing else crosses between the halves.
+alice := org.WithSubject(ctx, login.User.ID)
+acme, err := orgSvc.CreateOrganization(alice, "Acme", "acme")
+fmt.Println(acme.OwnerID == login.User.ID, err) // true <nil>
+
+inOrg := org.WithOrg(alice, acme.ID)
+inv, inviteToken, err := inviteSvc.InviteByEmail(inOrg, "carol@example.com", org.RoleAdmin)
+fmt.Println(inv.RoleKey, inviteToken != "", err) // admin true <nil>
+```
+
+Carol then signs up through `auth` like anyone else and calls
+`AcceptInvite` with the id `auth` minted for her — the invitation was created
+for an *address*, before she had an account at all.
+[`examples/auth`](examples/auth/main.go) runs exactly this, end to end.
+
 ## Errors
 
 Compare with `errors.Is`, never by string. `org` re-exports these as *aliases*,
@@ -1549,7 +1600,8 @@ rules and `Verify` returns a bool, so there is nothing to compare with
 | [`password`](password/) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` for a strength policy. The only package that pulls in `golang.org/x/crypto`. |
 | [`store/memory`](store/memory/) | In-memory `scope.Store`, `invite.Store` and `auth.Store` for dev, tests, and examples. |
 | [`store/drops`](store/drops/) | PostgreSQL stores built on drops — RBAC (composite-key membership), invitations, and the three auth tables. |
-| [`examples/basic`](examples/basic/) | Runnable, database-free tour. |
+| [`examples/basic`](examples/basic/) | Runnable, database-free tour of the RBAC half. |
+| [`examples/auth`](examples/auth/) | Runnable, database-free tour of `auth` + `org` + `invite` wired together. |
 
 Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
 

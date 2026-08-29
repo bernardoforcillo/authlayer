@@ -10,6 +10,14 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Runnable end-to-end example** (`examples/auth`) — `go run ./examples/auth`
+  wires `auth` + `org` + `invite` over `store/memory` and prints a trace: sign
+  up, verify the address, log in, verify the access token, create an
+  organization, invite a second user by email, sign that user up and accept,
+  authorize, refresh, log out. It is also the one place the `auth`/`invite`
+  seam is written down — `invite.New` takes the generic `*scope.Service`, so
+  the expression is `invite.New(orgSvc.Service, ...)`, reaching the field
+  `org.Service` embeds. `examples/basic` still covers the RBAC half alone.
 - **Per-action query guards** (`authlayer/scope`) — `Service.PermissionGuard`
   restricts a table's rows to the containers where the subject holds a specific
   `(resource, action)` grant, rather than to those they merely belong to. The
