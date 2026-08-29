@@ -11,19 +11,30 @@ import (
 	"github.com/bernardoforcillo/drops/pg"
 )
 
-// The id-bearing column names split by who mints the value, because only one
-// half has an escape hatch.
+// The id-bearing column names split by who mints the value, because the two
+// halves are configured independently.
 //
-// libraryIDColumns hold ids authlayer generates itself (uid.NewV7), so they are
-// always uuid: there is no configuration under which they hold anything else.
+// libraryIDColumns hold ids authlayer generates itself — UUIDv7 by default
+// (internal/uid), hence the uuid default — but scope.WithIDGenerator and
+// auth.WithIDGenerator can replace that generator with one producing ULIDs, a
+// database sequence, or a readable prefix scheme. These columns therefore
+// follow WithTextLibraryIDs (WithInviteTextLibraryIDs,
+// WithAuthTextLibraryIDs), which is what makes those two options honourable
+// against this backend rather than merely documented.
 //
 // userIDColumns hold a *user* id. authlayer generates those too when its own
-// auth owns the user table — hence the uuid default — but a consumer using only
-// the RBAC half supplies them from an existing user table, which may key on
-// anything. Those columns therefore follow WithTextUserIDs together: owner_id
-// is stamped from the context subject (scope/scope.go, pc.SetOwner(subject)),
-// exactly like organization_members.user_id, and invited_by / created_by are
-// the same class of value.
+// auth owns the user table — hence the same uuid default — but a consumer
+// using only the RBAC half supplies them from an existing user table, which
+// may key on anything. Those columns follow WithTextUserIDs together:
+// owner_id is stamped from the context subject (scope/scope.go,
+// pc.SetOwner(subject)), exactly like organization_members.user_id, and
+// invited_by / created_by are the same class of value.
+//
+// The two are separate options and not one, because the two questions are
+// genuinely independent on the scope and invite stores: a deployment can mint
+// ULIDs of its own while pointing at a users table that is UUID keyed, or the
+// reverse. The auth store is the exception and deliberately couples them —
+// see [WithAuthTextLibraryIDs].
 var (
 	libraryIDColumns = map[string]bool{
 		"id":           true,
@@ -37,6 +48,23 @@ var (
 		"created_by": true,
 	}
 )
+
+// idTypes records, per id-column family, whether those columns are typed
+// PostgreSQL uuid (true) or text (false). It is one value rather than two
+// bare bools threaded through walk and add so that a call site cannot get the
+// two the wrong way round: newColSet(tbl, model, false, true) compiles and
+// silently retypes the wrong family.
+type idTypes struct {
+	// library covers libraryIDColumns — the ids authlayer mints.
+	library bool
+	// user covers userIDColumns — the ids a consumer supplies.
+	user bool
+}
+
+// uuidIDs is the default every schema constructor starts from: both families
+// uuid, because authlayer generates UUIDv7 for everything it owns. The
+// With*Text*IDs options clear one field each.
+func uuidIDs() idTypes { return idTypes{library: true, user: true} }
 
 // colSet is the set of typed drops columns for one table, derived by walking a
 // model struct's drop: tags.
@@ -68,7 +96,7 @@ type colSet struct {
 // It panics on a field type it cannot map: a model the store cannot persist is
 // a startup programming error, and the same idiom is already used by
 // access.NewRole for a mis-declared role.
-func newColSet(tbl *pg.Table, model any, uuidUserIDs bool) *colSet {
+func newColSet(tbl *pg.Table, model any, ids idTypes) *colSet {
 	t := reflect.TypeOf(model)
 	if t == nil || t.Kind() != reflect.Struct {
 		panic(fmt.Sprintf(
@@ -84,7 +112,7 @@ func newColSet(tbl *pg.Table, model any, uuidUserIDs bool) *colSet {
 		bytes: map[string]*pg.Col[[]byte]{},
 		i32:   map[string]*pg.Col[int32]{},
 	}
-	c.walk(t, uuidUserIDs)
+	c.walk(t, ids)
 	return c
 }
 
@@ -143,7 +171,7 @@ func typeName(t reflect.Type) string {
 // is treated as one column, which add then rejects loudly, instead of being
 // flattened here while the scanner binds it whole — a divergence that would
 // corrupt reads with no panic.
-func (c *colSet) walk(t reflect.Type, uuidUserIDs bool) {
+func (c *colSet) walk(t reflect.Type, ids idTypes) {
 	for i := range t.NumField() {
 		f := t.Field(i)
 		if !f.IsExported() {
@@ -155,16 +183,16 @@ func (c *colSet) walk(t reflect.Type, uuidUserIDs bool) {
 		}
 		if tag != "" {
 			name, opts, _ := strings.Cut(tag, ",")
-			c.add(name, strings.Split(opts, ","), f.Type, uuidUserIDs)
+			c.add(name, strings.Split(opts, ","), f.Type, ids)
 			continue
 		}
 		if f.Anonymous && f.Type.Kind() == reflect.Struct {
-			c.walk(f.Type, uuidUserIDs)
+			c.walk(f.Type, ids)
 		}
 	}
 }
 
-func (c *colSet) add(name string, opts []string, ft reflect.Type, uuidUserIDs bool) {
+func (c *colSet) add(name string, opts []string, ft reflect.Type, ids idTypes) {
 	unique := false
 	for _, o := range opts {
 		if o == "unique" {
@@ -175,7 +203,7 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, uuidUserIDs bo
 	switch {
 	case ft.Kind() == reflect.String:
 		def := pg.Text(name)
-		if libraryIDColumns[name] || (userIDColumns[name] && uuidUserIDs) {
+		if (libraryIDColumns[name] && ids.library) || (userIDColumns[name] && ids.user) {
 			def = pg.UUID(name)
 		}
 		def = def.NotNull()

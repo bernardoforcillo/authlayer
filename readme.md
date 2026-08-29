@@ -66,10 +66,14 @@ RBAC engine pulls in `drops`, and `pgx/v5` comes with the PostgreSQL store.
   persists, so your profile fields live in your own tables and authlayer's
   migrations never own a column your product's shape decides.
   Use the RBAC half alone and nothing about users changes. Ids authlayer mints
-  are UUIDv7 and their columns are `uuid`;
-  `dropsstore.WithTextUserIDs()` remains the escape hatch for pointing the
-  **RBAC** store at a non-UUID user table of your own, and the auth store has
-  no such option, because there it owns the `users` table being referenced.
+  are UUIDv7 and their columns are `uuid` by default;
+  `dropsstore.WithTextUserIDs()` is the escape hatch for pointing the
+  **RBAC** store at a non-UUID user table of your own, and
+  `dropsstore.WithTextLibraryIDs()` the one for a non-UUID
+  [`WithIDGenerator`](#ids) of your own. The auth store has no
+  text-*user*-id option, because there it owns the `users` table being
+  referenced, but it does have `dropsstore.WithAuthTextLibraryIDs()`, which
+  moves all five of its id columns together.
 
 ## Quick start
 
@@ -384,7 +388,7 @@ goroutine; the first error stops the chain.
 | `WithPolicy(p)` | Replace the authorization policy. |
 | `WithHooks(h...)` | Append lifecycle hooks (accumulates across calls). |
 | `WithClock(fn)` | Timestamp source; default `time.Now().UTC()`. Inject a fixed clock for deterministic tests. |
-| `WithIDGenerator(fn)` | Id source for containers and custom roles; default is UUIDv7 from `crypto/rand`. **Must stay UUID-parseable against `store/drops`** — see [Ids](#ids). |
+| `WithIDGenerator(fn)` | Id source for containers and custom roles; default is UUIDv7 from `crypto/rand`. A non-UUID generator needs `dropsstore.WithTextLibraryIDs()` on `store/drops` — see [Ids](#ids). |
 | `WithParent(p, inherit)` | [Nest](#nested-scopes) this scope inside another, resolving standing through `p` and projecting it with `inherit`. |
 | `WithContainerResource(res)` | Name this scope's own container resource, so a [nested](#nested-scopes) `CreateContainer` knows what `<res>:create` to check for in the parent. |
 
@@ -557,7 +561,8 @@ by a concurrent call.
 The PostgreSQL store, generic over the container and member types:
 
 ```
-organizations         id PK (uuid), name, slug UNIQUE, owner_id, created_at, updated_at
+organizations         id PK (uuid by default), name, slug UNIQUE, owner_id,
+                      created_at, updated_at
 organization_members  (container_id, user_id) PK, role_key, joined_at
 organization_roles    id PK, container_id, key, name, permissions BYTEA,
                       created_at, UNIQUE (container_id, key)
@@ -587,13 +592,21 @@ type must tag `container_id`, `user_id`, `role_key` and `joined_at` — embeddin
 `scope.ContainerBase` and `scope.MemberBase` does that for you, and a type that
 misses one is rejected at construction rather than at the first query.
 
-Ids authlayer generates are UUIDv7 and their columns are `uuid`. So are the
-columns holding a user id — `owner_id` as much as `user_id` — since authlayer
-generates user ids too. If you use only the RBAC half against an existing user
-table whose ids are not UUIDs, pass `dropsstore.WithTextUserIDs()`: it retypes
-every user-id column at once, and leaves the ids authlayer mints for itself
-(`id`, `container_id`, `parent_id`) as `uuid`. That last clause is why it is
-not an escape hatch for `WithIDGenerator` — see [Ids](#ids).
+Ids authlayer generates are UUIDv7 and their columns are `uuid` by default. So
+are the columns holding a user id — `owner_id` as much as `user_id` — since
+authlayer generates user ids too. Two independent options retype them, because
+the two questions are independent:
+
+| Option | Retypes | Reach for it when |
+|---|---|---|
+| `WithTextUserIDs()` | `user_id`, `owner_id` (and `invited_by`, `created_by` via `WithInviteTextUserIDs()`) | You use only the RBAC half, against an existing user table whose ids are not UUIDs. |
+| `WithTextLibraryIDs()` | `id`, `container_id`, `parent_id` | You overrode `WithIDGenerator` with something a `uuid` column will not hold — see [Ids](#ids). |
+
+They compose, and a deployment minting non-UUID ids for both wants both.
+`CreateSchema` emits the right `CREATE TABLE` either way, but — like
+everything else it does — it will not retype a table that already exists, so
+choose before the tables are created or retype the columns in your own
+migration.
 
 The unique constraints are load-bearing: they are what turn a concurrent
 double-insert into `ErrSlugTaken`, `ErrAlreadyMember` or `ErrRoleKeyTaken`
@@ -613,8 +626,8 @@ stores over their own tables, each with its own `CreateSchema` and `Schema()`.
 The auth one owns three:
 
 ```
-users          id PK (uuid), email UNIQUE, email_verified_at, password_hash,
-               created_at, updated_at
+users          id PK (uuid by default), email UNIQUE, email_verified_at,
+               password_hash, created_at, updated_at
 sessions       id PK, user_id, token_hash UNIQUE, family_id, expires_at,
                created_at, rotated_at, user_agent, ip, INDEX (family_id)
 verifications  id PK, user_id, token_hash UNIQUE, purpose, email, expires_at,
@@ -642,8 +655,13 @@ version or by hand. The `family_id` index is not decoration either: every
 family revocation reads and locks by it, and `LogoutAll` runs one transaction
 per family. `AuthNames` / `WithAuthNames` rename the three tables if `users`
 is already taken in your database. Unlike the RBAC and invite stores, this one
-has no text-user-id option — it owns the `users` table its `user_id` columns
-point at, so `uuid` is the only self-consistent choice.
+has no text-*user*-id option — it owns the `users` table its `user_id` columns
+point at, so a `user_id` typed differently from `users.id` could never be
+self-consistent. What it has instead is `WithAuthTextLibraryIDs()`, one option
+that retypes all five id columns — `users.id`, `sessions.id`,
+`verifications.id`, and the two `user_id` columns referencing the first — so a
+non-UUID [`auth.WithIDGenerator`](#ids) works here too. A hatch that moved only
+the first three would fix `SignUp` and then break `Login`.
 
 No foreign keys are declared — not to a users table from the RBAC side, which
 authlayer does not own, and not between the three auth tables either, matching
@@ -1662,11 +1680,18 @@ go run ./examples/basic && go run ./examples/auth
 3.5k lines of the suite no static check would see. Every exclusion in it
 carries the reason it is there.
 
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs every command in
+that block on each push and pull request, plus two the hand gate does not: the
+unit tests under `-race`, and the live PostgreSQL lane below against a
+`postgres:17-alpine` service container with its own `authlayer_test` database.
+The Go version comes from `go.mod`'s own directive, so it cannot drift from the
+module.
+
 `internal/uid` is not importable — it is the RFC 9562 UUIDv7 generator
 authlayer uses for every id it mints (containers, roles, users, sessions,
 verifications), written out rather than depended on so the module stays at
 three requirements. `scope.WithIDGenerator` and `auth.WithIDGenerator` override
-it — within the limit [Ids](#ids) describes.
+it — see [Ids](#ids) for what `store/drops` needs when you do.
 
 ### Ids
 
@@ -1674,27 +1699,51 @@ it — within the limit [Ids](#ids) describes.
 everything authlayer mints. Against a `Store` of your own, the only requirement
 is that ids are unique and stable.
 
-**Against `store/drops` they must be UUID-parseable.** Every id the library
-mints for itself — a container's `id`, a role's `id`, `container_id`,
-`parent_id`, and `users`/`sessions`/`verifications` `id` — is a PostgreSQL
-`uuid` column, unconditionally. A ULID, a sequence number, or a readable
-`usr_a1b2c3` fails the first `CreateOrganization` or `SignUp` with
-`SQLSTATE 22P02` (`invalid_text_representation`).
+**Against `store/drops`, a non-UUID generator needs the matching
+text-library-ids option.** Every id the library mints for itself — a
+container's `id`, a role's `id`, `container_id`, `parent_id`, and
+`users`/`sessions`/`verifications` `id` — is a PostgreSQL `uuid` column *by
+default*, which is right for the UUIDv7 generator authlayer ships and wrong for
+any other. Pass the option for each store you use:
 
-`WithTextUserIDs` is **not** the escape hatch for this, despite the name's
-apparent reach. It types the columns holding a user id supplied from *outside*
-the library — `user_id`, `owner_id`, `invited_by`, `created_by` — so the RBAC
-half can sit on an existing non-UUID user table. It does not touch the ids
-authlayer mints. `New[...](db, WithTextUserIDs())` with a ULID generator still
-fails on the first write.
+```go
+scopeSt := dropsstore.New[org.Organization, org.Member](db,
+    dropsstore.WithTextLibraryIDs(), dropsstore.WithTextUserIDs())
+inviteSt := dropsstore.NewInviteStore(db,
+    dropsstore.WithInviteTextLibraryIDs(), dropsstore.WithInviteTextUserIDs())
+authSt := dropsstore.NewAuthStore(db, dropsstore.WithAuthTextLibraryIDs())
 
-The failure lands at the store, on the first write, and `store/memory` accepts
-any string — so a service developed and tested entirely against the memory
-store with a non-UUID generator passes every test and breaks on deployment.
-Both halves are pinned by test:
-`TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore` in `auth`, and
-`TestNonUUIDIDGeneratorFailsAgainstDropsLive` in `store/drops`' integration
-lane, which asserts the `22P02` specifically.
+orgSvc := org.New(ac, scopeSt, org.WithIDGenerator(ulid.Make))
+authSvc := auth.New(authSt, auth.WithIDGenerator(ulid.Make))
+```
+
+The `WithTextUserIDs` / `WithInviteTextUserIDs` calls are there because in this
+configuration the user ids stamped into `owner_id`, `user_id`, `invited_by` and
+`created_by` come from that same generator. They are a **separate** option
+covering a separate question — pointing the RBAC half at an existing non-UUID
+user table — and on their own they do nothing for `WithIDGenerator`:
+`New[...](db, WithTextUserIDs())` with a ULID generator still fails on the
+first write. The auth store has no text-*user*-id option at all;
+`WithAuthTextLibraryIDs` moves its `user_id` columns along with `users.id`,
+since it owns the table they reference.
+
+Without the right option, the first `CreateOrganization` or `SignUp` fails with
+`SQLSTATE 22P02` (`invalid_text_representation`) — at the store, on the first
+write. `store/memory` accepts any string, so a service developed and tested
+entirely against the memory store passes every test and breaks on deployment.
+All three directions are pinned by test:
+`TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore` in `auth`;
+`TestNonUUIDIDGeneratorFailsAgainstDropsLive` and
+`TestNonUUIDIDGeneratorFailsAgainstTheScopeStoreLive` in `store/drops`'
+integration lane, which assert the `22P02` on each half; and
+`TestTextLibraryIDsRoundTripANonUUIDGeneratorLive` in the same lane, which
+drives a ULID generator through a full sign-up/verify/login/refresh arc and a
+full organization/member/custom-role arc against live PostgreSQL with the
+options on.
+
+`CreateSchema` emits the right DDL either way and stays idempotent, but it
+never alters a table that already exists — so pick before the tables are
+created, or retype the columns in your own migration.
 
 ## Roadmap
 

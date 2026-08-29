@@ -39,8 +39,8 @@ func (n Names) withDefaults() Names {
 }
 
 type settings struct {
-	names       Names
-	uuidUserIDs bool
+	names Names
+	ids   idTypes
 }
 
 // Option customizes a Schema or Store at construction.
@@ -54,12 +54,45 @@ type Option func(*settings)
 //	}))
 func WithNames(n Names) Option { return func(s *settings) { s.names = n } }
 
-// WithTextUserIDs types user_id columns as text rather than uuid.
+// WithTextUserIDs types the user-id columns — user_id and owner_id — as text
+// rather than uuid.
 //
 // authlayer generates UUIDv7 ids for everything it owns, users included, so
 // uuid is the default. Use this only when the RBAC half is used on its own
 // against an existing user table whose ids are not UUIDs.
-func WithTextUserIDs() Option { return func(s *settings) { s.uuidUserIDs = false } }
+//
+// It does not reach the ids authlayer mints for itself; [WithTextLibraryIDs]
+// is the option for those, and the two compose.
+func WithTextUserIDs() Option { return func(s *settings) { s.ids.user = false } }
+
+// WithTextLibraryIDs types the library-minted id columns — id, parent_id and
+// container_id — as text rather than uuid.
+//
+// authlayer generates UUIDv7 ids (internal/uid) for every container and role
+// it mints, so uuid is the default and stays the default. Use this when
+// [github.com/bernardoforcillo/authlayer/scope.WithIDGenerator] has replaced
+// that generator with one whose output PostgreSQL's uuid parser does not
+// accept — a ULID, a database sequence, a readable "org_a1b2c3":
+//
+//	svc := org.New(ac, dropsstore.New[org.Organization, org.Member](db,
+//	    dropsstore.WithTextLibraryIDs()),
+//	    org.WithIDGenerator(ulid.Make))
+//
+// Without it, such a generator fails the first CreateContainer with SQLSTATE
+// 22P02 (invalid_text_representation) — at the store, on the first write,
+// which store/memory never reproduces.
+//
+// It is a separate option from [WithTextUserIDs] because the two questions
+// are independent: a deployment may mint ULIDs of its own while pointing at a
+// UUID-keyed users table, or the reverse. An auth-integrated deployment on a
+// non-UUID scheme generally wants both, since its user ids come from the same
+// generator.
+//
+// Changing it changes the DDL [Store.CreateSchema] emits for a table that
+// does not exist yet. Like every other part of that call it will not migrate
+// a table that already exists — see [Store.CreateSchema] — so switch it
+// before the tables are created, or retype the columns in your own migration.
+func WithTextLibraryIDs() Option { return func(s *settings) { s.ids.library = false } }
 
 // Schema holds the three tables and their derived columns:
 //
@@ -108,7 +141,7 @@ type Schema[C any, M any] struct {
 //     scope.ContainerBase and scope.MemberBase supplies all of them, and the
 //     panic names the type and the missing tag.
 func NewSchema[C any, M any](opts ...Option) *Schema[C, M] {
-	cfg := settings{uuidUserIDs: true}
+	cfg := settings{ids: uuidIDs()}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -122,9 +155,9 @@ func NewSchema[C any, M any](opts ...Option) *Schema[C, M] {
 		Members:    pg.NewTable(names.Members),
 		Roles:      pg.NewTable(names.Roles),
 	}
-	s.containers = newColSet(s.Containers, zeroC, cfg.uuidUserIDs)
-	s.members = newColSet(s.Members, zeroM, cfg.uuidUserIDs)
-	s.roles = newColSet(s.Roles, scope.RoleRecord{}, cfg.uuidUserIDs)
+	s.containers = newColSet(s.Containers, zeroC, cfg.ids)
+	s.members = newColSet(s.Members, zeroM, cfg.ids)
+	s.roles = newColSet(s.Roles, scope.RoleRecord{}, cfg.ids)
 
 	s.containers.require(zeroC, "container", "scope.ContainerBase", requiredContainerColumns)
 	s.members.require(zeroM, "member", "scope.MemberBase", requiredMemberColumns)

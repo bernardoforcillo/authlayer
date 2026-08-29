@@ -58,8 +58,10 @@ func TestDropsStoreIntegration(t *testing.T) {
 
 	// Subjects are UUIDs because that is the default: authlayer generates
 	// UUIDv7 user ids, so owner_id and user_id are uuid columns unless the
-	// store is built WithTextUserIDs. Minting them here also proves
-	// uid.NewV7's output round-trips through PostgreSQL's uuid parser.
+	// store is built WithTextUserIDs (and the containers' own ids unless it
+	// is built WithTextLibraryIDs — this store is built with neither).
+	// Minting them here also proves uid.NewV7's output round-trips through
+	// PostgreSQL's uuid parser.
 	aliceID, bobID, carolID := uid.NewV7(), uid.NewV7(), uid.NewV7()
 
 	// Owner creates an org and adds an admin.

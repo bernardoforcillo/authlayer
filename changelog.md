@@ -6,6 +6,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once a 1.0 is cut. Until then, minor versions may break API.
 
+## [Unreleased]
+
+### Added
+
+- **Continuous integration** (`.github/workflows/ci.yml`) — the gate this
+  project ran by hand through v0.1.0 now runs on GitHub Actions, on every push
+  and every pull request: `go build`, `go vet` with and without
+  `-tags integration`, a `gofmt -l` check, `golangci-lint` pinned to the
+  version the gate was last run with, and `go test ./... -count=1`. Two
+  additions beyond the hand gate. The unit tests also run under `-race`,
+  which they never had in CI — this package's correctness rests on a
+  compare-and-set session rotation and a mutex-guarded memory store. And the
+  live PostgreSQL lane runs too, against a `postgres:17-alpine` service
+  container holding a dedicated `authlayer_test` database, so the
+  drop-and-recreate the live fixtures perform has a database it exclusively
+  owns. That lane is where several of this project's Criticals were found; a
+  CI that skipped it would not protect the thing that needed protecting. The
+  Go version comes from `go.mod`'s own directive via
+  `setup-go`'s `go-version-file`, so it cannot drift from the module.
+
+- **A text-library-ids escape hatch** (`authlayer/store/drops`) —
+  `WithTextLibraryIDs()`, `WithInviteTextLibraryIDs()` and
+  `WithAuthTextLibraryIDs()` type the ids authlayer mints for itself — `id`,
+  `container_id`, `parent_id`, and the auth store's
+  `users`/`sessions`/`verifications` ids — as `text` rather than `uuid`. This
+  is what makes `scope.WithIDGenerator` and `auth.WithIDGenerator` true rather
+  than merely constrained: v0.1.0 typed those columns `uuid`
+  unconditionally, so a ULID, a database sequence, or a readable `usr_a1b2c3`
+  failed the first write with `SQLSTATE 22P02` and both options carried a
+  documented warning saying so. The auth store's option deliberately moves
+  `sessions.user_id` and `verifications.user_id` with `users.id`, since it owns
+  the table they reference — a hatch that moved only the three primary keys
+  would have fixed `SignUp` and broken `Login`. `WithTextUserIDs` and
+  `WithInviteTextUserIDs` remain separate options answering a separate
+  question (pointing the RBAC half at an existing non-UUID user table), and
+  the two families compose.
+
+  **`uuid` remains the default everywhere**, since authlayer generates UUIDv7,
+  and the live lane asserts that in both directions by reading
+  `information_schema` back. `CreateSchema` emits the correct `CREATE TABLE`
+  in either mode and stays idempotent; like every other part of that call it
+  will not retype a table that already exists, so choose before the tables are
+  created or retype the columns in your own migration.
+
+  Proven against live PostgreSQL, not only in schema-shape unit tests:
+  `TestTextLibraryIDsRoundTripANonUUIDGeneratorLive` drives one ULID generator
+  through a full sign-up / verify / login / refresh arc and a full
+  organization / member / custom-role arc with the options on, reading every
+  value back; `TestNonUUIDIDGeneratorFailsAgainstDropsLive` and
+  `TestNonUUIDIDGeneratorFailsAgainstTheScopeStoreLive` pin the `22P02`
+  without them.
+
+### Changed
+
+- **`scope.WithIDGenerator` and `auth.WithIDGenerator` no longer document a
+  constraint they no longer have.** Both carried a section headed "A generator
+  MUST produce UUID-parseable ids to use store/drops"; both now name the
+  option to pass instead. The readme's `Ids` section, its `store/drops` and
+  auth-store sections, and its scope options table say the same. The
+  behaviour those paragraphs described is still the default and is still
+  pinned by test — what changed is that it is now a default with a documented
+  way out, rather than a limit.
+
 ## [0.1.0] - 2026-08-29
 
 ### Added
