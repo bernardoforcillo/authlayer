@@ -2690,6 +2690,93 @@ func (s *deleteFamilyFailsStore) DeleteSessionsByFamily(context.Context, string)
 	return errDeleteFamilyBoom
 }
 
+// --- emptyFamilyOnReplayStore: wraps a real auth.Store and, on the replay
+// path specifically (MarkRotated reporting ok=false), hands back the ZERO
+// Session alongside it — the shape Store.MarkRotated's own prose forbids
+// ("the row as it stands"), but which nothing in the port enforces. It
+// records every DeleteSessionsByFamily argument so a test can prove the
+// service never issued a revocation keyed on the empty family id. ---
+
+type emptyFamilyOnReplayStore struct {
+	auth.Store
+	mu           sync.Mutex
+	familyDelete []string
+}
+
+func (s *emptyFamilyOnReplayStore) MarkRotated(ctx context.Context, tokenHash string, now time.Time) (auth.Session, bool, error) {
+	sess, ok, err := s.Store.MarkRotated(ctx, tokenHash, now)
+	if err == nil && !ok {
+		return auth.Session{}, false, nil
+	}
+	return sess, ok, err
+}
+
+func (s *emptyFamilyOnReplayStore) DeleteSessionsByFamily(ctx context.Context, familyID string) error {
+	s.mu.Lock()
+	s.familyDelete = append(s.familyDelete, familyID)
+	s.mu.Unlock()
+	return s.Store.DeleteSessionsByFamily(ctx, familyID)
+}
+
+func (s *emptyFamilyOnReplayStore) familyDeletes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.familyDelete...)
+}
+
+// TestRefreshFailsClosedWhenReplayCarriesNoFamilyID pins the guard on
+// Refresh's reuse-detection response. Detecting a replay and revoking the
+// family are one action, not two: the alarm is only worth anything because
+// containment follows it. A backend that returns (Session{}, false, nil) —
+// forbidden by MarkRotated's prose, enforced by nothing — would make
+// Refresh call DeleteSessionsByFamily(ctx, "") instead, which matches no
+// rows: ErrTokenReuse comes back, the caller believes the family was
+// revoked, and the attacker's successor keeps rotating.
+//
+// So an empty FamilyID here is treated as the backend contract violation it
+// is. The revocation is NOT attempted with a meaningless key and NOT
+// silently skipped; Refresh fails closed with an error that carries both
+// signals, exactly as the DeleteSessionsByFamily-failure branch does:
+// ErrTokenReuse (a replay WAS detected — that fact must survive) and
+// ErrStoreContract (this Store cannot be relied on to contain it).
+func TestRefreshFailsClosedWhenReplayCarriesNoFamilyID(t *testing.T) {
+	store := memory.NewAuthStore()
+	ctx := context.Background()
+	seed := auth.New(store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	mustSignUp(t, seed, "lyle@example.com", validPassword)
+	login, err := seed.Login(ctx, "lyle@example.com", validPassword, "1.2.3.4", "")
+	if err != nil {
+		t.Fatalf("seeding Login: %v", err)
+	}
+	refresh1 := login.RefreshToken
+
+	// Rotate once through the healthy store so refresh1 is genuinely
+	// superseded: the Refresh below is a real replay, not a fabricated one.
+	if _, err := seed.Refresh(ctx, refresh1); err != nil {
+		t.Fatalf("seeding rotation: %v", err)
+	}
+
+	violating := &emptyFamilyOnReplayStore{Store: store}
+	svc := auth.New(violating,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+
+	_, err = svc.Refresh(ctx, refresh1)
+	if !errors.Is(err, auth.ErrTokenReuse) {
+		t.Fatalf("err = %v, want it to satisfy errors.Is(err, ErrTokenReuse) — a replay WAS detected and that must not be lost", err)
+	}
+	if !errors.Is(err, auth.ErrStoreContract) {
+		t.Fatalf("err = %v, want it to satisfy errors.Is(err, ErrStoreContract) — an empty FamilyID on the replay path is a backend contract violation, not a condition to proceed through", err)
+	}
+	if got := violating.familyDeletes(); len(got) != 0 {
+		t.Fatalf("DeleteSessionsByFamily called with %q; want no call at all — revoking on an empty family id is a silent no-op dressed up as containment", got)
+	}
+}
+
 // TestRefreshReplayErrorPreservesReuseSignalEvenWhenFamilyDeleteFails pins
 // the "also take" fix: a DeleteSessionsByFamily failure while responding to
 // a detected replay must not mask that a replay WAS detected. The returned

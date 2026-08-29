@@ -146,20 +146,25 @@ var (
 	// session was already rotated away — [Store.MarkRotated] returning
 	// ok=false. This package cannot distinguish a genuine attacker replaying
 	// a stolen token from a legitimate client retrying a raced request with
-	// a now-stale one, so it treats every occurrence as compromise: by the
-	// time this error is returned, every session in the token's family has
-	// already been revoked via [Store.DeleteSessionsByFamily]. See Refresh's
-	// doc, "Why the whole family, not just the presented session".
+	// a now-stale one, so it treats every occurrence as compromise: when
+	// this error is returned ALONE — wrapping nothing else — every session
+	// in the token's family has already been revoked via
+	// [Store.DeleteSessionsByFamily]. See Refresh's doc, "Why the whole
+	// family, not just the presented session".
+	//
+	// Exactly two cases return it wrapped around a SECOND error, and in
+	// both a replay was detected while the family may still be live:
+	// [Store.DeleteSessionsByFamily] itself failing, and [ErrStoreContract]
+	// — MarkRotated reporting the replay but handing back a [Session] with
+	// no FamilyID, leaving nothing to revoke.
 	//
 	// A caller inspecting an error returned by Refresh with [errors.Is]
-	// MUST check ErrTokenReuse before checking whether the error wraps a
-	// [Store] error of its own: when [Store.DeleteSessionsByFamily] itself
-	// fails while responding to a detected replay, Refresh wraps BOTH — the
-	// returned error satisfies errors.Is against ErrTokenReuse (a replay
-	// WAS detected; that fact must never be lost merely because the
-	// housekeeping response to it also failed) and against whatever the
-	// Store's own error is (so the operational failure is not hidden
-	// either). See Refresh's doc, "Fail closed".
+	// MUST therefore check ErrTokenReuse before checking whether the error
+	// wraps anything else: in both cases the returned error satisfies
+	// errors.Is against ErrTokenReuse (a replay WAS detected; that fact
+	// must never be lost merely because the response to it also failed) and
+	// against the second error too (so the operational failure is not
+	// hidden either). See Refresh's doc, "Fail closed".
 	ErrTokenReuse = errors.New("authlayer/auth: refresh token reuse detected; session family revoked")
 	// ErrSessionRevoked: [Service.Refresh] won [Store.MarkRotated] — this
 	// caller's presented token was genuinely current and unrotated, and
@@ -191,6 +196,24 @@ var (
 	// recovery path this package exposes, since [Service.Login] and
 	// [Service.RequestPasswordReset] both look accounts up BY email.
 	ErrEmailRequired = errors.New("authlayer/auth: email must not be empty")
+	// ErrStoreContract: a [Store] returned a value its own documented
+	// contract forbids, at a point where continuing would silently degrade
+	// a security control rather than merely produce a wrong answer. This
+	// package cannot validate every Store response — most of the port's
+	// obligations (the atomicity MUSTs, the enumeration obligations) are
+	// unobservable from here — so this sentinel is deliberately narrow, not
+	// a general "the Store misbehaved" channel. It has exactly one trigger
+	// today: [Service.Refresh] detecting a replay ([Store.MarkRotated]
+	// returning ok=false) but being handed a [Session] with an empty
+	// FamilyID, which leaves it no family to revoke. See Refresh's doc,
+	// "Why the whole family, not just the presented session", for why
+	// proceeding there would fire the alarm while containment did nothing.
+	//
+	// It is always wrapped alongside the sentinel describing what the
+	// caller's own request did — ErrTokenReuse in that one case — so a
+	// caller matching on the request-level outcome keeps working and an
+	// operator gets the diagnosis.
+	ErrStoreContract = errors.New("authlayer/auth: store violated its documented contract")
 )
 
 // RateLimiter throttles [Service.Login] attempts by a caller-supplied key.
@@ -1070,7 +1093,10 @@ func (s *Service) VerifyEmail(ctx context.Context, plainToken string) (UserBase,
 //     request racing its own retry, so this method does not try to tell
 //     them apart. It revokes EVERY session sharing FamilyID via
 //     [Store.DeleteSessionsByFamily] — not merely the presented one — and
-//     returns [ErrTokenReuse]. See "Why the whole family" below. A
+//     returns [ErrTokenReuse]. See "Why the whole family" below. That
+//     revocation needs the family id MarkRotated returns with its ok=false,
+//     so an empty one is refused rather than used: see "Fail closed" for
+//     the [ErrStoreContract] case. A
 //     tokenHash that MarkRotated itself can no longer find (the row was
 //     deleted between step 1 and here — PurgeExpired, LogoutAll, or another
 //     reuse revocation racing this one) is also reported as ErrTokenInvalid,
@@ -1175,6 +1201,18 @@ func (s *Service) VerifyEmail(ctx context.Context, plainToken string) (UserBase,
 // Store's own error — see ErrTokenReuse's own doc for why losing that
 // signal would be worse than a slightly noisier one.
 //
+// Step 3's replay branch fails closed one step earlier, too. Revoking the
+// family needs the FamilyID of the row MarkRotated refused to rotate, and
+// MarkRotated's contract is to return that row — but a backend answering
+// (Session{}, false, nil) instead, which nothing in the port enforces,
+// would send DeleteSessionsByFamily an empty id that matches no rows: the
+// alarm fires, ErrTokenReuse comes back, and the family the caller believes
+// was revoked is still live, an attacker's successor included. Neither
+// revoking on a meaningless key nor skipping the revocation is acceptable,
+// so an empty FamilyID here is refused as the contract violation it is —
+// wrapping [ErrStoreContract] alongside ErrTokenReuse, for the same reason
+// the DeleteSessionsByFamily failure above wraps both.
+//
 // One accepted, disclosed trade-off: once step 3 has returned ok=true, the
 // presented token IS already rotated away — [Store.MarkRotated] performed
 // an irreversible write. If [token.Issue] subsequently fails (a
@@ -1225,6 +1263,19 @@ func (s *Service) Refresh(ctx context.Context, refreshPlain string) (LoginResult
 	if !ok {
 		// A genuine replay. Revoke the whole family, not just this session.
 		//
+		// First: this Store must have handed back the row it refused to
+		// rotate. [Store.MarkRotated] documents that it does; nothing
+		// enforces it, and a backend returning (Session{}, false, nil)
+		// would send DeleteSessionsByFamily an empty family id, which
+		// matches nothing — the alarm fires, ErrTokenReuse comes back, and
+		// containment silently does not happen. Neither proceeding with a
+		// meaningless key nor skipping the revocation is acceptable here,
+		// so this fails closed and says which contract was broken, while
+		// keeping the ErrTokenReuse signal a caller matches on — see
+		// [ErrStoreContract] and the method doc's "Fail closed".
+		if rotated.FamilyID == "" {
+			return zero, fmt.Errorf("%w: %w: MarkRotated reported a replay but returned a Session with no FamilyID, leaving no family to revoke", ErrTokenReuse, ErrStoreContract)
+		}
 		// A DeleteSessionsByFamily failure here must not swallow the fact
 		// that a replay WAS detected — see ErrTokenReuse's own doc for why
 		// both are wrapped rather than just derr alone.
