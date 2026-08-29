@@ -17,16 +17,25 @@ once a 1.0 is cut. Until then, minor versions may break API.
   a third-party backend author had no way to check their work. The suite covers
   every one of them plus the ordinary behavioural contract — error
   classification, email normalization on every read and write path, and
-  `PurgeExpired`'s strict cutoff — and drives the three obligations that only
-  appear under concurrency as real races: `MarkRotated`'s single winner,
-  `CreateUser`'s and `UpdateUserEmail`'s one-address-one-account atomicity, a
-  `MarkEmailVerified` racing an `UpdateUserEmail`, and a `CreateSuccessorSession`
-  racing the family revocation that must not leave it alive. Points the port
+  `PurgeExpired`'s strict cutoff. Six of its fifty checks are races, because the
+  obligations behind them are unreachable sequentially: `MarkRotated`'s single
+  winner; `CreateUser`'s and `UpdateUserEmail`'s one-address-one-account
+  atomicity, one check each; a `MarkEmailVerified` racing the `UpdateUserEmail`
+  that moves the address out from under it; a `CreateSuccessorSession` racing
+  the family revocation that must not leave it alive; and concurrent revocations
+  of one family. Points the port
   leaves unspecified are deliberately not asserted. Fifteen negative controls —
   each a store exactly one defect away from a correct one, paired into nineteen
   defect/check cases — assert the suite *fails* a non-compliant implementation;
   without them a suite that passes everything would look identical to one that
-  works.
+  works. Two of the seven are only partly reachable from outside the port and
+  the package doc says so rather than implying coverage: `CreateUser`'s
+  requirement that `ErrEmailTaken` come from the write attempt rather than a
+  separately-authorized read is a property of the backend's failure topology,
+  invisible to a caller, so only its atomicity consequence is asserted; and
+  `DeleteSessionsByFamily`'s serialization **MUST** is asserted through its
+  consequence, because forcing the lock-order inversion needs backend-specific
+  SQL on a second connection. `store/drops` carries that one itself.
 - **`authtest.RunTokenHashUniquenessContract`** — the uniqueness **MUST** on
   `Session.TokenHash` and `Verification.TokenHash`, as a separate entry point.
   `store/memory` declines that obligation deliberately (its own doc says so, and
