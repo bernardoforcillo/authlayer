@@ -55,7 +55,7 @@ func WithAuthNames(n AuthNames) AuthOption {
 //	                 created_at, updated_at, UNIQUE (email)
 //	<sessions>       id PK, user_id, token_hash, family_id, expires_at,
 //	                 created_at, rotated_at, user_agent, ip,
-//	                 UNIQUE (token_hash)
+//	                 UNIQUE (token_hash), INDEX (family_id)
 //	<verifications>  id PK, user_id, token_hash, purpose, email, expires_at,
 //	                 created_at, UNIQUE (token_hash)
 //
@@ -146,6 +146,18 @@ func NewAuthSchema(opts ...AuthOption) *AuthSchema {
 	// name and is swallowed as "already there"; on a pre-existing table
 	// missing the constraint entirely, it adds it.
 	s.Users.AddUnique(names.Users+"_email_key", s.users.col("email"))
+	// family_id is a plain (non-unique) index, not a constraint: every
+	// [AuthStore.DeleteSessionsByFamily] call and every
+	// [AuthStore.CreateSuccessorSession]-driven rotation reads or locks by
+	// family_id, and without an index both of DeleteSessionsByFamily's own
+	// statements (see that method's "Lock, then delete" doc) seq-scan the
+	// whole table — load-bearing now that a revocation costs a transaction
+	// per family, not one autocommit statement, so
+	// [github.com/bernardoforcillo/authlayer/auth.Service.LogoutAll]'s own
+	// per-family loop pays two scans per family instead of one. [CreateSchema]
+	// emits this the same idempotent, self-healing way it emits the UNIQUE
+	// constraints above.
+	s.Sessions.AddIndex(pg.NewIndex(names.Sessions+"_family_id_idx", s.Sessions, s.sessions.col("family_id")))
 
 	return s
 }
@@ -175,9 +187,11 @@ func (st *AuthStore) Schema() *AuthSchema { return st.s }
 // followed by all three UNIQUE constraints as guarded ALTER TABLE
 // statements — see [AuthSchema]'s doc for why email's is registered this
 // way too, not only the two TokenHash ones CREATE TABLE could never carry
-// in the first place. Every statement is idempotent, so the call is safe
-// to re-run and self-heals a pre-existing table missing a constraint; like
-// [Store.CreateSchema] and
+// in the first place — and then CREATE INDEX IF NOT EXISTS for every index
+// registered on a table (currently just sessions.family_id — see
+// [NewAuthSchema]'s own comment on that registration). Every statement is
+// idempotent, so the call is safe to re-run and self-heals a pre-existing
+// table missing a constraint or index; like [Store.CreateSchema] and
 // [InviteStore.CreateSchema] it adds what is missing and never alters what
 // is already there, so production deployments that own these tables via
 // their own migrations should skip it. No foreign keys are declared between
@@ -189,6 +203,11 @@ func (st *AuthStore) CreateSchema(ctx context.Context) error {
 		}
 		for _, ddl := range compositeConstraintDDL(t) {
 			if _, err := st.db.ExecExpr(ctx, ddl); err != nil {
+				return err
+			}
+		}
+		for _, idx := range t.Indexes() {
+			if _, err := st.db.ExecExpr(ctx, pg.CreateIndexIfNotExists(idx)); err != nil {
 				return err
 			}
 		}
@@ -512,12 +531,72 @@ func (st *AuthStore) DeleteSession(ctx context.Context, id string) error {
 // package's own integration test for the live reproduction and the fix's
 // confirmation.
 //
-// No advisory lock, and no family-level lock, is needed for this: the row
-// locks SELECT ... FOR UPDATE takes here already cover every session in the
-// family, which is exactly the set CreateSuccessorSession's own predecessor
-// lock is a member of.
+// # Revocation-versus-revocation: why a family-level advisory lock IS needed
+//
+// An earlier round of this method claimed no advisory or family-level lock
+// was needed here, reasoning that the row locks SELECT ... FOR UPDATE takes
+// already cover every session in the family. That reasoning was sound for
+// THIS method racing [AuthStore.CreateSuccessorSession] (the mint-versus-
+// revoke race above) — it does not extend to two concurrent calls to THIS
+// method, on the SAME family, racing each other.
+//
+// SELECT ... FOR UPDATE carries no ORDER BY, so the order in which it
+// acquires its row locks is whatever the query plan happens to produce, and
+// nothing here guarantees two concurrent executions of the identical query
+// acquire locks on the family's rows in the same order. When they don't,
+// call A can hold a lock call B wants while call B holds a lock call A
+// wants — a classic lock-order-inversion deadlock, something the single
+// autocommit DELETE this method used before could never do (a single
+// statement's own lock acquisition is internally ordered and atomic from
+// the caller's perspective). Adding ORDER BY to the SELECT does not fix
+// this: the DELETE that follows has no ordering of its own, so even a
+// consistently-ordered SELECT does not guarantee the subsequent DELETE (in
+// particular, on any row that only became visible in ITS re-snapshot — see
+// above) acquires locks in the same order across two concurrent calls.
+// Measured live: 8 deadlocks in ~1320 contended rounds of two concurrent
+// DeleteSessionsByFamily calls on one family (0 on the pre-lock-then-delete
+// shape, which could not exhibit this), the victim always this method
+// itself, surfacing to callers as a wrapped "deadlock detected" (SQLSTATE
+// 40P01) — which, reached through
+// [github.com/bernardoforcillo/authlayer/auth.Service.Refresh]'s reuse
+// path or [github.com/bernardoforcillo/authlayer/auth.Service.LogoutAll],
+// means the exact moment a compromise is detected and revocation is
+// attempted is when it can now fail, leaving the family live.
+//
+// The fix is a per-family [pg_advisory_xact_lock](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS),
+// taken as the very first statement of this transaction, before the SELECT
+// ... FOR UPDATE: it serializes every concurrent DeleteSessionsByFamily
+// call on the SAME family_id (whichever one arrives second simply waits
+// for the first to commit or roll back, at which point there is nothing
+// left for its own SELECT to lock in a conflicting order), while leaving
+// different families — which hash to different lock keys almost always,
+// and even a hash collision would only cost unrelated families a brief,
+// non-deadlocking wait — fully concurrent with each other. It is scoped to
+// this transaction only (pg_advisory_xact_lock releases automatically at
+// COMMIT/ROLLBACK, never needs an explicit unlock) and to THIS method only:
+// CreateSuccessorSession takes no such lock, and does not need one — the
+// mint-versus-revoke race above is already closed by per-row locking plus
+// this method's own re-snapshotting DELETE, with no risk of two
+// CreateSuccessorSession calls on the same family ever deadlocking each
+// other, since each targets a DIFFERENT predecessor row. Retrying on a
+// 40P01 instead of locking would also make the failure rate observable
+// disappear, but that hides a real lock-order hazard behind a retry loop
+// rather than removing it; the lock is preferred.
+//
+// The two int arguments to pg_advisory_xact_lock are hashtext('authlayer:sessions:family')
+// (a fixed namespace, so this lock key space does not collide with
+// whatever else the *pg.DB passed to [NewAuthStore] might use advisory
+// locks for) and hashtext(familyID) (the per-family key). hashtext returns
+// a 32-bit int, matching the (int, int) overload directly, with no cast
+// needed.
 func (st *AuthStore) DeleteSessionsByFamily(ctx context.Context, familyID string) error {
 	return st.db.InTx(ctx, func(txdb *pg.DB) error {
+		if _, err := txdb.Exec(ctx,
+			"SELECT pg_advisory_xact_lock(hashtext('authlayer:sessions:family'), hashtext($1))",
+			familyID); err != nil {
+			return err
+		}
+
 		var locked []struct {
 			ID string `drop:"id"`
 		}
@@ -644,11 +723,18 @@ func (st *AuthStore) MarkRotated(ctx context.Context, tokenHash string, now time
 // no longer a single autocommit DELETE, so even when ITS SELECT ... FOR
 // UPDATE starts after this transaction has already committed, its DELETE
 // re-snapshots afterward and still catches sess. No family-level (advisory)
-// lock was needed to close this fully; per-row locking on both sides,
-// composed with DeleteSessionsByFamily's extra re-snapshotting statement,
-// is enough. See this package's own integration tests for both scenarios
-// this now closes deterministically — including the ordering where THIS
-// method wins the row lock first.
+// lock is needed on THIS method to close the mint-versus-revoke race: per-
+// row locking on both sides, composed with DeleteSessionsByFamily's extra
+// re-snapshotting statement, is enough for that specific race. (A later
+// round added a family-level advisory lock to DeleteSessionsByFamily's own
+// transaction, but for an unrelated reason — two concurrent
+// DeleteSessionsByFamily calls on the SAME family deadlocking each other;
+// see that method's own "Revocation-versus-revocation" doc section. This
+// method neither takes nor needs that lock: two concurrent
+// CreateSuccessorSession calls never conflict this way, since each targets
+// a different predecessor row.) See this package's own integration tests
+// for both scenarios this now closes deterministically — including the
+// ordering where THIS method wins the row lock first.
 func (st *AuthStore) CreateSuccessorSession(ctx context.Context, predecessorID string, sess auth.Session) (auth.Session, bool, error) {
 	var created auth.Session
 	won := false

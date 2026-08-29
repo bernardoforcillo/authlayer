@@ -136,9 +136,11 @@ func TestAuthStoreCreateSchemaEmitsUniqueConstraints(t *testing.T) {
 		t.Fatalf("CreateSchema: %v", err)
 	}
 
-	// 3 CREATE TABLE + 3 ALTER TABLE ADD CONSTRAINT (users, sessions, verifications).
-	if len(fd.execs) != 6 {
-		t.Fatalf("CreateSchema issued %d statements, want 6:\n%s",
+	// 3 CREATE TABLE + 3 ALTER TABLE ADD CONSTRAINT (users, sessions,
+	// verifications) + 1 CREATE INDEX IF NOT EXISTS (sessions.family_id —
+	// see [NewAuthSchema]'s own comment on that registration).
+	if len(fd.execs) != 7 {
+		t.Fatalf("CreateSchema issued %d statements, want 7:\n%s",
 			len(fd.execs), strings.Join(fd.execs, "\n--\n"))
 	}
 
@@ -147,6 +149,7 @@ func TestAuthStoreCreateSchemaEmitsUniqueConstraints(t *testing.T) {
 		`ALTER TABLE "users" ADD CONSTRAINT "users_email_key" UNIQUE ("email");`,
 		`ALTER TABLE "sessions" ADD CONSTRAINT "sessions_token_hash" UNIQUE ("token_hash");`,
 		`ALTER TABLE "verifications" ADD CONSTRAINT "verifications_token_hash" UNIQUE ("token_hash");`,
+		`CREATE INDEX IF NOT EXISTS "sessions_family_id_idx" ON "sessions" ("family_id")`,
 	} {
 		if !strings.Contains(all, w) {
 			t.Fatalf("CreateSchema never emitted:\n%s\ngot:\n%s", w, all)
@@ -519,8 +522,19 @@ func TestDeleteSessionsByFamilyNoMatchesIsNotError(t *testing.T) {
 	if err := st.DeleteSessionsByFamily(context.Background(), "fam1"); err != nil {
 		t.Fatalf("DeleteSessionsByFamily: %v", err)
 	}
-	if !strings.Contains(fd.execs[0], `"family_id" = `) {
-		t.Fatalf("DELETE does not key on family_id: %q", fd.execs[0])
+	// fd.execs[0] is the per-family pg_advisory_xact_lock call — see this
+	// method's own "Revocation-versus-revocation" doc — issued as the
+	// transaction's first statement, before the row-locking SELECT (which
+	// routes through fd.queries, not fd.execs — see markRotatedWinSQL's own
+	// comment on that routing) and the DELETE.
+	if len(fd.execs) != 2 {
+		t.Fatalf("execs = %v, want exactly 2 (advisory lock, then DELETE)", fd.execs)
+	}
+	if !strings.Contains(fd.execs[0], "pg_advisory_xact_lock") {
+		t.Fatalf("execs[0] is not the advisory lock: %q", fd.execs[0])
+	}
+	if !strings.Contains(fd.execs[1], `"family_id" = `) {
+		t.Fatalf("DELETE does not key on family_id: %q", fd.execs[1])
 	}
 }
 

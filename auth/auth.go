@@ -492,6 +492,20 @@ type Store interface {
 	// uses. A backend whose CreateSuccessorSession takes no such lock (e.g.
 	// store/memory's single-mutex design, where the lock spans both methods'
 	// entire bodies) has no such gap to close.
+	//
+	// A backend using that SELECT-then-DELETE shape carries a second
+	// obligation this method's callers do not see directly: two concurrent
+	// calls to THIS method, on the SAME familyID, can deadlock each other.
+	// SELECT ... FOR UPDATE with no ORDER BY gives no guarantee that two
+	// concurrent executions acquire a family's row locks in the same order,
+	// so one call can hold a lock the other wants while waiting on a lock
+	// the other holds — a genuine lock-order-inversion deadlock a single
+	// autocommit DELETE could never exhibit. A backend using the row-lock-
+	// then-delete shape MUST additionally serialize concurrent calls on the
+	// same family — a per-family advisory transaction lock taken before the
+	// row-locking SELECT, as [github.com/bernardoforcillo/authlayer/store/drops.AuthStore]
+	// does, is sufficient; adding an ORDER BY to the SELECT is NOT, since
+	// the DELETE that follows has no ordering of its own.
 	DeleteSessionsByFamily(ctx context.Context, familyID string) error
 	// MarkRotated atomically marks the session identified by tokenHash as
 	// superseded, if and only if it is not already. ok reports whether THIS

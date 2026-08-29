@@ -26,6 +26,7 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -997,6 +998,278 @@ func TestDeleteSessionsByFamilyRemovesConcurrentlyMintedSuccessorLive(t *testing
 	}
 }
 
+// TestDeleteSessionsByFamilyConcurrentSameFamilyBothSucceedLive is round
+// 3's FIX 1 positive-path regression test: two GENUINELY concurrent calls
+// to the real, exported DeleteSessionsByFamily, targeting the SAME family,
+// must both succeed and leave zero survivors — the ordinary, non-hostile
+// case (two browser tabs both triggering LogoutAll, or a reuse-detection
+// revocation racing an explicit logout) that the revocation-versus-
+// revocation fix below must not turn into a false-positive failure.
+//
+// This test alone cannot demonstrate the deadlock the fix closes: two
+// textually identical, unordered SELECT ... FOR UPDATE queries against a
+// small, static row set deterministically visit rows in the SAME physical
+// order in this environment — confirmed directly, not assumed: 1960
+// rounds of exactly this scenario (rows/family between 20 and 500, run
+// against the PRE-advisory-lock code) produced 0 deadlocks. The mechanism
+// itself, and the fix, are proven instead by
+// TestDeleteSessionsByFamilyOppositeLockOrderRequiresAdvisoryLockLive
+// below, which deliberately constructs the opposite-order condition this
+// test cannot organically reach at this scale. See this package's own task
+// report for the measurement.
+func TestDeleteSessionsByFamilyConcurrentSameFamilyBothSucceedLive(t *testing.T) {
+	const rows = 20
+	st := newLiveAuthStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	userID := uid.NewV7()
+	familyID := uid.NewV7()
+
+	for i := 0; i < rows; i++ {
+		rotated := now
+		if _, err := st.CreateSession(ctx, auth.Session{
+			ID: uid.NewV7(), UserID: userID, TokenHash: uid.NewV7(), FamilyID: familyID,
+			ExpiresAt: now.Add(time.Hour), CreatedAt: now, RotatedAt: &rotated,
+		}); err != nil {
+			t.Fatalf("seed CreateSession %d: %v", i, err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	wg.Add(2)
+	for i := range errs {
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = st.DeleteSessionsByFamily(ctx, familyID)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("DeleteSessionsByFamily call %d: %v", i, err)
+		}
+	}
+
+	left, err := st.ListSessionsByUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("ListSessionsByUser returned %d session(s) after both concurrent deletes, want 0", len(left))
+	}
+}
+
+// TestDeleteSessionsByFamilyOppositeLockOrderRequiresAdvisoryLockLive is
+// the mandatory mutation-check target for round 3's FIX 1: it deliberately
+// constructs the exact lock-order inversion
+// [AuthStore.DeleteSessionsByFamily]'s "Revocation-versus-revocation" doc
+// section describes, since two REAL concurrent calls cannot be relied on
+// to reach it organically in every environment — see
+// TestDeleteSessionsByFamilyConcurrentSameFamilyBothSucceedLive's own doc
+// for the 1960-round measurement that found no natural divergence here.
+// SELECT ... FOR UPDATE with no ORDER BY gives PostgreSQL no obligation to
+// lock a family's rows in any particular order — the planner is free to
+// choose sequential-scan physical order, an index-scan order via
+// sessions_family_id_idx, or (at production scale, under
+// synchronize_seqscans or genuine concurrent write load) something that
+// varies run to run. This test does not wait for that variance to appear
+// on its own; it forces it, by racing the real DeleteSessionsByFamily
+// (call A, natural/unordered — confirmed directly, via EXPLAIN and by
+// reading back the row order, to be ascending id order against this exact
+// schema and seed) against a second, raw connection (call B) that locks
+// the SAME family's rows in the OPPOSITE, explicit order (highest id to
+// lowest) — a worst-case-equivalent stand-in for whatever order a second
+// concurrent caller's own unordered scan could legally choose.
+//
+// Call B locks one row per statement — seedRows separate round trips,
+// walking ids high to low — rather than issuing its own single combined
+// "ORDER BY id DESC ... FOR UPDATE". That combined form was tried first
+// and never once produced a deadlock: call A's single, fast, entirely
+// server-side statement (no per-row network round trip) reliably locks,
+// deletes and commits all seedRows rows before a second combined
+// statement even returns from the network, so the two never actually hold
+// conflicting locks at the same instant. Pacing call B's own locking out
+// over real wall-clock time — one ordinary network + parse/plan/execute
+// round trip per row — gives call A's fast sweep something to
+// meaningfully overlap with. Confirmed empirically at seedRows=300: call A
+// reliably blocks part-way through its scan, call B reliably blocks
+// part-way through its own reverse walk, PostgreSQL's deadlock detector
+// reliably fires after its default ~1s deadlock_timeout, and call A —
+// never call B — is reliably the aborted victim, matching what the
+// coordinator's own measurement against the real store reported ("the
+// victim always being DeleteSessionsByFamily").
+//
+// Call B is not a black box standing in for "some other client": it
+// reissues the IDENTICAL first statement DeleteSessionsByFamily itself
+// does — the same
+// pg_advisory_xact_lock(hashtext('authlayer:sessions:family'), hashtext($1))
+// call, with the same two arguments — before its own row-locking loop, so
+// this test exercises the real serialization mechanism, not an
+// approximation of it: pg_advisory_xact_lock is keyed globally by its two
+// integer arguments, identical across any session or connection that
+// calls it with the same key, so call A's real advisory-lock acquisition
+// (when the fix is in place) genuinely blocks call B here, and vice versa.
+// If a future change to DeleteSessionsByFamily's own advisory-lock
+// statement text or key derivation drifts from what is hardcoded here,
+// this test's own assumption (that B contends for THE SAME lock A takes)
+// silently stops holding — keep the two in sync.
+//
+// With the fix in place, this is deterministic, not merely likely:
+// whichever of A/B acquires the advisory lock first runs to completion
+// (deleting every row) before the other is even unblocked — the lock is
+// held for the acquiring transaction's full duration — so the second one's
+// own row-locking (in either order) finds nothing left to lock: both
+// succeed, zero survivors, no deadlock possible by construction, and both
+// finish in well under a second (confirmed: ~100-125ms each). Mutation-
+// checked by removing the production pg_advisory_xact_lock call: call A
+// then proceeds directly to its unordered scan with no gate at all, racing
+// call B's explicit reverse-order walk for real — SQLSTATE 40P01 after
+// PostgreSQL's own ~1s deadlock_timeout, reliably against call A.
+func TestDeleteSessionsByFamilyOppositeLockOrderRequiresAdvisoryLockLive(t *testing.T) {
+	const seedRows = 300
+	sqlDB, db := openLiveDB(t)
+	// Warm the pool to at least 2 live connections before the race, the
+	// same reasoning as [newLiveAuthStoreWarmed]'s own doc: call A's pool
+	// checkout (inside DeleteSessionsByFamily's InTx) and call B's own
+	// sqlDB.Conn below must both be satisfied from an already-open
+	// connection, not a fresh TCP + auth round trip — an unwarmed pool lets
+	// one side's connection-setup latency dwarf the other's, so they never
+	// actually race for the same rows at the same time.
+	sqlDB.SetMaxOpenConns(4)
+	sqlDB.SetMaxIdleConns(4)
+	{
+		var warm sync.WaitGroup
+		warm.Add(4)
+		for i := 0; i < 4; i++ {
+			go func() {
+				defer warm.Done()
+				var one int
+				if err := sqlDB.QueryRowContext(context.Background(), "SELECT 1").Scan(&one); err != nil {
+					t.Errorf("pool warm-up query: %v", err)
+				}
+			}()
+		}
+		warm.Wait()
+	}
+
+	st := dropsstore.NewAuthStore(db)
+	ctx := context.Background()
+	dropAuthTables(t, db, st)
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema: %v", err)
+	}
+	t.Cleanup(func() { dropAuthTables(t, db, st) })
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	userID := uid.NewV7()
+	familyID := uid.NewV7()
+	ids := make([]string, 0, seedRows)
+	for i := 0; i < seedRows; i++ {
+		id := uid.NewV7()
+		rotated := now
+		if _, err := st.CreateSession(ctx, auth.Session{
+			ID: id, UserID: userID, TokenHash: uid.NewV7(), FamilyID: familyID,
+			ExpiresAt: now.Add(time.Hour), CreatedAt: now, RotatedAt: &rotated,
+		}); err != nil {
+			t.Fatalf("seed CreateSession %d: %v", i, err)
+		}
+		ids = append(ids, id)
+	}
+	// uid.NewV7 is time-ordered, so ids is already ascending — the same
+	// order DeleteSessionsByFamily's own unordered SELECT ... FOR UPDATE
+	// naturally produces here (confirmed directly against this exact
+	// query+schema: a Bitmap Heap Scan over sessions_family_id_idx that
+	// returns rows in ascending id order for a freshly-seeded family, on
+	// this PostgreSQL version and configuration — see this package's own
+	// task report for the probe). Call B below walks ids in the OPPOSITE
+	// direction, one row at a time, to force a genuine opposite-order
+	// interleaving against call A's single combined, fast statement.
+
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		t.Fatalf("sqlDB.Conn: %v", err)
+	}
+	defer conn.Close()
+
+	var wg sync.WaitGroup
+	var aErr, bErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		aStart := time.Now()
+		aErr = st.DeleteSessionsByFamily(ctx, familyID)
+		t.Logf("call A (real DeleteSessionsByFamily) finished in %v, err=%v", time.Since(aStart), aErr)
+	}()
+	go func() {
+		defer wg.Done()
+		tx, txErr := conn.BeginTx(ctx, nil)
+		if txErr != nil {
+			bErr = txErr
+			return
+		}
+		// Safe no-op once Commit has already succeeded — same reasoning as
+		// this file's other raw-connection tests: guarantees this raw
+		// transaction never lingers open (holding a row or advisory lock)
+		// if this goroutine returns early on any path below.
+		defer func() { _ = tx.Rollback() }()
+
+		if _, err := tx.ExecContext(ctx,
+			"SELECT pg_advisory_xact_lock(hashtext('authlayer:sessions:family'), hashtext($1))",
+			familyID); err != nil {
+			bErr = err
+			return
+		}
+		// Lock every row individually, walking ids HIGH to LOW — the
+		// opposite of call A's ascending order — as seedRows separate
+		// round trips rather than one combined statement. Call A's own
+		// combined SELECT ... FOR UPDATE locks all of its rows within a
+		// single, fast, server-side statement; without deliberately
+		// drawing call B's own locking out over real wall-clock time the
+		// same way, one side reliably finishes (and commits) before the
+		// other even starts, and the two never actually contend for the
+		// same row at the same time — confirmed directly: a single
+		// combined ORDER BY id DESC statement here never once produced a
+		// deadlock (see the task report). One row per statement is slow
+		// enough, purely from ordinary network + parse/plan/execute
+		// overhead per round trip, to reliably overlap with call A's own
+		// (much faster) sweep from the other end.
+		raceStart := time.Now()
+		for i := len(ids) - 1; i >= 0; i-- {
+			var locked string
+			if err := tx.QueryRowContext(ctx, "SELECT id FROM sessions WHERE id = $1 FOR UPDATE", ids[i]).Scan(&locked); err != nil {
+				t.Logf("call B (raw, reverse order) failed after locking %d/%d rows in %v: %v", len(ids)-1-i, len(ids), time.Since(raceStart), err)
+				bErr = err
+				return
+			}
+		}
+		t.Logf("call B (raw, reverse order) locked all %d rows in %v", len(ids), time.Since(raceStart))
+		if _, err := tx.ExecContext(ctx, "DELETE FROM sessions WHERE family_id = $1", familyID); err != nil {
+			bErr = err
+			return
+		}
+		bErr = tx.Commit()
+	}()
+	wg.Wait()
+
+	left, lerr := st.ListSessionsByUser(ctx, userID)
+	if lerr != nil {
+		t.Fatalf("ListSessionsByUser: %v", lerr)
+	}
+	t.Logf("survivors = %d", len(left))
+
+	if aErr != nil {
+		t.Fatalf("DeleteSessionsByFamily (call A): %v — want nil (a lock-order deadlock here means the advisory lock this round added is missing or broken)", aErr)
+	}
+	if bErr != nil {
+		t.Fatalf("raw reverse-order peer (call B): %v — want nil", bErr)
+	}
+	if len(left) != 0 {
+		t.Fatalf("ListSessionsByUser returned %d session(s) after both concurrent deletes, want 0", len(left))
+	}
+}
+
 // newLiveAuthStoreWarmed is newLiveAuthStore's counterpart for a
 // concurrency test that needs the connection pool already holding n live
 // connections before the race starts — see
@@ -1145,6 +1418,13 @@ func TestMarkRotatedConcurrencyExactlyOneWinnerLive(t *testing.T) {
 // and invite_integration_test.go's
 // TestInviteStoreCreateSchemaLandsConstraintsOnRealPostgres. Also re-runs
 // CreateSchema to confirm it stays idempotent against a real server.
+//
+// It also confirms sessions_family_id_idx — a plain (non-unique) index, so
+// it does not appear in pg_constraint at all — by reading pg_indexes
+// instead, the same way the constraint assertions below read pg_constraint.
+// See [NewAuthSchema]'s own comment on why this index is load-bearing now
+// that [AuthStore.DeleteSessionsByFamily] costs a transaction per family
+// rather than one autocommit statement.
 func TestAuthStoreCreateSchemaLandsConstraintsOnRealPostgres(t *testing.T) {
 	dsn := os.Getenv("AUTHLAYER_TEST_DSN")
 	if dsn == "" {
@@ -1214,6 +1494,18 @@ func TestAuthStoreCreateSchemaLandsConstraintsOnRealPostgres(t *testing.T) {
 			t.Errorf("%s definition = %q, want %q", want.name, def, want.def)
 		}
 	}
+
+	var idxDef string
+	err = sqlDB.QueryRowContext(ctx,
+		`SELECT indexdef FROM pg_indexes WHERE tablename = 'sessions' AND indexname = $1`,
+		"sessions_family_id_idx").Scan(&idxDef)
+	if err != nil {
+		t.Fatalf("sessions_family_id_idx: %v", err)
+	}
+	if !strings.Contains(idxDef, "(family_id)") {
+		t.Fatalf("sessions_family_id_idx definition = %q, want it to index (family_id)", idxDef)
+	}
+	t.Logf("sessions_family_id_idx           i  %s", idxDef)
 }
 
 // TestAuthPurgeExpiredLive mirrors invite_integration_test.go's
