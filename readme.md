@@ -694,13 +694,14 @@ limits and warm it to `authtest.RaceGoroutines` connections first: goroutines
 that trickle in across a connection-setup window never actually contend, which
 silently weakens every race in the suite.
 
-Three obligations only exist under concurrency, so the suite drives them as real
-races — `MarkRotated`'s single winner, `CreateUser`'s and `UpdateUserEmail`'s
-one-address-one-account atomicity, a `MarkEmailVerified` racing an
-`UpdateUserEmail`, and a `CreateSuccessorSession` racing the family revocation
-that must not leave it alive. Each asserts a *linearizability* property rather
-than a timing guess: for the last two, the end state the suite rejects is one no
-serial order of the two calls can produce.
+Six of the fifty checks are races, because the obligations behind them are
+unreachable sequentially: `MarkRotated`'s single winner; `CreateUser`'s and
+`UpdateUserEmail`'s one-address-one-account atomicity, one check each; a
+`MarkEmailVerified` racing the `UpdateUserEmail` that moves the address out from
+under it; a `CreateSuccessorSession` racing the family revocation that must not
+leave it alive; and concurrent revocations of one family. The middle two assert a
+*linearizability* property rather than a timing guess — the end state they reject
+is one no serial order of the two calls can produce.
 
 Two things it does **not** do, stated here rather than left to be discovered:
 
