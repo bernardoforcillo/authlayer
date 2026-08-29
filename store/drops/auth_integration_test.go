@@ -1127,6 +1127,25 @@ func TestDeleteSessionsByFamilyConcurrentSameFamilyBothSucceedLive(t *testing.T)
 // then proceeds directly to its unordered scan with no gate at all, racing
 // call B's explicit reverse-order walk for real — SQLSTATE 40P01 after
 // PostgreSQL's own ~1s deadlock_timeout, reliably against call A.
+//
+// "The second one's own row-locking finds nothing left to lock" is not
+// just prose above — it is call B's OWN outcome whenever A wins the
+// advisory lock first, and it is the CORRECT, fix-working outcome, not a
+// failure: call B's per-row loop then receives sql.ErrNoRows on the very
+// first id it tries (A, having exclusively held the family since before
+// B's own advisory-lock call unblocked, has already deleted everything).
+// An earlier version of this test treated ANY error from that loop —
+// including this one — as a test failure, which made the test itself
+// flaky in proportion to how often call A happened to win: reproduced
+// directly, roughly 10% of runs (2/25 cold-pool, 7/30 warm-pool) failed
+// with "want nil" on exactly this legitimate sql.ErrNoRows. The loop below
+// treats sql.ErrNoRows specially — stop walking, let call B's own
+// zero-row DELETE/COMMIT run harmlessly, fall through to the shared
+// zero-survivors assertion — while any OTHER error (in particular a
+// genuine "deadlock detected", SQLSTATE 40P01, which is what the mutation
+// check above actually produces) still fails the test exactly as before.
+// This keeps the test's mutation-detection bite intact while removing the
+// false failure on the fix's own intended behavior.
 func TestDeleteSessionsByFamilyOppositeLockOrderRequiresAdvisoryLockLive(t *testing.T) {
 	const seedRows = 300
 	sqlDB, db := openLiveDB(t)
@@ -1236,15 +1255,36 @@ func TestDeleteSessionsByFamilyOppositeLockOrderRequiresAdvisoryLockLive(t *test
 		// overhead per round trip, to reliably overlap with call A's own
 		// (much faster) sweep from the other end.
 		raceStart := time.Now()
+		aWonRace := false
 		for i := len(ids) - 1; i >= 0; i-- {
 			var locked string
 			if err := tx.QueryRowContext(ctx, "SELECT id FROM sessions WHERE id = $1 FOR UPDATE", ids[i]).Scan(&locked); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					// Call A won the advisory lock ahead of call B — exactly
+					// what the fix is SUPPOSED to allow — and has already
+					// deleted this row, and by construction (DELETE FROM
+					// sessions WHERE family_id = $1 removes the WHOLE
+					// family in one statement) every other row in the
+					// family too. This is not a failure: stop walking and
+					// fall through to the DELETE/COMMIT below (which will
+					// correctly affect zero rows) and the final
+					// zero-survivors assertion. Only a genuine deadlock
+					// (SQLSTATE 40P01, NOT sql.ErrNoRows) means the mutual
+					// lock failed to serialize the two calls — that still
+					// falls through to the bErr branch below unchanged.
+					aWonRace = true
+					break
+				}
 				t.Logf("call B (raw, reverse order) failed after locking %d/%d rows in %v: %v", len(ids)-1-i, len(ids), time.Since(raceStart), err)
 				bErr = err
 				return
 			}
 		}
-		t.Logf("call B (raw, reverse order) locked all %d rows in %v", len(ids), time.Since(raceStart))
+		if aWonRace {
+			t.Logf("call B (raw, reverse order) found call A had already won and deleted the family, after %v", time.Since(raceStart))
+		} else {
+			t.Logf("call B (raw, reverse order) locked all %d rows in %v", len(ids), time.Since(raceStart))
+		}
 		if _, err := tx.ExecContext(ctx, "DELETE FROM sessions WHERE family_id = $1", familyID); err != nil {
 			bErr = err
 			return
