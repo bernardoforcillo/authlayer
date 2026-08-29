@@ -463,9 +463,37 @@ type Store interface {
 	// UserBase.Email, unconditionally clears EmailVerifiedAt back to nil, and
 	// stamps UpdatedAt with now, on the user identified by userID. Returns
 	// ErrUserNotFound when there is none, or ErrEmailTaken if a *different*
-	// user already holds the same normalized address — checked and written
-	// under one atomic step, the same discipline CreateUser uses, so two
-	// concurrent changes to the same address cannot both succeed.
+	// user already holds the same normalized address. The uniqueness check
+	// excludes the row being updated, so re-setting a user to the address it
+	// already holds is not a self-conflict.
+	//
+	// It MUST decide ErrEmailTaken and perform the write as a single atomic
+	// step — the same discipline [Store.MarkEmailVerified] and
+	// [Store.MarkRotated] require of themselves, and the same one CreateUser
+	// carries for its own ErrEmailTaken. A read-then-write implementation (a
+	// SELECT for a conflicting row, followed by a separate UPDATE) does not
+	// satisfy this contract even if each half is individually safe: two
+	// concurrent calls naming the same address can both find it free and
+	// both go on to write it, leaving two users sharing one normalized
+	// address. [UserBase.Email]'s own doc says what that costs — every
+	// address-keyed lookup in the package
+	// ([github.com/bernardoforcillo/authlayer/auth.Service.Login] and
+	// [github.com/bernardoforcillo/authlayer/auth.Service.RequestPasswordReset]
+	// both resolve a user by address) stops being well-defined and starts
+	// depending on row order. A single UPDATE whose uniqueness is enforced
+	// by the backend's own constraint on the email column — the shape
+	// [store/drops.AuthStore.UpdateUserEmail] uses — satisfies this by
+	// construction, as does a check and a write under one lock, the shape
+	// [store/memory.AuthStore.UpdateUserEmail] uses.
+	//
+	// This is what actually closes the two-callers-racing-one-address race,
+	// which is why
+	// [github.com/bernardoforcillo/authlayer/auth.Service.RequestEmailChange]
+	// deliberately performs no pre-check of its own (see that method's doc
+	// for why a pre-check there would be an enumeration oracle): the only
+	// enforcement point for that race is here, at redemption. A backend that
+	// splits the check from the write puts the race back with nothing above
+	// it to catch it.
 	//
 	// EmailVerifiedAt is always cleared, never left alone and never set from
 	// the new address: this method only records that the row's address

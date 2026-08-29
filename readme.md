@@ -483,15 +483,20 @@ those. Each method's contract is documented on the interface.
 
 `invite.Store` and `auth.Store` are separate ports with the same discipline,
 and both backends implement all three. `auth.Store` is the strictest of them:
-six of its eighteen methods carry an explicit **MUST**, each naming the
+seven of its eighteen methods carry an explicit **MUST**, each naming the
 failure it prevents. They are not all the same kind of obligation, and the
 difference matters to anyone writing a third-party backend.
 
-**Three demand atomicity** — `MarkRotated`, `CreateSuccessorSession` and
-`MarkEmailVerified`. Splitting any of them into a read and a later write
-reopens a security hole rather than merely narrowing a race: two successful
-rotations of one token, a successor resurrecting a family that was revoked
-mid-rotation, an address certified that nobody proved control of.
+**Four demand atomicity** — `MarkRotated`, `CreateSuccessorSession`,
+`MarkEmailVerified` and `UpdateUserEmail`. Splitting any of them into a read
+and a later write reopens a security hole rather than merely narrowing a race:
+two successful rotations of one token, a successor resurrecting a family that
+was revoked mid-rotation, an address certified that nobody proved control of,
+two accounts sharing one address. That last one has nothing above it to catch
+it — `RequestEmailChange` deliberately does *not* pre-check the new address,
+because a pre-check there would be an un-rate-limited "is this address
+registered?" oracle for any authenticated caller, so `UpdateUserEmail` at
+redemption is the only enforcement point there is.
 
 **Two are what `SignUp`'s enumeration safety leans on** — `CreateUser` must
 decide `ErrEmailTaken` from the same attempt that performs the write, and
@@ -517,10 +522,6 @@ not, since the `DELETE` that follows has no ordering of its own. A backend
 whose `CreateSuccessorSession` takes no such lock — `store/memory`, whose
 single mutex spans both methods' whole bodies — has no gap to close and owes
 neither.
-
-`UpdateUserEmail` states its own atomicity descriptively ("the same
-discipline `CreateUser` uses") rather than as a **MUST**. Every service
-invariant that leans on it needs it, so read it as one.
 
 Separately, `Session.TokenHash` and `Verification.TokenHash` each carry a
 uniqueness **MUST** on the record type rather than on a method — a `UNIQUE`

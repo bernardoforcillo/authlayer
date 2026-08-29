@@ -3,6 +3,7 @@ package memory_test
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -456,6 +457,93 @@ func TestUpdateUserEmailNotFound(t *testing.T) {
 	err := st.UpdateUserEmail(context.Background(), "nonesuch", "new@example.com", time.Now())
 	if !errors.Is(err, auth.ErrUserNotFound) {
 		t.Fatalf("UpdateUserEmail err = %v, want ErrUserNotFound", err)
+	}
+}
+
+// TestUpdateUserEmailConcurrentSameAddressExactlyOneWinner pins the
+// atomicity MUST on auth.Store.UpdateUserEmail: of many callers moving
+// DIFFERENT users to the SAME address at once, exactly one may succeed and
+// every other must get ErrEmailTaken.
+//
+// This is the MUST with the least above it. auth.Service.RequestEmailChange
+// deliberately performs no pre-check of the new address — a pre-check there
+// would be an un-rate-limited "is this address registered?" oracle for any
+// authenticated caller — so UpdateUserEmail at redemption is the only place
+// the two-callers-racing-one-address race is decided. A read-then-write
+// implementation lets every caller find the address free and every caller
+// write it, leaving several users sharing one normalized address and every
+// address-keyed lookup in the package (Login, RequestPasswordReset) reading
+// whichever row it happens to reach first.
+//
+// The final-state assertion is the load-bearing one: counting winners alone
+// would pass against a store that returned ErrEmailTaken to everybody and
+// wrote nothing.
+func TestUpdateUserEmailConcurrentSameAddressExactlyOneWinner(t *testing.T) {
+	const n = 50
+	const target = "contested@example.com"
+
+	st := newAuthStore()
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = "user" + strconv.Itoa(i)
+		if _, err := st.CreateUser(ctx, auth.UserBase{
+			ID: ids[i], Email: "start" + strconv.Itoa(i) + "@example.com",
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("CreateUser %s: %v", ids[i], err)
+		}
+	}
+
+	var successes, taken, other atomic.Int64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			<-start
+			switch err := st.UpdateUserEmail(ctx, id, target, now); {
+			case err == nil:
+				successes.Add(1)
+			case errors.Is(err, auth.ErrEmailTaken):
+				taken.Add(1)
+			default:
+				other.Add(1)
+			}
+		}(id)
+	}
+	close(start)
+	wg.Wait()
+
+	if got := other.Load(); got != 0 {
+		t.Fatalf("%d callers got an unexpected error from UpdateUserEmail", got)
+	}
+	if got := successes.Load(); got != 1 {
+		t.Fatalf("UpdateUserEmail succeeded for %d callers, want exactly 1 — a read-then-write implementation lets several racing callers all find %q free and all write it",
+			got, target)
+	}
+	if got := taken.Load(); got != n-1 {
+		t.Fatalf("UpdateUserEmail returned ErrEmailTaken to %d callers, want %d", got, n-1)
+	}
+
+	// Final state, read back rather than inferred from the counts: exactly
+	// one row holds the contested address.
+	holders := 0
+	for _, id := range ids {
+		u, err := st.FindUserByID(ctx, id)
+		if err != nil {
+			t.Fatalf("FindUserByID %s: %v", id, err)
+		}
+		if u.Email == target {
+			holders++
+		}
+	}
+	if holders != 1 {
+		t.Fatalf("%d users hold %q after the race, want exactly 1 — UserBase.Email's uniqueness requirement is broken and every address-keyed lookup is now order-dependent",
+			holders, target)
 	}
 }
 

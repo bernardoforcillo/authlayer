@@ -1939,3 +1939,86 @@ func TestDeleteVerificationsByUserAndPurposeUsesTheIndexLive(t *testing.T) {
 	}
 	t.Logf("SELF-HEAL %s", def)
 }
+
+// TestUpdateUserEmailConcurrentSameAddressExactlyOneWinnerLive is the live
+// counterpart of store/memory's
+// TestUpdateUserEmailConcurrentSameAddressExactlyOneWinner, and pins the
+// same atomicity MUST on auth.Store.UpdateUserEmail against a real server —
+// where "atomic" means something the memory store's single mutex cannot
+// demonstrate: many connections, no shared lock, and the UNIQUE (email)
+// constraint as the only arbiter.
+//
+// It is written independently rather than shared with the memory test for
+// the reason recorded at the top of this file about markRotatedContract:
+// that helper is unexported and lives in package memory_test, so nothing
+// outside store/memory can reach it.
+func TestUpdateUserEmailConcurrentSameAddressExactlyOneWinnerLive(t *testing.T) {
+	st := newLiveAuthStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	const n = 24
+	target := "contested-" + uid.NewV7() + "@example.com"
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = uid.NewV7()
+		if _, err := st.CreateUser(ctx, auth.UserBase{
+			ID: ids[i], Email: "start-" + uid.NewV7() + "@example.com",
+			CreatedAt: now, UpdatedAt: now,
+		}); err != nil {
+			t.Fatalf("CreateUser: %v", err)
+		}
+	}
+
+	var mu sync.Mutex
+	var successes, taken int
+	var others []error
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			<-start
+			err := st.UpdateUserEmail(ctx, id, target, now)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				successes++
+			case errors.Is(err, auth.ErrEmailTaken):
+				taken++
+			default:
+				others = append(others, err)
+			}
+		}(id)
+	}
+	close(start)
+	wg.Wait()
+
+	if len(others) > 0 {
+		t.Fatalf("unexpected errors from UpdateUserEmail: %v", others)
+	}
+	if successes != 1 {
+		t.Fatalf("UpdateUserEmail succeeded for %d callers, want exactly 1", successes)
+	}
+	if taken != n-1 {
+		t.Fatalf("UpdateUserEmail returned ErrEmailTaken to %d callers, want %d", taken, n-1)
+	}
+
+	// Read the final state back from the server rather than inferring it
+	// from the counts: exactly one row holds the contested address.
+	holders := 0
+	for _, id := range ids {
+		u, err := st.FindUserByID(ctx, id)
+		if err != nil {
+			t.Fatalf("FindUserByID: %v", err)
+		}
+		if u.Email == target {
+			holders++
+		}
+	}
+	if holders != 1 {
+		t.Fatalf("%d users hold %q after the race, want exactly 1", holders, target)
+	}
+}
