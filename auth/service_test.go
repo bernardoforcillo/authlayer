@@ -196,6 +196,14 @@ func (s *orderStore) UpdateUserEmail(ctx context.Context, userID, email string, 
 	return s.AuthStore.UpdateUserEmail(ctx, userID, email, now)
 }
 
+// UpdateUserPassword records its own call — used by
+// TestResetPasswordClaimsBeforeApplyOrdering, [ResetPassword]'s ordering
+// analogue of TestVerifyEmailClaimsBeforeApplyOrderingSignup above.
+func (s *orderStore) UpdateUserPassword(ctx context.Context, userID, passwordHash string, now time.Time) error {
+	s.record("UpdateUserPassword")
+	return s.AuthStore.UpdateUserPassword(ctx, userID, passwordHash, now)
+}
+
 func (s *orderStore) snapshot() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2305,5 +2313,594 @@ func TestRefreshReplayErrorPreservesReuseSignalEvenWhenFamilyDeleteFails(t *test
 	}
 	if !errors.Is(err, errDeleteFamilyBoom) {
 		t.Fatalf("err = %v, want it to ALSO satisfy errors.Is(err, errDeleteFamilyBoom) — the operational failure must not be hidden either", err)
+	}
+}
+
+// ============================================================
+// ChangePassword
+// ============================================================
+
+// TestChangePasswordRequiresCurrentPassword is the mandatory mutation-anchor
+// test: remove the current-password check and this must fail.
+func TestChangePasswordRequiresCurrentPassword(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "olga@example.com", validPassword)
+
+	err := svc.ChangePassword(ctx, user.ID, "", "wrong-current-password", "A-New-Valid-Pass1!")
+	if !errors.Is(err, auth.ErrInvalidCredentials) {
+		t.Fatalf("err = %v, want ErrInvalidCredentials", err)
+	}
+
+	// The stored hash must be untouched: the ORIGINAL password still works.
+	stored, ferr := store.FindUserByID(ctx, user.ID)
+	if ferr != nil {
+		t.Fatalf("FindUserByID: %v", ferr)
+	}
+	if !password.Bcrypt(testCost).Verify(validPassword, stored.PasswordHash) {
+		t.Fatal("PasswordHash was changed despite a wrong current password being supplied")
+	}
+}
+
+func TestChangePasswordWeakNextRejected(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "pete@example.com", validPassword)
+
+	err := svc.ChangePassword(ctx, user.ID, "", validPassword, "weak")
+	if !errors.Is(err, auth.ErrWeakPassword) {
+		t.Fatalf("err = %v, want ErrWeakPassword", err)
+	}
+
+	stored, ferr := store.FindUserByID(ctx, user.ID)
+	if ferr != nil {
+		t.Fatalf("FindUserByID: %v", ferr)
+	}
+	if !password.Bcrypt(testCost).Verify(validPassword, stored.PasswordHash) {
+		t.Fatal("PasswordHash was changed despite next failing the configured password rules")
+	}
+}
+
+func TestChangePasswordSuccessUpdatesHashAndAllowsNewLogin(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "quincy@example.com", validPassword)
+
+	const newPass = "Brand-New-Valid-Pass2!"
+	if err := svc.ChangePassword(ctx, user.ID, "", validPassword, newPass); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+
+	if _, _, _, err := svc.Login(ctx, "quincy@example.com", validPassword, "1.2.3.4", ""); !errors.Is(err, auth.ErrInvalidCredentials) {
+		t.Fatalf("Login(old password) err = %v, want ErrInvalidCredentials", err)
+	}
+	if _, _, _, err := svc.Login(ctx, "quincy@example.com", newPass, "1.2.3.4", ""); err != nil {
+		t.Fatalf("Login(new password): %v, want success", err)
+	}
+}
+
+// TestChangePasswordRevokesOtherSessionsKeepsCurrentAlive pins the "every
+// OTHER session, but not the caller's own" contract, and the
+// currentSessionID mechanism this task's implementation chose to identify
+// it: device A's session (whose id is passed as currentSessionID) survives,
+// device B's is revoked.
+func TestChangePasswordRevokesOtherSessionsKeepsCurrentAlive(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "rita@example.com", validPassword)
+
+	_, accessA, refreshA, err := svc.Login(ctx, "rita@example.com", validPassword, "1.2.3.4", "device-a")
+	if err != nil {
+		t.Fatalf("Login(device A): %v", err)
+	}
+	_, _, refreshB, err := svc.Login(ctx, "rita@example.com", validPassword, "5.6.7.8", "device-b")
+	if err != nil {
+		t.Fatalf("Login(device B): %v", err)
+	}
+
+	claimsA, err := token.Parse(accessA, testSigningKey)
+	if err != nil {
+		t.Fatalf("token.Parse(accessA): %v", err)
+	}
+
+	const newPass = "Rotated-Valid-Pass3!"
+	if err := svc.ChangePassword(ctx, user.ID, claimsA.SessionID, validPassword, newPass); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+
+	sessions, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("len(sessions) after ChangePassword = %d, want 1 (only the caller's own session survives)", len(sessions))
+	}
+	if sessions[0].ID != claimsA.SessionID {
+		t.Fatalf("surviving session id = %q, want the caller's own %q", sessions[0].ID, claimsA.SessionID)
+	}
+
+	if _, err := svc.Refresh(ctx, refreshA); err != nil {
+		t.Fatalf("Refresh(device A, the spared session) after ChangePassword: %v, want success", err)
+	}
+	if _, err := svc.Refresh(ctx, refreshB); !errors.Is(err, auth.ErrTokenInvalid) {
+		t.Fatalf("Refresh(device B, revoked) err = %v, want ErrTokenInvalid", err)
+	}
+}
+
+// TestChangePasswordNoCurrentSessionRevokesAll pins the documented
+// fail-closed default: an empty (or unrecognised) currentSessionID protects
+// nothing — every session is revoked, matching LogoutAll.
+func TestChangePasswordNoCurrentSessionRevokesAll(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "sam2@example.com", validPassword)
+	mustLogin(t, svc, "sam2@example.com", validPassword)
+
+	if err := svc.ChangePassword(ctx, user.ID, "", validPassword, "Another-Valid-Pass4!"); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+
+	sessions, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("len(sessions) = %d, want 0 — an empty currentSessionID must protect nothing", len(sessions))
+	}
+}
+
+func TestChangePasswordUnknownUserPropagatesNotFound(t *testing.T) {
+	svc, _ := newTestService(t)
+	err := svc.ChangePassword(context.Background(), "no-such-user-id", "", validPassword, "Another-Valid-Pass5!")
+	if !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("err = %v, want ErrUserNotFound", err)
+	}
+}
+
+// ============================================================
+// RequestPasswordReset
+// ============================================================
+
+func TestRequestPasswordResetKnownAddressReturnsRedeemableToken(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "tara@example.com", validPassword)
+
+	tok, ok, err := svc.RequestPasswordReset(ctx, "Tara@Example.com", "1.2.3.4")
+	if err != nil {
+		t.Fatalf("RequestPasswordReset: %v", err)
+	}
+	if !ok {
+		t.Fatal("ok = false, want true for a known address")
+	}
+	if tok == "" {
+		t.Fatal("token is empty for a known address")
+	}
+
+	v, err := store.FindVerificationByHash(ctx, token.HashOpaque(tok))
+	if err != nil {
+		t.Fatalf("FindVerificationByHash: %v", err)
+	}
+	if v.Purpose != auth.PurposePasswordReset {
+		t.Fatalf("Purpose = %q, want %q", v.Purpose, auth.PurposePasswordReset)
+	}
+	if v.UserID != user.ID {
+		t.Fatalf("UserID = %q, want %q", v.UserID, user.ID)
+	}
+	if v.Email != "tara@example.com" {
+		t.Fatalf("Email = %q, want \"tara@example.com\"", v.Email)
+	}
+}
+
+// TestRequestPasswordResetUnknownAddressReturnsFalseNilError is the
+// mandatory mutation-anchor test: make RequestPasswordReset return an error
+// for an unknown address, and this must fail.
+func TestRequestPasswordResetUnknownAddressReturnsFalseNilError(t *testing.T) {
+	svc, _ := newTestService(t)
+
+	tok, ok, err := svc.RequestPasswordReset(context.Background(), "nobody-here@example.com", "1.2.3.4")
+	if err != nil {
+		t.Fatalf("err = %v, want nil — never an error purely because the address is unknown", err)
+	}
+	if ok {
+		t.Fatal("ok = true, want false for an unknown address")
+	}
+	if tok != "" {
+		t.Fatalf("token = %q, want empty for an unknown address", tok)
+	}
+}
+
+func TestRequestPasswordResetRequiresIP(t *testing.T) {
+	svc, _ := newTestService(t)
+	_, _, err := svc.RequestPasswordReset(context.Background(), "anyone@example.com", "")
+	if !errors.Is(err, auth.ErrMissingIP) {
+		t.Fatalf("err = %v, want ErrMissingIP", err)
+	}
+}
+
+func TestRequestPasswordResetIPRateLimitedDeniesBeforeStoreAccess(t *testing.T) {
+	limiter := &fakeLimiter{allow: false}
+	store := newCountingStore()
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+		auth.WithRateLimiter(limiter),
+	)
+
+	tok, ok, err := svc.RequestPasswordReset(context.Background(), "anyone@example.com", "9.9.9.9")
+	if !errors.Is(err, auth.ErrRateLimited) {
+		t.Fatalf("err = %v, want ErrRateLimited", err)
+	}
+	if ok || tok != "" {
+		t.Fatalf("ok=%v tok=%q despite the IP rate limiter denying; want false/empty", ok, tok)
+	}
+	if got := store.calls(); got != 0 {
+		t.Fatalf("Store touched %d times despite the IP limiter denying; want 0", got)
+	}
+}
+
+// TestRequestPasswordResetAddressRateLimitSameShapeAsUnknown pins the
+// brief's point 2: a per-ADDRESS rate-limit denial for a KNOWN address must
+// return the exact same shape as an unknown address — ("", false, nil) —
+// never ErrRateLimited, which would itself become an oracle.
+func TestRequestPasswordResetAddressRateLimitSameShapeAsUnknown(t *testing.T) {
+	addressLimiter := &fakeLimiter{allow: false}
+	svc, _ := newTestService(t, auth.WithPasswordResetRateLimiter(addressLimiter))
+	ctx := context.Background()
+	mustSignUp(t, svc, "uma2@example.com", validPassword)
+
+	tok, ok, err := svc.RequestPasswordReset(ctx, "uma2@example.com", "1.2.3.4")
+	if err != nil {
+		t.Fatalf("err = %v, want nil (never ErrRateLimited for the address-keyed limiter)", err)
+	}
+	if ok {
+		t.Fatal("ok = true despite the address rate limiter denying")
+	}
+	if tok != "" {
+		t.Fatalf("token = %q, want empty", tok)
+	}
+
+	addressLimiter.mu.Lock()
+	defer addressLimiter.mu.Unlock()
+	if len(addressLimiter.keys) != 1 || addressLimiter.keys[0] != "uma2@example.com" {
+		t.Fatalf("address limiter keys = %v, want [\"uma2@example.com\"] (keyed by the normalized address)", addressLimiter.keys)
+	}
+}
+
+// TestRequestPasswordResetReadFailureIndistinguishableAcrossBranches proves
+// a FindUserByEmail outage — a call that runs on EVERY invocation — fails
+// the known and unknown branches identically, mirroring
+// TestSignUpReadFailureIndistinguishableAcrossBranches.
+func TestRequestPasswordResetReadFailureIndistinguishableAcrossBranches(t *testing.T) {
+	store := &errStore{AuthStore: memory.NewAuthStore(), failFindUserByEmail: true}
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	now := time.Now().UTC()
+	seedHash, err := password.Bcrypt(testCost).Hash(validPassword)
+	if err != nil {
+		t.Fatalf("seed hash: %v", err)
+	}
+	if _, err := store.AuthStore.CreateUser(context.Background(), auth.UserBase{
+		ID: "seed-reset-1", Email: "vince2@example.com", PasswordHash: seedHash, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed CreateUser: %v", err)
+	}
+
+	_, _, errKnown := svc.RequestPasswordReset(context.Background(), "vince2@example.com", "1.2.3.4")
+	_, _, errUnknown := svc.RequestPasswordReset(context.Background(), "never-registered@example.com", "1.2.3.4")
+
+	if errKnown == nil {
+		t.Fatal("RequestPasswordReset(known address) succeeded despite the read path being broken")
+	}
+	if errUnknown == nil {
+		t.Fatal("RequestPasswordReset(unknown address) succeeded despite the read path being broken")
+	}
+	if !errors.Is(errKnown, errStoreBoom) || !errors.Is(errUnknown, errStoreBoom) {
+		t.Fatalf("errKnown=%v errUnknown=%v, want both to wrap errStoreBoom", errKnown, errUnknown)
+	}
+}
+
+// TestRequestPasswordResetCreateVerificationFailureNotDistinguishable pins
+// point 3 of "The enumeration property, again": a failure reachable ONLY on
+// the known-address branch (CreateVerification) must not surface as an
+// error at all — it must return the exact same shape an unknown address
+// gets.
+func TestRequestPasswordResetCreateVerificationFailureNotDistinguishable(t *testing.T) {
+	inner := memory.NewAuthStore()
+	seedHash, err := password.Bcrypt(testCost).Hash(validPassword)
+	if err != nil {
+		t.Fatalf("seed hash: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := inner.CreateUser(context.Background(), auth.UserBase{
+		ID: "seed-reset-2", Email: "wade@example.com", PasswordHash: seedHash, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed CreateUser: %v", err)
+	}
+
+	store := &verificationWriteFailStore{AuthStore: inner}
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+
+	tokKnown, okKnown, errKnown := svc.RequestPasswordReset(context.Background(), "wade@example.com", "1.2.3.4")
+	tokUnknown, okUnknown, errUnknown := svc.RequestPasswordReset(context.Background(), "never-registered2@example.com", "1.2.3.4")
+
+	if errKnown != nil {
+		t.Fatalf("errKnown = %v, want nil — CreateVerification's failure must not surface as an error", errKnown)
+	}
+	if errUnknown != nil {
+		t.Fatalf("errUnknown = %v, want nil", errUnknown)
+	}
+	if okKnown != okUnknown || okKnown != false {
+		t.Fatalf("okKnown=%v okUnknown=%v, want both false — identical to the unknown-address shape", okKnown, okUnknown)
+	}
+	if tokKnown != tokUnknown || tokKnown != "" {
+		t.Fatalf("tokKnown=%q tokUnknown=%q, want both empty", tokKnown, tokUnknown)
+	}
+}
+
+// ============================================================
+// ResetPassword
+// ============================================================
+
+func TestResetPasswordSuccessChangesPasswordAndBurnsToken(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	mustSignUp(t, svc, "xena@example.com", validPassword)
+
+	tok, ok, err := svc.RequestPasswordReset(ctx, "xena@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+
+	const newPass = "Reset-Valid-Pass6!"
+	if err := svc.ResetPassword(ctx, tok, newPass); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	if _, _, _, err := svc.Login(ctx, "xena@example.com", validPassword, "1.2.3.4", ""); !errors.Is(err, auth.ErrInvalidCredentials) {
+		t.Fatalf("Login(old password) err = %v, want ErrInvalidCredentials", err)
+	}
+	if _, _, _, err := svc.Login(ctx, "xena@example.com", newPass, "1.2.3.4", ""); err != nil {
+		t.Fatalf("Login(new password): %v, want success", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(tok)); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(redeemed token) err = %v, want ErrVerificationNotFound", ferr)
+	}
+	if err := svc.ResetPassword(ctx, tok, "Another-Valid-Pass7!"); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("second ResetPassword(same token) err = %v, want ErrVerificationNotFound", err)
+	}
+}
+
+// TestResetPasswordRevokesAllSessions is the mandatory mutation-anchor test:
+// remove the session-revocation step and this must fail. Unlike
+// ChangePassword, ResetPassword spares NOTHING — both of the account's
+// devices, logged in BEFORE the reset, must be revoked.
+func TestResetPasswordRevokesAllSessions(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "yara@example.com", validPassword)
+	_, _, refreshA, err := svc.Login(ctx, "yara@example.com", validPassword, "1.2.3.4", "device-a")
+	if err != nil {
+		t.Fatalf("Login(device A): %v", err)
+	}
+	_, _, refreshB, err := svc.Login(ctx, "yara@example.com", validPassword, "5.6.7.8", "device-b")
+	if err != nil {
+		t.Fatalf("Login(device B): %v", err)
+	}
+
+	tok, ok, err := svc.RequestPasswordReset(ctx, "yara@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	if err := svc.ResetPassword(ctx, tok, "Reset-Valid-Pass8!"); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	sessions, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("len(sessions) after ResetPassword = %d, want 0 (every session, every device, must be revoked)", len(sessions))
+	}
+	if _, err := svc.Refresh(ctx, refreshA); !errors.Is(err, auth.ErrTokenInvalid) {
+		t.Fatalf("Refresh(device A) after ResetPassword err = %v, want ErrTokenInvalid", err)
+	}
+	if _, err := svc.Refresh(ctx, refreshB); !errors.Is(err, auth.ErrTokenInvalid) {
+		t.Fatalf("Refresh(device B) after ResetPassword err = %v, want ErrTokenInvalid", err)
+	}
+}
+
+// TestResetPasswordClaimsBeforeApplyOrdering is the mandatory
+// mutation-anchor test for ordering: reverse ResetPassword's claim/apply
+// order and this must fail. Mirrors
+// TestVerifyEmailClaimsBeforeApplyOrderingSignup's technique exactly, via
+// orderStore's UpdateUserPassword override.
+func TestResetPasswordClaimsBeforeApplyOrdering(t *testing.T) {
+	store := newOrderStore()
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	ctx := context.Background()
+	mustSignUp(t, svc, "zack@example.com", validPassword)
+
+	tok, ok, err := svc.RequestPasswordReset(ctx, "zack@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	store.mu.Lock()
+	store.order = nil
+	store.mu.Unlock()
+
+	if err := svc.ResetPassword(ctx, tok, "Ordered-Valid-Pass9!"); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	got := store.snapshot()
+	want := []string{"DeleteVerification", "UpdateUserPassword"}
+	if !equalStrings(got, want) {
+		t.Fatalf("call order = %v, want %v (claim must happen before apply)", got, want)
+	}
+}
+
+func TestResetPasswordUnknownToken(t *testing.T) {
+	svc, _ := newTestService(t)
+	err := svc.ResetPassword(context.Background(), "this-token-was-never-issued", "Some-Valid-Pass10!")
+	if !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("err = %v, want ErrVerificationNotFound", err)
+	}
+}
+
+func TestResetPasswordExpiredTokenNotClaimed(t *testing.T) {
+	fixedNow := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	store := memory.NewAuthStore()
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+		auth.WithClock(func() time.Time { return fixedNow }),
+	)
+	ctx := context.Background()
+	mustSignUp(t, svc, "abby@example.com", validPassword)
+
+	tok, ok, err := svc.RequestPasswordReset(ctx, "abby@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+
+	later := fixedNow.Add(2 * time.Hour) // past the 1h password-reset TTL
+	svcLater := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+		auth.WithClock(func() time.Time { return later }),
+	)
+
+	if err := svcLater.ResetPassword(ctx, tok, "Expired-Valid-Pass11!"); !errors.Is(err, auth.ErrVerificationExpired) {
+		t.Fatalf("err = %v, want ErrVerificationExpired", err)
+	}
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(tok)); ferr != nil {
+		t.Fatalf("verification was deleted despite being expired-not-claimed: %v", ferr)
+	}
+}
+
+func TestResetPasswordWrongPurposeRejectedNotClaimed(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	res, err := svc.SignUp(ctx, "cody@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+
+	// res.VerifyToken is a "signup"-purpose token; present it to
+	// ResetPassword, which only redeems "password_reset".
+	if err := svc.ResetPassword(ctx, res.VerifyToken, "Wrong-Purpose-Pass12!"); !errors.Is(err, auth.ErrVerificationPurpose) {
+		t.Fatalf("err = %v, want ErrVerificationPurpose", err)
+	}
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(res.VerifyToken)); ferr != nil {
+		t.Fatalf("signup verification was burned by ResetPassword: %v", ferr)
+	}
+}
+
+func TestResetPasswordWeakNextPasswordNotClaimed(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	mustSignUp(t, svc, "dana2@example.com", validPassword)
+
+	tok, ok, err := svc.RequestPasswordReset(ctx, "dana2@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+
+	if err := svc.ResetPassword(ctx, tok, "weak"); !errors.Is(err, auth.ErrWeakPassword) {
+		t.Fatalf("err = %v, want ErrWeakPassword", err)
+	}
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(tok)); ferr != nil {
+		t.Fatalf("token was burned despite next failing password rules: %v", ferr)
+	}
+}
+
+// ============================================================
+// RequestEmailChange
+// ============================================================
+
+func TestRequestEmailChangeMintsRedeemableToken(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "erin2@example.com", validPassword)
+
+	tok, err := svc.RequestEmailChange(ctx, user.ID, "  Erin-New@Example.COM ")
+	if err != nil {
+		t.Fatalf("RequestEmailChange: %v", err)
+	}
+	if tok == "" {
+		t.Fatal("token is empty")
+	}
+
+	v, err := store.FindVerificationByHash(ctx, token.HashOpaque(tok))
+	if err != nil {
+		t.Fatalf("FindVerificationByHash: %v", err)
+	}
+	if v.Purpose != auth.PurposeEmailChange {
+		t.Fatalf("Purpose = %q, want %q", v.Purpose, auth.PurposeEmailChange)
+	}
+	if v.Email != "erin-new@example.com" {
+		t.Fatalf("Email = %q, want normalized \"erin-new@example.com\"", v.Email)
+	}
+	if v.UserID != user.ID {
+		t.Fatalf("UserID = %q, want %q", v.UserID, user.ID)
+	}
+
+	got, err := svc.VerifyEmail(ctx, tok)
+	if err != nil {
+		t.Fatalf("VerifyEmail: %v", err)
+	}
+	if got.Email != "erin-new@example.com" {
+		t.Fatalf("Email after redemption = %q, want \"erin-new@example.com\"", got.Email)
+	}
+	if got.EmailVerifiedAt == nil {
+		t.Fatal("EmailVerifiedAt is nil after redeeming an email_change token")
+	}
+}
+
+func TestRequestEmailChangeTakenEmailRejected(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	userA := mustSignUp(t, svc, "finn@example.com", validPassword)
+	mustSignUp(t, svc, "gwen@example.com", validPassword)
+
+	tok, err := svc.RequestEmailChange(ctx, userA.ID, "gwen@example.com")
+	if !errors.Is(err, auth.ErrEmailTaken) {
+		t.Fatalf("err = %v, want ErrEmailTaken", err)
+	}
+	if tok != "" {
+		t.Fatalf("token = %q, want empty when the email is taken", tok)
+	}
+}
+
+func TestRequestEmailChangeUnknownUserPropagatesNotFound(t *testing.T) {
+	svc, _ := newTestService(t)
+	_, err := svc.RequestEmailChange(context.Background(), "no-such-user-id", "someone@example.com")
+	if !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("err = %v, want ErrUserNotFound", err)
+	}
+}
+
+func TestRequestEmailChangeSameEmailAllowed(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "holly@example.com", validPassword)
+
+	tok, err := svc.RequestEmailChange(ctx, user.ID, "Holly@Example.com")
+	if err != nil {
+		t.Fatalf("RequestEmailChange(own current address): %v, want success", err)
+	}
+	if tok == "" {
+		t.Fatal("token is empty")
 	}
 }
