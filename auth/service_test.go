@@ -3840,3 +3840,180 @@ func TestRequestEmailChangeRejectsEmptyEmail(t *testing.T) {
 		t.Fatalf("FindUserByEmail returned a different user: got %q, want %q", stillThere.ID, user.ID)
 	}
 }
+
+// ============================================================
+// VerifyAccessToken
+// ============================================================
+
+// TestVerifyAccessTokenRoundTripsBothMintingPaths pins the point of the
+// method: a Service that was given the keys can verify what it issued,
+// without the caller keeping a second copy of the key material. Both
+// minting paths are covered, and the SessionID claim is asserted against
+// the session each token was actually minted for, since that claim is what
+// ChangePassword's currentSessionID parameter consumes.
+func TestVerifyAccessTokenRoundTripsBothMintingPaths(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "vera@example.com", validPassword)
+
+	login, err := svc.Login(ctx, "vera@example.com", validPassword, "1.2.3.4", "agent")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	claims, err := svc.VerifyAccessToken(login.AccessToken)
+	if err != nil {
+		t.Fatalf("VerifyAccessToken(Login's token): %v", err)
+	}
+	if claims.Subject != user.ID {
+		t.Fatalf("Subject = %q, want the logged-in user's id %q", claims.Subject, user.ID)
+	}
+	if claims.Email != "vera@example.com" {
+		t.Fatalf("Email = %q, want \"vera@example.com\"", claims.Email)
+	}
+	sessions, err := svc.ListSessions(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 1 || claims.SessionID != sessions[0].ID {
+		t.Fatalf("SessionID = %q, want the id of the one live session %+v", claims.SessionID, sessions)
+	}
+
+	rotated, err := svc.Refresh(ctx, login.RefreshToken)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	next, err := svc.VerifyAccessToken(rotated.AccessToken)
+	if err != nil {
+		t.Fatalf("VerifyAccessToken(Refresh's token): %v", err)
+	}
+	if next.SessionID == claims.SessionID {
+		t.Fatal("Refresh's access token carries the PREDECESSOR's SessionID; want the successor's")
+	}
+}
+
+// TestVerifyAccessTokenAcceptsEveryConfiguredKey pins that verification
+// uses the whole key list, not only the signing key — which is what makes
+// a rotation transparent to tokens already in flight. A token minted while
+// the old key led the list must still verify once a new key leads it and
+// the old one has moved down.
+func TestVerifyAccessTokenAcceptsEveryConfiguredKey(t *testing.T) {
+	oldKey := bytes.Repeat([]byte("o"), 32)
+	newKey := bytes.Repeat([]byte("n"), 32)
+	store := memory.NewAuthStore()
+	ctx := context.Background()
+
+	before := auth.New(store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{oldKey}, 15*time.Minute),
+	)
+	mustSignUp(t, before, "rota@example.com", validPassword)
+	login, err := before.Login(ctx, "rota@example.com", validPassword, "1.2.3.4", "agent")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	after := auth.New(store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{newKey, oldKey}, 15*time.Minute),
+	)
+	if _, err := after.VerifyAccessToken(login.AccessToken); err != nil {
+		t.Fatalf("VerifyAccessToken after rotation: %v, want the retired key still accepted", err)
+	}
+
+	retired := auth.New(store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{newKey}, 15*time.Minute),
+	)
+	if _, err := retired.VerifyAccessToken(login.AccessToken); !errors.Is(err, token.ErrInvalidSignature) {
+		t.Fatalf("VerifyAccessToken once the old key is dropped = %v, want token.ErrInvalidSignature", err)
+	}
+}
+
+// TestVerifyAccessTokenRejections pins that the failures surface as the
+// token package's OWN sentinels, unwrapped and untranslated, so a caller
+// can tell an expired token from a forged one.
+func TestVerifyAccessTokenRejections(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	mustSignUp(t, svc, "reject@example.com", validPassword)
+	login, err := svc.Login(ctx, "reject@example.com", validPassword, "1.2.3.4", "agent")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	if _, err := svc.VerifyAccessToken("not.a.jwt"); !errors.Is(err, token.ErrMalformedToken) {
+		t.Fatalf("VerifyAccessToken(garbage) = %v, want token.ErrMalformedToken", err)
+	}
+
+	// A token signed by a key this Service does not hold.
+	foreign := auth.New(memory.NewAuthStore(),
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{bytes.Repeat([]byte("x"), 32)}, 15*time.Minute),
+	)
+	mustSignUp(t, foreign, "foreign@example.com", validPassword)
+	other, err := foreign.Login(ctx, "foreign@example.com", validPassword, "1.2.3.4", "agent")
+	if err != nil {
+		t.Fatalf("Login(foreign): %v", err)
+	}
+	if _, err := svc.VerifyAccessToken(other.AccessToken); !errors.Is(err, token.ErrInvalidSignature) {
+		t.Fatalf("VerifyAccessToken(foreign key) = %v, want token.ErrInvalidSignature", err)
+	}
+
+	// An expired token: mint with a one-nanosecond TTL against the same key.
+	brief := auth.New(memory.NewAuthStore(),
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, time.Nanosecond),
+	)
+	mustSignUp(t, brief, "brief@example.com", validPassword)
+	shortLived, err := brief.Login(ctx, "brief@example.com", validPassword, "1.2.3.4", "agent")
+	if err != nil {
+		t.Fatalf("Login(brief): %v", err)
+	}
+	if _, err := svc.VerifyAccessToken(shortLived.AccessToken); !errors.Is(err, token.ErrExpiredToken) {
+		t.Fatalf("VerifyAccessToken(expired) = %v, want token.ErrExpiredToken", err)
+	}
+
+	// No WithJWT at all: fails closed with the same sentinel Login's own
+	// token.Issue would produce, never "verified".
+	keyless := auth.New(memory.NewAuthStore(), auth.WithHasher(password.Bcrypt(testCost)))
+	if _, err := keyless.VerifyAccessToken(login.AccessToken); !errors.Is(err, token.ErrKeyTooShort) {
+		t.Fatalf("VerifyAccessToken on a Service with no signing key = %v, want token.ErrKeyTooShort", err)
+	}
+}
+
+// TestVerifyAccessTokenIgnoresSessionRevocation pins the bound the method's
+// doc states rather than letting a reader assume otherwise: verification is
+// signature and expiry, with no Store lookup, so a token whose session has
+// been revoked outright still verifies until its own TTL runs out. This is
+// the same stateless-access-token limitation every revocation path in this
+// package carries, asserted here at the one method a reader would most
+// expect to close it.
+func TestVerifyAccessTokenIgnoresSessionRevocation(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "revoked@example.com", validPassword)
+	login, err := svc.Login(ctx, "revoked@example.com", validPassword, "1.2.3.4", "agent")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	if err := svc.LogoutAll(ctx, user.ID); err != nil {
+		t.Fatalf("LogoutAll: %v", err)
+	}
+	sessions, err := svc.ListSessions(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("ListSessions returned %d row(s) after LogoutAll; want 0", len(sessions))
+	}
+
+	claims, err := svc.VerifyAccessToken(login.AccessToken)
+	if err != nil {
+		t.Fatalf("VerifyAccessToken after LogoutAll = %v; want nil — this method checks signature and expiry, never the Store", err)
+	}
+	if claims.SessionID == "" {
+		t.Fatal("claims.SessionID is empty; it is the hook an application uses to close this gap itself")
+	}
+}

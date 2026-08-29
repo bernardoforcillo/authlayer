@@ -967,6 +967,72 @@ func (s *Service) signingKey() []byte {
 	return s.cfg.signingKey[0]
 }
 
+// VerifyAccessToken verifies raw — an access token minted by
+// [Service.Login] or [Service.Refresh] — against the keys [WithJWT]
+// configured, and returns its claims. Every key in that list is tried, not
+// only the signing key, which is what makes a key rotation transparent to
+// tokens already in flight (see [token.Parse]).
+//
+// This exists so an application does not have to keep a SECOND copy of the
+// key material beside the Service that already holds it. Verifying an
+// access token is the most frequent operation in a real deployment — once
+// per request — and every other credential this package issues is redeemed
+// through a method of its own; without this one, that single hottest path
+// was the exception, and duplicated key material is how a rotation goes
+// half-applied.
+//
+// # Errors
+//
+// The errors are [github.com/bernardoforcillo/authlayer/token]'s own,
+// unwrapped and unchanged: ErrMalformedToken, ErrUnsupportedAlgorithm,
+// ErrInvalidSignature, ErrExpiredToken, and ErrKeyTooShort — compare with
+// [errors.Is] against the token package, not this one. This method
+// deliberately adds no auth-level sentinel of its own: it performs no
+// authentication decision beyond what token.Parse already performs, so a
+// translated error would carry no information the original does not, while
+// costing the caller the ability to tell "expired" from "forged".
+//
+// A Service built without [WithJWT] returns token.ErrKeyTooShort here,
+// matching how [Service.Login] fails closed on the same misconfiguration —
+// a missing key is not distinguishable from a zero-length one, and neither
+// may be treated as "verified".
+//
+// # What a nil error does and does not mean
+//
+// It means the token was signed by one of the configured keys and has not
+// expired. It does NOT mean the session behind it still exists: an access
+// token is stateless, this method makes no [Store] call at all (which is
+// why it takes no context.Context), and a token issued for a session that
+// [Service.Logout], [Service.LogoutAll], [Service.RevokeSession],
+// [Service.ChangePassword], [Service.ResetPassword] or [Service.Refresh]'s
+// reuse response has since revoked keeps verifying here until its own TTL
+// runs out. See [Service.LogoutAll]'s doc, "What this does not revoke".
+// An application that needs revocation honoured sooner looks the returned
+// [token.Claims.SessionID] up in the Store on every request; this method
+// hands back the claim so that choice is available, and does not make it.
+//
+// # The pairing with ChangePassword
+//
+// [Service.ChangePassword] takes a currentSessionID so it can spare the
+// caller's own session while revoking every other one, and the value it
+// wants is exactly the SessionID claim on the access token that
+// authenticated the request. This method is how a handler obtains it:
+//
+//	claims, err := svc.VerifyAccessToken(bearer)
+//	if err != nil {
+//		// 401 — do not proceed
+//	}
+//	err = svc.ChangePassword(ctx, claims.Subject, claims.SessionID, current, next)
+//
+// Passing an empty or foreign currentSessionID is not an error; it revokes
+// everything, which is the fail-closed direction — see that method's doc.
+func (s *Service) VerifyAccessToken(raw string) (token.Claims, error) {
+	if len(s.cfg.signingKey) == 0 {
+		return token.Claims{}, fmt.Errorf("%w: no signing key is configured; call WithJWT", token.ErrKeyTooShort)
+	}
+	return token.Parse(raw, s.cfg.signingKey...)
+}
+
 // VerifyEmail redeems plainToken: a "signup" token marks the account's
 // current email verified; an "email_change" token overwrites the account's
 // email to the address the token was minted for (see
@@ -1614,7 +1680,9 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // presented session — ordinarily the SessionID claim off the access token
 // an application already validated to authenticate this very request (see
 // [token.Claims.SessionID], stamped by [Service.Login] and [Service.Refresh]
-// at mint time). Passing an empty string, or an id that does not belong to
+// at mint time). [Service.VerifyAccessToken] is how to obtain it from that
+// token without keeping a second copy of the signing keys; its doc has the
+// two-line pairing. Passing an empty string, or an id that does not belong to
 // userID at all, protects nothing: every session is revoked, the same as
 // [Service.LogoutAll] — a deliberately fail-closed default for a
 // security-sensitive action, not a silent no-op. A caller that cannot
