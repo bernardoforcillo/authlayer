@@ -1274,21 +1274,48 @@ func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (Logi
 	return LoginResult[U]{User: wrapped, AccessToken: accessToken, RefreshToken: refreshPlainNew}, nil
 }
 
-// Logout revokes the single session identified by refreshPlain. It is
-// idempotent: a refreshPlain this Store has never issued, or one whose
-// session has already been removed (by a prior Logout, [Service.LogoutAll],
+// Logout revokes the session identified by refreshPlain. It is idempotent:
+// a refreshPlain this Store has never issued, or one whose session has
+// already been removed (by a prior Logout, [Service.LogoutAll],
 // [Service.RevokeSession], reuse-triggered family revocation, or
 // [Store.PurgeExpired]), returns nil rather than an error — a caller
 // logging out is asking "make sure this session does not exist", and both
 // of those starting states already satisfy that, so there is nothing to
 // report as a failure.
 //
-// Unlike [Service.Refresh], Logout does not check RotatedAt or ExpiresAt:
-// whatever session [token.HashOpaque](refreshPlain) identifies, current or
-// superseded, expired or not, is removed. This is a single-session logout —
-// it does NOT revoke the rest of the session's family; see
-// [Service.LogoutAll] for that. A non-sentinel Store error is returned
-// as-is; see the package's "Fail closed" constraint.
+// Presenting a CURRENT (unrotated) token is an ordinary single-session
+// logout: exactly that [Session] row is removed, and the rest of its family
+// — in particular its rotated-but-unexpired predecessors, the rows reuse
+// detection needs — is left alone. Nothing has been presented that would
+// justify sweeping them, and see [Service.LogoutAll] for the deliberate
+// "everything, everywhere" call. ExpiresAt is not checked either way: an
+// expired token still identifies a row, and removing it is what the caller
+// asked for.
+//
+// # A superseded token revokes the family
+//
+// If the located session is already rotated (RotatedAt != nil), Logout
+// revokes its WHOLE family via [Store.DeleteSessionsByFamily] and returns
+// nil — the caller asked to be logged out and they are, more thoroughly.
+// Presenting a superseded token carries the identical signal it carries at
+// [Service.Refresh], and the two paths must not disagree about what it
+// means.
+//
+// Deleting that single row instead was a complete bypass of reuse
+// detection, and it needed no race. Reuse detection works precisely BECAUSE
+// the rotated predecessor row is retained: a replay of it loses
+// [Store.MarkRotated], and that ok=false is what fires
+// [Store.DeleteSessionsByFamily]. So a thief holding a stolen refresh token
+// R could call [Service.Refresh](R) to win the rotation and take successor
+// S_a, then call Logout(R) with the SAME stolen token to delete the row the
+// victim's replay would have tripped over. The victim's client then
+// presents R, receives [ErrTokenInvalid] rather than [ErrTokenReuse], the
+// family is never revoked, S_a rotates indefinitely, and the victim sees a
+// benign "session expired". Confirmed against live PostgreSQL as well as
+// the in-memory store.
+//
+// A non-sentinel Store error is returned as-is; see the package's "Fail
+// closed" constraint.
 func (s *Service[U, PU]) Logout(ctx context.Context, refreshPlain string) error {
 	sess, err := s.store.FindSessionByHash(ctx, token.HashOpaque(refreshPlain))
 	switch {
@@ -1296,6 +1323,17 @@ func (s *Service[U, PU]) Logout(ctx context.Context, refreshPlain string) error 
 		return nil
 	case err != nil:
 		return err
+	}
+	if sess.RotatedAt != nil {
+		// A superseded token was presented. That is the SAME signal
+		// [Service.Refresh] treats as a replay, and the two paths must not
+		// disagree about what it means — see the method doc's "A
+		// superseded token" section. Revoke the whole family rather than
+		// deleting the tripwire row this session is.
+		if err := s.store.DeleteSessionsByFamily(ctx, sess.FamilyID); err != nil {
+			return err
+		}
+		return nil
 	}
 	if err := s.store.DeleteSession(ctx, sess.ID); err != nil {
 		if errors.Is(err, ErrSessionNotFound) {
@@ -1342,23 +1380,63 @@ func (s *Service[U, PU]) LogoutAll(ctx context.Context, userID string) error {
 // ListSessions returns every session belonging to userID — rotated or not,
 // expired or not, exactly as [Store.ListSessionsByUser] reports them — and
 // nothing belonging to any other user: it is a thin, scoped pass-through,
-// not a place this package adds cross-user visibility. A caller wanting
+// not a place this package adds cross-user visibility.
+//
+// # This is rotation history, not a device list
+//
+// Because rotated rows are retained until [Store.PurgeExpired] (they are
+// what makes replay detectable — see auth.go's package doc), one device
+// refreshing at the 15-minute default TTL accumulates about 97 rows in a
+// day, 96 of them superseded, none purgeable until the refresh TTL passes.
+// A "your devices" screen is therefore NOT this slice: a caller wanting
 // only the currently-presentable sessions filters on RotatedAt == nil and
-// ExpiresAt.After(now) itself.
+// ExpiresAt.After(now) itself, and a caller wanting one entry per LOGIN
+// groups by FamilyID — every row sharing a FamilyID descends from the same
+// login on the same device.
+//
+// [Service.RevokeSession] takes a Session.ID but revokes that session's
+// whole FAMILY, precisely so a handler built from this listing signs the
+// device out whichever of its rows the user happened to pick — see that
+// method's doc.
 func (s *Service[U, PU]) ListSessions(ctx context.Context, userID string) ([]Session, error) {
 	return s.store.ListSessionsByUser(ctx, userID)
 }
 
-// RevokeSession deletes exactly one session, identified by sessionID, but
-// ONLY if it belongs to userID — never by sessionID alone. A sessionID that
-// exists but belongs to a DIFFERENT user is reported identically to a
-// sessionID that does not exist at all ([Store]'s ErrSessionNotFound): this
-// method authorizes the delete itself, by the id's membership in userID's
-// own [Store.ListSessionsByUser] results, rather than trusting a
+// RevokeSession signs out the login that sessionID belongs to: it resolves
+// sessionID to its [Session] FamilyID and revokes that whole family via
+// [Store.DeleteSessionsByFamily] — but ONLY if sessionID belongs to userID,
+// never by sessionID alone. A sessionID that exists but belongs to a
+// DIFFERENT user is reported identically to a sessionID that does not exist
+// at all ([Store]'s ErrSessionNotFound): this method authorizes the
+// revocation itself, by the id's membership in userID's own
+// [Store.ListSessionsByUser] results, rather than trusting a
 // caller-supplied (userID, sessionID) pair to already be consistent. An
 // application handler that reads userID from an authenticated caller's own
 // access token and sessionID from request input cannot use this method to
-// revoke a different user's session by guessing or enumerating ids.
+// revoke a different user's session — or, now, a different user's family —
+// by guessing or enumerating ids. Revoking a family that has already been
+// revoked is not an error: DeleteSessionsByFamily deleting zero rows
+// succeeds, so this method is idempotent for as long as the id remains
+// resolvable, and reports ErrSessionNotFound once the rows are gone.
+//
+// # Why a family, not a row
+//
+// A family is one login on one device — every row sharing a FamilyID
+// descends from it by rotation — so "revoke the family" is exactly what a
+// "sign this device out" control means, and every other revocation path in
+// this package ([Service.LogoutAll], [Service.ChangePassword],
+// [Service.ResetPassword], and [Service.Refresh]'s own reuse response)
+// already works per family.
+//
+// Deleting the single named row instead silently failed to sign anything
+// out, in the most common way this method is called.
+// [Service.ListSessions] returns rotation HISTORY (see its doc), so a "your
+// devices" screen built from it lists a family's superseded rows alongside
+// its current one — about 97 rows per device per day at the default TTL,
+// 96 of them superseded. Revoking whichever row the user picked deleted a
+// superseded entry, returned nil, and left the device refreshing from its
+// current successor: a revocation UI that reports success and signs nobody
+// out.
 func (s *Service[U, PU]) RevokeSession(ctx context.Context, userID, sessionID string) error {
 	sessions, err := s.store.ListSessionsByUser(ctx, userID)
 	if err != nil {
@@ -1366,7 +1444,9 @@ func (s *Service[U, PU]) RevokeSession(ctx context.Context, userID, sessionID st
 	}
 	for _, sess := range sessions {
 		if sess.ID == sessionID {
-			return s.store.DeleteSession(ctx, sess.ID)
+			// Resolve the named session to its FAMILY and revoke that —
+			// see the method doc's "Why a family, not a row" section.
+			return s.store.DeleteSessionsByFamily(ctx, sess.FamilyID)
 		}
 	}
 	return ErrSessionNotFound

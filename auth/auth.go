@@ -473,12 +473,21 @@ type Store interface {
 	// treat alike, so do not distinguish them. Order is unspecified.
 	ListSessionsByUser(ctx context.Context, userID string) ([]Session, error)
 	// DeleteSession removes a session by id, returning ErrSessionNotFound
-	// when no row matched. This is a single-session logout.
+	// when no row matched. This is a single-session logout, and the service
+	// layer reaches it for exactly one case: a
+	// [github.com/bernardoforcillo/authlayer/auth.Service.Logout] presenting
+	// a CURRENT (RotatedAt == nil) refresh token. A superseded row is never
+	// deleted individually — deleting one destroys the tripwire reuse
+	// detection depends on, so Logout routes that case to
+	// DeleteSessionsByFamily instead; see Service.Logout's own doc.
 	DeleteSession(ctx context.Context, id string) error
 	// DeleteSessionsByFamily removes every session sharing familyID, however
-	// many there are. This is the reuse-detection response: see the package
-	// doc's "Sessions, families, and rotation" section for when the service
-	// layer calls it. Deleting zero rows is not an error.
+	// many there are. This is the reuse-detection response — see the package
+	// doc's "Sessions, families, and rotation" section — and also every
+	// explicit revocation the service layer performs: LogoutAll, the
+	// per-family sweeps in ChangePassword and ResetPassword, RevokeSession
+	// (which resolves a session id to its family), and a Logout presented a
+	// superseded token. Deleting zero rows is not an error.
 	//
 	// On a backend where [Store.CreateSuccessorSession] takes a row-level
 	// lock on the predecessor for its transaction's duration (see that

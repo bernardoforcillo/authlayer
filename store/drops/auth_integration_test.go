@@ -22,6 +22,7 @@
 package dropsstore_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -31,13 +32,34 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/bernardoforcillo/authlayer/auth"
 	"github.com/bernardoforcillo/authlayer/internal/uid"
+	"github.com/bernardoforcillo/authlayer/password"
 	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
 	"github.com/bernardoforcillo/drops/pg"
 	"github.com/bernardoforcillo/drops/stdlib"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
+
+// liveTestPassword satisfies password.DefaultRules() and is shared by the
+// service-level live tests below.
+const liveTestPassword = "Correct-Horse-Battery-9!"
+
+// newLiveAuthService wires a real auth.Service over a live AuthStore. A few
+// tests in this file exercise SERVICE behaviour (session revocation
+// semantics) rather than store behaviour, because the defects they pin were
+// reproduced against a real server and a memory-store-only regression test
+// would not prove the fix holds there. bcrypt runs at MinCost so the suite
+// stays fast; the default UUIDv7 id generator is left in place because the
+// drops schema types every id column as uuid.
+func newLiveAuthService(st *dropsstore.AuthStore) *auth.Service[auth.UserBase, *auth.UserBase] {
+	return auth.New[auth.UserBase](st,
+		auth.WithHasher(password.Bcrypt(bcrypt.MinCost)),
+		auth.WithJWT([][]byte{bytes.Repeat([]byte("k"), 32)}, 15*time.Minute),
+	)
+}
 
 // openLiveDB opens AUTHLAYER_TEST_DSN and wraps it in *pg.DB, skipping the
 // test if the DSN is unset. It registers sqlDB.Close() as a cleanup BEFORE
@@ -1595,5 +1617,109 @@ func TestAuthPurgeExpiredLive(t *testing.T) {
 	}
 	if _, err := st.FindVerificationByHash(ctx, "purge-ver-2"); err != nil {
 		t.Fatalf("ver2 err = %v, want it to survive", err)
+	}
+}
+
+// TestLogoutOfRotatedTokenRevokesFamilyLive is the live-PostgreSQL half of
+// auth's TestLogoutOfRotatedTokenRevokesFamily. The defect it pins — Logout
+// deleting the retained rotated row that reuse detection trips over, so a
+// thief who rotates a stolen token and then logs the SAME stolen token out
+// disarms the tripwire and keeps a rotating successor — was confirmed
+// against a real server before the fix, so the fix is confirmed there too
+// rather than only against the in-memory store's semantics.
+func TestLogoutOfRotatedTokenRevokesFamilyLive(t *testing.T) {
+	st := newLiveAuthStore(t)
+	ctx := context.Background()
+	svc := newLiveAuthService(st)
+
+	res, err := svc.SignUp(ctx, "live-logout-family@example.com", liveTestPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	_, _, stolen, err := svc.Login(ctx, "live-logout-family@example.com", liveTestPassword, "203.0.113.9", "thief")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	attacker, err := svc.Refresh(ctx, stolen)
+	if err != nil {
+		t.Fatalf("Refresh(stolen): %v", err)
+	}
+	if err := svc.Logout(ctx, stolen); err != nil {
+		t.Fatalf("Logout(rotated token) err = %v, want nil", err)
+	}
+
+	sessions, err := st.ListSessionsByUser(ctx, res.User.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("ListSessionsByUser returned %d row(s) after Logout of a rotated token; want 0 — the family must be revoked", len(sessions))
+	}
+	if _, err := svc.Refresh(ctx, attacker.RefreshToken); !errors.Is(err, auth.ErrTokenInvalid) {
+		t.Fatalf("Refresh(successor) err = %v, want ErrTokenInvalid — the attacker's successor must not outlive the family", err)
+	}
+}
+
+// TestRevokeSessionRevokesWholeFamilyLive is the live-PostgreSQL half of
+// auth's TestRevokeSessionRevokesWholeFamilyNotOneRow: a "your devices"
+// screen is built from ListSessions, which returns rotation history, so
+// revoking whichever row the user picked must sign the whole login out —
+// and must not spill into another family.
+func TestRevokeSessionRevokesWholeFamilyLive(t *testing.T) {
+	st := newLiveAuthStore(t)
+	ctx := context.Background()
+	svc := newLiveAuthService(st)
+
+	res, err := svc.SignUp(ctx, "live-revoke-family@example.com", liveTestPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	_, _, deviceA, err := svc.Login(ctx, "live-revoke-family@example.com", liveTestPassword, "203.0.113.9", "device-a")
+	if err != nil {
+		t.Fatalf("Login(device A): %v", err)
+	}
+	_, _, deviceB, err := svc.Login(ctx, "live-revoke-family@example.com", liveTestPassword, "198.51.100.7", "device-b")
+	if err != nil {
+		t.Fatalf("Login(device B): %v", err)
+	}
+
+	rotatedA, err := svc.Refresh(ctx, deviceA)
+	if err != nil {
+		t.Fatalf("Refresh(device A): %v", err)
+	}
+
+	listed, err := svc.ListSessions(ctx, res.User.ID)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(listed) != 3 {
+		t.Fatalf("ListSessions returned %d rows, want 3 (A's predecessor, A's successor, B)", len(listed))
+	}
+	var supersededA string
+	for _, sess := range listed {
+		if sess.RotatedAt != nil {
+			supersededA = sess.ID
+		}
+	}
+	if supersededA == "" {
+		t.Fatal("no superseded row found in the listing")
+	}
+
+	if err := svc.RevokeSession(ctx, res.User.ID, supersededA); err != nil {
+		t.Fatalf("RevokeSession(superseded row): %v", err)
+	}
+	if _, err := svc.Refresh(ctx, rotatedA.RefreshToken); !errors.Is(err, auth.ErrTokenInvalid) {
+		t.Fatalf("Refresh(device A's current token) err = %v, want ErrTokenInvalid — the device must actually be signed out", err)
+	}
+	remaining, err := st.ListSessionsByUser(ctx, res.User.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("ListSessionsByUser returned %d row(s), want 1 — device B's family must be untouched", len(remaining))
+	}
+	if _, err := svc.Refresh(ctx, deviceB); err != nil {
+		t.Fatalf("Refresh(device B): %v — revocation must not spill across families", err)
 	}
 }

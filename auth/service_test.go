@@ -1771,6 +1771,92 @@ func TestLogoutRevokesSessionAndIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestLogoutOfRotatedTokenRevokesFamily pins the fix for a complete bypass
+// of reuse detection that needed no race at all.
+//
+// Reuse detection works precisely BECAUSE the rotated predecessor row is
+// retained: a replay of it loses [Store.MarkRotated] and that ok=false is
+// what triggers [Store.DeleteSessionsByFamily]. Routing Logout to
+// [Store.DeleteSession] deleted that tripwire unconditionally, so a thief
+// holding a stolen refresh token R could Refresh(R) to win the rotation and
+// obtain successor S_a, then call Logout(R) with the SAME stolen token to
+// remove the row R's replay would have tripped over. The victim's client
+// later presents R, gets ErrTokenInvalid instead of ErrTokenReuse, the
+// family is never revoked, S_a keeps rotating indefinitely, and the victim
+// sees a benign "session expired".
+//
+// Presenting a superseded token to Logout carries the identical signal it
+// carries at [Service.Refresh], so the two paths must not disagree about
+// what it means: Logout now revokes the whole family and returns nil — the
+// caller asked to be logged out and they are, more thoroughly.
+func TestLogoutOfRotatedTokenRevokesFamily(t *testing.T) {
+	svc, store := newTestService(t)
+	mustSignUp(t, svc, "wallace@example.com", validPassword)
+	user, _, stolen := mustLogin(t, svc, "wallace@example.com", validPassword)
+	ctx := context.Background()
+
+	// The thief rotates the stolen token, taking over the family.
+	attacker, err := svc.Refresh(ctx, stolen)
+	if err != nil {
+		t.Fatalf("Refresh(stolen): %v", err)
+	}
+
+	// ...and then disarms the tripwire with the same stolen token.
+	if err := svc.Logout(ctx, stolen); err != nil {
+		t.Fatalf("Logout(rotated token) err = %v, want nil", err)
+	}
+
+	sessions, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("ListSessionsByUser returned %d session(s) after Logout of a rotated token; want 0 — the family must be revoked, not just the presented row", len(sessions))
+	}
+	if _, err := svc.Refresh(ctx, attacker.RefreshToken); !errors.Is(err, auth.ErrTokenInvalid) {
+		t.Fatalf("Refresh(successor) after Logout(its rotated predecessor) err = %v, want ErrTokenInvalid — the attacker's successor must not outlive the family", err)
+	}
+}
+
+// TestLogoutOfCurrentTokenLeavesFamilyTripwiresInPlace pins the OTHER side
+// of the same branch, so the fix above is not read as "Logout always takes
+// the family": presenting a CURRENT (unrotated) token is evidence of
+// nothing, so it stays a single-session logout. The family's
+// rotated-but-unexpired predecessor rows are deliberately left alone —
+// they are the tripwire, and nothing has been presented that would justify
+// sweeping them. Nothing in the family is refreshable afterward either
+// way; the difference is that a later replay of a predecessor still
+// reports ErrTokenReuse rather than a silent ErrTokenInvalid.
+func TestLogoutOfCurrentTokenLeavesFamilyTripwiresInPlace(t *testing.T) {
+	svc, store := newTestService(t)
+	mustSignUp(t, svc, "wanda@example.com", validPassword)
+	user, _, first := mustLogin(t, svc, "wanda@example.com", validPassword)
+	ctx := context.Background()
+
+	rotated, err := svc.Refresh(ctx, first)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	if err := svc.Logout(ctx, rotated.RefreshToken); err != nil {
+		t.Fatalf("Logout(current token): %v", err)
+	}
+
+	sessions, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("ListSessionsByUser returned %d session(s), want 1 — the rotated predecessor is the tripwire and must survive a single-session logout", len(sessions))
+	}
+	if sessions[0].RotatedAt == nil {
+		t.Fatal("the surviving row is not the rotated predecessor")
+	}
+	if _, err := svc.Refresh(ctx, first); !errors.Is(err, auth.ErrTokenReuse) {
+		t.Fatalf("Refresh(predecessor) after Logout(its successor) err = %v, want ErrTokenReuse — the tripwire must still fire", err)
+	}
+}
+
 // TestLogoutAllRevokesEveryFamilyIncludingRotatedPredecessors pins
 // LogoutAll: every session across every family for the user is gone
 // afterward, including a rotated-but-unexpired predecessor row a
@@ -1872,6 +1958,119 @@ func TestRevokeSessionRequiresOwnership(t *testing.T) {
 	}
 	if len(gone) != 0 {
 		t.Fatalf("len(gone) = %d, want 0", len(gone))
+	}
+}
+
+// TestRevokeSessionRevokesWholeFamilyNotOneRow pins RevokeSession's family
+// semantics, and the reason they are not a nicety.
+//
+// [Service.ListSessions] is a pass-through over [Store.ListSessionsByUser],
+// which returns rotation HISTORY: one device refreshing at the 15-minute
+// default TTL accumulates 97 rows in a day, 96 of them superseded and none
+// purgeable for 30 days. The obvious "your devices" screen lists those rows
+// and calls RevokeSession on the one the user picked. Deleting that single
+// row returned nil while the device kept refreshing from its current
+// successor — a revocation UI that reports success and signs nobody out.
+//
+// A device-list entry IS a family (one login), so revoking the family is
+// precisely "sign this device out". Every other revocation path in the
+// package already goes per-family; this was the lone exception, and the one
+// a UI calls.
+func TestRevokeSessionRevokesWholeFamilyNotOneRow(t *testing.T) {
+	svc, store := newTestService(t)
+	mustSignUp(t, svc, "xenia@example.com", validPassword)
+	user, _, deviceA := mustLogin(t, svc, "xenia@example.com", validPassword)
+	ctx := context.Background()
+
+	// A second, independent login: a different device, a different family,
+	// which must survive untouched.
+	_, _, deviceB, err := svc.Login(ctx, "xenia@example.com", validPassword, "198.51.100.7", "device-b")
+	if err != nil {
+		t.Fatalf("second Login: %v", err)
+	}
+
+	// Device A refreshes once, so its family holds a superseded predecessor
+	// plus a current successor — exactly what a device list would show two
+	// rows for.
+	rotatedA, err := svc.Refresh(ctx, deviceA)
+	if err != nil {
+		t.Fatalf("Refresh(device A): %v", err)
+	}
+
+	listed, err := svc.ListSessions(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(listed) != 3 {
+		t.Fatalf("ListSessions returned %d rows, want 3 (A's predecessor, A's successor, B) — the premise of this test is that history is listed", len(listed))
+	}
+	var supersededA string
+	for _, sess := range listed {
+		if sess.RotatedAt != nil {
+			supersededA = sess.ID
+		}
+	}
+	if supersededA == "" {
+		t.Fatal("no superseded row found in the listing")
+	}
+
+	// The user picks the superseded row off the device list and revokes it.
+	if err := svc.RevokeSession(ctx, user.ID, supersededA); err != nil {
+		t.Fatalf("RevokeSession(superseded row): %v", err)
+	}
+
+	if _, err := svc.Refresh(ctx, rotatedA.RefreshToken); !errors.Is(err, auth.ErrTokenInvalid) {
+		t.Fatalf("Refresh(device A's current token) after revoking a row of its family err = %v, want ErrTokenInvalid — the device must actually be signed out", err)
+	}
+
+	remaining, err := store.ListSessionsByUser(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(remaining) != 1 {
+		t.Fatalf("ListSessionsByUser returned %d row(s) after revoking one family, want 1 — device B's family must be untouched", len(remaining))
+	}
+	if _, err := svc.Refresh(ctx, deviceB); err != nil {
+		t.Fatalf("Refresh(device B) after revoking device A's family: %v — revocation must not spill across families", err)
+	}
+}
+
+// TestRevokeSessionCannotRevokeAnotherUsersFamily is the ownership half of
+// the family change: resolving a session to its family must not become a
+// way to sign another user out. A foreign session id is still reported
+// exactly as a nonexistent one, and the foreign family survives intact —
+// including its rotated predecessor, which the family-wide delete would
+// have taken had the ownership check been bypassed.
+func TestRevokeSessionCannotRevokeAnotherUsersFamily(t *testing.T) {
+	svc, store := newTestService(t)
+	userA := mustSignUp(t, svc, "yuri@example.com", validPassword)
+	userB := mustSignUp(t, svc, "zola@example.com", validPassword)
+	ctx := context.Background()
+	mustLogin(t, svc, "yuri@example.com", validPassword)
+	_, _, bRefresh := mustLogin(t, svc, "zola@example.com", validPassword)
+
+	if _, err := svc.Refresh(ctx, bRefresh); err != nil {
+		t.Fatalf("Refresh(B): %v", err)
+	}
+	bSessions, err := store.ListSessionsByUser(ctx, userB.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser(B): %v", err)
+	}
+	if len(bSessions) != 2 {
+		t.Fatalf("len(bSessions) = %d, want 2", len(bSessions))
+	}
+
+	for _, sess := range bSessions {
+		if err := svc.RevokeSession(ctx, userA.ID, sess.ID); !errors.Is(err, auth.ErrSessionNotFound) {
+			t.Fatalf("RevokeSession(A, B's session %q) err = %v, want ErrSessionNotFound", sess.ID, err)
+		}
+	}
+	still, err := store.ListSessionsByUser(ctx, userB.ID)
+	if err != nil {
+		t.Fatalf("ListSessionsByUser(B) after A's attempts: %v", err)
+	}
+	if len(still) != 2 {
+		t.Fatalf("len(still) = %d, want 2 — B's whole family must survive A's unauthorized attempts", len(still))
 	}
 }
 

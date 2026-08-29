@@ -1028,10 +1028,28 @@ theft: it is `ErrTokenInvalid` and leaves the family intact.
 
 Rotated-but-unexpired rows are kept on purpose — they are what makes replay
 detectable at all — and `Store.PurgeExpired` is the cron that sweeps expired
-sessions and verifications later. `Logout` revokes one session and is
-idempotent; `LogoutAll` revokes every family a user has; `RevokeSession`
-deletes one session by id but only if it belongs to the named user, reporting
-another user's session identically to a nonexistent one.
+sessions and verifications later. Because they are kept, **revocation is
+per-family, not per-row**, everywhere it can be:
+
+- `Logout` is idempotent. Presented a *current* token it removes that one
+  session and leaves the family's tripwire rows alone. Presented a
+  *superseded* one it revokes the whole family and still returns `nil` — the
+  same signal `Refresh` treats as a replay, so the two paths agree about what
+  it means. Deleting that row instead was a complete bypass of reuse
+  detection that needed no race: a thief who steals `R`, refreshes it into
+  `S_a`, then calls `Logout(R)` removed the very row the victim's replay
+  would have tripped over, so the victim got a benign `ErrTokenInvalid`, the
+  family was never revoked, and `S_a` rotated on indefinitely.
+- `LogoutAll` revokes every family a user has.
+- `RevokeSession` takes a session id but revokes that session's **family**,
+  and only if the id belongs to the named user — another user's session is
+  still reported identically to a nonexistent one. A family is one login on
+  one device, so this is precisely "sign this device out". `ListSessions`
+  returns rotation *history*, not a device list — one device refreshing at
+  the 15-minute default accumulates about 97 rows a day, 96 superseded — so
+  revoking the single row a user picked off such a listing used to delete a
+  superseded entry, return `nil`, and leave the device signed in. Group by
+  `FamilyID` to build the listing; any row of a family revokes it.
 
 ### What "revocable" actually means
 

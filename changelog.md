@@ -278,6 +278,16 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `WithJWT`, `WithRefreshTTL`, `WithClock`, `WithIDGenerator`,
   `WithRateLimiter`, `WithPasswordResetRateLimiter`,
   `WithRequireVerifiedEmail` and `WithClaimsExtender`.
+  **Revocation is per-family.** `LogoutAll`, `ChangePassword`,
+  `ResetPassword`, `RevokeSession` and reuse detection all revoke whole
+  session families, because rotated-but-unexpired rows are retained and are
+  what makes a replay detectable. `RevokeSession` takes a session id but
+  revokes that id's family — a family is one login on one device, and
+  `ListSessions` returns rotation history (about 97 rows per device per day
+  at the default TTL), so revoking one listed row signed nobody out.
+  `Logout` presented a *superseded* token likewise revokes the family rather
+  than deleting the row a replay would trip over; presented a current token
+  it stays a single-session logout.
   **What "revocable" does and does not mean:** revoking a session removes the
   refresh token's row, so `Refresh` on it fails immediately and
   `ListSessions` stops reporting it — but it does **not** invalidate an
