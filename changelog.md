@@ -275,12 +275,29 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `auth.NormalizeEmail` (trim, lowercase) is applied on every read and write,
   so a case or whitespace variant can neither create a duplicate nor slip
   past a uniqueness check. The surface is `SignUp`, `VerifyEmail`, `Login`,
-  `Refresh`, `Logout`, `LogoutAll`, `ListSessions`, `RevokeSession`,
-  `ChangePassword`, `RequestPasswordReset`, `ResetPassword` and
-  `RequestEmailChange`, configured through `WithHasher`, `WithRules`,
-  `WithJWT`, `WithRefreshTTL`, `WithClock`, `WithIDGenerator`,
-  `WithRateLimiter`, `WithPasswordResetRateLimiter`,
+  `Refresh`, `VerifyAccessToken`, `Logout`, `LogoutAll`, `ListSessions`,
+  `RevokeSession`, `User`, `ChangePassword`, `RequestPasswordReset`,
+  `ResetPassword`, `RequestEmailChange` and `PurgeExpired`, configured through
+  `WithHasher`, `WithRules`, `WithJWT`, `WithRefreshTTL`,
+  `WithVerificationTTL`, `WithPasswordResetTTL`, `WithClock`,
+  `WithIDGenerator`, `WithRateLimiter`, `WithPasswordResetRateLimiter`,
   `WithRequireVerifiedEmail` and `WithClaimsExtender`.
+  `Login` and `Refresh` both return a `LoginResult` — user, access token,
+  refresh token — rather than one returning a named struct and the other a
+  positional tuple whose two same-typed token strings a caller can transpose
+  silently. `VerifyAccessToken` verifies against the keys `WithJWT` already
+  holds, so an application does not keep a second copy of the key material for
+  the one operation it performs per request; it returns `token`'s own
+  sentinels, and its `SessionID` claim is what `ChangePassword`'s
+  `currentSessionID` consumes. `User(ctx, id)` is the read path that scrubs
+  `PasswordHash`, which `Store.FindUserByID` — previously the only exported
+  way to read a user — does not. `PurgeExpired` is a pass-through so a caller
+  holding only the `Service` can run the housekeeping this package requires;
+  retained predecessor rows are removed by nothing else. The four token
+  lifetimes each have an option: `WithJWT`, `WithRefreshTTL`,
+  `WithVerificationTTL` (24h default, covering `signup` and `email_change`)
+  and `WithPasswordResetTTL` (1h default). Every duration option ignores a
+  non-positive value and keeps its default.
   **Revocation is per-family.** `LogoutAll`, `ChangePassword`,
   `ResetPassword`, `RevokeSession` and reuse detection all revoke whole
   session families, because rotated-but-unexpired rows are retained and are
@@ -318,6 +335,13 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `ErrSessionRevoked` rather than resurrecting a family revoked in the window
   between the two. Both windows stay closed only insofar as the backend
   honours the atomicity the port demands; both shipped stores do.
+  Where a backend's answer is checkable, it is checked: a `MarkRotated` that
+  reports a replay but returns no `FamilyID` leaves nothing to revoke, so
+  `Refresh` fails closed with `ErrStoreContract` wrapped alongside
+  `ErrTokenReuse` rather than issuing a revocation on an empty key that
+  matches no rows — firing the alarm while containment silently no-ops.
+  `ErrTokenReuse` returned ALONE still means the family is already revoked;
+  wrapped, it means a replay was detected and the family may still be live.
   **Enumeration-safe sign-up:** `SignUp` returns
   `(SignUpResult{Created: false}, nil)` for an address already registered —
   never an error — and holds the property by construction rather than by

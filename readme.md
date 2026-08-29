@@ -1088,9 +1088,16 @@ a third. An expired refresh token is ordinary end-of-life, not evidence of
 theft: it is `ErrTokenInvalid` and leaves the family intact.
 
 Rotated-but-unexpired rows are kept on purpose — they are what makes replay
-detectable at all — and `Store.PurgeExpired` is the cron that sweeps expired
-sessions and verifications later. Because they are kept, **revocation is
-per-family, not per-row**, everywhere it can be:
+detectable at all — and `auth.Service.PurgeExpired(ctx, before)` is the cron
+that sweeps expired sessions and verifications later, a pass-through to the
+`Store` method of the same name. It is housekeeping, not a security boundary
+(an expired row is already refused by `Refresh`, `VerifyEmail` and
+`ResetPassword` without it) but this package does *require* it, since nothing
+else removes a retained predecessor row. Like `invite`'s, it authorizes
+nothing and spans every user the store holds, so call it from a cron job or a
+superuser console, never a per-request handler. The cutoff is literal: a
+`before` in the future signs out live sessions. Because those rows are kept,
+**revocation is per-family, not per-row**, everywhere it can be:
 
 - `Logout` is idempotent. Presented a *current* token it removes that one
   session and leaves the family's tripwire rows alone. Presented a
@@ -1112,20 +1119,52 @@ per-family, not per-row**, everywhere it can be:
   superseded entry, return `nil`, and leave the device signed in. Group by
   `FamilyID` to build the listing; any row of a family revokes it.
 
+### Verifying an access token
+
+`WithJWT` already holds the keys, so verification is a method rather than
+something you re-wire with a second copy of the key material:
+
+```go
+claims, err := svc.VerifyAccessToken(next.AccessToken)
+fmt.Println(err, claims.Subject == login.User.ID) // <nil> true
+
+u, _ := svc.User(ctx, claims.Subject)
+fmt.Println(u.Email, u.PasswordHash == "") // bob@example.com true
+```
+
+It tries every key in the list, not just the signing key, which is what makes
+a rotation transparent to tokens already in flight. Failures are
+[`token`](token/)'s own sentinels — `ErrMalformedToken`,
+`ErrUnsupportedAlgorithm`, `ErrInvalidSignature`, `ErrExpiredToken`,
+`ErrKeyTooShort` — unwrapped, so you can tell an expired token from a forged
+one; a `Service` built without `WithJWT` returns `ErrKeyTooShort` here exactly
+as `Login` fails closed on the same misconfiguration. `claims.SessionID` is
+what `ChangePassword` wants for its `currentSessionID`, which is the pairing
+most handlers need:
+
+```go
+err = svc.ChangePassword(ctx, claims.Subject, claims.SessionID,
+    "Correct-Horse-Battery-7", "Another-Valid-Pass22!")
+fmt.Println(err) // <nil>
+```
+
+`User(ctx, id)` is the read path that goes with it: a thin wrapper over
+`Store.FindUserByID` that scrubs `PasswordHash` like every other `Service`
+method, which the `Store`'s own method — the only exported way to read a user
+before it existed — does not.
+
 ### What "revocable" actually means
 
 **Revoking a session does not invalidate an access token already issued for
-it.** The access token is a stateless JWT: `token.Parse` checks its signature
-and its expiry and looks nothing up. A device holding one keeps working until
-that token expires — up to 15 minutes with the default TTL — no matter what
-`Refresh`, `Logout`, `LogoutAll`, `RevokeSession`, `ChangePassword` or
-`ResetPassword` did to the session behind it. Continuing the example above,
-where reuse detection has just revoked the entire family:
+it.** Verification is signature and expiry and nothing else: neither
+`VerifyAccessToken` nor the `token.Parse` beneath it looks anything up. A
+device holding a token keeps working until it expires — up to 15 minutes with
+the default TTL — no matter what `Refresh`, `Logout`, `LogoutAll`,
+`RevokeSession`, `ChangePassword` or `ResetPassword` did to the session behind
+it. The verification above ran *after* reuse detection had already revoked the
+entire family:
 
 ```go
-claims, err := token.Parse(next.AccessToken, key)
-fmt.Println(err, claims.Subject == login.User.ID) // <nil> true — still valid
-
 sessions, _ := svc.ListSessions(ctx, claims.Subject)
 fmt.Println(claims.SessionID != "", len(sessions)) // true 0
 ```
@@ -1196,8 +1235,9 @@ alone.
 
 `ChangePassword(ctx, userID, currentSessionID, current, next)` requires the
 current password, then revokes every session **except** the caller's own
-family — pass the `sid` from the access token that authenticated the request;
-an empty or foreign id revokes everything, which is the fail-closed direction.
+family — pass the `sid` from the access token that authenticated the request,
+which is what [`VerifyAccessToken`](#verifying-an-access-token) hands you; an
+empty or foreign id revokes everything, which is the fail-closed direction.
 `RequestPasswordReset` returns `(token, ok, nil)` and never errors merely
 because an address is unknown. `ResetPassword` claims the verification first
 and applies second (a failure after the claim burns the token rather than
@@ -1425,7 +1465,7 @@ that step to also report which of three conditions applied would require a
 second, separate read, which is exactly the race atomicity rules out — and
 `JoinViaLink` re-reads the link afterwards to tell them apart.
 
-[`auth`](#authentication) adds seventeen, split the same way — some raised by
+[`auth`](#authentication) adds eighteen, split the same way — some raised by
 the `Store` on a lookup or a constraint, the rest by the service:
 
 | Error | Meaning | Suggested status |
@@ -1447,13 +1487,16 @@ the `Store` on a lookup or a constraint, the rest by the service:
 | `ErrEmailRequired` | `RequestEmailChange` was given an address that is empty once normalized | 400 |
 | `ErrRateLimited` | The IP-keyed `RateLimiter` refused. Never returned for the address-keyed reset limiter — see [Rate limiting](#rate-limiting) | 429 |
 | `ErrMissingIP` | `Login` or `RequestPasswordReset` was called with an empty ip — a wiring bug, not caller input | 500 |
+| `ErrStoreContract` | A `Store` returned a value its own contract forbids, where continuing would silently degrade a security control. One trigger today: `MarkRotated` reporting a replay but returning no `FamilyID`, leaving `Refresh` no family to revoke | 500 |
 
 `SignUp` is the one method that reports a duplicate address without an error
 at all; see [Enumeration-safe sign-up](#enumeration-safe-sign-up).
-`ErrTokenReuse` must be checked *before* testing whether an error wraps a
-store error of its own: when the family revocation that responds to a
-detected replay itself fails, `Refresh` wraps both, so the alarm is never lost
-to the housekeeping failure.
+`ErrTokenReuse` must be checked *before* testing whether an error wraps
+anything else. Returned alone it means the family is already revoked; it comes
+wrapped around a second error in exactly two cases, and in both a replay was
+detected while the family may still be live — the family revocation itself
+failing, and `ErrStoreContract`. Either way the alarm is never lost to the
+failure of the response to it.
 
 [`token`](token/) adds six. The first four are what a caller gets from
 `Parse` for a bad token. The last two report a bad *key or TTL* rather than a
