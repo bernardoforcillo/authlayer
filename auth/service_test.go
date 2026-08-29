@@ -3005,20 +3005,23 @@ func TestChangePasswordInvalidatesOutstandingResetToken(t *testing.T) {
 // TestChangePasswordInvalidatesOutstandingEmailChangeToken pins the OTHER
 // half of the same side door. An "email_change" verification is a stronger
 // primitive than a reset token, not a weaker one: it lives 24h rather than
-// 1h, [Service.RequestEmailChange] needs no current password to mint one
-// (a briefly-stolen access token is enough), and [Service.VerifyEmail]
-// redeems it with NO authentication at all, moving the account to the
-// attacker's address. After that the victim cannot recover — [Service.Login]
-// and [Service.RequestPasswordReset] both look accounts up BY email — so a
-// pending email_change surviving the one action a user takes on suspecting
-// compromise is a full, unrecoverable takeover held open for a day.
+// 1h, and [Service.VerifyEmail] redeems it with NO authentication at all,
+// moving the account to the attacker's address. After that the victim
+// cannot recover — [Service.Login] and [Service.RequestPasswordReset] both
+// look accounts up BY email — so a pending email_change surviving the one
+// action a user takes on suspecting compromise is a full, unrecoverable
+// takeover held open for a day. Minting one now costs the current password
+// (see TestRequestEmailChangeRequiresCurrentPassword), which is why the
+// arming call below supplies it — but the whole premise of a password
+// change is that the old password may be in someone else's hands, so a
+// token armed before it was rotated must not outlive the rotation.
 func TestChangePasswordInvalidatesOutstandingEmailChangeToken(t *testing.T) {
 	svc, store := newTestService(t)
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "iris3@example.com", validPassword)
 
 	// The attacker, holding a stolen session, arms the takeover.
-	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "attacker@evil.example")
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "attacker@evil.example")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}
@@ -3658,7 +3661,7 @@ func TestResetPasswordInvalidatesOutstandingEmailChangeToken(t *testing.T) {
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "jonah2@example.com", validPassword)
 
-	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "attacker2@evil.example")
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "attacker2@evil.example")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}
@@ -3718,7 +3721,7 @@ func TestRequestEmailChangeMintsRedeemableToken(t *testing.T) {
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "erin2@example.com", validPassword)
 
-	tok, err := svc.RequestEmailChange(ctx, user.ID, "  Erin-New@Example.COM ")
+	tok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "  Erin-New@Example.COM ")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}
@@ -3768,7 +3771,7 @@ func TestRequestEmailChangeTakenEmailDeferredToRedemption(t *testing.T) {
 	userA := mustSignUp(t, svc, "finn@example.com", validPassword)
 	mustSignUp(t, svc, "gwen@example.com", validPassword)
 
-	tok, err := svc.RequestEmailChange(ctx, userA.ID, "gwen@example.com")
+	tok, err := svc.RequestEmailChange(ctx, userA.ID, validPassword, "gwen@example.com")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v, want success — the taken-email check is deferred to redemption", err)
 	}
@@ -3797,7 +3800,7 @@ func TestRequestEmailChangeTakenEmailDeferredToRedemption(t *testing.T) {
 
 func TestRequestEmailChangeUnknownUserPropagatesNotFound(t *testing.T) {
 	svc, _ := newTestService(t)
-	_, err := svc.RequestEmailChange(context.Background(), "no-such-user-id", "someone@example.com")
+	_, err := svc.RequestEmailChange(context.Background(), "no-such-user-id", validPassword, "someone@example.com")
 	if !errors.Is(err, auth.ErrUserNotFound) {
 		t.Fatalf("err = %v, want ErrUserNotFound", err)
 	}
@@ -3808,7 +3811,7 @@ func TestRequestEmailChangeSameEmailAllowed(t *testing.T) {
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "holly@example.com", validPassword)
 
-	tok, err := svc.RequestEmailChange(ctx, user.ID, "Holly@Example.com")
+	tok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "Holly@Example.com")
 	if err != nil {
 		t.Fatalf("RequestEmailChange(own current address): %v, want success", err)
 	}
@@ -3831,10 +3834,10 @@ func TestRequestEmailChangeRejectsEmptyEmail(t *testing.T) {
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "ivy2@example.com", validPassword)
 
-	if _, err := svc.RequestEmailChange(ctx, user.ID, ""); !errors.Is(err, auth.ErrEmailRequired) {
+	if _, err := svc.RequestEmailChange(ctx, user.ID, validPassword, ""); !errors.Is(err, auth.ErrEmailRequired) {
 		t.Fatalf("RequestEmailChange(\"\") err = %v, want ErrEmailRequired", err)
 	}
-	if _, err := svc.RequestEmailChange(ctx, user.ID, "   "); !errors.Is(err, auth.ErrEmailRequired) {
+	if _, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "   "); !errors.Is(err, auth.ErrEmailRequired) {
 		t.Fatalf("RequestEmailChange(whitespace-only) err = %v, want ErrEmailRequired", err)
 	}
 
@@ -3847,6 +3850,126 @@ func TestRequestEmailChangeRejectsEmptyEmail(t *testing.T) {
 	}
 	if stillThere.ID != user.ID {
 		t.Fatalf("FindUserByEmail returned a different user: got %q, want %q", stillThere.ID, user.ID)
+	}
+}
+
+// --- verificationMintCountingStore: wraps memory.AuthStore, counting
+// CreateVerification calls — used to prove RequestEmailChange mints NOTHING
+// when its current-password check fails, rather than merely returning an
+// error after arming a token anyway. ---
+
+type verificationMintCountingStore struct {
+	*memory.AuthStore
+	mu    sync.Mutex
+	mints int
+}
+
+func (s *verificationMintCountingStore) CreateVerification(ctx context.Context, v auth.Verification) (auth.Verification, error) {
+	s.mu.Lock()
+	s.mints++
+	s.mu.Unlock()
+	return s.AuthStore.CreateVerification(ctx, v)
+}
+
+func (s *verificationMintCountingStore) mintCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mints
+}
+
+// TestRequestEmailChangeRequiresCurrentPassword is the mandatory
+// mutation-anchor test for the credential gate: delete the Verify call and
+// this must fail.
+//
+// Arming an identifier rotation used to require NOTHING but a user id and an
+// address, while rotating the OTHER credential ([Service.ChangePassword])
+// required the current password. That asymmetry was the root of the
+// account-takeover chain the sweeps in ChangePassword/ResetPassword/LogoutAll
+// only contain after the fact: a briefly-held session, or a leaked 15-minute
+// access token (which per every revocation path's "What this does not
+// revoke" section outlives even LogoutAll), was enough to arm a 24-hour,
+// no-authentication address move. With the password required, an attacker
+// who can arm one already owns the account by other means.
+func TestRequestEmailChangeRequiresCurrentPassword(t *testing.T) {
+	store := &verificationMintCountingStore{AuthStore: memory.NewAuthStore()}
+	svc := auth.New(store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "nadia@example.com", validPassword)
+	mintsAfterSignUp := store.mintCount()
+
+	tok, err := svc.RequestEmailChange(ctx, user.ID, "not-the-current-password", "attacker@evil.example")
+	if !errors.Is(err, auth.ErrInvalidCredentials) {
+		t.Fatalf("RequestEmailChange(wrong current password) err = %v, want ErrInvalidCredentials", err)
+	}
+	if tok != "" {
+		t.Fatalf("token = %q, want empty — a rejected request must hand back nothing redeemable", tok)
+	}
+	if got := store.mintCount(); got != mintsAfterSignUp {
+		t.Fatalf("CreateVerification calls = %d, want %d — a rejected request must mint no verification at all", got, mintsAfterSignUp)
+	}
+
+	// And the account is still reachable at its own address: nothing about
+	// this rejected call moved it or armed anything that could.
+	stored, err := store.FindUserByID(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.Email != "nadia@example.com" {
+		t.Fatalf("stored email = %q, want %q", stored.Email, "nadia@example.com")
+	}
+}
+
+// TestRequestEmailChangeNoPasswordCredentialTreatedAsInvalid pins the
+// timing discipline this method borrows wholesale from
+// [Service.ChangePassword] and [Service.Login]: an account with NO password
+// credential (see UserBase's doc — a real, supported state) must not skip
+// the comparison and answer instantly. Dummy runs, Verify never runs
+// against an empty hash, and the caller gets the same ErrInvalidCredentials
+// a wrong password gets.
+func TestRequestEmailChangeNoPasswordCredentialTreatedAsInvalid(t *testing.T) {
+	spy := newSpyHasher()
+	svc, store := newTestService(t, auth.WithHasher(spy))
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, err := store.CreateUser(ctx, auth.UserBase{
+		ID:        "oauth-user-2",
+		Email:     "oauth2@example.com",
+		CreatedAt: now,
+		UpdatedAt: now,
+		// PasswordHash intentionally left empty.
+	}); err != nil {
+		t.Fatalf("seeding CreateUser: %v", err)
+	}
+
+	if _, err := svc.RequestEmailChange(ctx, "oauth-user-2", "anything", "elsewhere@example.com"); !errors.Is(err, auth.ErrInvalidCredentials) {
+		t.Fatalf("err = %v, want ErrInvalidCredentials", err)
+	}
+	hashN, verifyN, dummyN := spy.counts()
+	if hashN != 0 || verifyN != 0 || dummyN != 1 {
+		t.Fatalf("hasher calls (hash,verify,dummy) = (%d,%d,%d), want (0,0,1) — Verify must never run against an empty hash, and the comparison must not be skipped outright", hashN, verifyN, dummyN)
+	}
+}
+
+// TestRequestEmailChangeChecksCredentialBeforeValidatingNewEmail pins the
+// ORDER of the two rejections against each other, the same way
+// ChangePassword refuses to even validate `next` for a caller who failed
+// the current-password check. A caller who does not know the password
+// learns nothing about the address they proposed — not even that it was
+// malformed.
+func TestRequestEmailChangeChecksCredentialBeforeValidatingNewEmail(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "nadia2@example.com", validPassword)
+
+	_, err := svc.RequestEmailChange(ctx, user.ID, "not-the-current-password", "   ")
+	if !errors.Is(err, auth.ErrInvalidCredentials) {
+		t.Fatalf("err = %v, want ErrInvalidCredentials — the credential check must run before newEmail is even normalized", err)
+	}
+	if errors.Is(err, auth.ErrEmailRequired) {
+		t.Fatalf("err = %v, want ErrInvalidCredentials only — reporting ErrEmailRequired here tells an unauthenticated caller their input was parsed", err)
 	}
 }
 
@@ -4091,7 +4214,7 @@ func TestWithVerificationTTLAppliesToBothVerificationPurposes(t *testing.T) {
 		t.Fatalf("signup ExpiresAt = %v, want %v", signup.ExpiresAt, want)
 	}
 
-	changeTok, err := svc.RequestEmailChange(ctx, res.User.ID, "tilda-new@example.com")
+	changeTok, err := svc.RequestEmailChange(ctx, res.User.ID, validPassword, "tilda-new@example.com")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}

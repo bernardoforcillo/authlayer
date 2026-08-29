@@ -187,8 +187,10 @@ var (
 	// ErrEmailRequired: [Service.RequestEmailChange] was given a newEmail
 	// that is empty once normalized (see [NormalizeEmail] — this also
 	// catches a whitespace-only value, not just a literal ""). Checked
-	// before anything else, including the [Store.FindUserByID] existence
-	// check, so a malformed request never reaches the Store at all. Without
+	// after that method's [Store.FindUserByID] lookup and its
+	// current-password check, and before anything is minted: a caller who
+	// fails the credential check is told only [ErrInvalidCredentials],
+	// never that the address they proposed was also malformed. Without
 	// this guard, an empty newEmail minted a redeemable token exactly like
 	// any other, and successful redemption via [Service.VerifyEmail] set
 	// [UserBase.Email] to "" — a self-inflicted account lockout with no
@@ -349,9 +351,8 @@ func WithRefreshTTL(d time.Duration) Option {
 // deliberately shorter lifetime — see [WithPasswordResetTTL].
 //
 // Shortening this shortens the window in which an "email_change" token —
-// the strongest of the three, since [Service.RequestEmailChange] mints one
-// with no current password and [Service.VerifyEmail] redeems it with no
-// authentication at all — remains armed; see [Service.ChangePassword]'s
+// the strongest of the three, since [Service.VerifyEmail] redeems it with
+// no authentication at all — remains armed; see [Service.ChangePassword]'s
 // doc, "Why both purposes", for why that window matters.
 func WithVerificationTTL(d time.Duration) Option {
 	return func(c *config) {
@@ -1911,19 +1912,22 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // A still-valid "email_change" token is the STRONGER of the two, and
 // sweeping only the reset one left the stronger door open: it lives
 // [WithVerificationTTL]'s window (24h by default) rather than the reset
-// token's [WithPasswordResetTTL] one (1h by default),
-// [Service.RequestEmailChange] mints one with no current password at all
-// (so a briefly-stolen access token — which, per "What revocation does not
-// revoke" above, outlives even [Service.LogoutAll] for up to its own TTL —
-// suffices to arm it), and [Service.VerifyEmail] redeems it with NO
-// authentication whatsoever, moving the address to the attacker's via
-// [Store.UpdateUserEmail]. After that the victim cannot recover:
+// token's [WithPasswordResetTTL] one (1h by default), and
+// [Service.VerifyEmail] redeems it with NO authentication whatsoever,
+// moving the address to the attacker's via [Store.UpdateUserEmail]. After
+// that the victim cannot recover:
 // [Service.Login] and [Service.RequestPasswordReset] both look accounts up
-// BY email. Purpose-scoping the sweep is still right — an "email_change"
-// token is not a "password_reset" token, and this method deliberately does
-// not touch "signup" tokens, which grant nothing over the credential — but
-// purpose-scoping was never a reason to leave a credential-rotation bypass
-// armed.
+// BY email. [Service.RequestEmailChange] now requires the current password
+// to mint one (see its doc, "Why this needs the current password"), so an
+// attacker can no longer arm this from a stolen session alone — but a
+// token armed BEFORE the credential leaked, or by the owner themselves
+// before they suspected anything, is exactly what this sweep is for, and
+// the whole point of a password change is that the old password may be in
+// someone else's hands. Purpose-scoping the sweep is still right — an
+// "email_change" token is not a "password_reset" token, and this method
+// deliberately does not touch "signup" tokens, which grant nothing over
+// the credential — but purpose-scoping was never a reason to leave a
+// credential-rotation bypass armed.
 //
 // Both sweeps carry the SAME guarantee, and it is SEQUENTIAL ONLY: nothing
 // orders either against a concurrently-running [Service.RequestPasswordReset]
@@ -2337,14 +2341,16 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 // The email_change sweep closes the stronger of the two doors, and sweeping
 // only the reset one left it open: an "email_change" token lives
 // [WithVerificationTTL]'s window (24h by default) rather than this token's
-// [WithPasswordResetTTL] one (1h by default), is minted with
-// no current password at all by [Service.RequestEmailChange], and is
-// redeemed by [Service.VerifyEmail] with NO authentication whatsoever —
-// moving the account to the attacker's address, after which the victim
-// cannot recover, since [Service.Login] and [Service.RequestPasswordReset]
-// both look accounts up BY email. A reset is a credential rotation, most
-// often performed precisely because the account may be compromised, so it
-// must not leave that armed.
+// [WithPasswordResetTTL] one (1h by default), and is redeemed by
+// [Service.VerifyEmail] with NO authentication whatsoever — moving the
+// account to the attacker's address, after which the victim cannot
+// recover, since [Service.Login] and [Service.RequestPasswordReset] both
+// look accounts up BY email. Minting one now takes the current password
+// ([Service.RequestEmailChange]), so it can no longer be armed from a
+// stolen session alone; a token armed before the credential leaked still
+// can be, and a reset is a credential rotation most often performed
+// precisely because the account may be compromised, so it must not leave
+// that armed.
 //
 // These are the same two side doors [Service.ChangePassword] closes for its
 // own, differently-triggered path, with the identical SEQUENTIAL-ONLY scope
@@ -2487,10 +2493,39 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 
 // RequestEmailChange mints an "email_change" [Verification] bound to
 // newEmail for the already-authenticated user identified by userID, and
-// returns its plaintext token. Redeeming it — via [Service.VerifyEmail],
-// which recognises [PurposeEmailChange] — overwrites the account's email to
-// newEmail and marks that address verified; see VerifyEmail's own doc for
-// the redemption side.
+// returns its plaintext token — but only after current verifies against
+// that account's existing password credential. Redeeming it — via
+// [Service.VerifyEmail], which recognises [PurposeEmailChange] —
+// overwrites the account's email to newEmail and marks that address
+// verified; see VerifyEmail's own doc for the redemption side.
+//
+// # Why this needs the current password
+//
+// This method ARMS a rotation of the account's login identifier, and
+// [Service.VerifyEmail] then redeems it with no authentication whatsoever.
+// So it is held to the same standard as [Service.ChangePassword], which
+// rotates the other credential and has always required the current
+// password: an authenticated session alone is not enough to arm either one.
+//
+// Without this check the two rotations were asymmetric, and that asymmetry
+// was itself the vulnerability. A briefly-held session — or a leaked
+// access token, which per every revocation path's "What this does not
+// revoke" section stays honoured for up to its own TTL even after
+// [Service.LogoutAll] — bought an "email_change" token living
+// [WithVerificationTTL]'s window (24h by default). Redeeming it moves the
+// account to the attacker's address via [Store.UpdateUserEmail], after
+// which the victim cannot recover: [Service.Login] and
+// [Service.RequestPasswordReset] both look accounts up BY email. Requiring
+// the password does not merely narrow that window; it removes the step
+// change, because an attacker who has the password already owns the
+// account by every other door too.
+//
+// The sweeps in [Service.ChangePassword], [Service.ResetPassword] and
+// [Service.LogoutAll] contain an already-armed token; this check is what
+// stops one being armed in the first place. Both halves are wanted: the
+// sweeps still matter for a token the user armed themselves and then
+// changed their mind about, or armed before a compromise they only later
+// noticed.
 //
 // Unlike [Service.SignUp] and [Service.RequestPasswordReset], this method
 // is not held to an enumeration-safety discipline: userID identifies an
@@ -2500,22 +2535,33 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 // needs to give nothing to. Accordingly it fails loudly and early rather
 // than uniformly:
 //
-//  1. newEmail is normalized (see [NormalizeEmail]) and, if that leaves it
-//     empty — a literal "", or whitespace-only input — this returns
-//     [ErrEmailRequired] before touching the [Store] at all. Without this,
-//     an empty newEmail minted a token exactly like any other, and a
-//     successful redemption via [Service.VerifyEmail] set [UserBase.Email]
-//     to "": reproduced directly, this bricks the account — [Service.Login]
-//     and [Service.RequestPasswordReset] both look accounts up BY email, so
-//     an account with no email cannot be reached by either again. This was
-//     this method's only input check before this guard was added; removing
-//     it (see the ErrEmailTaken discussion below, which removed the OTHER
-//     check) would have left newEmail entirely unvalidated.
-//  2. [Store.FindUserByID] loads userID; ErrUserNotFound propagates as-is
+//  1. [Store.FindUserByID] loads userID; ErrUserNotFound propagates as-is
 //     rather than being folded into some enumeration-safe shape — an
 //     invalid userID here is a caller bug (a stale or forged id), not an
 //     anonymous probe.
-//  3. A fresh [Verification] is minted with Purpose [PurposeEmailChange]
+//  2. current is checked against the stored hash, with the SAME timing
+//     discipline [Service.ChangePassword] and [Service.Login] apply to
+//     their own: an account holding no password credential at all
+//     (PasswordHash == "" — see [UserBase]'s doc) runs
+//     [password.Hasher.Dummy] and then returns [ErrInvalidCredentials],
+//     so "this account cannot be verified against" costs the same as "the
+//     password was simply wrong" and is reported identically. A mismatch
+//     is ErrInvalidCredentials too; nothing is written, and newEmail is
+//     never even normalized, so a caller who does not know the password
+//     learns nothing about the address they proposed either — the same
+//     stance ChangePassword takes on next.
+//  3. newEmail is normalized (see [NormalizeEmail]) and, if that leaves it
+//     empty — a literal "", or whitespace-only input — this returns
+//     [ErrEmailRequired]. Without this, an empty newEmail minted a token
+//     exactly like any other, and a successful redemption via
+//     [Service.VerifyEmail] set [UserBase.Email] to "": reproduced
+//     directly, this bricks the account — [Service.Login] and
+//     [Service.RequestPasswordReset] both look accounts up BY email, so an
+//     account with no email cannot be reached by either again. This was
+//     this method's only input check before the guard above was added;
+//     removing it (see the ErrEmailTaken discussion below, which removed
+//     the OTHER check) would have left newEmail entirely unvalidated.
+//  4. A fresh [Verification] is minted with Purpose [PurposeEmailChange]
 //     and Email set to newEmail (never the account's OLD address — see
 //     [Verification.Email]'s doc for why this field always carries the NEW
 //     address for this purpose specifically), using the same
@@ -2527,30 +2573,46 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 // method into an un-rate-limited "is this address registered?" oracle for
 // ANY authenticated caller — one signup buys unlimited queries against
 // arbitrary addresses, with no [RateLimiter] of any kind gating it, unlike
-// [Service.RequestPasswordReset]'s carefully-bounded equivalent. The
-// pre-check was never the actual enforcement point: [Store.UpdateUserEmail]
-// re-checks the identical condition atomically at REDEMPTION time
-// regardless (see that method's doc), which is what genuinely closes the
-// two-callers-racing-the-same-address race. Removing the pre-check costs a
-// caller nothing but the timing of discovery: a request for an
-// already-taken address still mints a token exactly like any other, and
-// [Service.VerifyEmail] surfaces [ErrEmailTaken] at redemption instead —
-// the one-time token is burned for nothing in that case, the same
-// already-accepted cost [Service.VerifyEmail]'s "claims before applies"
-// ordering imposes for every other doomed redemption. Requesting a change
-// to the account's OWN current address is not an error either way: at
-// redemption, [Store.UpdateUserEmail]'s uniqueness check excludes the
-// caller's own row.
+// [Service.RequestPasswordReset]'s carefully-bounded equivalent. (The
+// current-password check above narrows that oracle to a caller who also
+// knows the account's password, but it was never the reason the pre-check
+// had to go.) The pre-check was never the actual enforcement point:
+// [Store.UpdateUserEmail] re-checks the identical condition atomically at
+// REDEMPTION time regardless (see that method's doc), which is what
+// genuinely closes the two-callers-racing-the-same-address race. Removing
+// the pre-check costs a caller nothing but the timing of discovery: a
+// request for an already-taken address still mints a token exactly like
+// any other, and [Service.VerifyEmail] surfaces [ErrEmailTaken] at
+// redemption instead — the one-time token is burned for nothing in that
+// case, the same already-accepted cost [Service.VerifyEmail]'s "claims
+// before applies" ordering imposes for every other doomed redemption.
+// Requesting a change to the account's OWN current address is not an error
+// either way: at redemption, [Store.UpdateUserEmail]'s uniqueness check
+// excludes the caller's own row.
 //
-// A Store or [token.GenerateOpaque] error at any step is returned as-is.
-func (s *Service) RequestEmailChange(ctx context.Context, userID, newEmail string) (string, error) {
+// A Store, Hasher or [token.GenerateOpaque] error at any step is returned
+// as-is.
+func (s *Service) RequestEmailChange(ctx context.Context, userID, current, newEmail string) (string, error) {
+	u, err := s.store.FindUserByID(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+
+	// The credential gate, before anything else this method could report —
+	// see the method doc's "Why this needs the current password". This is
+	// [Service.ChangePassword]'s check, verbatim, because arming an
+	// identifier rotation is the same kind of act as rotating the password.
+	if u.PasswordHash == "" {
+		s.cfg.hasher.Dummy(current)
+		return "", ErrInvalidCredentials
+	}
+	if !s.cfg.hasher.Verify(current, u.PasswordHash) {
+		return "", ErrInvalidCredentials
+	}
+
 	normalized := NormalizeEmail(newEmail)
 	if normalized == "" {
 		return "", ErrEmailRequired
-	}
-
-	if _, err := s.store.FindUserByID(ctx, userID); err != nil {
-		return "", err
 	}
 
 	now := s.cfg.clock()
