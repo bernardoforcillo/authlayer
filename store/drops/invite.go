@@ -5,8 +5,9 @@ import (
 	"errors"
 	"time"
 
-	"github.com/bernardoforcillo/authlayer/invite"
 	"github.com/bernardoforcillo/drops/pg"
+
+	"github.com/bernardoforcillo/authlayer/invite"
 )
 
 // InviteNames are the two table names an InviteStore persists to. The zero

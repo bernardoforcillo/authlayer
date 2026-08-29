@@ -7,9 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bernardoforcillo/drops/pg"
+
 	"github.com/bernardoforcillo/authlayer/org"
 	"github.com/bernardoforcillo/authlayer/scope"
-	"github.com/bernardoforcillo/drops/pg"
 )
 
 func TestColSetTypesIDColumnsAsUUID(t *testing.T) {

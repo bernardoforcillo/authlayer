@@ -4,9 +4,10 @@ import (
 	"context"
 	"errors"
 
-	"github.com/bernardoforcillo/authlayer/access"
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
+
+	"github.com/bernardoforcillo/authlayer/access"
 )
 
 // MembershipGuard builds a drops query guard that restricts a resource table's

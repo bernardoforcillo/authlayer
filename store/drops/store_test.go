@@ -8,10 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bernardoforcillo/authlayer/org"
-	"github.com/bernardoforcillo/authlayer/scope"
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
+
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/scope"
 )
 
 // Compile-time proof the drops store satisfies the Store port.

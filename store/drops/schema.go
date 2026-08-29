@@ -12,8 +12,9 @@
 package dropsstore
 
 import (
-	"github.com/bernardoforcillo/authlayer/scope"
 	"github.com/bernardoforcillo/drops/pg"
+
+	"github.com/bernardoforcillo/authlayer/scope"
 )
 
 // Names are the three table names a scope instance persists to. The zero value

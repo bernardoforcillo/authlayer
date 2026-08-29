@@ -7,8 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bernardoforcillo/authlayer/invite"
 	"github.com/bernardoforcillo/drops/pg"
+
+	"github.com/bernardoforcillo/authlayer/invite"
 )
 
 func newInviteStore(fd *fakeDriver) *InviteStore {

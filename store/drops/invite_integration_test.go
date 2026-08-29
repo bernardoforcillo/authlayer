@@ -19,12 +19,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bernardoforcillo/authlayer/internal/uid"
-	"github.com/bernardoforcillo/authlayer/invite"
-	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
 	"github.com/bernardoforcillo/drops/pg"
 	"github.com/bernardoforcillo/drops/stdlib"
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/bernardoforcillo/authlayer/internal/uid"
+	"github.com/bernardoforcillo/authlayer/invite"
+	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
 )
 
 // newLiveInviteStore opens a connection from AUTHLAYER_TEST_DSN, builds a

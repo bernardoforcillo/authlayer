@@ -5,9 +5,10 @@ import (
 	"errors"
 	"time"
 
-	"github.com/bernardoforcillo/authlayer/scope"
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
+
+	"github.com/bernardoforcillo/authlayer/scope"
 )
 
 // Store is a drops-backed scope.Store[C, M]. It is pure persistence: the engine

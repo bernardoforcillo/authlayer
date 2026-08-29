@@ -1053,8 +1053,10 @@ func TestLoginRateLimitKeyedByIPNotEmail(t *testing.T) {
 	limiter := &fakeLimiter{allow: true}
 	svc, _ := newTestService(t, auth.WithRateLimiter(limiter))
 
-	svc.Login(context.Background(), "victim@example.com", "x", "198.51.100.7", "")
-	svc.Login(context.Background(), "someone-else@example.com", "x", "198.51.100.7", "")
+	// Both calls fail (no such accounts) — this test is about which key the
+	// limiter was asked about, not the outcome.
+	_, _ = svc.Login(context.Background(), "victim@example.com", "x", "198.51.100.7", "")
+	_, _ = svc.Login(context.Background(), "someone-else@example.com", "x", "198.51.100.7", "")
 
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()

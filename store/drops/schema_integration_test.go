@@ -8,11 +8,12 @@ import (
 	"os"
 	"testing"
 
-	"github.com/bernardoforcillo/authlayer/org"
-	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
 	"github.com/bernardoforcillo/drops/pg"
 	"github.com/bernardoforcillo/drops/stdlib"
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/bernardoforcillo/authlayer/org"
+	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
 )
 
 // Proves CreateSchema's plpgsql DO block actually lands the composite

@@ -16,13 +16,14 @@ import (
 	"os"
 	"testing"
 
+	"github.com/bernardoforcillo/drops/pg"
+	"github.com/bernardoforcillo/drops/stdlib"
+	_ "github.com/jackc/pgx/v5/stdlib"
+
 	"github.com/bernardoforcillo/authlayer/access"
 	"github.com/bernardoforcillo/authlayer/internal/uid"
 	"github.com/bernardoforcillo/authlayer/org"
 	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
-	"github.com/bernardoforcillo/drops/pg"
-	"github.com/bernardoforcillo/drops/stdlib"
-	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 func TestDropsStoreIntegration(t *testing.T) {

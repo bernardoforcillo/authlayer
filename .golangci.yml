@@ -1,52 +1,82 @@
+# golangci-lint v2 configuration for authlayer.
+#
+# Run it with `golangci-lint run` (v2.x required — the `version` key below is
+# what selects the v2 schema; a v1 binary refuses this file).
+#
+# Everything under `linters.enable` is IN ADDITION to golangci-lint's own
+# defaults, which already cover errcheck, govet, ineffassign, staticcheck
+# (gosimple was folded into it in v2) and unused.
+version: "2"
+
+run:
+  # Lint the integration lane too. Those files carry `//go:build integration`
+  # and are otherwise invisible to every static check in this file — about
+  # 3.5k lines of the suite, including the live PostgreSQL tests.
+  build-tags:
+    - integration
+  tests: true
+
 linters:
   enable:
     - bodyclose
-    - errcheck
     - gocritic
-    - goimports
-    - gosimple
-    - govet
-    - ineffassign
     - noctx
     - nolintlint
-    - staticcheck
     - unconvert
     - unparam
-    - unused
 
-linters-settings:
-  errcheck:
-    # Builder.WriteByte returns error only to satisfy io.ByteWriter (go
-    # vet's stdmethods check requires the signature); the error is always
-    # nil. Skip it, exactly as errcheck skips (*strings.Builder).WriteByte
-    # by default.
-    exclude-functions:
-      - (*github.com/bernardoforcillo/drops.Builder).WriteByte
-  goimports:
-    local-prefixes: github.com/bernardoforcillo/drops
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - style
-    disabled-checks:
-      - commentFormatting  # not enforced here
-      - ifElseChain
-  unparam:
-    check-exported: false  # exported API params are intentional
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+      disabled-checks:
+        # This codebase's doc comments are deliberately long-form prose with
+        # section headings and indented lists; commentFormatting fights that.
+        - commentFormatting
+        - ifElseChain
+        # Deliberate: every exported function here carries a doc comment
+        # that names and explains each result at length, and the nine sites
+        # this fires on are seven test helpers plus two functions whose
+        # godoc already says more than a parameter name could. Naming
+        # results to satisfy a style check would duplicate that prose in a
+        # worse place.
+        - unnamedResult
+    unparam:
+      # Exported signatures are contracts, not incidental — a parameter this
+      # package never varies today is still part of the port's shape.
+      check-exported: false
+
+  exclusions:
+    generated: lax
+    presets:
+      # errcheck on os/io housekeeping (.Close, .Flush, print*, os.Setenv).
+      # The Close calls this suppresses are all `defer rows.Close()` /
+      # `defer conn.Close()` in the live-PostgreSQL lane, where the error
+      # cannot inform the test; a leaked HTTP body is caught by bodyclose
+      # instead, which is enabled above.
+      - std-error-handling
+    rules:
+      # Shadowing in tests is the ordinary Go pattern (err, ctx, ...).
+      - path: _test\.go
+        linters: [govet]
+        text: shadow
+      # Test helpers deliberately take parameters they always pass the same
+      # value for: `mustSignUp(t, svc, "gina@example.com", validPassword)`
+      # reads as one fact at the call site, and the day a test needs a
+      # different password the helper is already shaped for it.
+      - path: _test\.go
+        linters: [unparam]
 
 issues:
-  # Don't report shadowing in test files — common Go test pattern.
-  exclude-rules:
-    - path: "_test\\.go"
-      linters: [govet]
-      text: "shadow"
-    # Example test files may have unused exported symbols.
-    - path: "example_test\\.go"
-      linters: [unused, unparam]
-  # Raise the line limit a bit for table-driven tests.
   max-issues-per-linter: 0
   max-same-issues: 0
 
-run:
-  timeout: 5m
-  tests: true
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/bernardoforcillo/authlayer

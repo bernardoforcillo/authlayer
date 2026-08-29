@@ -35,15 +35,16 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/bernardoforcillo/authlayer/auth"
-	"github.com/bernardoforcillo/authlayer/internal/uid"
-	"github.com/bernardoforcillo/authlayer/password"
-	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
 	"github.com/bernardoforcillo/drops/stdlib"
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/internal/uid"
+	"github.com/bernardoforcillo/authlayer/password"
+	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
 )
 
 // liveTestPassword satisfies password.DefaultRules() and is shared by the
@@ -1798,9 +1799,9 @@ type recordingDriver struct {
 	execs []string
 }
 
-func (d *recordingDriver) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
-	d.execs = append(d.execs, sql)
-	return d.Driver.Exec(ctx, sql, args...)
+func (d *recordingDriver) Exec(ctx context.Context, query string, args ...any) (drops.Result, error) {
+	d.execs = append(d.execs, query)
+	return d.Driver.Exec(ctx, query, args...)
 }
 
 func (d *recordingDriver) last() string {
@@ -1810,13 +1811,13 @@ func (d *recordingDriver) last() string {
 	return d.execs[len(d.execs)-1]
 }
 
-// explain returns the plan for sql with args bound, as one newline-joined
+// explain returns the plan for query with args bound, as one newline-joined
 // string.
-func explain(t *testing.T, sqlDB *sql.DB, sql string, args ...any) string {
+func explain(t *testing.T, sqlDB *sql.DB, query string, args ...any) string {
 	t.Helper()
-	rows, err := sqlDB.QueryContext(context.Background(), "EXPLAIN "+sql, args...)
+	rows, err := sqlDB.QueryContext(context.Background(), "EXPLAIN "+query, args...)
 	if err != nil {
-		t.Fatalf("EXPLAIN %s: %v", sql, err)
+		t.Fatalf("EXPLAIN %s: %v", query, err)
 	}
 	defer rows.Close()
 	var lines []string

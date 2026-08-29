@@ -7,10 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bernardoforcillo/authlayer/auth"
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/bernardoforcillo/authlayer/auth"
 )
 
 func newAuthStore(fd *fakeDriver) *AuthStore {
