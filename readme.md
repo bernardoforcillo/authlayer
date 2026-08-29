@@ -481,17 +481,55 @@ owe the engine is the right sentinel error when a lookup finds nothing —
 those. Each method's contract is documented on the interface.
 
 `invite.Store` and `auth.Store` are separate ports with the same discipline,
-and both backends implement all three. `auth.Store` is the strictest of them.
-Four of its eighteen methods — `MarkRotated`, `CreateSuccessorSession`,
-`MarkEmailVerified` and `UpdateUserEmail` — carry an explicit atomicity
-**MUST**, each naming the failure it prevents, because splitting any of them
-into a read and a later write reopens a security hole rather than merely
-narrowing a race. Two more carry obligations `SignUp`'s enumeration safety
-leans on: `CreateUser` must decide `ErrEmailTaken` from the same attempt that
-performs the write, and `FindUserByEmail` must read its own writes. All six
-are written on the interface as requirements with their consequences spelled
-out, because they constrain any third-party backend as much as the two shipped
-ones — see [Authentication](#enumeration-safe-sign-up).
+and both backends implement all three. `auth.Store` is the strictest of them:
+six of its eighteen methods carry an explicit **MUST**, each naming the
+failure it prevents. They are not all the same kind of obligation, and the
+difference matters to anyone writing a third-party backend.
+
+**Three demand atomicity** — `MarkRotated`, `CreateSuccessorSession` and
+`MarkEmailVerified`. Splitting any of them into a read and a later write
+reopens a security hole rather than merely narrowing a race: two successful
+rotations of one token, a successor resurrecting a family that was revoked
+mid-rotation, an address certified that nobody proved control of.
+
+**Two are what `SignUp`'s enumeration safety leans on** — `CreateUser` must
+decide `ErrEmailTaken` from the same attempt that performs the write, and
+`FindUserByEmail` must read its own writes. Either one violated turns a
+single `SignUp` call into an "is this address registered?" oracle from inside
+the store, where no amount of care in `SignUp` itself can see it.
+
+**One demands the opposite of the other five: an *extra* read, and
+serialization.** `DeleteSessionsByFamily` carries two **MUST**s that apply to
+any backend whose `CreateSuccessorSession` holds a row-level lock on the
+predecessor for a transaction's duration — the shape `store/drops` uses.
+A single autocommit `DELETE FROM sessions WHERE family_id = $1` is **not
+sufficient** there: its snapshot is taken *before* it waits for that lock, so
+once unblocked it deletes only what existed at the earlier instant and misses
+the successor committed while it waited — leaving a revoked family with one
+live, fully rotating session. Such a backend must re-snapshot *after* the
+wait (a `SELECT ... FOR UPDATE` over the family's rows, then the `DELETE`,
+in one transaction), and must *additionally* serialize concurrent calls on
+the same family, because that locking `SELECT` has no ordering guarantee and
+two callers can deadlock each other. A per-family advisory transaction lock
+taken before the `SELECT` is sufficient; an `ORDER BY` on the `SELECT` is
+not, since the `DELETE` that follows has no ordering of its own. A backend
+whose `CreateSuccessorSession` takes no such lock — `store/memory`, whose
+single mutex spans both methods' whole bodies — has no gap to close and owes
+neither.
+
+`UpdateUserEmail` states its own atomicity descriptively ("the same
+discipline `CreateUser` uses") rather than as a **MUST**. Every service
+invariant that leans on it needs it, so read it as one.
+
+Separately, `Session.TokenHash` and `Verification.TokenHash` each carry a
+uniqueness **MUST** on the record type rather than on a method — a `UNIQUE`
+constraint in a SQL backend. `MarkRotated`'s single-winner contract breaks
+without it *with no atomicity defect at all*, so a backend that satisfies
+every method obligation above and skips these is still wrong.
+
+All of them are written on the port as requirements with their consequences
+spelled out, because they constrain any third-party backend as much as the
+two shipped ones — see [Authentication](#enumeration-safe-sign-up).
 
 ### `store/memory`
 

@@ -1140,6 +1140,20 @@ func (s *Service[U, PU]) VerifyEmail(ctx context.Context, plainToken string) (U,
 // sharing this login to sign in again: a deliberate, security-first
 // tradeoff, not an oversight.
 //
+// With one bound, and it is sharpest exactly here. "Sign in again" means
+// every [Session] row is gone, so no REFRESH token in this family works. It
+// does NOT invalidate an ACCESS token already issued for any of them: a
+// short-lived HS256 JWT (see [WithJWT] — 15 minutes by default) is
+// stateless, and this package never looks a presented one up in the [Store]
+// (see [token.Parse]). In the worst case just described — an attacker who
+// rotated into a successor moments before this revocation — that attacker
+// holds a freshly-minted access token and keeps whatever access it alone
+// authorizes for up to its full TTL AFTER the alarm has fired and the
+// family is gone. Reuse detection contains the compromise at the refresh
+// boundary, not instantly. See [Service.LogoutAll]'s doc, "What this does
+// not revoke", for the same bound stated in full and for the SessionID
+// ("sid") claim that is the hook for closing it.
+//
 // # Why step 5 exists
 //
 // Winning step 3 proves the predecessor row existed and was unrotated at
@@ -1345,6 +1359,21 @@ func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (Logi
 // benign "session expired". Confirmed against live PostgreSQL as well as
 // the in-memory store.
 //
+// # What this does not revoke
+//
+// Either way — one row or the whole family — "revoked" means the [Session]
+// row is gone, so the REFRESH token cannot be presented again. It does NOT
+// invalidate an ACCESS token already issued for that session: a short-lived
+// HS256 JWT (see [WithJWT] — 15 minutes by default) is stateless, and this
+// package never looks a presented one up in the [Store] (see [token.Parse]).
+// A device holding one keeps working, on whatever its access token alone
+// authorizes, for up to the remainder of that token's own TTL after this
+// call. The family case is the one to watch: it now signs out MORE than the
+// caller presented, and every one of those devices keeps its current access
+// token for up to a full TTL. See [Service.LogoutAll]'s doc, "What this does
+// not revoke", for the same bound in full and for the SessionID ("sid")
+// claim that is the hook for closing it.
+//
 // A non-sentinel Store error is returned as-is; see the package's "Fail
 // closed" constraint.
 func (s *Service[U, PU]) Logout(ctx context.Context, refreshPlain string) error {
@@ -1379,8 +1408,9 @@ func (s *Service[U, PU]) Logout(ctx context.Context, refreshPlain string) error 
 }
 
 // LogoutAll revokes every session belonging to userID, across every
-// family — every device and browser this user is currently signed in on.
-// A user with none is not an error.
+// family — every device and browser this user is currently signed in on,
+// bounded by "What this does not revoke" below. A user with none is not an
+// error.
 //
 // This is implemented as one [Store.DeleteSessionsByFamily] call per
 // DISTINCT family among the user's sessions, rather than one
@@ -1390,6 +1420,34 @@ func (s *Service[U, PU]) Logout(ctx context.Context, refreshPlain string) error 
 // for why those rows are retained rather than deleted at rotation time),
 // not merely whichever rows happened to still exist at the instant the
 // list was read.
+//
+// # What this does not revoke
+//
+// "Every device" above means every [Session] row — every REFRESH token — is
+// gone: [Service.Refresh] on any of them now fails, and
+// [Service.ListSessions] returns nothing. It does NOT invalidate an ACCESS
+// token already issued for any of those sessions. A short-lived HS256 JWT
+// (see [WithJWT] — 15 minutes by default) is stateless by design, and this
+// package never looks a presented one up in the [Store], only verifies its
+// signature and expiry (see [token.Parse]). A device holding one keeps
+// working, on every request its access token alone authorizes, for up to
+// the remainder of that token's own TTL after this call has removed every
+// session it had. So the refresh side is revoked INSTANTLY and the access
+// side WITHIN ONE ACCESS TTL — read the "every device and browser" sentence
+// above with that bound attached.
+//
+// This is inherent to a stateless access token, not a defect of this
+// method, and every other revocation path in this package
+// ([Service.Logout], [Service.RevokeSession], [Service.ChangePassword],
+// [Service.ResetPassword], and [Service.Refresh]'s own reuse response)
+// carries it identically. An application that needs another device's access
+// to stop being honoured sooner than that TTL must check the SessionID
+// ("sid") claim (see [token.Claims.SessionID], stamped by [Service.Login]
+// and [Service.Refresh] at mint time) against the [Store] on every request
+// — the same per-request lookup [Service.Refresh] and
+// [Service.RevokeSession] already perform — rather than trusting a parsed,
+// still-unexpired JWT alone. Shortening the access TTL through [WithJWT]
+// narrows the window without closing it.
 func (s *Service[U, PU]) LogoutAll(ctx context.Context, userID string) error {
 	sessions, err := s.store.ListSessionsByUser(ctx, userID)
 	if err != nil {
@@ -1468,6 +1526,22 @@ func (s *Service[U, PU]) ListSessions(ctx context.Context, userID string) ([]Ses
 // superseded entry, returned nil, and left the device refreshing from its
 // current successor: a revocation UI that reports success and signs nobody
 // out.
+//
+// # What this does not revoke
+//
+// "Sign this device out" is a claim about [Session] rows, which is to say
+// about the family's REFRESH tokens: they are gone, and [Service.Refresh]
+// on any of them fails immediately. It does NOT invalidate an ACCESS token
+// the device was already issued. That token is a stateless HS256 JWT (see
+// [WithJWT] — 15 minutes by default) this package never looks up in the
+// [Store], only verifies (see [token.Parse]), so the revoked device keeps
+// whatever its access token alone authorizes for up to the remainder of
+// that token's own TTL after this call returns nil. A "your devices" screen
+// that reports "signed out" immediately is therefore accurate about the
+// refresh side and up to one access TTL early about the rest — worth saying
+// in the UI if the distinction matters to the operator. See
+// [Service.LogoutAll]'s doc, "What this does not revoke", for the same
+// bound in full and for the SessionID ("sid") claim that closes it.
 func (s *Service[U, PU]) RevokeSession(ctx context.Context, userID, sessionID string) error {
 	sessions, err := s.store.ListSessionsByUser(ctx, userID)
 	if err != nil {

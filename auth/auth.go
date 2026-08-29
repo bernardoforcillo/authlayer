@@ -56,6 +56,35 @@
 // deliberate, security-first tradeoff: an occasional false positive from a
 // genuine race is the cost of never leaving a stolen token's family alive.
 //
+// # What revocation revokes, and what it does not
+//
+// Every "sign in again" and "every device" claim in this package — here, in
+// [Store.DeleteSessionsByFamily]'s own doc, and in [Service.Logout],
+// [Service.LogoutAll], [Service.RevokeSession], [Service.ChangePassword],
+// [Service.ResetPassword] and [Service.Refresh]'s reuse response — is a claim
+// about [Session] rows, which is to say about REFRESH tokens. Deleting them
+// is instant and complete: no deleted session can be refreshed, and none is
+// listed.
+//
+// It says nothing about an ACCESS token already issued for one of those
+// sessions. That token is a stateless HS256 JWT; the service layer verifies
+// its signature and expiry
+// ([github.com/bernardoforcillo/authlayer/token.Parse]) and never looks it
+// up in a Store, so a device holding one keeps whatever access it alone
+// authorizes for up to the remainder of its own TTL (15 minutes by
+// Service's default) after every session behind it is gone. The refresh
+// side is revocable instantly, the access side within one access TTL, and
+// no revocation path in this package narrows the second one.
+//
+// The hook for closing that gap is the SessionID ("sid") claim
+// ([github.com/bernardoforcillo/authlayer/token.Claims]), stamped at mint
+// time with the id of the session the token came from: an application that
+// needs another device's access to stop sooner than the TTL looks sid up in
+// the Store on every request rather than trusting a parsed, still-unexpired
+// JWT. This package puts sid in the token so that choice exists; it does
+// not make the choice, because the cost is a database round trip per
+// request. See [Service.LogoutAll]'s doc, "What this does not revoke".
+//
 // # Verification tokens
 //
 // [Verification] covers three one-time flows that all share the same shape —
