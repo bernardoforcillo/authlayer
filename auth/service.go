@@ -276,6 +276,18 @@ type config struct {
 	resetLimiter         RateLimiter
 	claimsExtender       func(UserBase) map[string]any
 	requireVerifiedEmail bool
+	// identityStore is the OPTIONAL external-identity port — see
+	// [WithIdentityStore]. nil means no external sign-in is configured, and
+	// every entry point needing it fails with [ErrOAuthNotConfigured]
+	// rather than dereferencing this.
+	identityStore IdentityStore
+	// linking is the implicit-link policy for external sign-in — see
+	// [Linking] and [WithLinking]. It is deliberately left at its ZERO
+	// VALUE by defaultConfig rather than assigned there: [LinkVerified] is
+	// that zero value, so a config built by any route at all — including
+	// one a future refactor forgets to run through defaultConfig — carries
+	// the safe policy. See [LinkVerified]'s own doc.
+	linking Linking
 }
 
 func defaultConfig() config {
@@ -586,6 +598,53 @@ func WithClaimsExtender(f func(UserBase) map[string]any) Option {
 	}
 }
 
+// WithIdentityStore wires the OPTIONAL [IdentityStore] port, enabling
+// external ("sign in with Google/GitHub/…") identities. The default is nil:
+// a Service built without this option persists no identities at all, and
+// every entry point that needs the port refuses with
+// [ErrOAuthNotConfigured] rather than dereferencing nil. A nil s is ignored,
+// leaving the default (or a prior option) in place.
+//
+// It is a separate port, not part of [Store], because [Store] is released:
+// adding a method to it would break every third-party backend. See
+// [IdentityStore]'s own doc, and auth/identity.go's package doc, for the
+// boundary this port keeps — in particular that authlayer stores no provider
+// access or refresh tokens.
+func WithIdentityStore(s IdentityStore) Option {
+	return func(c *config) {
+		if s != nil {
+			c.identityStore = s
+		}
+	}
+}
+
+// WithLinking sets the [Linking] policy governing when an external sign-in
+// may implicitly attach a provider's identity to a PRE-EXISTING local
+// account matched by email address. The default is [LinkVerified], which is
+// Linking's zero value — see that constant's doc for why the safe policy is
+// the one a caller gets by saying nothing.
+//
+// It PANICS when m is not one of the three declared constants, rather than
+// silently falling back to some policy the caller did not choose. A linking
+// mode is a security decision made once, at wiring time, by a human reading
+// this option's doc; a typo'd or out-of-range value is a construction bug,
+// and the alternative — a Service that exists holding a mode no branch of
+// the ladder handles — is either a runtime denial nobody can explain or, far
+// worse, a fallback that links more freely than intended. This matches
+// [github.com/bernardoforcillo/authlayer/scope.New]'s stance on WithParent
+// and [github.com/bernardoforcillo/authlayer/access.Access.NewRole]'s on a
+// mis-declared role.
+func WithLinking(m Linking) Option {
+	return func(c *config) {
+		switch m {
+		case LinkVerified, LinkNever, LinkAlways:
+			c.linking = m
+		default:
+			panic(fmt.Sprintf("authlayer/auth: WithLinking(%d): unknown linking mode", int(m)))
+		}
+	}
+}
+
 // SignUpResult is the outcome of [Service.SignUp]. Both branches return a
 // nil error; Created and VerifyToken are what differ, and User is populated
 // only on the new-account branch.
@@ -682,10 +741,14 @@ type Service struct {
 
 // New wires a [Store] and options into a Service.
 //
-// It cannot fail: every [Option] either applies a valid value or leaves the
-// default in place (each option's own doc says which inputs it ignores), and
-// there is no type argument to get wrong. That is why it returns no error,
-// matching every other constructor in this codebase (scope.New, invite.New).
+// It returns no error, matching every other constructor in this codebase
+// (scope.New, invite.New): every [Option] but one either applies a valid
+// value or leaves the default in place (each option's own doc says which
+// inputs it ignores), and there is no type argument to get wrong. The
+// exception is [WithLinking], which PANICS on a mode outside its three
+// declared constants rather than leaving the Service holding a policy no
+// branch handles — see that option's doc, and scope.New, which takes the
+// same construction-time stance on WithParent.
 // The one configuration this constructor cannot check for you is [WithJWT]:
 // there is no default signing key, so a Service built without one — or with
 // one under the 32-byte HS256 floor — fails closed the first time
