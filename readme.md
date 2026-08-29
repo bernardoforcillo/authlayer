@@ -1090,13 +1090,12 @@ closing it.
 
 A library that returns a token cannot fake "we emailed the account already on
 file", so `SignUp` does not try: a duplicate address is **not an error**. Both
-outcomes return `(SignUpResult, nil)`, and `Created` is the only field that
-tells them apart.
+outcomes return `(SignUpResult, nil)`.
 
 ```go
 again, err := svc.SignUp(ctx, "BOB@example.com", "Some-Other-Password-9")
 fmt.Println(again.Created, again.VerifyToken == "", err) // false true <nil>
-fmt.Println(again.User.Email, again.User.PasswordHash == "") // bob@example.com true
+fmt.Println(again.User == (auth.UserBase{}))             // true — nothing of the account
 
 weak, err := svc.SignUp(ctx, "carol@example.com", "short")
 fmt.Println(weak.Created, errors.Is(err, auth.ErrWeakPassword)) // false true
@@ -1109,16 +1108,20 @@ branches with its result discarded on the duplicate one, so there is no call,
 and therefore no failure, that one branch can reach and the other cannot. A
 probe never touches the real accountholder's pending verification either; the
 duplicate branch's mint is purely additive, so nobody can destroy a victim's
-emailed link by "signing up" as them. The duplicate branch never hands back
-credential material: `PasswordHash` is cleared on both branches (and carries
-`json:"-"` at the type level).
+emailed link by "signing up" as them. And the duplicate branch hands back the
+**zero** `User`, never the account it found: that record's `ID`, `CreatedAt`
+and `EmailVerifiedAt` would each answer "is this address registered?" on their
+own, in one request, to someone who has proven nothing about the address.
 
-**The caller's obligation.** None of this survives a handler that returns a
-different status code, a different body, or a measurably different latency
-depending on `Created`. Use `VerifyToken` — non-empty only when `Created` is
-true — to decide whether to send mail, never to decide what to tell the HTTP
-client. The property is enforced up to the boundary of the function and no
-further.
+**The caller's obligation.** A public sign-up handler must emit a **fixed
+response regardless of outcome** — same status code, same body shape, same
+rough latency. That is stronger than "don't branch on `Created`": `Created`,
+whether `VerifyToken` is present, whether `User` is populated, and the wall
+clock are all observable, and any one of them reaching the client answers the
+question the method exists not to answer. Use `VerifyToken` — non-empty only
+when `Created` is true — to decide whether to send mail, never to decide what
+to tell the HTTP client. The property is enforced up to the boundary of the
+function and no further.
 
 Two `Store` obligations are load-bearing here and are documented as
 requirements on the port: `CreateUser` must decide `ErrEmailTaken` from the

@@ -322,9 +322,14 @@ once a 1.0 is cut. Until then, minor versions may break API.
   every `Store` call after `CreateUser` runs on both branches with its result
   discarded on the duplicate one, so no failure is reachable on one branch
   only. A probe never disturbs the real accountholder's pending verification,
-  and `PasswordHash` is cleared on both branches (and carries `json:"-"` on
-  `UserBase`). The caller must return a byte-identical response regardless of
-  `Created`, or the property is lost at the transport layer.
+  and the duplicate branch hands back the **zero** `User` rather than the
+  account it found, whose `ID`, `CreatedAt` and `EmailVerifiedAt` would each
+  answer "is this address registered?" on their own; `PasswordHash` is cleared
+  on the branch that does populate `User` (and carries `json:"-"` on
+  `UserBase`). The caller must emit a fixed response regardless of the
+  outcome — stronger than "don't branch on `Created`", since `Created`,
+  `VerifyToken`'s presence, whether `User` is populated and the wall clock are
+  all observable — or the property is lost at the transport layer.
   `RequestPasswordReset` returns `(token, ok, nil)` and never errors merely
   because an address is unknown; a denial from the address-keyed limiter
   returns that same shape rather than `ErrRateLimited`, which would itself be

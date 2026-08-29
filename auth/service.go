@@ -435,30 +435,43 @@ func WithClaimsExtender[U any](f func(U) map[string]any) Option {
 	}
 }
 
-// SignUpResult is the outcome of [Service.SignUp]. See that method's doc
-// for the full enumeration-safety contract; the short version: Created is
-// the ONLY field that tells the two branches apart, both branches return a
-// nil error, and it is the CALLER's responsibility to not let that
-// difference leak — a caller that returns Created literally, or a
-// differently-shaped/differently-timed HTTP response depending on it,
-// destroys the property no code in this package can protect once control
-// leaves it. See SignUp's doc for the details.
+// SignUpResult is the outcome of [Service.SignUp]. Both branches return a
+// nil error; Created and VerifyToken are what differ, and User is populated
+// only on the new-account branch.
+//
+// # The caller's obligation
+//
+// A public sign-up handler MUST emit a FIXED response — same status code,
+// same body shape, same rough latency — regardless of the outcome. That is
+// the actual requirement, and it is stronger than "do not branch on
+// Created": nothing in this struct is safe to reflect back to an
+// unauthenticated caller merely because it is not the Created bool.
+// VerifyToken's presence, the shape of User, and how long the call took are
+// all observable, and any of them differing between outcomes answers "is
+// this address registered?" just as well. Use VerifyToken (non-empty only
+// when Created is true) to decide whether to SEND MAIL — never to decide
+// what to tell the HTTP caller. The property is enforced up to the boundary
+// of this function and no further; see [Service.SignUp]'s doc for what this
+// package does hold, and for the timing residual it does not.
 type SignUpResult[U any] struct {
 	// Created is true for a genuinely new account, false when the address
-	// was already registered. This is the only field a caller may treat
-	// differently between branches — see the type doc.
+	// was already registered. See the type doc for what a caller may do
+	// with that: decide whether to send mail, not what to answer.
 	Created bool
-	// User is the newly created user when Created is true, or the existing
-	// account (loaded fresh from the Store) when Created is false.
-	// PasswordHash is always cleared to "" on this field, on BOTH branches
-	// — never the live bcrypt digest, whether it is one this call just
-	// produced (the caller already knows the plaintext it submitted, so
-	// that specific hash is not new information) or, on the duplicate
-	// branch, an existing account's real, active credential, which a
-	// caller who merely attempted to sign up with that address has no
-	// business ever seeing. If a caller genuinely needs the existing
-	// account's credential material for some other purpose, load it
-	// directly from the Store — SignUp does not hand it out.
+	// User is the newly created user when Created is true, and the ZERO
+	// value of U when Created is false — never the account that was found.
+	// SignUp's duplicate branch does load that account (unconditionally,
+	// on both branches, which is what keeps its Store-call sequence
+	// identical — see [Service.SignUp]), but it is not handed out: its ID,
+	// CreatedAt and EmailVerifiedAt each answer "is this address
+	// registered?" on their own, in one request, to a caller who has
+	// proven nothing about the address. Populating this field only when
+	// Created is true mirrors VerifyToken's own rule for the same reason.
+	//
+	// PasswordHash is cleared to "" on the branch that DOES populate this
+	// field: the caller already knows the plaintext it submitted, so that
+	// specific hash is not new information, but it is not this package's
+	// to hand back either — see [UserBase.PasswordHash]'s own doc.
 	User U
 	// VerifyToken is the plain "signup" verification token, present only
 	// when Created is true. Empty when Created is false — SignUp DOES
@@ -563,9 +576,8 @@ func (s *Service[U, PU]) wrap(b UserBase) U {
 // A library that mints tokens cannot fake "we emailed the address that's
 // already on file" the way a real mail send can, so SignUp does not try:
 // instead, EVERY code path — new address or already-registered — returns
-// (SignUpResult, nil) whenever the underlying operations succeed. Created
-// is the only field that distinguishes them. Several things hold,
-// deliberately, and each is load-bearing on its own:
+// (SignUpResult, nil) whenever the underlying operations succeed. Several
+// things hold, deliberately, and each is load-bearing on its own:
 //
 //  1. plainPassword is validated against the configured [password.Rules]
 //     BEFORE anything else — before the address is even normalized, let
@@ -578,18 +590,25 @@ func (s *Service[U, PU]) wrap(b UserBase) U {
 //  3. Once an outcome IS determined, the already-registered branch returns
 //     a nil error, never one of this package's sentinels or the Store's.
 //     An error return is itself an observable signal a caller could branch
-//     on, so "duplicate" is encoded ONLY in SignUpResult.Created, a plain
-//     bool inside an otherwise-identical success value.
+//     on, so "duplicate" is encoded in the returned [SignUpResult], not in
+//     the error.
+//  4. The already-registered branch hands back the ZERO
+//     [SignUpResult.User], never the account it found — see that field's
+//     doc. That account's ID, CreatedAt and EmailVerifiedAt would each
+//     answer "is this address registered?" on their own, in a single
+//     request, to a caller who has proven nothing about the address.
 //
-// None of this survives contact with an HTTP handler that inspects
-// Created and returns a different status code, a different body, or does
-// so measurably faster or slower for one branch than the other. Whatever
-// calls SignUp MUST return a byte-identical response — same status, same
-// body shape, same rough latency — regardless of Created; use
-// VerifyToken (non-empty only when Created is true) to decide whether to
-// send an email, never to decide what to tell the HTTP caller. The
-// property is enforced up to the boundary of this function and no
-// further.
+// None of this survives contact with an HTTP handler that lets the two
+// outcomes look different from outside. Whatever calls SignUp MUST return
+// a FIXED response — same status, same body shape, same rough latency —
+// regardless of the outcome. That obligation is strictly stronger than
+// "do not branch on Created": Created, whether VerifyToken is present,
+// whether User is populated, and the wall clock are all observable, and
+// any one of them reaching an unauthenticated caller answers the question
+// this method exists not to answer. Use VerifyToken (non-empty only when
+// Created is true) to decide whether to SEND AN EMAIL, never to decide
+// what to tell the HTTP caller. The property is enforced up to the
+// boundary of this function and no further.
 //
 // # Fail closed, by construction
 //
@@ -634,11 +653,13 @@ func (s *Service[U, PU]) wrap(b UserBase) U {
 // The Store calls SignUp performs are therefore identical on every
 // invocation, branch-independent through step 4. The only place the two
 // branches diverge is the FINAL, in-process decision of what to put in
-// the return value — Created and VerifyToken, exactly the one difference
-// [SignUpResult] documents as legitimate. The enumeration property holds
-// by CONSTRUCTION — there is no Store call either branch can reach that
-// the other cannot — not by an argument about how comparable two
-// different code paths happen to be.
+// the return value — Created, VerifyToken, and whether User is populated
+// at all. The enumeration property holds by CONSTRUCTION — there is no
+// Store call either branch can reach that the other cannot — not by an
+// argument about how comparable two different code paths happen to be.
+// What construction does NOT make indistinguishable is the returned
+// VALUE: keeping that from leaking is the caller's obligation, stated
+// above and on [SignUpResult].
 //
 // # What this does NOT do to an already-registered account
 //
@@ -696,8 +717,9 @@ func (s *Service[U, PU]) wrap(b UserBase) U {
 // store/drops both honor them today (documented on their own CreateUser
 // implementations); a third-party Store implementation must too.
 //
-// SignUpResult.User never carries a live PasswordHash on either branch —
-// see that field's own doc and [UserBase.PasswordHash]'s.
+// SignUpResult.User is populated only when Created is true, and never
+// carries a live PasswordHash even then — see that field's own doc and
+// [UserBase.PasswordHash]'s.
 func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string) (SignUpResult[U], error) {
 	if failed := password.Validate(plainPassword, s.cfg.rules); len(failed) > 0 {
 		return SignUpResult[U]{}, fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
@@ -738,7 +760,12 @@ func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string
 	user.PasswordHash = ""
 
 	if !created {
-		return SignUpResult[U]{Created: false, User: s.wrap(user)}, nil
+		// The zero U, not the account that was found — see
+		// [SignUpResult.User]. The caller attempted to register an address
+		// they have proven nothing about; handing them that account's id,
+		// CreatedAt and EmailVerifiedAt would answer "is this address
+		// registered?" outright.
+		return SignUpResult[U]{Created: false}, nil
 	}
 	return SignUpResult[U]{Created: true, User: s.wrap(user), VerifyToken: plainToken}, nil
 }
@@ -1646,12 +1673,12 @@ func (s *Service[U, PU]) ChangePassword(ctx context.Context, userID, currentSess
 // registered address it mints a "password_reset" [Verification] and returns
 // (token, true, nil); for an unknown address it returns ("", false, nil) —
 // deliberately never an error purely because the address is unregistered.
-// ok is the ONLY field a caller may treat differently between the two
-// cases — see [Service.SignUp]'s doc, "Enumeration safety", for the
-// identical discipline this places on the CALLER: whatever wraps this
-// method MUST return a byte-identical response regardless of ok, using ok
-// only to decide whether to actually send a reset email, never to shape an
-// HTTP response.
+// The CALLER carries the same obligation [Service.SignUp] places on its
+// own caller — see that method's doc, "Enumeration safety": whatever wraps
+// this method MUST return a FIXED response, same status and body shape and
+// rough latency, regardless of the outcome. ok exists to decide whether to
+// actually send a reset email, never to shape an HTTP response, and
+// neither does the returned token's presence.
 //
 // ip must be non-empty ([ErrMissingIP]) and, if a [RateLimiter] is
 // configured via [WithRateLimiter], allows this ip ([ErrRateLimited]) —

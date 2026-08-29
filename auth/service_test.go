@@ -409,8 +409,53 @@ func TestSignUpEnumerationSafeOnDuplicate(t *testing.T) {
 	if second.VerifyToken != "" {
 		t.Fatalf("SignUp(duplicate).VerifyToken = %q, want empty", second.VerifyToken)
 	}
-	if second.User.ID != first.User.ID {
-		t.Fatalf("SignUp(duplicate).User.ID = %q, want the existing user's id %q", second.User.ID, first.User.ID)
+	if second.User.ID != "" {
+		t.Fatalf("SignUp(duplicate).User.ID = %q, want empty — the duplicate branch must not hand back the existing account (its own id is %q)", second.User.ID, first.User.ID)
+	}
+}
+
+// TestSignUpDuplicateBranchReturnsZeroUser pins that the duplicate branch
+// hands back the ZERO U, not the existing account.
+//
+// User was documented as "the existing account (loaded fresh from the
+// Store) when Created is false", with only PasswordHash scrubbed. That left
+// the real ID, CreatedAt and EmailVerifiedAt in a value handed to whoever
+// typed a stranger's address into a sign-up form. A handler obeying the
+// readme literally — same status, same body shape, never branching on
+// Created — still shipped a one-shot enumeration oracle: EmailVerifiedAt
+// non-null vs null, and an old vs just-now CreatedAt, each answer "is this
+// address registered?" in a single request, alongside leaking another
+// user's account metadata outright.
+//
+// Returning the zero value does NOT by itself make the two branches
+// indistinguishable — Created and VerifyToken still differ, and the caller
+// still owes a fixed response — but it removes the leak of someone else's
+// record, mirroring VerifyToken's own "populated only when Created is
+// true" rule.
+func TestSignUpDuplicateBranchReturnsZeroUser(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	victim, err := svc.SignUp(ctx, "victim3@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("seeding SignUp: %v", err)
+	}
+	// Verify the victim's address, so EmailVerifiedAt is non-nil and
+	// CreatedAt is genuinely in the past relative to the probe — the two
+	// fields that answered the enumeration question on their own.
+	if _, err := svc.VerifyEmail(ctx, victim.VerifyToken); err != nil {
+		t.Fatalf("VerifyEmail(victim): %v", err)
+	}
+
+	probe, err := svc.SignUp(ctx, "VICTIM3@example.com ", "Attacker-Chosen-Pass21!")
+	if err != nil {
+		t.Fatalf("SignUp(probe) err = %v, want nil", err)
+	}
+	if probe.Created {
+		t.Fatal("probe reported Created = true for an already-registered address")
+	}
+	if probe.User != (testUser{}) {
+		t.Fatalf("SignUp(duplicate).User = %+v, want the zero value — the duplicate branch must carry none of the existing account's metadata", probe.User)
 	}
 }
 
