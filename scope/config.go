@@ -39,33 +39,47 @@ type Option func(*config)
 // only requires that ids are unique and stable. A nil generator is ignored,
 // leaving the default in place.
 //
-// # A generator MUST produce UUID-parseable ids to use store/drops
+// # A non-UUID generator needs WithTextLibraryIDs on store/drops
 //
-// The engine's own indifference is not the whole story, and an earlier
-// version of this doc — "override it for ULIDs, a database sequence, or
-// whatever your schema expects" — promised flexibility the shipped
-// PostgreSQL backend does not have.
+// The engine's own indifference is not the whole story, because the shipped
+// PostgreSQL backend has to declare a column type.
 // [github.com/bernardoforcillo/authlayer/store/drops] types every id this
 // library mints for itself — a container's id, a role's id, and the
 // container_id / parent_id columns that reference them — as PostgreSQL uuid
-// unconditionally.
+// BY DEFAULT, which is correct for the default generator and wrong for any
+// other. Override this option and you must pass
+// [github.com/bernardoforcillo/authlayer/store/drops.WithTextLibraryIDs] as
+// well, which types those columns text instead:
 //
-// [github.com/bernardoforcillo/authlayer/store/drops.WithTextUserIDs] does
-// NOT cover this, despite the name's apparent reach: it types the columns
-// holding a user id supplied from OUTSIDE this library (user_id, owner_id,
-// invited_by, created_by), so that the RBAC half can sit on an existing
-// non-UUID user table. Built with it and a ULID generator, the first
-// CreateContainer still fails with SQLSTATE 22P02
+//	st := dropsstore.New[org.Organization, org.Member](db, dropsstore.WithTextLibraryIDs())
+//	svc := org.New(ac, st, org.WithIDGenerator(ulid.Make))
+//
+// Pass it to the invitation store too
+// ([github.com/bernardoforcillo/authlayer/store/drops.WithInviteTextLibraryIDs])
+// if that half is in use, and to the auth store
+// ([github.com/bernardoforcillo/authlayer/store/drops.WithAuthTextLibraryIDs])
+// if the same generator mints user ids.
+//
+// Without it, the first CreateContainer fails with SQLSTATE 22P02
 // (invalid_text_representation), at the Store rather than at construction —
 // and [github.com/bernardoforcillo/authlayer/store/memory] accepts any
 // string, so a service tested only against that one passes everything and
-// breaks on deployment. Pinned by
-// TestNonUUIDIDGeneratorFailsAgainstDropsLive in store/drops's integration
+// breaks on deployment. Both directions are pinned live:
+// TestNonUUIDIDGeneratorFailsAgainstTheScopeStoreLive asserts that 22P02 and
+// TestTextLibraryIDsRoundTripANonUUIDGeneratorLive round-trips a ULID
+// generator end to end with the option on, both in store/drops's integration
 // lane.
+//
+// [github.com/bernardoforcillo/authlayer/store/drops.WithTextUserIDs] is a
+// DIFFERENT option and does not cover this, despite the name's apparent
+// reach: it types the columns holding a user id supplied from OUTSIDE this
+// library (user_id, owner_id, invited_by, created_by), so that the RBAC half
+// can sit on an existing non-UUID user table. The two compose, and a
+// deployment minting its own non-UUID ids for both generally wants both.
 //
 // Against a Store of your own, use whatever that schema accepts.
 // [github.com/bernardoforcillo/authlayer/auth.WithIDGenerator] carries the
-// identical constraint, for the identical reason.
+// identical requirement, for the identical reason.
 //
 //	org.New(ac, store, org.WithIDGenerator(func() string { return uuid.NewString() }))
 func WithIDGenerator(gen func() string) Option {
