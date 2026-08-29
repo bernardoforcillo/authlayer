@@ -1640,13 +1640,16 @@ func (s *Service[U, PU]) ChangePassword(ctx context.Context, userID, currentSess
 //  5. Timing is the channel that remains, and it is measured, not merely
 //     theoretical. Against a live PostgreSQL-backed [Store]
 //     ([github.com/bernardoforcillo/authlayer/store/drops]), 400 samples
-//     per branch measured a known-address median of 1510µs against an
-//     unknown-address median of 308µs — Δ≈1.2ms, roughly 5×, with the two
-//     distributions nearly disjoint under low-jitter, same-host
+//     per branch first measured a known-address median of 1510µs against
+//     an unknown-address median of 308µs — Δ≈1.2ms, roughly 5×, with the
+//     two distributions nearly disjoint under low-jitter, same-host
 //     measurement. Point 1's second branch-exclusive write (added to honour
-//     [Store]'s DeleteVerificationsByUserAndPurpose contract) widens this
-//     further; it was one extra local write when first measured; it is two
-//     now. Over realistic WAN jitter this needs on the order of 10² to 10³
+//     [Store]'s DeleteVerificationsByUserAndPurpose contract) widened it:
+//     re-measured after that write, the known-address median ran 2276-3453µs
+//     against an unknown-address 556-576µs — Δ≈1.7-2.9ms, roughly 4-6×,
+//     disjoint at the known branch's 5th percentile against the unknown
+//     branch's 95th. The channel got wider, not narrower, and the number
+//     here is the post-write one. Over realistic WAN jitter this needs on the order of 10² to 10³
 //     samples against the SAME address to resolve reliably — practical for
 //     a targeted check against one suspected address, not for bulk
 //     enumeration across many candidates, but real, and this doc will not
