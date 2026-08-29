@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,27 +30,30 @@ const testCost = bcrypt.MinCost
 // used across this suite's Services.
 var testSigningKey = bytes.Repeat([]byte("k"), 32)
 
-// testUser is an application's own user type: it embeds auth.UserBase and
-// adds one extra field, DisplayName, satisfying auth.MutableUser entirely
-// through promoted methods (see UserBase.Base / UserBase.SetBase) — no
-// method of its own is written, which is itself the property this type
-// exists to demonstrate.
+// testUser is a caller's OWN struct that embeds auth.UserBase and adds a
+// profile field of its own. Service does not consume it — this package is
+// not generic over a user type (see auth/service.go's package doc, "Why
+// Service is not generic over your user type") — but embedding UserBase in
+// exactly this way is what an application does with the record auth hands
+// back, so this type exists to pin that the json:"-" tag on PasswordHash
+// survives promotion through such an embedding. See
+// TestUserBasePasswordHashExcludedFromJSON, its only use.
 type testUser struct {
 	auth.UserBase
 	DisplayName string
 }
 
-// newTestService builds a Service[testUser] over a fresh in-memory store, a
+// newTestService builds a Service over a fresh in-memory store, a
 // fast (testCost) Hasher, and a fixed signing key, plus whatever additional
 // options a test needs.
-func newTestService(t *testing.T, opts ...auth.Option) (*auth.Service[testUser, *testUser], *memory.AuthStore) {
+func newTestService(t *testing.T, opts ...auth.Option) (*auth.Service, *memory.AuthStore) {
 	t.Helper()
 	store := memory.NewAuthStore()
 	base := []auth.Option{
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	}
-	svc := auth.New[testUser](store, append(base, opts...)...)
+	svc := auth.New(store, append(base, opts...)...)
 	return svc, store
 }
 
@@ -341,7 +345,7 @@ const validPassword = "Correct-Horse-Battery-9!"
 // password.Validate call to after the lookup, and this must fail.
 func TestSignUpValidatesPasswordBeforeLookup(t *testing.T) {
 	store := newCountingStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -363,7 +367,7 @@ func TestSignUpValidatesPasswordBeforeLookup(t *testing.T) {
 // through.
 func TestSignUpWeakPasswordIdenticalForNewAndExistingAddress(t *testing.T) {
 	store := newCountingStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -454,7 +458,7 @@ func TestSignUpDuplicateBranchReturnsZeroUser(t *testing.T) {
 	if probe.Created {
 		t.Fatal("probe reported Created = true for an already-registered address")
 	}
-	if probe.User != (testUser{}) {
+	if probe.User != (auth.UserBase{}) {
 		t.Fatalf("SignUp(duplicate).User = %+v, want the zero value — the duplicate branch must carry none of the existing account's metadata", probe.User)
 	}
 }
@@ -567,7 +571,7 @@ func TestSignUpHashesOnBothBranchesSymmetrically(t *testing.T) {
 // result.
 func TestSignUpFailsClosedOnCreateUserError(t *testing.T) {
 	store := &errStore{AuthStore: memory.NewAuthStore(), failCreateUser: true}
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -600,7 +604,7 @@ func TestSignUpFailsClosedOnCreateUserError(t *testing.T) {
 // store and asserts both fail with the SAME error.
 func TestSignUpReadFailureIndistinguishableAcrossBranches(t *testing.T) {
 	store := &errStore{AuthStore: memory.NewAuthStore(), failFindUserByEmail: true}
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -652,7 +656,7 @@ func TestSignUpWriteFailureIndistinguishableAcrossBranches(t *testing.T) {
 	}
 
 	store := &allWritesFailStore{AuthStore: inner}
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -692,7 +696,7 @@ func TestSignUpVerificationWriteFailureIndistinguishable(t *testing.T) {
 	}
 
 	store := &verificationWriteFailStore{AuthStore: inner}
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -733,7 +737,7 @@ func TestSignUpUsersTableWriteFailureIndistinguishable(t *testing.T) {
 	}
 
 	store := &usersTableWritesFailStore{AuthStore: inner}
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -840,7 +844,7 @@ func TestSignUpProbeDoesNotDestroyVictimsVerification(t *testing.T) {
 // would fail; it does not.
 func TestSignUpNeverCallsDeleteVerifications(t *testing.T) {
 	store := &deleteVerificationsFailStore{AuthStore: memory.NewAuthStore()}
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -855,24 +859,6 @@ func TestSignUpNeverCallsDeleteVerifications(t *testing.T) {
 	}
 	if probe.Created {
 		t.Fatal("Created = true on a duplicate address")
-	}
-}
-
-// TestNewUserBaseDirectlyUsable confirms an application with no extra
-// profile fields can instantiate Service[UserBase] directly — UserBase
-// satisfies MutableUser via its own promoted Base/SetBase methods.
-func TestNewUserBaseDirectlyUsable(t *testing.T) {
-	store := memory.NewAuthStore()
-	svc := auth.New[auth.UserBase](store,
-		auth.WithHasher(password.Bcrypt(testCost)),
-		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
-	)
-	res, err := svc.SignUp(context.Background(), "erin@example.com", validPassword)
-	if err != nil {
-		t.Fatalf("SignUp: %v", err)
-	}
-	if res.User.Email != "erin@example.com" {
-		t.Fatalf("User.Email = %q, want \"erin@example.com\"", res.User.Email)
 	}
 }
 
@@ -895,7 +881,7 @@ func TestSignUpDoesNotConsultRateLimiter(t *testing.T) {
 // Login
 // ============================================================
 
-func mustSignUp(t *testing.T, svc *auth.Service[testUser, *testUser], email, plain string) testUser {
+func mustSignUp(t *testing.T, svc *auth.Service, email, plain string) auth.UserBase {
 	t.Helper()
 	res, err := svc.SignUp(context.Background(), email, plain)
 	if err != nil {
@@ -909,23 +895,24 @@ func mustSignUp(t *testing.T, svc *auth.Service[testUser, *testUser], email, pla
 // Refresh/Logout/session-management suite below, which cares about the
 // resulting user and refresh token, not about Login's own behaviour
 // (already pinned above).
-func mustLogin(t *testing.T, svc *auth.Service[testUser, *testUser], email, plain string) (user testUser, access, refresh string) {
+func mustLogin(t *testing.T, svc *auth.Service, email, plain string) (user auth.UserBase, access, refresh string) {
 	t.Helper()
-	user, access, refresh, err := svc.Login(context.Background(), email, plain, "203.0.113.9", "test-agent")
+	res, err := svc.Login(context.Background(), email, plain, "203.0.113.9", "test-agent")
 	if err != nil {
 		t.Fatalf("Login(%q): %v", email, err)
 	}
-	return user, access, refresh
+	return res.User, res.AccessToken, res.RefreshToken
 }
 
 func TestLoginSuccess(t *testing.T) {
 	svc, store := newTestService(t)
 	mustSignUp(t, svc, "gina@example.com", validPassword)
 
-	user, access, refresh, err := svc.Login(context.Background(), "Gina@Example.com", validPassword, "203.0.113.5", "test-agent")
+	login, err := svc.Login(context.Background(), "Gina@Example.com", validPassword, "203.0.113.5", "test-agent")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
+	user, access, refresh := login.User, login.AccessToken, login.RefreshToken
 	if user.Email != "gina@example.com" {
 		t.Fatalf("Email = %q, want \"gina@example.com\"", user.Email)
 	}
@@ -969,7 +956,7 @@ func TestLoginUnknownUserFailsWithDummy(t *testing.T) {
 	spy := newSpyHasher()
 	svc, _ := newTestService(t, auth.WithHasher(spy))
 
-	_, _, _, err := svc.Login(context.Background(), "nobody@example.com", "whatever", "1.2.3.4", "")
+	_, err := svc.Login(context.Background(), "nobody@example.com", "whatever", "1.2.3.4", "")
 	if !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Fatalf("err = %v, want ErrInvalidCredentials", err)
 	}
@@ -987,7 +974,7 @@ func TestLoginWrongPasswordFailsWithVerify(t *testing.T) {
 	spy.hashCalls, spy.verifyCalls, spy.dummyCalls = nil, nil, nil
 	spy.mu.Unlock()
 
-	_, _, _, err := svc.Login(context.Background(), "henry@example.com", "wrong-password", "1.2.3.4", "")
+	_, err := svc.Login(context.Background(), "henry@example.com", "wrong-password", "1.2.3.4", "")
 	if !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Fatalf("err = %v, want ErrInvalidCredentials", err)
 	}
@@ -1003,8 +990,8 @@ func TestLoginUnknownUserAndWrongPasswordReturnSameError(t *testing.T) {
 	svc, _ := newTestService(t)
 	mustSignUp(t, svc, "ivy@example.com", validPassword)
 
-	_, _, _, errUnknown := svc.Login(context.Background(), "nobody@example.com", "x", "1.2.3.4", "")
-	_, _, _, errWrong := svc.Login(context.Background(), "ivy@example.com", "wrong", "1.2.3.4", "")
+	_, errUnknown := svc.Login(context.Background(), "nobody@example.com", "x", "1.2.3.4", "")
+	_, errWrong := svc.Login(context.Background(), "ivy@example.com", "wrong", "1.2.3.4", "")
 
 	if !errors.Is(errUnknown, auth.ErrInvalidCredentials) || !errors.Is(errWrong, auth.ErrInvalidCredentials) {
 		t.Fatalf("errs = %v, %v, want both ErrInvalidCredentials", errUnknown, errWrong)
@@ -1029,7 +1016,7 @@ func TestLoginNoPasswordCredentialTreatedAsInvalid(t *testing.T) {
 		t.Fatalf("seeding CreateUser: %v", err)
 	}
 
-	_, _, _, err := svc.Login(context.Background(), "oauth@example.com", "anything", "1.2.3.4", "")
+	_, err := svc.Login(context.Background(), "oauth@example.com", "anything", "1.2.3.4", "")
 	if !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Fatalf("err = %v, want ErrInvalidCredentials", err)
 	}
@@ -1042,13 +1029,13 @@ func TestLoginNoPasswordCredentialTreatedAsInvalid(t *testing.T) {
 func TestLoginRateLimitedDeniesBeforeStoreAccess(t *testing.T) {
 	limiter := &fakeLimiter{allow: false}
 	store := newCountingStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 		auth.WithRateLimiter(limiter),
 	)
 
-	_, _, _, err := svc.Login(context.Background(), "anyone@example.com", "whatever", "9.9.9.9", "")
+	_, err := svc.Login(context.Background(), "anyone@example.com", "whatever", "9.9.9.9", "")
 	if !errors.Is(err, auth.ErrRateLimited) {
 		t.Fatalf("err = %v, want ErrRateLimited", err)
 	}
@@ -1084,7 +1071,7 @@ func TestLoginFailsClosedOnRateLimiterError(t *testing.T) {
 	limiter := &fakeLimiter{err: errStoreBoom}
 	svc, _ := newTestService(t, auth.WithRateLimiter(limiter))
 
-	_, _, _, err := svc.Login(context.Background(), "anyone@example.com", "x", "1.2.3.4", "")
+	_, err := svc.Login(context.Background(), "anyone@example.com", "x", "1.2.3.4", "")
 	if !errors.Is(err, errStoreBoom) {
 		t.Fatalf("err = %v, want errStoreBoom (rate limiter errors must fail closed, not be swallowed)", err)
 	}
@@ -1095,12 +1082,12 @@ func TestLoginFailsClosedOnRateLimiterError(t *testing.T) {
 
 func TestLoginFailsClosedOnStoreLookupError(t *testing.T) {
 	store := &errStore{AuthStore: memory.NewAuthStore(), failFindUserByEmail: true}
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
 
-	_, _, _, err := svc.Login(context.Background(), "anyone@example.com", "x", "1.2.3.4", "")
+	_, err := svc.Login(context.Background(), "anyone@example.com", "x", "1.2.3.4", "")
 	if !errors.Is(err, errStoreBoom) {
 		t.Fatalf("err = %v, want errStoreBoom", err)
 	}
@@ -1113,7 +1100,7 @@ func TestLoginRequireVerifiedEmailBlocksUnverified(t *testing.T) {
 	svc, _ := newTestService(t, auth.WithRequireVerifiedEmail(true))
 	mustSignUp(t, svc, "jack@example.com", validPassword)
 
-	_, _, _, err := svc.Login(context.Background(), "jack@example.com", validPassword, "1.2.3.4", "")
+	_, err := svc.Login(context.Background(), "jack@example.com", validPassword, "1.2.3.4", "")
 	if !errors.Is(err, auth.ErrEmailNotVerified) {
 		t.Fatalf("err = %v, want ErrEmailNotVerified", err)
 	}
@@ -1129,10 +1116,11 @@ func TestLoginRequireVerifiedEmailAllowsVerified(t *testing.T) {
 		t.Fatalf("VerifyEmail: %v", err)
 	}
 
-	user, _, _, err := svc.Login(context.Background(), "kate@example.com", validPassword, "1.2.3.4", "")
+	login, err := svc.Login(context.Background(), "kate@example.com", validPassword, "1.2.3.4", "")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
+	user := login.User
 	if user.EmailVerifiedAt == nil {
 		t.Fatal("EmailVerifiedAt is nil on the returned user after verification")
 	}
@@ -1142,7 +1130,7 @@ func TestLoginDefaultAllowsUnverified(t *testing.T) {
 	svc, _ := newTestService(t) // WithRequireVerifiedEmail not set
 	mustSignUp(t, svc, "leo@example.com", validPassword)
 
-	if _, _, _, err := svc.Login(context.Background(), "leo@example.com", validPassword, "1.2.3.4", ""); err != nil {
+	if _, err := svc.Login(context.Background(), "leo@example.com", validPassword, "1.2.3.4", ""); err != nil {
 		t.Fatalf("Login: %v, want success (default does not require verification)", err)
 	}
 }
@@ -1151,9 +1139,9 @@ func TestLoginDefaultAllowsUnverified(t *testing.T) {
 // original version discarded the loaded user with `_ = u` and only checked
 // key-presence, so it could not have detected the extender receiving an
 // empty/wrong user at all. This version instead simulates exactly what a
-// real application does per WithClaimsExtender's corrected doc: look up its
+// real application does per WithClaimsExtender's doc: look up its
 // OWN profile data keyed by the real, authenticated user's id
-// (u.Base().ID) — which requires Login to hand the extender the actual
+// (u.ID) — which requires Login to hand the extender the actual
 // user it just authenticated, not a separately (and differently)
 // constructed one — and asserts the CLAIM VALUE that lookup produced, not
 // merely that some key exists.
@@ -1164,11 +1152,11 @@ func TestLoginIssuesAccessTokenWithExtraClaims(t *testing.T) {
 	plans := map[string]string{}
 
 	store := memory.NewAuthStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
-		auth.WithClaimsExtender(func(u testUser) map[string]any {
-			return map[string]any{"plan": plans[u.Base().ID]}
+		auth.WithClaimsExtender(func(u auth.UserBase) map[string]any {
+			return map[string]any{"plan": plans[u.ID]}
 		}),
 	)
 
@@ -1181,10 +1169,11 @@ func TestLoginIssuesAccessTokenWithExtraClaims(t *testing.T) {
 	}
 	plans[res.User.ID] = "gold-plan"
 
-	loggedIn, access, _, err := svc.Login(context.Background(), "mona@example.com", validPassword, "1.2.3.4", "")
+	login, err := svc.Login(context.Background(), "mona@example.com", validPassword, "1.2.3.4", "")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
+	loggedIn, access := login.User, login.AccessToken
 	if loggedIn.ID != res.User.ID {
 		t.Fatalf("Login returned user id %q, want the signed-up user's id %q", loggedIn.ID, res.User.ID)
 	}
@@ -1211,7 +1200,7 @@ func TestLoginRejectsEmptyIP(t *testing.T) {
 	svc, _ := newTestService(t)
 	mustSignUp(t, svc, "pia@example.com", validPassword)
 
-	_, _, _, err := svc.Login(context.Background(), "pia@example.com", validPassword, "", "")
+	_, err := svc.Login(context.Background(), "pia@example.com", validPassword, "", "")
 	if !errors.Is(err, auth.ErrMissingIP) {
 		t.Fatalf("err = %v, want ErrMissingIP", err)
 	}
@@ -1223,10 +1212,10 @@ func TestLoginRejectsEmptyIP(t *testing.T) {
 // reach — visible to Store.ListSessionsByUser regardless.
 func TestLoginNoSigningKeyFailsClosed(t *testing.T) {
 	store := memory.NewAuthStore()
-	svc := auth.New[testUser](store, auth.WithHasher(password.Bcrypt(testCost))) // no WithJWT
+	svc := auth.New(store, auth.WithHasher(password.Bcrypt(testCost))) // no WithJWT
 	user := mustSignUp(t, svc, "nora@example.com", validPassword)
 
-	_, _, _, err := svc.Login(context.Background(), "nora@example.com", validPassword, "1.2.3.4", "")
+	_, err := svc.Login(context.Background(), "nora@example.com", validPassword, "1.2.3.4", "")
 	if !errors.Is(err, token.ErrKeyTooShort) {
 		t.Fatalf("err = %v, want token.ErrKeyTooShort", err)
 	}
@@ -1244,7 +1233,7 @@ func TestLoginNormalizesEmail(t *testing.T) {
 	svc, _ := newTestService(t)
 	mustSignUp(t, svc, "oscar@example.com", validPassword)
 
-	if _, _, _, err := svc.Login(context.Background(), "  Oscar@EXAMPLE.com", validPassword, "1.2.3.4", ""); err != nil {
+	if _, err := svc.Login(context.Background(), "  Oscar@EXAMPLE.com", validPassword, "1.2.3.4", ""); err != nil {
 		t.Fatalf("Login with a case/whitespace variant: %v, want success", err)
 	}
 }
@@ -1297,7 +1286,7 @@ func TestVerifyEmailUnknownToken(t *testing.T) {
 func TestVerifyEmailExpiredTokenNotClaimed(t *testing.T) {
 	fixedNow := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	store := memory.NewAuthStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 		auth.WithClock(func() time.Time { return fixedNow }),
@@ -1312,7 +1301,7 @@ func TestVerifyEmailExpiredTokenNotClaimed(t *testing.T) {
 	// 24h) by rebuilding the Service with a later fixed clock instead of
 	// mutating the closure, then verifying against the SAME store.
 	later := fixedNow.Add(25 * time.Hour)
-	svcLater := auth.New[testUser](store,
+	svcLater := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 		auth.WithClock(func() time.Time { return later }),
@@ -1331,7 +1320,7 @@ func TestVerifyEmailExpiredTokenNotClaimed(t *testing.T) {
 
 func TestVerifyEmailPasswordResetPurposeRejected(t *testing.T) {
 	store := memory.NewAuthStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -1367,7 +1356,7 @@ func TestVerifyEmailPasswordResetPurposeRejected(t *testing.T) {
 
 func TestVerifyEmailChangeUpdatesAddressAndVerifies(t *testing.T) {
 	store := memory.NewAuthStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -1417,7 +1406,7 @@ func TestVerifyEmailChangeUpdatesAddressAndVerifies(t *testing.T) {
 // catch a literal statement-order swap.
 func TestVerifyEmailClaimsBeforeApplyOrderingSignup(t *testing.T) {
 	store := newOrderStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -1445,7 +1434,7 @@ func TestVerifyEmailClaimsBeforeApplyOrderingSignup(t *testing.T) {
 // UpdateUserEmail and MarkEmailVerified.
 func TestVerifyEmailClaimsBeforeApplyOrderingEmailChange(t *testing.T) {
 	store := newOrderStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -1534,7 +1523,7 @@ func TestVerifyEmailConcurrentSameTokenExactlyOneWinner(t *testing.T) {
 
 func TestVerifyEmailFailsClosedOnLookupStoreError(t *testing.T) {
 	store := &errStore{AuthStore: memory.NewAuthStore(), failFindVerificationByHash: true}
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -1605,10 +1594,11 @@ func TestLoginNeverReturnsPasswordHash(t *testing.T) {
 	svc, _ := newTestService(t)
 	mustSignUp(t, svc, "karl@example.com", validPassword)
 
-	user, _, _, err := svc.Login(context.Background(), "karl@example.com", validPassword, "1.2.3.4", "")
+	login, err := svc.Login(context.Background(), "karl@example.com", validPassword, "1.2.3.4", "")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
+	user := login.User
 	if user.PasswordHash != "" {
 		t.Fatalf("Login returned User.PasswordHash = %q, want empty", user.PasswordHash)
 	}
@@ -1628,6 +1618,160 @@ func TestVerifyEmailNeverReturnsPasswordHash(t *testing.T) {
 	}
 	if user.PasswordHash != "" {
 		t.Fatalf("VerifyEmail returned User.PasswordHash = %q, want empty", user.PasswordHash)
+	}
+}
+
+// TestEveryPathReturningAUserBaseScrubsPasswordHash is the exhaustive
+// version of the three per-method pins above, and it exists because
+// dropping the Service[U, PU] type parameter moved every one of these
+// values from "a U this package reconstructed" to "the UserBase the Store
+// handed back" — the same struct the live bcrypt digest arrives in. The
+// scrub is now the ONLY thing between the Store and the caller on these
+// paths, so this test enumerates them rather than trusting that a future
+// method remembers.
+//
+// Step 1 finds every exported *auth.Service method whose results carry a
+// UserBase (directly, or as a field of a returned struct) BY REFLECTION,
+// and fails if any of them is missing from the driver table — so a new
+// user-returning method added later cannot quietly ship unscrubbed. Step 2
+// drives each one and asserts both halves: the returned PasswordHash is
+// empty AND the Store's own copy is not, which is what makes an empty
+// return value evidence of scrubbing rather than of a broken fixture.
+func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
+	ctx := context.Background()
+
+	// drivers: one per exported Service method that hands a UserBase back.
+	// Each returns the value the caller would see, plus the user id whose
+	// stored row must still hold a live digest.
+	drivers := map[string]func(t *testing.T, svc *auth.Service) (auth.UserBase, string){
+		"SignUp": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
+			res, err := svc.SignUp(ctx, "scrub-signup@example.com", validPassword)
+			if err != nil {
+				t.Fatalf("SignUp: %v", err)
+			}
+			return res.User, res.User.ID
+		},
+		"Login": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
+			u := mustSignUp(t, svc, "scrub-login@example.com", validPassword)
+			login, err := svc.Login(ctx, "scrub-login@example.com", validPassword, "1.2.3.4", "agent")
+			if err != nil {
+				t.Fatalf("Login: %v", err)
+			}
+			return login.User, u.ID
+		},
+		"Refresh": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
+			u := mustSignUp(t, svc, "scrub-refresh@example.com", validPassword)
+			_, _, refresh := mustLogin(t, svc, "scrub-refresh@example.com", validPassword)
+			res, err := svc.Refresh(ctx, refresh)
+			if err != nil {
+				t.Fatalf("Refresh: %v", err)
+			}
+			return res.User, u.ID
+		},
+		"VerifyEmail": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
+			res, err := svc.SignUp(ctx, "scrub-verify@example.com", validPassword)
+			if err != nil {
+				t.Fatalf("SignUp: %v", err)
+			}
+			u, err := svc.VerifyEmail(ctx, res.VerifyToken)
+			if err != nil {
+				t.Fatalf("VerifyEmail: %v", err)
+			}
+			return u, res.User.ID
+		},
+	}
+
+	// Step 1: no user-returning method may be absent from the table above.
+	userBaseType := reflect.TypeOf(auth.UserBase{})
+	carriesUserBase := func(rt reflect.Type) bool {
+		if rt == userBaseType {
+			return true
+		}
+		if rt.Kind() != reflect.Struct {
+			return false
+		}
+		for i := 0; i < rt.NumField(); i++ {
+			if rt.Field(i).Type == userBaseType {
+				return true
+			}
+		}
+		return false
+	}
+	svcType := reflect.TypeOf(&auth.Service{})
+	for i := 0; i < svcType.NumMethod(); i++ {
+		m := svcType.Method(i)
+		returnsUser := false
+		for j := 0; j < m.Type.NumOut(); j++ {
+			if carriesUserBase(m.Type.Out(j)) {
+				returnsUser = true
+			}
+		}
+		if returnsUser {
+			if _, ok := drivers[m.Name]; !ok {
+				t.Errorf("Service.%s returns a UserBase but has no driver in this test — every path that hands a UserBase to a caller must be pinned here", m.Name)
+			}
+		}
+	}
+
+	// Step 2: every driver's value is scrubbed, and the Store's is not.
+	for name, drive := range drivers {
+		t.Run(name, func(t *testing.T) {
+			svc, store := newTestService(t)
+			got, userID := drive(t, svc)
+			if got.PasswordHash != "" {
+				t.Fatalf("%s returned User.PasswordHash = %q, want empty — this is a live credential digest", name, got.PasswordHash)
+			}
+			if got.ID == "" {
+				t.Fatalf("%s returned the zero UserBase; the driver is not exercising the populated path", name)
+			}
+			stored, err := store.FindUserByID(ctx, userID)
+			if err != nil {
+				t.Fatalf("FindUserByID: %v", err)
+			}
+			if stored.PasswordHash == "" {
+				t.Fatalf("%s: the STORE's own copy has no PasswordHash either — the fixture is broken, so an empty return value proves nothing", name)
+			}
+		})
+	}
+}
+
+// TestClaimsExtenderNeverSeesPasswordHash pins the other direction the
+// scrub protects: WithClaimsExtender hands application code a UserBase on
+// both minting paths, and a callback that returned map[string]any{"h":
+// u.PasswordHash} would write a live bcrypt digest into a JWT that then
+// travels to the client. Both Login and Refresh clear the field BEFORE
+// calling the extender, which is what that Option's doc promises.
+func TestClaimsExtenderNeverSeesPasswordHash(t *testing.T) {
+	var seen []string
+	store := memory.NewAuthStore()
+	svc := auth.New(store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+		auth.WithClaimsExtender(func(u auth.UserBase) map[string]any {
+			seen = append(seen, u.PasswordHash)
+			return nil
+		}),
+	)
+
+	ctx := context.Background()
+	if _, err := svc.SignUp(ctx, "extender-scrub@example.com", validPassword); err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	login, err := svc.Login(ctx, "extender-scrub@example.com", validPassword, "1.2.3.4", "agent")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if _, err := svc.Refresh(ctx, login.RefreshToken); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	if len(seen) != 2 {
+		t.Fatalf("claims extender ran %d time(s), want 2 (one Login, one Refresh)", len(seen))
+	}
+	for i, h := range seen {
+		if h != "" {
+			t.Fatalf("claims extender call %d saw PasswordHash = %q, want empty", i+1, h)
+		}
 	}
 }
 
@@ -1741,7 +1885,7 @@ func TestRefreshReuseRevokesWholeFamilyNotJustPresentedSession(t *testing.T) {
 func TestRefreshExpiredTokenInvalidAndFamilyIntact(t *testing.T) {
 	fixedNow := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	store := memory.NewAuthStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 		auth.WithRefreshTTL(time.Hour),
@@ -1751,15 +1895,16 @@ func TestRefreshExpiredTokenInvalidAndFamilyIntact(t *testing.T) {
 	if _, err := svc.SignUp(ctx, "cara@example.com", validPassword); err != nil {
 		t.Fatalf("SignUp: %v", err)
 	}
-	user, _, refresh1, err := svc.Login(ctx, "cara@example.com", validPassword, "1.2.3.4", "")
+	login, err := svc.Login(ctx, "cara@example.com", validPassword, "1.2.3.4", "")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
+	user, refresh1 := login.User, login.RefreshToken
 
 	// A second Service sharing the same Store, with the clock moved past
 	// the 1-hour refresh TTL.
 	later := fixedNow.Add(2 * time.Hour)
-	svcLater := auth.New[testUser](store,
+	svcLater := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 		auth.WithRefreshTTL(time.Hour),
@@ -1913,10 +2058,11 @@ func TestLogoutAllRevokesEveryFamilyIncludingRotatedPredecessors(t *testing.T) {
 	ctx := context.Background()
 
 	// A second, independent login — a second device/family.
-	_, _, refreshDeviceB, err := svc.Login(ctx, "flynn@example.com", validPassword, "198.51.100.2", "device-b")
+	login, err := svc.Login(ctx, "flynn@example.com", validPassword, "198.51.100.2", "device-b")
 	if err != nil {
 		t.Fatalf("second Login: %v", err)
 	}
+	refreshDeviceB := login.RefreshToken
 
 	// Rotate device A once, so its family has a rotated-but-unexpired
 	// predecessor plus a current successor.
@@ -2029,10 +2175,11 @@ func TestRevokeSessionRevokesWholeFamilyNotOneRow(t *testing.T) {
 
 	// A second, independent login: a different device, a different family,
 	// which must survive untouched.
-	_, _, deviceB, err := svc.Login(ctx, "xenia@example.com", validPassword, "198.51.100.7", "device-b")
+	login, err := svc.Login(ctx, "xenia@example.com", validPassword, "198.51.100.7", "device-b")
 	if err != nil {
 		t.Fatalf("second Login: %v", err)
 	}
+	deviceB := login.RefreshToken
 
 	// Device A refreshes once, so its family holds a superseded predecessor
 	// plus a current successor — exactly what a device list would show two
@@ -2127,7 +2274,7 @@ func TestRevokeSessionCannotRevokeAnotherUsersFamily(t *testing.T) {
 func TestRefreshRotatedRowRetainedUntilPurgeExpired(t *testing.T) {
 	fixedNow := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	store := memory.NewAuthStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 		auth.WithRefreshTTL(24*time.Hour),
@@ -2137,10 +2284,11 @@ func TestRefreshRotatedRowRetainedUntilPurgeExpired(t *testing.T) {
 	if _, err := svc.SignUp(ctx, "ivan@example.com", validPassword); err != nil {
 		t.Fatalf("SignUp: %v", err)
 	}
-	user, _, refresh1, err := svc.Login(ctx, "ivan@example.com", validPassword, "1.2.3.4", "")
+	login, err := svc.Login(ctx, "ivan@example.com", validPassword, "1.2.3.4", "")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
+	user, refresh1 := login.User, login.RefreshToken
 
 	res, err := svc.Refresh(ctx, refresh1)
 	if err != nil {
@@ -2254,25 +2402,26 @@ func (s *parkingStore) CreateSuccessorSession(ctx context.Context, predecessorID
 // and win the compare-and-set — every run takes the identical path.
 func TestRefreshConcurrentSameTokenExactlyOneWinnerFamilyRevoked(t *testing.T) {
 	store := memory.NewAuthStore()
-	seed := auth.New[testUser](store,
+	seed := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
 	ctx := context.Background()
 	user := mustSignUp(t, seed, "hank@example.com", validPassword)
-	_, _, refresh1, err := seed.Login(ctx, "hank@example.com", validPassword, "1.2.3.4", "seed-agent")
+	login, err := seed.Login(ctx, "hank@example.com", validPassword, "1.2.3.4", "seed-agent")
 	if err != nil {
 		t.Fatalf("seeding Login: %v", err)
 	}
+	refresh1 := login.RefreshToken
 
 	parking := newParkingStore(store)
-	svc := auth.New[testUser](parking,
+	svc := auth.New(parking,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
 
 	type result struct {
-		res auth.LoginResult[testUser]
+		res auth.LoginResult
 		err error
 	}
 	firstDone := make(chan result, 1)
@@ -2383,25 +2532,26 @@ func (s *parkAfterMarkRotatedStore) MarkRotated(ctx context.Context, tokenHash s
 // predecessor gone and fail closed with ErrSessionRevoked, minting nothing.
 func TestRefreshFamilyRevokedBetweenMarkRotatedAndSuccessorFailsClosed(t *testing.T) {
 	store := memory.NewAuthStore()
-	seed := auth.New[testUser](store,
+	seed := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
 	ctx := context.Background()
 	user := mustSignUp(t, seed, "iris@example.com", validPassword)
-	_, _, refresh1, err := seed.Login(ctx, "iris@example.com", validPassword, "1.2.3.4", "seed-agent")
+	login, err := seed.Login(ctx, "iris@example.com", validPassword, "1.2.3.4", "seed-agent")
 	if err != nil {
 		t.Fatalf("seeding Login: %v", err)
 	}
+	refresh1 := login.RefreshToken
 
 	parking := newParkAfterMarkRotatedStore(store)
-	svc := auth.New[testUser](parking,
+	svc := auth.New(parking,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
 
 	type result struct {
-		res auth.LoginResult[testUser]
+		res auth.LoginResult
 		err error
 	}
 	done := make(chan result, 1)
@@ -2464,25 +2614,26 @@ func TestRefreshFamilyRevokedBetweenMarkRotatedAndSuccessorFailsClosed(t *testin
 // revoking this exact family when the parked winner is released.
 func TestLogoutAllReliableAgainstConcurrentRefresh(t *testing.T) {
 	store := memory.NewAuthStore()
-	seed := auth.New[testUser](store,
+	seed := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
 	ctx := context.Background()
 	user := mustSignUp(t, seed, "jonas@example.com", validPassword)
-	_, _, refresh1, err := seed.Login(ctx, "jonas@example.com", validPassword, "1.2.3.4", "seed-agent")
+	login, err := seed.Login(ctx, "jonas@example.com", validPassword, "1.2.3.4", "seed-agent")
 	if err != nil {
 		t.Fatalf("seeding Login: %v", err)
 	}
+	refresh1 := login.RefreshToken
 
 	parking := newParkAfterMarkRotatedStore(store)
-	svc := auth.New[testUser](parking,
+	svc := auth.New(parking,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
 
 	type result struct {
-		res auth.LoginResult[testUser]
+		res auth.LoginResult
 		err error
 	}
 	done := make(chan result, 1)
@@ -2547,19 +2698,20 @@ func (s *deleteFamilyFailsStore) DeleteSessionsByFamily(context.Context, string)
 // either one is worse than a slightly noisier error.
 func TestRefreshReplayErrorPreservesReuseSignalEvenWhenFamilyDeleteFails(t *testing.T) {
 	store := memory.NewAuthStore()
-	seed := auth.New[testUser](store,
+	seed := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
 	ctx := context.Background()
 	mustSignUp(t, seed, "kara@example.com", validPassword)
-	_, _, refresh1, err := seed.Login(ctx, "kara@example.com", validPassword, "1.2.3.4", "")
+	login, err := seed.Login(ctx, "kara@example.com", validPassword, "1.2.3.4", "")
 	if err != nil {
 		t.Fatalf("seeding Login: %v", err)
 	}
+	refresh1 := login.RefreshToken
 
 	failing := &deleteFamilyFailsStore{Store: store}
-	svc := auth.New[testUser](failing,
+	svc := auth.New(failing,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -2635,10 +2787,10 @@ func TestChangePasswordSuccessUpdatesHashAndAllowsNewLogin(t *testing.T) {
 		t.Fatalf("ChangePassword: %v", err)
 	}
 
-	if _, _, _, err := svc.Login(ctx, "quincy@example.com", validPassword, "1.2.3.4", ""); !errors.Is(err, auth.ErrInvalidCredentials) {
+	if _, err := svc.Login(ctx, "quincy@example.com", validPassword, "1.2.3.4", ""); !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Fatalf("Login(old password) err = %v, want ErrInvalidCredentials", err)
 	}
-	if _, _, _, err := svc.Login(ctx, "quincy@example.com", newPass, "1.2.3.4", ""); err != nil {
+	if _, err := svc.Login(ctx, "quincy@example.com", newPass, "1.2.3.4", ""); err != nil {
 		t.Fatalf("Login(new password): %v, want success", err)
 	}
 }
@@ -2653,14 +2805,16 @@ func TestChangePasswordRevokesOtherSessionsKeepsCurrentAlive(t *testing.T) {
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "rita@example.com", validPassword)
 
-	_, accessA, refreshA, err := svc.Login(ctx, "rita@example.com", validPassword, "1.2.3.4", "device-a")
+	loginA, err := svc.Login(ctx, "rita@example.com", validPassword, "1.2.3.4", "device-a")
 	if err != nil {
 		t.Fatalf("Login(device A): %v", err)
 	}
-	_, _, refreshB, err := svc.Login(ctx, "rita@example.com", validPassword, "5.6.7.8", "device-b")
+	accessA, refreshA := loginA.AccessToken, loginA.RefreshToken
+	loginB, err := svc.Login(ctx, "rita@example.com", validPassword, "5.6.7.8", "device-b")
 	if err != nil {
 		t.Fatalf("Login(device B): %v", err)
 	}
+	refreshB := loginB.RefreshToken
 
 	claimsA, err := token.Parse(accessA, testSigningKey)
 	if err != nil {
@@ -2802,7 +2956,7 @@ func TestChangePasswordInvalidatesOutstandingEmailChangeToken(t *testing.T) {
 // can only be the new one propagating.
 func TestChangePasswordFailsClosedWhenEmailChangeSweepFails(t *testing.T) {
 	store := &purposeSweepFailStore{AuthStore: memory.NewAuthStore(), failPurpose: auth.PurposeEmailChange}
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -2878,7 +3032,7 @@ func TestRequestPasswordResetRequiresIP(t *testing.T) {
 func TestRequestPasswordResetIPRateLimitedDeniesBeforeStoreAccess(t *testing.T) {
 	limiter := &fakeLimiter{allow: false}
 	store := newCountingStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 		auth.WithRateLimiter(limiter),
@@ -2930,7 +3084,7 @@ func TestRequestPasswordResetAddressRateLimitSameShapeAsUnknown(t *testing.T) {
 // TestSignUpReadFailureIndistinguishableAcrossBranches.
 func TestRequestPasswordResetReadFailureIndistinguishableAcrossBranches(t *testing.T) {
 	store := &errStore{AuthStore: memory.NewAuthStore(), failFindUserByEmail: true}
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -2978,7 +3132,7 @@ func TestRequestPasswordResetCreateVerificationFailureNotDistinguishable(t *test
 	}
 
 	store := &verificationWriteFailStore{AuthStore: inner}
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -3051,10 +3205,10 @@ func TestResetPasswordSuccessChangesPasswordAndBurnsToken(t *testing.T) {
 		t.Fatalf("ResetPassword: %v", err)
 	}
 
-	if _, _, _, err := svc.Login(ctx, "xena@example.com", validPassword, "1.2.3.4", ""); !errors.Is(err, auth.ErrInvalidCredentials) {
+	if _, err := svc.Login(ctx, "xena@example.com", validPassword, "1.2.3.4", ""); !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Fatalf("Login(old password) err = %v, want ErrInvalidCredentials", err)
 	}
-	if _, _, _, err := svc.Login(ctx, "xena@example.com", newPass, "1.2.3.4", ""); err != nil {
+	if _, err := svc.Login(ctx, "xena@example.com", newPass, "1.2.3.4", ""); err != nil {
 		t.Fatalf("Login(new password): %v, want success", err)
 	}
 
@@ -3074,14 +3228,16 @@ func TestResetPasswordRevokesAllSessions(t *testing.T) {
 	svc, store := newTestService(t)
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "yara@example.com", validPassword)
-	_, _, refreshA, err := svc.Login(ctx, "yara@example.com", validPassword, "1.2.3.4", "device-a")
+	loginA, err := svc.Login(ctx, "yara@example.com", validPassword, "1.2.3.4", "device-a")
 	if err != nil {
 		t.Fatalf("Login(device A): %v", err)
 	}
-	_, _, refreshB, err := svc.Login(ctx, "yara@example.com", validPassword, "5.6.7.8", "device-b")
+	refreshA := loginA.RefreshToken
+	loginB, err := svc.Login(ctx, "yara@example.com", validPassword, "5.6.7.8", "device-b")
 	if err != nil {
 		t.Fatalf("Login(device B): %v", err)
 	}
+	refreshB := loginB.RefreshToken
 
 	tok, ok, err := svc.RequestPasswordReset(ctx, "yara@example.com", "1.2.3.4")
 	if err != nil || !ok {
@@ -3113,7 +3269,7 @@ func TestResetPasswordRevokesAllSessions(t *testing.T) {
 // orderStore's UpdateUserPassword override.
 func TestResetPasswordClaimsBeforeApplyOrdering(t *testing.T) {
 	store := newOrderStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)
@@ -3154,7 +3310,7 @@ func TestResetPasswordUnknownToken(t *testing.T) {
 func TestResetPasswordExpiredTokenNotClaimed(t *testing.T) {
 	fixedNow := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	store := memory.NewAuthStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 		auth.WithClock(func() time.Time { return fixedNow }),
@@ -3168,7 +3324,7 @@ func TestResetPasswordExpiredTokenNotClaimed(t *testing.T) {
 	}
 
 	later := fixedNow.Add(2 * time.Hour) // past the 1h password-reset TTL
-	svcLater := auth.New[testUser](store,
+	svcLater := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 		auth.WithClock(func() time.Time { return later }),
@@ -3291,7 +3447,7 @@ func TestResetPasswordStampsEmailVerifiedClosingTheLockout(t *testing.T) {
 	user := mustSignUp(t, svc, "locked@example.com", validPassword)
 
 	// The address is unverified, so the owner cannot get in at all.
-	if _, _, _, err := svc.Login(ctx, "locked@example.com", validPassword, "1.2.3.4", "agent"); !errors.Is(err, auth.ErrEmailNotVerified) {
+	if _, err := svc.Login(ctx, "locked@example.com", validPassword, "1.2.3.4", "agent"); !errors.Is(err, auth.ErrEmailNotVerified) {
 		t.Fatalf("Login before the reset err = %v, want ErrEmailNotVerified — the premise of this test", err)
 	}
 
@@ -3310,7 +3466,7 @@ func TestResetPasswordStampsEmailVerifiedClosingTheLockout(t *testing.T) {
 	if stored.EmailVerifiedAt == nil {
 		t.Fatal("EmailVerifiedAt is still nil after a completed reset — redeeming a token delivered to the address is proof of control, and without stamping it the owner stays locked out with no resend path")
 	}
-	if _, _, _, err := svc.Login(ctx, "locked@example.com", "Recovered-Valid-Pass22!", "1.2.3.4", "agent"); err != nil {
+	if _, err := svc.Login(ctx, "locked@example.com", "Recovered-Valid-Pass22!", "1.2.3.4", "agent"); err != nil {
 		t.Fatalf("Login after the reset: %v — proving control of the address must actually let the owner in", err)
 	}
 }
@@ -3323,7 +3479,7 @@ func TestResetPasswordStampsEmailVerifiedClosingTheLockout(t *testing.T) {
 func TestResetPasswordDoesNotRestampAnAlreadyVerifiedAddress(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	store := memory.NewAuthStore()
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 		auth.WithClock(func() time.Time { return now }),
@@ -3441,7 +3597,7 @@ func TestResetPasswordInvalidatesOutstandingEmailChangeToken(t *testing.T) {
 // still succeeds and a propagated error can only be the new sweep's.
 func TestResetPasswordFailsClosedWhenEmailChangeSweepFails(t *testing.T) {
 	store := &purposeSweepFailStore{AuthStore: memory.NewAuthStore(), failPurpose: auth.PurposeEmailChange}
-	svc := auth.New[testUser](store,
+	svc := auth.New(store,
 		auth.WithHasher(password.Bcrypt(testCost)),
 		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
 	)

@@ -54,16 +54,17 @@ RBAC engine pulls in `drops`, and `pgx/v5` comes with the PostgreSQL store.
 - **Two enforcement points.** An in-memory decision (`Can` / `Authorize` /
   `HasPermission`) *and* a drops `pg.Guard` that filters rows at the database.
   Both read the acting subject and the active scope from the same `context`.
-- **Users are opt-in, and still your type.** The RBAC half — `scope`, `org`,
-  `team`, `invite` — stores no users and declares no foreign key to yours: a
-  user id is a value it carries, never one it validates against a schema of
-  its own. [`auth`](#authentication) is the half that *does* own a `users`
-  table (plus `sessions` and `verifications`), and it owns it the same way the
-  engine owns containers: generic over your type, which supplies its own
-  fields and embeds `auth.UserBase` — id, email, verification stamp, password
-  hash, timestamps — exactly as a container embeds `scope.ContainerBase` and a
-  membership embeds `scope.MemberBase`. authlayer persists the `UserBase`-shaped
-  part and nothing else, so the rest of your profile stays in your own tables.
+- **Users are opt-in, and the credential record is fixed.** The RBAC half —
+  `scope`, `org`, `team`, `invite` — stores no users and declares no foreign
+  key to yours: a user id is a value it carries, never one it validates
+  against a schema of its own. [`auth`](#authentication) is the half that
+  *does* own a `users` table (plus `sessions` and `verifications`), and unlike
+  the engine's containers it is **not** generic over your type. A container is
+  genuinely application-shaped, so `scope` takes yours; a credential record is
+  not. `auth.UserBase` — id, email, verification stamp, password hash,
+  timestamps — is the whole record `auth` needs and the whole record it
+  persists, so your profile fields live in your own tables and authlayer's
+  migrations never own a column your product's shape decides.
   Use the RBAC half alone and nothing about users changes. Ids authlayer mints
   are UUIDv7 and their columns are `uuid`;
   `dropsstore.WithTextUserIDs()` remains the escape hatch for pointing the
@@ -979,16 +980,16 @@ otherwise write by hand.
 no middleware, no base URL. No email delivery — `SignUp`,
 `RequestPasswordReset` and `RequestEmailChange` each return a plaintext token
 exactly once and putting it in a message is entirely yours, the same division
-[`invite`](#invitations) already draws. And no user profile beyond what you
-embed: the `Store` persists the `auth.UserBase`-shaped part of your type and
-nothing else, so a `Plan` or `DisplayName` field of your own is yours to load
-and save (`WithClaimsExtender`'s doc has the worked example).
+[`invite`](#invitations) already draws. And no user profile: the `Store`
+persists `auth.UserBase` and nothing else, so a `Plan` or `DisplayName` field
+of your own is yours to load and save, keyed by `UserBase.ID`
+(`WithClaimsExtender`'s doc has the worked example).
 
 ### Sign-up, verification, login
 
 ```go
 key := []byte("32-bytes-or-more-from-your-vault") // the HS256 floor, RFC 7518 §3.2
-svc := auth.New[auth.UserBase](memory.NewAuthStore(), // swap for drops
+svc := auth.New(memory.NewAuthStore(), // swap for drops
     auth.WithJWT([][]byte{key}, 15*time.Minute), // access-token TTL
     auth.WithRefreshTTL(30*24*time.Hour),        // session lifetime
     auth.WithRequireVerifiedEmail(true))
@@ -1001,14 +1002,18 @@ fmt.Println(res.Created, res.User.Email) // true bob@example.com
 _, err := svc.VerifyEmail(ctx, res.VerifyToken)
 fmt.Println(err) // <nil>
 
-user, access, refresh, err := svc.Login(ctx,
+login, err := svc.Login(ctx,
     "bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
-fmt.Println(user.ID != "", access != "", refresh != "", err) // true true true <nil>
+fmt.Println(login.User.ID != "", login.AccessToken != "", err) // true true <nil>
 ```
 
-`U` is your own type embedding `auth.UserBase`, exactly as a container embeds
-`scope.ContainerBase`; `auth.UserBase` itself is a fine `U` when you have no
-extra fields. Every address is passed through `auth.NormalizeEmail` (trim,
+`Login` and `Refresh` both return a `LoginResult` — the user, an access token
+and a refresh token — rather than one returning a named struct and the other a
+positional tuple whose two same-typed token strings a caller can transpose
+without the compiler noticing. The user is an `auth.UserBase`: **`auth` is not
+generic over a user type of yours**, unlike `scope`, and the [package
+doc](auth/) says why in full. Your profile fields go in your own tables, keyed
+by `UserBase.ID`. Every address is passed through `auth.NormalizeEmail` (trim,
 lowercase) on every read and write, which is why the trailing space and the
 capitals above vanish and why `BOB@example.com` cannot become a second
 account. `ip` must be non-empty — a blank one would put every caller that
@@ -1048,16 +1053,16 @@ from a client retrying a raced request — so it treats every replay as
 compromise and revokes the whole family. Continuing from above:
 
 ```go
-next, err := svc.Refresh(ctx, refresh)
-fmt.Println(next.RefreshToken != refresh, err) // true <nil>
+next, err := svc.Refresh(ctx, login.RefreshToken)
+fmt.Println(next.RefreshToken != login.RefreshToken, err) // true <nil>
 
-_, err = svc.Refresh(ctx, refresh) // the token we already rotated away
+_, err = svc.Refresh(ctx, login.RefreshToken) // the token we already rotated away
 fmt.Println(errors.Is(err, auth.ErrTokenReuse)) // true
 
 _, err = svc.Refresh(ctx, next.RefreshToken) // died with its family
 fmt.Println(errors.Is(err, auth.ErrTokenInvalid)) // true
 
-live, _ := svc.ListSessions(ctx, user.ID)
+live, _ := svc.ListSessions(ctx, login.User.ID)
 fmt.Println(len(live)) // 0
 ```
 
@@ -1118,7 +1123,7 @@ where reuse detection has just revoked the entire family:
 
 ```go
 claims, err := token.Parse(next.AccessToken, key)
-fmt.Println(err, claims.Subject == user.ID) // <nil> true — still valid
+fmt.Println(err, claims.Subject == login.User.ID) // <nil> true — still valid
 
 sessions, _ := svc.ListSessions(ctx, claims.Subject)
 fmt.Println(claims.SessionID != "", len(sessions)) // true 0
@@ -1349,17 +1354,17 @@ shadow a reserved claim:
 _, err = token.Issue(token.Claims{Subject: "u1"}, []byte("too-short"), time.Minute)
 fmt.Println(errors.Is(err, token.ErrKeyTooShort)) // true
 
-ext := auth.New[auth.UserBase](memory.NewAuthStore(),
+ext := auth.New(memory.NewAuthStore(),
     auth.WithJWT([][]byte{key}, 15*time.Minute),
     auth.WithClaimsExtender(func(u auth.UserBase) map[string]any {
         return map[string]any{"plan": "pro", "sub": "victim"}
     }))
 _, _ = ext.SignUp(ctx, "dana@example.com", "Correct-Horse-Battery-7")
-dana, accessToken, _, _ := ext.Login(ctx,
+dana, _ := ext.Login(ctx,
     "dana@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
 
-c, err := token.Parse(accessToken, key)
-fmt.Println(err, c.Subject == dana.ID)       // <nil> true
+c, err := token.Parse(dana.AccessToken, key)
+fmt.Println(err, c.Subject == dana.User.ID)  // <nil> true
 fmt.Println(c.Extra["plan"], c.Extra["sub"]) // pro victim
 ```
 
@@ -1477,7 +1482,7 @@ rules and `Verify` returns a bool, so there is nothing to compare with
 | [`org`](org/) | Organization RBAC — `scope` with the type parameters fixed and the names spelled "organization". |
 | [`team`](team/) | Team RBAC nested inside `org` via `scope.WithParent` — the worked example of [nesting](#nested-scopes). |
 | [`invite`](invite/) | [Invitations](#invitations) — email tokens and reusable links admitting a user with no standing yet, via `scope.Service.GrantMembership`. |
-| [`auth`](auth/) | [Authentication](#authentication) — `Service[U]` over your own user type, its `Store` port, and the user/session/verification records. Sign-up, login, email verification, refresh rotation, and the password lifecycle. |
+| [`auth`](auth/) | [Authentication](#authentication) — `Service`, its `Store` port, and the user/session/verification records. Sign-up, login, email verification, refresh rotation, and the password lifecycle. |
 | [`token`](token/) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled, [single-algorithm](#the-jwt-and-why-hand-rolling-it-is-defensible) HS256 JWT. Standard library only. |
 | [`password`](password/) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` for a strength policy. The only package that pulls in `golang.org/x/crypto`. |
 | [`store/memory`](store/memory/) | In-memory `scope.Store`, `invite.Store` and `auth.Store` for dev, tests, and examples. |

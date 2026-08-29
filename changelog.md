@@ -265,11 +265,13 @@ once a 1.0 is cut. Until then, minor versions may break API.
   ends the "authlayer stores no users" invariant** — but only for consumers
   that use this package. `scope`, `org`, `team` and `invite` are unchanged
   and still carry a user id as an opaque value with no foreign key to
-  anything. `Service[U]` is generic over the application's own user type,
-  which embeds `auth.UserBase` (id, normalized email, `EmailVerifiedAt`,
-  password hash, timestamps) exactly as a container embeds
-  `scope.ContainerBase`; only the `UserBase`-shaped part is persisted, so the
-  rest of a profile stays in the application's own tables.
+  anything. Unlike `scope.Service`, `auth.Service` is **not** generic over an
+  application type: a container is genuinely application-shaped, a credential
+  record is not. `auth.UserBase` (id, normalized email, `EmailVerifiedAt`,
+  password hash, timestamps) is the whole record the package needs and the
+  whole record it persists, so an application's profile fields stay in its own
+  tables, keyed by `UserBase.ID`, and authlayer's migrations never own a
+  product-shaped column.
   `auth.NormalizeEmail` (trim, lowercase) is applied on every read and write,
   so a case or whitespace variant can neither create a duplicate nor slip
   past a uniqueness check. The surface is `SignUp`, `VerifyEmail`, `Login`,

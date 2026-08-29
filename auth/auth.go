@@ -135,15 +135,15 @@ type UserBase struct {
 	//
 	// json:"-" is deliberate, not an oversight: this is a live, active
 	// credential digest, and the ordinary way it would otherwise leak is
-	// not a careless one — a handler that JSON-encodes its own type
-	// embedding UserBase (exactly what auth/service.go's Service[U] hands
-	// back from SignUp, Login, and VerifyEmail) ships it to the client by
-	// default unless every such handler remembers to strip it by hand. A
-	// struct tag closes that for every embedding type and every call site
-	// at once, present and future, rather than depending on each one
-	// remembering to. It does not protect a non-JSON leak (a log line, a
-	// %+v, a different encoder) — see auth/service.go's own additional,
-	// explicit clearing on its returned values for that.
+	// not a careless one — a handler that JSON-encodes a UserBase, or its
+	// own type embedding one, ships it to the client by default unless
+	// every such handler remembers to strip it by hand. A struct tag closes
+	// that for every embedding type and every call site at once, present
+	// and future, rather than depending on each one remembering to. It does
+	// not protect a non-JSON leak (a log line, a %+v, a different encoder)
+	// — so auth/service.go additionally clears this field, explicitly, on
+	// every value it hands back: [Service.SignUp], [Service.Login],
+	// [Service.Refresh] and [Service.VerifyEmail].
 	PasswordHash string `drop:"password_hash" json:"-"`
 	// CreatedAt is stamped by the service clock at signup.
 	CreatedAt time.Time `drop:"created_at"`

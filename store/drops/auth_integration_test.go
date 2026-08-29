@@ -54,8 +54,8 @@ const liveTestPassword = "Correct-Horse-Battery-9!"
 // would not prove the fix holds there. bcrypt runs at MinCost so the suite
 // stays fast; the default UUIDv7 id generator is left in place because the
 // drops schema types every id column as uuid.
-func newLiveAuthService(st *dropsstore.AuthStore) *auth.Service[auth.UserBase, *auth.UserBase] {
-	return auth.New[auth.UserBase](st,
+func newLiveAuthService(st *dropsstore.AuthStore) *auth.Service {
+	return auth.New(st,
 		auth.WithHasher(password.Bcrypt(bcrypt.MinCost)),
 		auth.WithJWT([][]byte{bytes.Repeat([]byte("k"), 32)}, 15*time.Minute),
 	)
@@ -1636,10 +1636,11 @@ func TestLogoutOfRotatedTokenRevokesFamilyLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignUp: %v", err)
 	}
-	_, _, stolen, err := svc.Login(ctx, "live-logout-family@example.com", liveTestPassword, "203.0.113.9", "thief")
+	login, err := svc.Login(ctx, "live-logout-family@example.com", liveTestPassword, "203.0.113.9", "thief")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
+	stolen := login.RefreshToken
 
 	attacker, err := svc.Refresh(ctx, stolen)
 	if err != nil {
@@ -1675,14 +1676,15 @@ func TestRevokeSessionRevokesWholeFamilyLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignUp: %v", err)
 	}
-	_, _, deviceA, err := svc.Login(ctx, "live-revoke-family@example.com", liveTestPassword, "203.0.113.9", "device-a")
+	loginA, err := svc.Login(ctx, "live-revoke-family@example.com", liveTestPassword, "203.0.113.9", "device-a")
 	if err != nil {
 		t.Fatalf("Login(device A): %v", err)
 	}
-	_, _, deviceB, err := svc.Login(ctx, "live-revoke-family@example.com", liveTestPassword, "198.51.100.7", "device-b")
+	loginB, err := svc.Login(ctx, "live-revoke-family@example.com", liveTestPassword, "198.51.100.7", "device-b")
 	if err != nil {
 		t.Fatalf("Login(device B): %v", err)
 	}
+	deviceA, deviceB := loginA.RefreshToken, loginB.RefreshToken
 
 	rotatedA, err := svc.Refresh(ctx, deviceA)
 	if err != nil {
@@ -1735,7 +1737,7 @@ func TestRevokeSessionRevokesWholeFamilyLive(t *testing.T) {
 func TestResetPasswordStampsEmailVerifiedLive(t *testing.T) {
 	st := newLiveAuthStore(t)
 	ctx := context.Background()
-	svc := auth.New[auth.UserBase](st,
+	svc := auth.New(st,
 		auth.WithHasher(password.Bcrypt(bcrypt.MinCost)),
 		auth.WithJWT([][]byte{bytes.Repeat([]byte("k"), 32)}, 15*time.Minute),
 		auth.WithRequireVerifiedEmail(true),
@@ -1745,7 +1747,7 @@ func TestResetPasswordStampsEmailVerifiedLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignUp: %v", err)
 	}
-	if _, _, _, err := svc.Login(ctx, "live-locked@example.com", liveTestPassword, "203.0.113.9", "agent"); !errors.Is(err, auth.ErrEmailNotVerified) {
+	if _, err := svc.Login(ctx, "live-locked@example.com", liveTestPassword, "203.0.113.9", "agent"); !errors.Is(err, auth.ErrEmailNotVerified) {
 		t.Fatalf("Login before the reset err = %v, want ErrEmailNotVerified", err)
 	}
 
@@ -1765,7 +1767,7 @@ func TestResetPasswordStampsEmailVerifiedLive(t *testing.T) {
 	if stored.EmailVerifiedAt == nil {
 		t.Fatal("EmailVerifiedAt is still nil after a completed reset")
 	}
-	if _, _, _, err := svc.Login(ctx, "live-locked@example.com", recovered, "203.0.113.9", "agent"); err != nil {
+	if _, err := svc.Login(ctx, "live-locked@example.com", recovered, "203.0.113.9", "agent"); err != nil {
 		t.Fatalf("Login after the reset: %v", err)
 	}
 }

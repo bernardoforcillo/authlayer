@@ -7,13 +7,41 @@
 // primitives, and a Store to produce the three flows an application
 // actually calls.
 //
-// Like [github.com/bernardoforcillo/authlayer/scope.Service], Service is
-// generic over the application's own user type U: embed [UserBase] in your
-// own struct to add whatever profile fields you like, and Service reads and
-// writes the embedded identity/credential fields through the [User] /
-// [MutableUser] interfaces, which [UserBase] itself satisfies via promoted
-// methods — see those types' docs. An application with no extra fields uses
-// [UserBase] itself as U.
+// # Why Service is not generic over your user type
+//
+// [github.com/bernardoforcillo/authlayer/scope.Service] IS generic over the
+// application's container and member types, and a reader arriving from that
+// package will notice this one is not. The difference is deliberate, and it
+// is about what each package owns rather than about consistency for its own
+// sake.
+//
+// A container is genuinely application-shaped. scope has no opinion about
+// what a workspace, project or tenant IS: the application declares the
+// struct, embeds scope.ContainerBase in it, passes ITS OWN value in to
+// CreateContainer, and [github.com/bernardoforcillo/authlayer/store/drops]
+// derives the table from that type — so the extra fields are persisted,
+// round-tripped, and handed back. The type parameter carries real weight
+// there.
+//
+// A credential record is not application-shaped. This package needs exactly
+// one fixed set of columns to do its job — an id, a normalized email, a
+// verification stamp, a password hash, timestamps — and every one of them is
+// load-bearing for a flow it implements. [UserBase] is that record, and it is
+// the whole record: Service reads and writes UserBase, [Store] persists
+// UserBase, and store/drops derives the users table from UserBase. Profile
+// data — a display name, a plan, a locale — belongs in your own tables, which
+// is also what keeps this library's migrations from ever owning a column your
+// product's shape decides. Look those fields up yourself, keyed by
+// UserBase.ID; [WithClaimsExtender]'s doc has the worked example.
+//
+// An earlier version of this package DID carry a Service[U, PU] type
+// parameter, presented as the ContainerBase analogy above. It was inert: no
+// method accepted a U, the value handed back was reconstructed from a zero U
+// with the loaded UserBase written onto it, and store/drops derived its table
+// from UserBase regardless — so an application's extra fields were
+// unreachable in both directions, and a claims extender always saw them zero.
+// Removing it is what this doc section replaces the analogy with, rather than
+// leaving a claim the code never honoured.
 package auth
 
 import (
@@ -27,34 +55,6 @@ import (
 	"github.com/bernardoforcillo/authlayer/password"
 	"github.com/bernardoforcillo/authlayer/token"
 )
-
-// User is the read side of an application-supplied user type: whatever
-// extra fields it embeds, it must give back the [UserBase] this Service
-// manages. [UserBase] itself implements this (Base returns the receiver
-// unchanged), so any type that embeds UserBase satisfies User automatically
-// through method promotion, with no code of its own.
-type User interface {
-	// Base returns the embedded UserBase.
-	Base() UserBase
-}
-
-// MutableUser is the write side: the pointer receiver Service uses to stamp
-// what it creates and to load what a Store returns back onto U. Embedding
-// [UserBase] is enough to satisfy this too, for the same promotion reason
-// as [User].
-type MutableUser interface {
-	User
-	// SetBase overwrites the embedded UserBase wholesale.
-	SetBase(UserBase)
-}
-
-// Base implements [User]. Embedding UserBase in an application's own user
-// type promotes this method for free.
-func (u UserBase) Base() UserBase { return u }
-
-// SetBase implements [MutableUser]. Embedding UserBase in an application's
-// own user type promotes this method for free.
-func (u *UserBase) SetBase(b UserBase) { *u = b }
 
 // The three closed values [Verification.Purpose] takes — see that field's
 // doc and [Store]'s sentinel-error doc for why the closed set lives here,
@@ -227,12 +227,8 @@ type config struct {
 	// additionally consults — see [WithPasswordResetRateLimiter]'s doc for
 	// why it is a second, independent config slot rather than reusing
 	// limiter (which stays IP-keyed everywhere it is used).
-	resetLimiter RateLimiter
-	// claimsExtender holds a func(U) map[string]any, type-erased to `any`
-	// because config itself is not generic over U (see the codebase note
-	// on WithClaimsExtender for why). New asserts it back to the concrete
-	// function type exactly once, at construction — see New's doc.
-	claimsExtender       any
+	resetLimiter         RateLimiter
+	claimsExtender       func(UserBase) map[string]any
 	requireVerifiedEmail bool
 }
 
@@ -405,31 +401,27 @@ func WithRequireVerifiedEmail(require bool) Option {
 // extender's map to reach the reserved keys at all. The default is nil:
 // Login issues tokens with Extra unset.
 //
-// u carries the real, freshly-loaded identity: whatever [UserBase] fields
-// this package itself manages (ID, Email, EmailVerifiedAt, ...) are
-// genuinely populated — see Service's unexported wrap method, which starts
-// from the zero U. Anything your own type embeds
-// BEYOND UserBase is not: [Store] only ever persists the UserBase-shaped
-// portion (see that interface's own doc), so this package has no way to
-// recover a field like Plan from storage on your behalf. Look such fields
-// up yourself, inside the callback, keyed by the real u.Base().ID:
+// u is the real, freshly-loaded [UserBase] the caller just authenticated —
+// every field this package manages (ID, Email, EmailVerifiedAt, CreatedAt,
+// UpdatedAt) is genuinely populated, with the single, deliberate exception
+// of PasswordHash, which is cleared to "" before the callback ever sees it
+// so an extender cannot embed a live credential digest into a JWT claim by
+// accident (see [UserBase.PasswordHash]'s own doc).
 //
-//	auth.New[MyUser](store, auth.WithClaimsExtender(func(u MyUser) map[string]any {
-//		profile := myApp.Profiles.Lookup(u.Base().ID) // your own store, not this package's
+// UserBase is the WHOLE record this package owns — see the package doc's
+// "Why Service is not generic over your user type". A profile field of your
+// own (a plan, a display name, a locale) lives in your own tables, so look
+// it up inside the callback, keyed by u.ID:
+//
+//	auth.New(store, auth.WithClaimsExtender(func(u auth.UserBase) map[string]any {
+//		profile := myApp.Profiles.Lookup(u.ID) // your own store, not this package's
 //		return map[string]any{"plan": profile.Plan}
 //	}))
 //
-// U here MUST be exactly the same type argument given to [New] — Go cannot
-// enforce that statically, because config (and therefore this Option) is
-// not itself generic over U (see config's own doc for why: making Option
-// generic would force every OTHER option, none of which mention U in their
-// own arguments, to be called with an explicit type argument at every call
-// site, e.g. auth.WithHasher[MyUser](h), which is worse ergonomics than the
-// one narrow risk this trades for). New asserts the callback back to
-// func(U) map[string]any exactly once, immediately after applying every
-// Option — so a mismatched type argument here panics loudly at
-// construction time, not silently or deep inside a later Login call.
-func WithClaimsExtender[U any](f func(U) map[string]any) Option {
+// The callback runs on every [Service.Login] and every [Service.Refresh]
+// that reaches the minting step, so its cost is paid per token issued: a
+// lookup here is a lookup on the login path.
+func WithClaimsExtender(f func(UserBase) map[string]any) Option {
 	return func(c *config) {
 		if f != nil {
 			c.claimsExtender = f
@@ -455,13 +447,13 @@ func WithClaimsExtender[U any](f func(U) map[string]any) Option {
 // what to tell the HTTP caller. The property is enforced up to the boundary
 // of this function and no further; see [Service.SignUp]'s doc for what this
 // package does hold, and for the timing residual it does not.
-type SignUpResult[U any] struct {
+type SignUpResult struct {
 	// Created is true for a genuinely new account, false when the address
 	// was already registered. See the type doc for what a caller may do
 	// with that: decide whether to send mail, not what to answer.
 	Created bool
 	// User is the newly created user when Created is true, and the ZERO
-	// value of U when Created is false — never the account that was found.
+	// [UserBase] when Created is false — never the account that was found.
 	// SignUp's duplicate branch does load that account (unconditionally,
 	// on both branches, which is what keeps its Store-call sequence
 	// identical — see [Service.SignUp]), but it is not handed out: its ID,
@@ -474,7 +466,7 @@ type SignUpResult[U any] struct {
 	// field: the caller already knows the plaintext it submitted, so that
 	// specific hash is not new information, but it is not this package's
 	// to hand back either — see [UserBase.PasswordHash]'s own doc.
-	User U
+	User UserBase
 	// VerifyToken is the plain "signup" verification token, present only
 	// when Created is true. Empty when Created is false — SignUp DOES
 	// mint a "signup" Verification for the existing account too, on every
@@ -486,86 +478,69 @@ type SignUpResult[U any] struct {
 	VerifyToken string
 }
 
-// LoginResult is the outcome of a successful [Service.Refresh]: the account
-// the redeemed refresh token belongs to, a freshly issued access token, and
-// the plaintext of the new refresh token minted as this rotation's
-// successor. See Refresh's own doc for the full ladder that produces one.
-type LoginResult[U any] struct {
-	// User is the account the rotated session belongs to, freshly loaded
-	// from the Store — never a cached or stale copy carried over from
-	// whatever session lookup happened earlier in the ladder. PasswordHash
+// LoginResult is the outcome of a successful [Service.Login] and of a
+// successful [Service.Refresh]: the account, a freshly issued access token,
+// and the plaintext of the refresh token that now names the caller's live
+// session. Both methods populate all three fields — a login and a rotation
+// hand back the same thing, so they return the same type rather than one
+// returning a named struct and the other a positional tuple of two
+// same-typed token strings a caller can transpose without the compiler
+// noticing.
+type LoginResult struct {
+	// User is the authenticated account, freshly loaded from the Store —
+	// never a cached or stale copy carried over from whatever session
+	// lookup happened earlier in [Service.Refresh]'s ladder. PasswordHash
 	// is always cleared to "" here, matching every other Service method
-	// that hands back U — see [UserBase.PasswordHash]'s own doc.
-	User U
+	// that hands back a [UserBase] — see [UserBase.PasswordHash]'s own doc.
+	User UserBase
 	// AccessToken is a fresh, short-lived HS256 JWT — see [WithJWT] — bound
-	// to the NEW session (its SessionID claim is the successor's, not the
-	// rotated-away predecessor's).
+	// to the session named by RefreshToken: from [Service.Login], the
+	// session that login just created; from [Service.Refresh], the NEW
+	// successor session, not the rotated-away predecessor. Verify one with
+	// [Service.VerifyAccessToken].
 	AccessToken string
-	// RefreshToken is the plaintext of the newly minted successor session's
-	// refresh token. Present this on the NEXT call to Refresh; the token
-	// just redeemed to produce this result is now rotated away and will
-	// fail with [ErrTokenReuse], revoking the whole family, if presented
-	// again.
+	// RefreshToken is the plaintext of the session's refresh token, stored
+	// by this package only as its sha256. Present it on the NEXT call to
+	// [Service.Refresh]. A token already exchanged through Refresh is
+	// rotated away and will fail with [ErrTokenReuse], revoking the whole
+	// family, if presented again.
 	RefreshToken string
 }
 
 // Service mints, authenticates, and verifies accounts for one application.
-// U is the application's own user type; see the package doc for the
-// [User]/[MutableUser] embedding convention that lets Service read and
-// write it. A Service performs no authorization of its own — there is
-// nothing to authorize yet at sign-up or login, unlike
-// [github.com/bernardoforcillo/authlayer/scope.Service] — and is safe for
-// concurrent use if its Store, Hasher, and RateLimiter are; it caches
-// nothing.
-type Service[U any, PU interface {
-	*U
-	MutableUser
-}] struct {
-	store    Store
-	cfg      config
-	extender func(U) map[string]any
+// It is NOT generic over an application user type — unlike
+// [github.com/bernardoforcillo/authlayer/scope.Service], which is generic
+// over the container and member types it persists on your behalf. See the
+// package doc, "Why Service is not generic over your user type", for the
+// reasoning and for what to do with the profile fields this package
+// deliberately does not carry.
+//
+// A Service performs no authorization of its own — there is nothing to
+// authorize yet at sign-up or login — and is safe for concurrent use if its
+// Store, Hasher, and RateLimiter are; it caches nothing.
+type Service struct {
+	store Store
+	cfg   config
 }
 
-// New wires a [Store] and options into a Service. The pointer type
-// parameter PU is inferred, so callers write New[U](store, opts...) —
-// matching [github.com/bernardoforcillo/authlayer/scope.New]'s own
-// pointer-type-parameter convention. An application with no extra profile
-// fields can instantiate New[UserBase](store, opts...) directly, since
-// UserBase satisfies MutableUser itself (see [UserBase.Base] /
-// [UserBase.SetBase]).
+// New wires a [Store] and options into a Service.
 //
-// If [WithClaimsExtender] was used, its callback is asserted back to its
-// concrete func(U) map[string]any type here — see that Option's doc for why
-// this is the one place a type mismatch between it and U surfaces, and why
-// that surfacing is a panic rather than a returned error: New has no error
-// return, matching every other constructor in this codebase
-// (scope.New, invite.New), because misconfiguration here is a wiring bug
-// caught once at startup, not a runtime condition a caller is expected to
-// handle per call.
-func New[U any, PU interface {
-	*U
-	MutableUser
-}](store Store, opts ...Option) *Service[U, PU] {
+// It cannot fail: every [Option] either applies a valid value or leaves the
+// default in place (each option's own doc says which inputs it ignores), and
+// there is no type argument to get wrong. That is why it returns no error,
+// matching every other constructor in this codebase (scope.New, invite.New).
+// The one configuration this constructor cannot check for you is [WithJWT]:
+// there is no default signing key, so a Service built without one fails
+// closed the first time [Service.Login] tries to issue a token — see that
+// option's doc.
+func New(store Store, opts ...Option) *Service {
 	cfg := defaultConfig()
 	for _, o := range opts {
 		if o != nil {
 			o(&cfg)
 		}
 	}
-	svc := &Service[U, PU]{store: store, cfg: cfg}
-	if cfg.claimsExtender != nil {
-		svc.extender = cfg.claimsExtender.(func(U) map[string]any)
-	}
-	return svc
-}
-
-// wrap loads b into a freshly zeroed U via the [MutableUser] write side —
-// the inverse of U.Base(), used everywhere this Service hands a UserBase
-// loaded from or returned by the Store back to its own caller as U.
-func (s *Service[U, PU]) wrap(b UserBase) U {
-	var u U
-	PU(&u).SetBase(b)
-	return u
+	return &Service{store: store, cfg: cfg}
 }
 
 // SignUp registers a new account, or reports that the address is already
@@ -726,9 +701,9 @@ func (s *Service[U, PU]) wrap(b UserBase) U {
 // SignUpResult.User is populated only when Created is true, and never
 // carries a live PasswordHash even then — see that field's own doc and
 // [UserBase.PasswordHash]'s.
-func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string) (SignUpResult[U], error) {
+func (s *Service) SignUp(ctx context.Context, email, plainPassword string) (SignUpResult, error) {
 	if failed := password.Validate(plainPassword, s.cfg.rules); len(failed) > 0 {
-		return SignUpResult[U]{}, fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
+		return SignUpResult{}, fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
 	}
 
 	normalized := NormalizeEmail(email)
@@ -736,7 +711,7 @@ func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string
 
 	hash, err := s.cfg.hasher.Hash(plainPassword)
 	if err != nil {
-		return SignUpResult[U]{}, err
+		return SignUpResult{}, err
 	}
 
 	_, err = s.store.CreateUser(ctx, UserBase{
@@ -748,7 +723,7 @@ func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string
 	})
 	created := err == nil
 	if err != nil && !errors.Is(err, ErrEmailTaken) {
-		return SignUpResult[U]{}, err
+		return SignUpResult{}, err
 	}
 
 	// From here on, EVERY call is identical regardless of branch — see
@@ -756,24 +731,24 @@ func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string
 	// that determines the shape of the final return.
 	user, ferr := s.store.FindUserByEmail(ctx, normalized)
 	if ferr != nil {
-		return SignUpResult[U]{}, ferr
+		return SignUpResult{}, ferr
 	}
 
 	plainToken, verr := s.mintSignupVerification(ctx, user.ID, user.Email, now)
 	if verr != nil {
-		return SignUpResult[U]{}, verr
+		return SignUpResult{}, verr
 	}
 	user.PasswordHash = ""
 
 	if !created {
-		// The zero U, not the account that was found — see
+		// The zero UserBase, not the account that was found — see
 		// [SignUpResult.User]. The caller attempted to register an address
 		// they have proven nothing about; handing them that account's id,
 		// CreatedAt and EmailVerifiedAt would answer "is this address
 		// registered?" outright.
-		return SignUpResult[U]{Created: false}, nil
+		return SignUpResult{Created: false}, nil
 	}
-	return SignUpResult[U]{Created: true, User: s.wrap(user), VerifyToken: plainToken}, nil
+	return SignUpResult{Created: true, User: user, VerifyToken: plainToken}, nil
 }
 
 // mintSignupVerification mints and persists a fresh "signup" [Verification]
@@ -782,7 +757,7 @@ func (s *Service[U, PU]) SignUp(ctx context.Context, email, plainPassword string
 // method's "Fail closed, by construction" section — and never preceded by
 // deleting any prior verification; see "What this does NOT do" there for
 // why that would be a mistake.
-func (s *Service[U, PU]) mintSignupVerification(ctx context.Context, userID, email string, now time.Time) (string, error) {
+func (s *Service) mintSignupVerification(ctx context.Context, userID, email string, now time.Time) (string, error) {
 	plainToken, tokenHash, err := token.GenerateOpaque()
 	if err != nil {
 		return "", err
@@ -804,7 +779,10 @@ func (s *Service[U, PU]) mintSignupVerification(ctx context.Context, userID, ema
 // Login authenticates email/plainPassword and, on success, mints a new
 // session: an access token (a short-lived, HS256-signed JWT — see
 // [WithJWT]) and a refresh token (a long-lived opaque bearer token, whose
-// hash becomes the minted [Session]'s TokenHash). ip and userAgent are
+// hash becomes the minted [Session]'s TokenHash). Both, with the
+// authenticated account, come back in a [LoginResult] — the same type
+// [Service.Refresh] returns, since a login and a rotation hand a caller the
+// same three things. ip and userAgent are
 // stamped onto that Session as audit fields (see [Session.IP] /
 // [Session.UserAgent]) and ip additionally keys the rate limiter, if one is
 // configured — see [RateLimiter]'s doc for why never email.
@@ -858,19 +836,19 @@ func (s *Service[U, PU]) mintSignupVerification(ctx context.Context, userID, ema
 // as-is, never folded into ErrInvalidCredentials or a silent success — see
 // the package-level "Fail closed" constraint this method, like every other
 // one in this file, is held to.
-func (s *Service[U, PU]) Login(ctx context.Context, email, plainPassword, ip, userAgent string) (U, string, string, error) {
-	var zero U
+func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent string) (LoginResult, error) {
+	var zero LoginResult
 
 	if ip == "" {
-		return zero, "", "", ErrMissingIP
+		return zero, ErrMissingIP
 	}
 	if s.cfg.limiter != nil {
 		allowed, err := s.cfg.limiter.Allow(ctx, ip)
 		if err != nil {
-			return zero, "", "", err
+			return zero, err
 		}
 		if !allowed {
-			return zero, "", "", ErrRateLimited
+			return zero, ErrRateLimited
 		}
 	}
 
@@ -879,46 +857,45 @@ func (s *Service[U, PU]) Login(ctx context.Context, email, plainPassword, ip, us
 	switch {
 	case errors.Is(err, ErrUserNotFound):
 		s.cfg.hasher.Dummy(plainPassword)
-		return zero, "", "", ErrInvalidCredentials
+		return zero, ErrInvalidCredentials
 	case err != nil:
-		return zero, "", "", err
+		return zero, err
 	}
 
 	if u.PasswordHash == "" {
 		s.cfg.hasher.Dummy(plainPassword)
-		return zero, "", "", ErrInvalidCredentials
+		return zero, ErrInvalidCredentials
 	}
 	if !s.cfg.hasher.Verify(plainPassword, u.PasswordHash) {
-		return zero, "", "", ErrInvalidCredentials
+		return zero, ErrInvalidCredentials
 	}
 
 	if s.cfg.requireVerifiedEmail && u.EmailVerifiedAt == nil {
-		return zero, "", "", ErrEmailNotVerified
+		return zero, ErrEmailNotVerified
 	}
 
 	now := s.cfg.clock()
 	sessionID := s.cfg.idGen()
 	refreshPlain, refreshHash, err := token.GenerateOpaque()
 	if err != nil {
-		return zero, "", "", err
+		return zero, err
 	}
 
-	// Cleared before wrap, not after: this way neither the claims extender
-	// (an application-supplied callback that could otherwise embed it
-	// into a JWT claim without realizing) nor this method's own return
-	// value ever sees a live credential digest — see
+	// Cleared before the claims extender runs, not after: this way neither
+	// the extender (an application-supplied callback that could otherwise
+	// embed it into a JWT claim without realizing) nor this method's own
+	// return value ever sees a live credential digest — see
 	// [UserBase.PasswordHash]'s own doc for why that field carries json:"-"
 	// but is additionally cleared here rather than relying on that alone.
 	u.PasswordHash = ""
 
-	// wrapped is the ONE user value both the claims extender and this
-	// method's own return statement use — see [WithClaimsExtender]'s doc
-	// for why the extender must see the real, just-authenticated identity
-	// rather than a separately (and identically) reconstructed one.
-	wrapped := s.wrap(u)
+	// u is the ONE user value both the claims extender and this method's
+	// own return statement use — see [WithClaimsExtender]'s doc for why the
+	// extender must see the real, just-authenticated identity rather than a
+	// separately (and identically) reconstructed one.
 	var extra map[string]any
-	if s.extender != nil {
-		extra = s.extender(wrapped)
+	if s.cfg.claimsExtender != nil {
+		extra = s.cfg.claimsExtender(u)
 	}
 	// Issued BEFORE CreateSession, deliberately — see "Order of checks"
 	// point 6 above: a bad signing key must fail before any Session row
@@ -930,7 +907,7 @@ func (s *Service[U, PU]) Login(ctx context.Context, email, plainPassword, ip, us
 		Extra:     extra,
 	}, s.signingKey(), s.cfg.accessTTL)
 	if err != nil {
-		return zero, "", "", err
+		return zero, err
 	}
 
 	if _, err := s.store.CreateSession(ctx, Session{
@@ -948,10 +925,10 @@ func (s *Service[U, PU]) Login(ctx context.Context, email, plainPassword, ip, us
 		UserAgent: userAgent,
 		IP:        ip,
 	}); err != nil {
-		return zero, "", "", err
+		return zero, err
 	}
 
-	return wrapped, accessToken, refreshPlain, nil
+	return LoginResult{User: u, AccessToken: accessToken, RefreshToken: refreshPlain}, nil
 }
 
 // signingKey returns the current signing key ([WithJWT]'s keys[0]), or nil
@@ -960,7 +937,7 @@ func (s *Service[U, PU]) Login(ctx context.Context, email, plainPassword, ip, us
 // token.ErrKeyTooShort for anything under 32 bytes, nil included — be what
 // fails a misconfigured Service closed, with a clear, existing sentinel,
 // instead of this package inventing a second one or panicking itself.
-func (s *Service[U, PU]) signingKey() []byte {
+func (s *Service) signingKey() []byte {
 	if len(s.cfg.signingKey) == 0 {
 		return nil
 	}
@@ -1020,8 +997,8 @@ func (s *Service[U, PU]) signingKey() []byte {
 // direction: under-verifying (the caller must request a fresh token) rather
 // than leaving a claimed-but-not-yet-applied token redeemable by a second
 // presentation.
-func (s *Service[U, PU]) VerifyEmail(ctx context.Context, plainToken string) (U, error) {
-	var zero U
+func (s *Service) VerifyEmail(ctx context.Context, plainToken string) (UserBase, error) {
+	var zero UserBase
 
 	v, err := s.store.FindVerificationByHash(ctx, token.HashOpaque(plainToken))
 	if err != nil {
@@ -1061,7 +1038,7 @@ func (s *Service[U, PU]) VerifyEmail(ctx context.Context, plainToken string) (U,
 		return zero, err
 	}
 	u.PasswordHash = ""
-	return s.wrap(u), nil
+	return u, nil
 }
 
 // Refresh redeems refreshPlain — the opaque refresh token plaintext handed
@@ -1212,8 +1189,8 @@ func (s *Service[U, PU]) VerifyEmail(ctx context.Context, plainToken string) (U,
 // cannot avoid the token-loss window itself, since step 3 must run, and
 // commit, before this method is even allowed to decide whether it may mint
 // at all.
-func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (LoginResult[U], error) {
-	var zero LoginResult[U]
+func (s *Service) Refresh(ctx context.Context, refreshPlain string) (LoginResult, error) {
+	var zero LoginResult
 	now := s.cfg.clock()
 	tokenHash := token.HashOpaque(refreshPlain)
 
@@ -1263,7 +1240,6 @@ func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (Logi
 		return zero, err
 	}
 	u.PasswordHash = ""
-	wrapped := s.wrap(u)
 
 	successorID := s.cfg.idGen()
 	refreshPlainNew, refreshHashNew, err := token.GenerateOpaque()
@@ -1272,8 +1248,8 @@ func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (Logi
 	}
 
 	var extra map[string]any
-	if s.extender != nil {
-		extra = s.extender(wrapped)
+	if s.cfg.claimsExtender != nil {
+		extra = s.cfg.claimsExtender(u)
 	}
 	// Issued BEFORE step 5, deliberately, matching Login's own ordering and
 	// for the same reason: a bad signing key must fail before step 5 is
@@ -1321,7 +1297,7 @@ func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (Logi
 		return zero, ErrSessionRevoked
 	}
 
-	return LoginResult[U]{User: wrapped, AccessToken: accessToken, RefreshToken: refreshPlainNew}, nil
+	return LoginResult{User: u, AccessToken: accessToken, RefreshToken: refreshPlainNew}, nil
 }
 
 // Logout revokes the session identified by refreshPlain. It is idempotent:
@@ -1381,7 +1357,7 @@ func (s *Service[U, PU]) Refresh(ctx context.Context, refreshPlain string) (Logi
 //
 // A non-sentinel Store error is returned as-is; see the package's "Fail
 // closed" constraint.
-func (s *Service[U, PU]) Logout(ctx context.Context, refreshPlain string) error {
+func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 	sess, err := s.store.FindSessionByHash(ctx, token.HashOpaque(refreshPlain))
 	switch {
 	case errors.Is(err, ErrSessionNotFound):
@@ -1453,7 +1429,7 @@ func (s *Service[U, PU]) Logout(ctx context.Context, refreshPlain string) error 
 // [Service.RevokeSession] already perform — rather than trusting a parsed,
 // still-unexpired JWT alone. Shortening the access TTL through [WithJWT]
 // narrows the window without closing it.
-func (s *Service[U, PU]) LogoutAll(ctx context.Context, userID string) error {
+func (s *Service) LogoutAll(ctx context.Context, userID string) error {
 	sessions, err := s.store.ListSessionsByUser(ctx, userID)
 	if err != nil {
 		return err
@@ -1492,7 +1468,7 @@ func (s *Service[U, PU]) LogoutAll(ctx context.Context, userID string) error {
 // whole FAMILY, precisely so a handler built from this listing signs the
 // device out whichever of its rows the user happened to pick — see that
 // method's doc.
-func (s *Service[U, PU]) ListSessions(ctx context.Context, userID string) ([]Session, error) {
+func (s *Service) ListSessions(ctx context.Context, userID string) ([]Session, error) {
 	return s.store.ListSessionsByUser(ctx, userID)
 }
 
@@ -1547,7 +1523,7 @@ func (s *Service[U, PU]) ListSessions(ctx context.Context, userID string) ([]Ses
 // in the UI if the distinction matters to the operator. See
 // [Service.LogoutAll]'s doc, "What this does not revoke", for the same
 // bound in full and for the SessionID ("sid") claim that closes it.
-func (s *Service[U, PU]) RevokeSession(ctx context.Context, userID, sessionID string) error {
+func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) error {
 	sessions, err := s.store.ListSessionsByUser(ctx, userID)
 	if err != nil {
 		return err
@@ -1688,7 +1664,7 @@ func (s *Service[U, PU]) RevokeSession(ctx context.Context, userID, sessionID st
 //
 // A Store or Hasher error at any step is returned as-is — see the
 // package's "Fail closed" constraint.
-func (s *Service[U, PU]) ChangePassword(ctx context.Context, userID, currentSessionID, current, next string) error {
+func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, current, next string) error {
 	u, err := s.store.FindUserByID(ctx, userID)
 	if err != nil {
 		return err
@@ -1933,7 +1909,7 @@ func (s *Service[U, PU]) ChangePassword(ctx context.Context, userID, currentSess
 // pairing here for replica lag to exploit asymmetrically), so it is called
 // out here as a general caveat rather than inherited as the same numbered
 // obligation.
-func (s *Service[U, PU]) RequestPasswordReset(ctx context.Context, email, ip string) (string, bool, error) {
+func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (string, bool, error) {
 	if ip == "" {
 		return "", false, ErrMissingIP
 	}
@@ -2142,7 +2118,7 @@ func (s *Service[U, PU]) RequestPasswordReset(ctx context.Context, email, ip str
 // loop is returned immediately, leaving whichever families were already
 // revoked revoked and the rest untouched — the caller sees a non-nil error
 // either way and must not assume the reset "mostly worked".
-func (s *Service[U, PU]) ResetPassword(ctx context.Context, plainToken, next string) error {
+func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) error {
 	v, err := s.store.FindVerificationByHash(ctx, token.HashOpaque(plainToken))
 	if err != nil {
 		return err
@@ -2278,7 +2254,7 @@ func (s *Service[U, PU]) ResetPassword(ctx context.Context, plainToken, next str
 // caller's own row.
 //
 // A Store or [token.GenerateOpaque] error at any step is returned as-is.
-func (s *Service[U, PU]) RequestEmailChange(ctx context.Context, userID, newEmail string) (string, error) {
+func (s *Service) RequestEmailChange(ctx context.Context, userID, newEmail string) (string, error) {
 	normalized := NormalizeEmail(newEmail)
 	if normalized == "" {
 		return "", ErrEmailRequired
