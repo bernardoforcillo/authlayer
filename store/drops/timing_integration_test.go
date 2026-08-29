@@ -526,9 +526,13 @@ func medianOf(d []time.Duration) time.Duration {
 	return c[len(c)/2]
 }
 
-// newTimingAuthStore is newLiveAuthStoreWarmed with the raw *sql.DB handed
-// back too, which this harness needs for VACUUM — a statement drops has no
-// builder for, and one that cannot run inside a transaction.
+// newTimingAuthStore is newLiveAuthStore with the pool capped at 4 and one
+// warm-up query issued, so the first measured statement is not paying for
+// connection setup — the same reasoning [warmPool] applies at concurrency
+// scale, though this harness needs only one live connection, not a pool of
+// them. The raw *sql.DB is handed back too, which this harness needs for
+// VACUUM — a statement drops has no builder for, and one that cannot run
+// inside a transaction.
 func newTimingAuthStore(t *testing.T) (*dropsstore.AuthStore, *sql.DB) {
 	t.Helper()
 	sqlDB, db := openLiveDB(t)

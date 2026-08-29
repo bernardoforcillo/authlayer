@@ -547,14 +547,20 @@ An in-process, generic store backed by maps. Zero dependencies, concurrency
 safe, and the reference implementation of the contract — use it for development,
 tests, and examples. It does not enforce uniqueness of your own fields (a slug,
 say), and its `WithTx` approximates a transaction by snapshot-and-restore under
-a mutex. `memory.NewInviteStore()` and `memory.NewAuthStore()` are the
-`invite.Store` and `auth.Store` counterparts. The auth one enforces exactly
-two of the uniqueness constraints its port describes — one account per
-normalized email, and no id collision on any `Create*` — and, like the invite
-store, defers the `token_hash` uniqueness `auth.Store` requires of a backend
-to `store/drops`. It satisfies every atomicity MUST the port states by holding
-one mutex for each method's entire body, so no check-then-write can be split
-by a concurrent call.
+a mutex. `memory.NewInviteStore()` and `memory.NewAuthStore()` are the `invite.Store`
+and `auth.Store` counterparts. The auth one enforces every uniqueness
+constraint its port describes — one account per normalized email, no id
+collision on any `Create*`, and the `token_hash` uniqueness `auth.Store`
+requires of a backend on both `Session` and `Verification`, reported as
+`memory.ErrTokenHashTaken`. It used to defer that last one to `store/drops`,
+the way the invite store still defers `TokenHash` and `Code`; that left a
+caller who developed here and deployed there meeting the constraint for the
+first time in production, so it went away. A hash collision gets a
+backend-level error rather than a port sentinel because `auth.Store`
+classifies only `ErrIDTaken` on the `Create*` methods — `store/drops` answers
+the same case with the driver's own unique violation. It satisfies every
+atomicity MUST the port states by holding one mutex for each method's entire
+body, so no check-then-write can be split by a concurrent call.
 
 ### `store/drops`
 
@@ -681,6 +687,74 @@ AUTHLAYER_TEST_DSN='postgres://…?sslmode=disable' go test -tags integration ./
 > running at once — or anything else writing those tables — will fail each
 > other in ways that look like product bugs (`relation ... does not exist`
 > mid-run, timing measurements polluted by the other client's writes).
+
+### Writing your own `auth.Store`
+
+`auth.Store` is the strictest port in this library — seven of its eighteen
+methods carry a **MUST**, and the [Storage](#storage) section above says what
+each one costs when it is violated. Those requirements bind a third-party
+backend exactly as much as the two shipped ones, so they ship as an executable
+suite rather than as prose alone:
+
+```go
+import "github.com/bernardoforcillo/authlayer/auth/authtest"
+
+func TestMyStoreSatisfiesTheAuthContract(t *testing.T) {
+    authtest.RunStoreContract(t, func(t *testing.T) auth.Store {
+        return myStoreWithEmptyTables(t)   // called once per check
+    })
+}
+```
+
+The factory must hand back a store with **no** users, sessions or verifications
+in it — several checks assert counts over the whole table — and may register
+teardown with `t.Cleanup` or call `t.Skip`. Ids are UUIDv7 and every address is
+unique per call, so the suite runs unchanged against a backend that types its id
+columns as `uuid`. If your store opens connections on demand, raise your pool
+limits and warm it to `authtest.RaceGoroutines` connections first: goroutines
+that trickle in across a connection-setup window never actually contend, which
+silently weakens every race in the suite.
+
+Six of the fifty-two checks are races, because the obligations behind them are
+unreachable sequentially: `MarkRotated`'s single winner; `CreateUser`'s and
+`UpdateUserEmail`'s one-address-one-account atomicity, one check each; a
+`MarkEmailVerified` racing the `UpdateUserEmail` that moves the address out from
+under it; a `CreateSuccessorSession` racing the family revocation that must not
+leave it alive; and concurrent revocations of one family. The middle two assert a
+*linearizability* property rather than a timing guess — the end state they reject
+is one no serial order of the two calls can produce.
+
+Two things it does **not** do, stated here rather than left to be discovered:
+
+- `CreateUser`'s MUST is that `ErrEmailTaken` comes from the same attempt that
+  performs the write, so a condition denying writes but not reads cannot make a
+  duplicate address answer faster than a new one. Whether your backend consulted
+  a separate read first is invisible to a caller — the port itself permits an
+  in-process map to check first, precisely because its write cannot fail on its
+  own. The suite asserts the observable consequence (two concurrent creates of
+  one address, one winner); the read-authorization half is for review, not test.
+- `DeleteSessionsByFamily`'s serialization MUST is asserted only through its
+  consequence: concurrent calls on one family must all succeed and leave no
+  survivors. Forcing the lock-order inversion needs backend-specific SQL on a
+  second connection, which no port-level suite can write. `store/drops` carries
+  that test itself.
+
+Token-hash uniqueness is *in* that suite, not an extra alongside it.
+`Session.TokenHash` and `Verification.TokenHash` carry their **MUST** on the
+record type rather than on a method, and a backend that satisfies every method
+obligation and skips these is still wrong — a shared hash defeats
+`MarkRotated`'s single winner with no atomicity defect at all. It was briefly a
+second entry point, `RunTokenHashUniquenessContract`, because `store/memory`
+declined the obligation; that backend now enforces it and the entry point is
+gone, since shipping the check as opt-in told the next in-memory backend author
+it was optional.
+
+The suite's own tests include fifteen deliberately non-compliant stores — one
+whose `MarkRotated` lets every caller win, one whose `CreateUser` checks then
+writes non-atomically, one whose `DeleteSessionsByFamily` snapshots the family
+before it waits — paired into nineteen defect/check cases, each asserted to
+**fail** the check that covers it. A contract suite that passes everything is
+worthless, and that is not visible without controls.
 
 ## Custom scopes
 

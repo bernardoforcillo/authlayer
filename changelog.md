@@ -58,6 +58,45 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `TestNonUUIDIDGeneratorFailsAgainstTheScopeStoreLive` pin the `22P02`
   without them.
 
+- **`auth/authtest` — an exported contract-test suite for `auth.Store`**
+  (`authtest.RunStoreContract(t, newStore)`). `auth.Store` is an eighteen-method
+  port, seven of whose methods carry a normative **MUST**; until now those were
+  enforced by prose and by the two backends this repository happens to ship, so
+  a third-party backend author had no way to check their work. The suite covers
+  every one of them plus the ordinary behavioural contract — error
+  classification, email normalization on every read and write path, and
+  `PurgeExpired`'s strict cutoff. Six of its fifty-two checks are races, because the
+  obligations behind them are unreachable sequentially: `MarkRotated`'s single
+  winner; `CreateUser`'s and `UpdateUserEmail`'s one-address-one-account
+  atomicity, one check each; a `MarkEmailVerified` racing the `UpdateUserEmail`
+  that moves the address out from under it; a `CreateSuccessorSession` racing
+  the family revocation that must not leave it alive; and concurrent revocations
+  of one family. Points the port
+  leaves unspecified are deliberately not asserted. Fifteen negative controls —
+  each a store exactly one defect away from a correct one, paired into nineteen
+  defect/check cases — assert the suite *fails* a non-compliant implementation;
+  without them a suite that passes everything would look identical to one that
+  works. Two of the seven are only partly reachable from outside the port and
+  the package doc says so rather than implying coverage: `CreateUser`'s
+  requirement that `ErrEmailTaken` come from the write attempt rather than a
+  separately-authorized read is a property of the backend's failure topology,
+  invisible to a caller, so only its atomicity consequence is asserted; and
+  `DeleteSessionsByFamily`'s serialization **MUST** is asserted through its
+  consequence, because forcing the lock-order inversion needs backend-specific
+  SQL on a second connection. `store/drops` carries that one itself.
+- **Token-hash uniqueness is part of that suite**, as
+  `CreateSession/TokenHashIsUnique` and `CreateVerification/TokenHashIsUnique`.
+  `Session.TokenHash` and `Verification.TokenHash` carry their **MUST** on the
+  record type rather than on a method, and a backend that satisfies every
+  method obligation and skips these is still wrong: a shared hash defeats
+  `MarkRotated`'s single-winner contract *with no atomicity defect at all*,
+  because two concurrent callers each atomically win a different one of the
+  colliding rows. It shipped briefly as a separate entry point,
+  `RunTokenHashUniquenessContract`, because `store/memory` did not enforce it —
+  the backend changed instead (see below), and the second entry point is gone.
+  What a rejected duplicate *returns* is still not asserted, since the port
+  classifies only `ErrIDTaken` there.
+
 ### Changed
 
 - **`scope.WithIDGenerator` and `auth.WithIDGenerator` no longer document a
@@ -68,6 +107,34 @@ once a 1.0 is cut. Until then, minor versions may break API.
   behaviour those paragraphs described is still the default and is still
   pinned by test — what changed is that it is now a default with a documented
   way out, rather than a limit.
+
+- **`store/memory`'s `AuthStore` now enforces `Session.TokenHash` and
+  `Verification.TokenHash` uniqueness**, which `auth.Store` requires of a
+  backend and which this store previously deferred to `store/drops` (its
+  package doc said so). The port's own text is why that did not hold: a shared
+  hash breaks `MarkRotated`'s single-winner contract with no atomicity defect
+  at all, which is the property refresh rotation rests on, and a caller who
+  developed against `store/memory` and deployed against `store/drops` met the
+  divergence for the first time in production. `CreateSession`,
+  `CreateSuccessorSession` and `CreateVerification` now reject a colliding hash
+  under the same acquisition of `mu` as the write, exactly as `CreateUser`'s
+  email check already worked.
+- **New: `memory.ErrTokenHashTaken`**, what those three methods return on a
+  collision. Deliberately not `auth.ErrIDTaken` and not a new `auth` sentinel:
+  `auth.Store`'s error contract classifies exactly one conflict on the
+  `Create*` methods — an id that already identifies a row of that same kind —
+  and explicitly leaves token-hash uniqueness to the backend's own constraint.
+  `store/drops` answers the same case with the driver's `pg.ErrUniqueViolation`
+  unwrapped; both backends now agree the write must fail, and neither pretends
+  the port classifies it. `invite`'s parallel (`EmailInvite.TokenHash`,
+  `Link.Code`) is unchanged and still deferred: `invite.Store` is a separate
+  port with its own obligations.
+- **`store/drops`' live lane no longer reimplements the `MarkRotated` contract.**
+  It ran an independent copy because the original lived in an unexported helper
+  in a `_test.go` file, reachable from nowhere else; both backends now run the
+  same exported suite. The backend-specific live tests — the ones that stage a
+  lock ordering with raw SQL on a second connection, which no port-level suite
+  can express — are unchanged.
 
 ## [0.1.0] - 2026-08-29
 
