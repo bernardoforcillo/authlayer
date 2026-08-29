@@ -1789,6 +1789,90 @@ func TestResetPasswordStampsEmailVerifiedLive(t *testing.T) {
 	}
 }
 
+// TestLogoutAllSweepsPendingVerificationsLive is the live-PostgreSQL
+// regression for the takeover that survived "sign out everywhere". The
+// vulnerability was demonstrated against this store, so the fix is pinned
+// against it too rather than only against store/memory: an attacker's
+// pending email_change outlived LogoutAll and VerifyEmail redeemed it
+// afterwards with no authentication at all, moving the account to an
+// address Login and RequestPasswordReset can no longer reach the victim at.
+func TestLogoutAllSweepsPendingVerificationsLive(t *testing.T) {
+	st := newLiveAuthStore(t)
+	ctx := context.Background()
+	svc := newLiveAuthService(st)
+
+	res, err := svc.SignUp(ctx, "live-sweep@example.com", liveTestPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	changeTok, err := svc.RequestEmailChange(ctx, res.User.ID, liveTestPassword, "attacker@evil.example")
+	if err != nil {
+		t.Fatalf("RequestEmailChange: %v", err)
+	}
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "live-sweep@example.com", "203.0.113.9")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+
+	if err := svc.LogoutAll(ctx, res.User.ID); err != nil {
+		t.Fatalf("LogoutAll: %v", err)
+	}
+
+	if _, err := svc.VerifyEmail(ctx, changeTok); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("VerifyEmail(email_change) after LogoutAll err = %v, want ErrVerificationNotFound", err)
+	}
+	if err := svc.ResetPassword(ctx, resetTok, "Attacker-Chosen-Pass24!"); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("ResetPassword after LogoutAll err = %v, want ErrVerificationNotFound", err)
+	}
+	stored, err := st.FindUserByID(ctx, res.User.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.Email != "live-sweep@example.com" {
+		t.Fatalf("stored email = %q, want the original — the account was moved after a sign-out-everywhere", stored.Email)
+	}
+}
+
+// TestVerifyEmailChangeSweepsResetTokensLive is the live regression for the
+// mirror gap: an address rotation that swept no reset token left a link in
+// the mailbox the user was fleeing able to reset the password of the
+// account at its NEW address for the rest of the reset TTL. Verified
+// against this store before the fix; pinned against it now.
+func TestVerifyEmailChangeSweepsResetTokensLive(t *testing.T) {
+	st := newLiveAuthStore(t)
+	ctx := context.Background()
+	svc := newLiveAuthService(st)
+
+	res, err := svc.SignUp(ctx, "live-old@example.com", liveTestPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	// A reset link is issued to the address the user is about to leave.
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "live-old@example.com", "203.0.113.9")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+
+	changeTok, err := svc.RequestEmailChange(ctx, res.User.ID, liveTestPassword, "live-new@example.com")
+	if err != nil {
+		t.Fatalf("RequestEmailChange: %v", err)
+	}
+	moved, err := svc.VerifyEmail(ctx, changeTok)
+	if err != nil {
+		t.Fatalf("VerifyEmail(email_change): %v", err)
+	}
+	if moved.Email != "live-new@example.com" {
+		t.Fatalf("email after redemption = %q, want %q", moved.Email, "live-new@example.com")
+	}
+
+	if err := svc.ResetPassword(ctx, resetTok, "Old-Mailbox-Pass25!"); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("ResetPassword(token delivered to the OLD address) err = %v, want ErrVerificationNotFound", err)
+	}
+	if _, err := svc.Login(ctx, "live-new@example.com", liveTestPassword, "203.0.113.9", "agent"); err != nil {
+		t.Fatalf("Login with the ORIGINAL password after the refused reset: %v, want success", err)
+	}
+}
+
 // recordingDriver wraps a real drops driver and keeps every statement it
 // executes, so a test can recover the EXACT SQL a store method issued and
 // then EXPLAIN that same string. Writing the DELETE out by hand in the test
