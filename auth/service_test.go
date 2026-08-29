@@ -1668,6 +1668,14 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 			}
 			return res.User, u.ID
 		},
+		"User": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
+			seeded := mustSignUp(t, svc, "scrub-user@example.com", validPassword)
+			u, err := svc.User(ctx, seeded.ID)
+			if err != nil {
+				t.Fatalf("User: %v", err)
+			}
+			return u, seeded.ID
+		},
 		"VerifyEmail": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
 			res, err := svc.SignUp(ctx, "scrub-verify@example.com", validPassword)
 			if err != nil {
@@ -4015,5 +4023,41 @@ func TestVerifyAccessTokenIgnoresSessionRevocation(t *testing.T) {
 	}
 	if claims.SessionID == "" {
 		t.Fatal("claims.SessionID is empty; it is the hook an application uses to close this gap itself")
+	}
+}
+
+// ============================================================
+// User
+// ============================================================
+
+// TestUserReturnsTheAccountAndPropagatesNotFound pins the accessor's own
+// two outcomes. The scrub it performs is pinned by
+// TestEveryPathReturningAUserBaseScrubsPasswordHash, which enumerates every
+// user-returning method rather than testing this one in isolation.
+func TestUserReturnsTheAccountAndPropagatesNotFound(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	seeded := mustSignUp(t, svc, "una@example.com", validPassword)
+
+	got, err := svc.User(ctx, seeded.ID)
+	if err != nil {
+		t.Fatalf("User: %v", err)
+	}
+	if got.ID != seeded.ID || got.Email != "una@example.com" {
+		t.Fatalf("User = %+v, want the seeded account %+v", got, seeded)
+	}
+
+	// The Store's own copy is untouched by the scrub: clearing the field on
+	// the value handed out must not clear the stored credential.
+	stored, err := store.FindUserByID(ctx, seeded.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.PasswordHash == "" {
+		t.Fatal("the Store's own PasswordHash was cleared too — User must scrub its copy, not the row")
+	}
+
+	if _, err := svc.User(ctx, "no-such-user"); !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("User(unknown id) = %v, want ErrUserNotFound", err)
 	}
 }

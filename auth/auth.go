@@ -143,7 +143,7 @@ type UserBase struct {
 	// not protect a non-JSON leak (a log line, a %+v, a different encoder)
 	// — so auth/service.go additionally clears this field, explicitly, on
 	// every value it hands back: [Service.SignUp], [Service.Login],
-	// [Service.Refresh] and [Service.VerifyEmail].
+	// [Service.Refresh], [Service.VerifyEmail] and [Service.User].
 	PasswordHash string `drop:"password_hash" json:"-"`
 	// CreatedAt is stamped by the service clock at signup.
 	CreatedAt time.Time `drop:"created_at"`

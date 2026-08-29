@@ -1033,6 +1033,43 @@ func (s *Service) VerifyAccessToken(raw string) (token.Claims, error) {
 	return token.Parse(raw, s.cfg.signingKey...)
 }
 
+// User loads the account identified by userID, returning [ErrUserNotFound]
+// when there is none. PasswordHash is cleared to "" on the returned value,
+// like every other path in this package that hands a [UserBase] back — see
+// that field's own doc.
+//
+// It is otherwise a thin wrapper over [Store.FindUserByID], and that scrub
+// is exactly why it exists. Without it the only exported way to read a user
+// was the Store's own method, which returns the row as stored — including
+// the LIVE bcrypt digest — so the read path a caller was forced onto was
+// the one path in this package that did not scrub, and the caller had to
+// know to do it themselves. [Service.SignUp], [Service.Login],
+// [Service.Refresh] and [Service.VerifyEmail] each hand back a user because
+// they just did something to it; this method exists for the ordinary case
+// of having only an id, most often the Subject claim off an access token
+// [Service.VerifyAccessToken] just verified. It is the counterpart of
+// [github.com/bernardoforcillo/authlayer/scope.Service.Container], which
+// exists on that Service for the same "another package needs to read one by
+// id" reason.
+//
+// It reads nothing from the context and performs no check that the caller
+// is entitled to ask — exactly like scope.Service.Container. Do not expose
+// it directly to end users: a handler must have already decided, by its own
+// reasoning, that this account's record belongs in front of whoever is
+// asking. The record is small and fixed (see the package doc, "Why Service
+// is not generic over your user type"), so what it discloses is an id, an
+// email address, a verification stamp and two timestamps — but an email
+// address handed to the wrong caller is still a disclosure, and the id
+// itself is what every other method in this package authorizes on.
+func (s *Service) User(ctx context.Context, userID string) (UserBase, error) {
+	u, err := s.store.FindUserByID(ctx, userID)
+	if err != nil {
+		return UserBase{}, err
+	}
+	u.PasswordHash = ""
+	return u, nil
+}
+
 // VerifyEmail redeems plainToken: a "signup" token marks the account's
 // current email verified; an "email_change" token overwrites the account's
 // email to the address the token was minted for (see
