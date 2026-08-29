@@ -102,8 +102,9 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `AddMember` call. `InviteByEmail` mints a one-time **bearer** token — it
   pays out at most once, but to whoever presents it: acceptance never compares
   the accepting subject to `EmailInvite.Email`, which is a delivery hint and
-  an audit record, since authlayer stores no users and has no notion of a
-  subject's verified address. Bind an invitation to its recipient in your own
+  an audit record, since `invite` stores no users and takes no dependency on
+  `auth`, so it has no verified address to compare against. (`auth`, below,
+  does store users — this package simply cannot see them.) Bind an invitation to its recipient in your own
   application if you need that, using `PreviewInvite` to read the invited
   address without consuming the token. Only the token's sha256 is persisted
   (`EmailInvite.TokenHash`), since the token is
@@ -333,9 +334,17 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `RequestPasswordReset` returns `(token, ok, nil)` and never errors merely
   because an address is unknown; a denial from the address-keyed limiter
   returns that same shape rather than `ErrRateLimited`, which would itself be
-  an oracle. What remains is timing: a known address answers roughly
-  1.7–2.9 ms slower than an unknown one (about 4–6×, measured against a live
-  PostgreSQL store) because the known branch performs two extra local writes.
+  an oracle. What remains is timing: a known address answers several times
+  slower than an unknown one, because the known branch performs two extra
+  writes. The measurement is a test rather than a claim —
+  `TestRequestPasswordResetTimingChannelLive` in `store/drops`' integration
+  lane reports it — and what reproduces is the shape: the two distributions
+  are disjoint at the known branch's 5th percentile against the unknown
+  branch's 95th. On one machine that was a 9.5–16.7 ms known median against
+  0.7–0.9 ms, roughly 12–25×; absolute figures vary by host, and a
+  deployment's gap is wider still, since `verifications` carries no
+  `(user_id, purpose)` index and the invalidating `DELETE` therefore scans
+  the whole table.
   `WithPasswordResetRateLimiter` is what bounds that sampling, and it also
   bounds the flip side of re-issue invalidation — anyone who knows an address
   can destroy that account's pending reset link by looping requests. There is

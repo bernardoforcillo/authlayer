@@ -29,12 +29,15 @@ import (
 //
 // Email is a delivery hint and an audit record — where the token was sent,
 // and what to show on a "pending invitations" screen — not an authorization
-// check. It cannot be one here: authlayer stores no users at all — a user id
-// is a value it carries, never one it validates — so it has no verified
-// address to compare the accepting subject against. An application that needs
-// the invitation bound to its
+// check. It cannot be one here: THIS package stores no users and takes no
+// dependency on [github.com/bernardoforcillo/authlayer/auth] — a user id is
+// a value it carries, never one it validates — so it has no verified address
+// to compare the accepting subject against. (authlayer as a whole does store
+// users, in auth.UserBase, EmailVerifiedAt included; this package simply
+// cannot see them.) An application that needs the invitation bound to its
 // recipient must enforce that itself, before calling AcceptInvite — compare
-// Email against the authenticated user's own verified address, using
+// Email against the authenticated user's own verified address
+// (auth.UserBase.EmailVerifiedAt, if that is where the account lives), using
 // [Service.PreviewInvite] to read the invited address out of a token without
 // consuming it.
 //

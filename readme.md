@@ -1015,6 +1015,23 @@ account. `ip` must be non-empty — a blank one would put every caller that
 omits it into a single shared rate-limit bucket, so it is `ErrMissingIP`
 rather than a tolerated "unknown".
 
+**Two of the four lifetimes are not configurable.** `WithJWT` sets the access
+token's TTL and `WithRefreshTTL` the session's, as above. The two
+`Verification` lifetimes are constants with no `Option` behind them:
+
+| Token | Minted by | TTL | Configurable |
+|---|---|---|---|
+| access | `Login`, `Refresh` | 15 min default | `WithJWT` |
+| refresh (session) | `Login`, `Refresh` | 30 days default | `WithRefreshTTL` |
+| `signup`, `email_change` | `SignUp`, `RequestEmailChange` | **24 hours** | no |
+| `password_reset` | `RequestPasswordReset` | **1 hour** | no |
+
+The signup window is generous on purpose — mail that arrives late must not
+force a whole new sign-up — and the reset window is short on purpose, because
+a reset link grants a full credential change rather than an "I own this
+address" attestation. If your deployment needs either changed, that is a
+change to `auth`'s own constants today, not a wiring decision.
+
 ### Rotation, reuse detection, and family revocation
 
 A login mints two credentials. The **access token** is a short-lived HS256 JWT
@@ -1202,7 +1219,7 @@ an unrate-limited "is this registered?" oracle for any authenticated caller.
 Both `ChangePassword` and `ResetPassword` also invalidate every outstanding
 `password_reset` **and** `email_change` token for the account, which closes two
 real side doors. The reset one: an attacker who requested a reset link and
-waited would otherwise keep a working way in for the token's whole TTL, even
+waited would otherwise keep a working way in for that token's whole hour, even
 after the victim changed their password — the one thing a user does on
 suspecting compromise. The `email_change` one is stronger and was the half
 left open for a while: that token lives 24 hours rather than one, needs no
@@ -1432,8 +1449,11 @@ detected replay itself fails, `Refresh` wraps both, so the alarm is never lost
 to the housekeeping failure.
 
 [`token`](token/) adds six. The first four are what a caller gets from
-`Parse`; the last two are misconfiguration, surfaced from `Issue`, and no
-request can trigger them:
+`Parse` for a bad token. The last two report a bad *key or TTL* rather than a
+bad token — but only `ErrInvalidTTL` is confined to `Issue`. `Parse` checks
+every key's length before it looks at the token at all and refuses the whole
+call with `ErrKeyTooShort` if any one of them is short, so a misconfigured
+`Service` surfaces that on the request path, not only at startup:
 
 | Error | Meaning | Suggested status |
 |---|---|---|

@@ -328,7 +328,8 @@ func WithClock(now func() time.Time) Option {
 }
 
 // WithIDGenerator sets the id generator used for users, sessions, and
-// verifications. The default is UUIDv7 ([uid.NewV7]) — matching
+// verifications. The default is UUIDv7 (internal/uid.NewV7, not importable
+// from outside this module) — matching
 // [github.com/bernardoforcillo/authlayer/scope.WithIDGenerator]'s own
 // rationale. A nil generator is ignored, leaving the default (or a prior
 // option) in place.
@@ -406,7 +407,8 @@ func WithRequireVerifiedEmail(require bool) Option {
 //
 // u carries the real, freshly-loaded identity: whatever [UserBase] fields
 // this package itself manages (ID, Email, EmailVerifiedAt, ...) are
-// genuinely populated — see [Service.wrap]. Anything your own type embeds
+// genuinely populated — see Service's unexported wrap method, which starts
+// from the zero U. Anything your own type embeds
 // BEYOND UserBase is not: [Store] only ever persists the UserBase-shaped
 // portion (see that interface's own doc), so this package has no way to
 // recover a field like Plan from storage on your behalf. Look such fields
@@ -999,8 +1001,11 @@ func (s *Service[U, PU]) signingKey() []byte {
 // version of this exact pattern did elsewhere in this codebase: see
 // [github.com/bernardoforcillo/authlayer/invite.Service.AcceptInvite]'s doc,
 // "Ordering, and why", for the incident this method is deliberately built
-// not to repeat ("Plan 4 shipped the reverse and admitted two subjects from
-// one invitation"). Applying first would let every caller racing on the
+// not to repeat. That method shipped admit-first, claim-second, which left
+// the invite row in place while the membership was being granted — so the
+// token stayed redeemable "by ANYONE presenting it, not merely by the
+// original caller retrying", and a one-time credential paid out more than
+// once. Applying first would let every caller racing on the
 // same token reach MarkEmailVerified/UpdateUserEmail — both idempotent
 // writes to the SAME target user and address, so a race does not escalate
 // to a different account the way AcceptInvite's did — but it would still
@@ -1794,14 +1799,15 @@ func (s *Service[U, PU]) ChangePassword(ctx context.Context, userID, currentSess
 //     unlike SignUp — where [Store.CreateUser]'s own attempt IS the
 //     new-vs-duplicate signal and leaves a real [UserBase] row on BOTH
 //     branches for every later step to run against — this method has no
-//     row on the unknown branch to run either write against. [s.cfg.clock]
-//     and [s.cfg.idGen] are pulled in by those same two writes and so are
-//     branch-exclusive too; neither can fail, so neither adds anything to
-//     point 3's error-set argument, but a caller-injected [WithIDGenerator]
-//     with an observable side effect or its own cost (a shared counter, an
-//     external ID service) would run only on the known branch — the
-//     default, [github.com/bernardoforcillo/authlayer/internal/uid.NewV7],
-//     is a pure local computation and carries no such risk.
+//     row on the unknown branch to run either write against. The clock and
+//     the configured id generator are pulled in by those same two writes
+//     and so are branch-exclusive too; neither can fail, so neither adds
+//     anything to point 3's error-set argument, but a caller-injected
+//     [WithIDGenerator] with an observable side effect or its own cost (a
+//     shared counter, an external ID service) would run only on the
+//     known branch — the
+//     default, internal/uid.NewV7, is a pure local computation and carries
+//     no such risk.
 //
 //     This does NOT mean no symmetric alternative exists — an earlier
 //     version of this doc claimed exactly that, and it was wrong. Neither
@@ -2035,9 +2041,12 @@ func (s *Service[U, PU]) RequestPasswordReset(ctx context.Context, email, ip str
 // # Ordering, and why it is not negotiable
 //
 // Exactly like [Service.VerifyEmail] — see that method's doc, "Ordering,
-// and why it is not negotiable", for the incident ("Plan 4 shipped the
-// reverse and admitted two subjects from one invitation") this ordering is
-// deliberately built not to repeat — this method claims the verification
+// and why it is not negotiable", for the incident this ordering is
+// deliberately built not to repeat: an earlier
+// [github.com/bernardoforcillo/authlayer/invite.Service.AcceptInvite]
+// applied its effect before claiming its token, leaving a one-time
+// credential redeemable by anyone who presented it while the effect was
+// still being applied — this method claims the verification
 // FIRST ([Store.DeleteVerification], rows-affected gated so at most one of
 // any two callers racing the SAME token ever sees a nil error) and only
 // THEN applies its effect ([Store.UpdateUserPassword], then the session
