@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once a 1.0 is cut. Until then, minor versions may break API.
 
-## [Unreleased]
+## [0.1.0] - 2026-08-29
 
 ### Added
 
@@ -312,7 +312,14 @@ once a 1.0 is cut. Until then, minor versions may break API.
   lifetimes each have an option: `WithJWT`, `WithRefreshTTL`,
   `WithVerificationTTL` (24h default, covering `signup` and `email_change`)
   and `WithPasswordResetTTL` (1h default). Every duration option ignores a
-  non-positive value and keeps its default.
+  non-positive value and keeps its default. `WithJWT` validates the WHOLE key
+  list, not just `keys[0]`, and ignores one containing any unusable key
+  exactly as it ignores a nil one: `token.Issue` checks only the key it signs
+  with while `token.Parse` refuses a call whose list contains a short key, so
+  a `Service` built from `{good, short}` would otherwise mint access tokens it
+  could never verify — every login succeeding and every subsequent request
+  failing. The floor is not restated here; each key is checked by asking
+  `token.Issue`.
   **Revocation is per-family.** `LogoutAll`, `ChangePassword`,
   `ResetPassword`, `RevokeSession` and reuse detection all revoke whole
   session families, because rotated-but-unexpired rows are retained and are
@@ -353,13 +360,17 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `ErrSessionRevoked` rather than resurrecting a family revoked in the window
   between the two. Both windows stay closed only insofar as the backend
   honours the atomicity the port demands; both shipped stores do.
-  Where a backend's answer is checkable, it is checked: a `MarkRotated` that
-  reports a replay but returns no `FamilyID` leaves nothing to revoke, so
-  `Refresh` fails closed with `ErrStoreContract` wrapped alongside
-  `ErrTokenReuse` rather than issuing a revocation on an empty key that
-  matches no rows — firing the alarm while containment silently no-ops.
-  `ErrTokenReuse` returned ALONE still means the family is already revoked;
-  wrapped, it means a replay was detected and the family may still be live.
+  Where a backend's answer is checkable, it is checked: a `Session` handed
+  back with no `FamilyID` leaves nothing to revoke, so every path that
+  revokes a family fails closed with `ErrStoreContract` rather than issuing a
+  revocation on an empty key that matches no rows — firing the alarm, or
+  reporting a device signed out, while containment silently no-ops. Three
+  paths reach it: `Refresh` on a reported replay, `Logout` of a superseded
+  token, and `RevokeSession`. Only `Refresh` has a second signal worth
+  keeping, so only there is it wrapped alongside `ErrTokenReuse`; the other
+  two return it alone. `ErrTokenReuse` returned ALONE still means the family
+  is already revoked; wrapped, it means a replay was detected and the family
+  may still be live.
   **Enumeration-safe sign-up:** `SignUp` returns
   `(SignUpResult{Created: false}, nil)` for an address already registered —
   never an error — and holds the property by construction rather than by
@@ -384,7 +395,7 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `TestRequestPasswordResetTimingChannelLive` in `store/drops`' integration
   lane reports it — and what reproduces is the shape: the two distributions
   are disjoint at the known branch's 5th percentile against the unknown
-  branch's 95th. On one machine that was a 4.1–8.7 ms known median against
+  branch's 95th. On one machine that was a 3.3–8.7 ms known median against
   0.5–1.0 ms, roughly 5.5–12×; absolute figures vary by host and even by day
   on the same host, and a deployment's gap is wider still to the extent
   autovacuum is behind. Table size does not widen it: `verifications` carries
@@ -404,7 +415,10 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `ResetPassword` claims the verification before applying it, so a failure
   after the claim burns the token rather than leaving it redeemable twice,
   and then revokes every session. A completed reset also stamps
-  `EmailVerifiedAt` when it is not already set: a reset token is only ever
+  `EmailVerifiedAt` when it is not already set — **after** the revocation, not
+  before, so a failure in that optional audit stamp cannot return an error
+  having rotated the credential while leaving every session, a thief's
+  included, still refreshable: a reset token is only ever
   deliverable to the address it was minted for, so redeeming one proves
   control of that address. That is the only way out of
   `WithRequireVerifiedEmail(true)` for an address whose signup mail was lost
@@ -416,23 +430,48 @@ once a 1.0 is cut. Until then, minor versions may break API.
   doors: the attacker who requested a reset link and waited keeps a way in for
   its whole TTL even after the victim changes their password, and — the
   stronger of the two — an `email_change` token lives 24 hours rather than
-  one, needs no current password to mint, and is redeemed by `VerifyEmail`
-  with no authentication at all, moving the account to an address from which
-  the victim cannot recover, since `Login` and `RequestPasswordReset` both
-  look accounts up by email. **Both sweeps are sequential only:** nothing
+  one and is redeemed by `VerifyEmail` with no authentication at all, moving
+  the account to an address from which the victim cannot recover, since
+  `Login` and `RequestPasswordReset` both look accounts up by email.
+  **`LogoutAll` sweeps both purposes too**, after revoking the sessions:
+  "sign out of every device" is what a user clicks on spotting an intruder, so
+  it must leave nothing armed that undoes it, and sweeping only on the two
+  credential paths meant the takeover survived it. `Logout` and
+  `RevokeSession` sweep **nothing**, deliberately — they are per-device and
+  routine, and sweeping there would break a flow with no attacker in it:
+  request an email change on a desktop, sign that desktop out, click the link
+  that arrives on a phone. Each says so in its own doc.
+  **The mirror holds as well:** redeeming an `email_change` invalidates the
+  account's outstanding `password_reset` tokens, because a reset link is
+  deliverable to exactly one address and moving the account away from it must
+  not leave a link in the abandoned mailbox able to reset the credential at
+  the new one. That redemption does *not* revoke sessions: `VerifyEmail` is
+  unauthenticated by construction, so a sign-out-everywhere effect there would
+  hand a denial-of-service lever to anyone who obtains the link, and arming
+  the token already cost the current password — `LogoutAll` is the
+  authenticated control for that. **Every sweep is sequential only:** nothing
   orders them against a `RequestPasswordReset` or `RequestEmailChange` whose
   own `CreateVerification` is genuinely concurrent, and such a token can still
   survive and later redeem; closing that would need a transaction spanning
-  both, which the `Store` port does not offer. `RequestEmailChange` performs
+  both, which the `Store` port does not offer. **`RequestEmailChange` requires
+  the current password**, exactly as `ChangePassword` does and with the same
+  timing discipline (a credential-less account spends a comparable `Dummy` and
+  gets the same `ErrInvalidCredentials`; a caller who fails the check is not
+  told whether the address they proposed even parsed). Arming a rotation of
+  the account's login identifier is the same kind of act as rotating its
+  password, and `VerifyEmail` redeems the result with no authentication at
+  all — so without the check a briefly-held session, or a leaked 15-minute
+  access token, bought a 24-hour account takeover. It performs
   no address pre-check — uniqueness is enforced atomically at redemption
   instead, because a pre-check was an unrate-limited "is this registered?"
-  oracle for any authenticated caller. Seventeen sentinel errors:
+  oracle for any authenticated caller. Eighteen sentinel errors:
   `ErrUserNotFound`, `ErrEmailTaken`, `ErrIDTaken`, `ErrSessionNotFound`,
   `ErrVerificationNotFound`, `ErrEmailMismatch`, `ErrWeakPassword`,
   `ErrInvalidCredentials`, `ErrEmailNotVerified`, `ErrRateLimited`,
   `ErrMissingIP`, `ErrVerificationExpired`, `ErrVerificationPurpose`,
   `ErrTokenInvalid`, `ErrTokenReuse`, `ErrSessionRevoked`,
-  `ErrEmailRequired`. `store/memory` and `store/drops` each ship a reference
+  `ErrEmailRequired`, `ErrStoreContract`. `store/memory` and `store/drops`
+  each ship a reference
   `auth.Store`; `Store.PurgeExpired` sweeps expired sessions and
   verifications for a cron, and never removes users.
 - **Auth persistence** (`authlayer/store/memory`, `authlayer/store/drops`) —
@@ -668,5 +707,6 @@ OAuth) is not part of this release.
 - `github.com/jackc/pgx/v5` v5.10.0 (PostgreSQL store only)
 - Go 1.26+
 
-[Unreleased]: https://github.com/bernardoforcillo/authlayer/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/bernardoforcillo/authlayer/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/bernardoforcillo/authlayer/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/bernardoforcillo/authlayer/releases/tag/v0.0.1

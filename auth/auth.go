@@ -126,8 +126,28 @@ type UserBase struct {
 	// org.Organization.Slug for the precedent), though a backend remains
 	// free to declare it some other way (e.g. pg.Table.AddUnique).
 	Email string `drop:"email,unique"`
-	// EmailVerifiedAt is when the user confirmed this address via a
-	// "signup"-purpose [Verification]. nil means unverified.
+	// EmailVerifiedAt is when control of this address was proven. nil means
+	// unverified.
+	//
+	// Three service paths stamp it, all of them through
+	// [Store.MarkEmailVerified] and all of them proving control of the
+	// address the redeemed token was DELIVERED to:
+	//
+	//   - a "signup" redemption
+	//     ([github.com/bernardoforcillo/authlayer/auth.Service.VerifyEmail]),
+	//     certifying the address the account already holds;
+	//   - an "email_change" redemption (the same method), certifying the NEW
+	//     address immediately after [Store.UpdateUserEmail] moves the row to
+	//     it;
+	//   - a completed
+	//     [github.com/bernardoforcillo/authlayer/auth.Service.ResetPassword],
+	//     which stamps it only when it is not already set and the account
+	//     still holds the address the reset token was minted for — a reset
+	//     token is deliverable only to that address, so redeeming one is the
+	//     same proof arriving through a different door.
+	//
+	// [Store.UpdateUserEmail] clears it back to nil, unconditionally: moving
+	// the address proves nothing about the new one on its own.
 	EmailVerifiedAt *time.Time `drop:"email_verified_at"`
 	// PasswordHash is the bcrypt (or other [github.com/bernardoforcillo/authlayer/password.Hasher])
 	// output for this user's password credential. Empty means no password
@@ -240,10 +260,20 @@ type Verification struct {
 	//   - "email_change": the *new* address the token was minted for, to be
 	//     switched to on redemption via [Store.UpdateUserEmail] — never the
 	//     user's old/current address.
-	//   - "password_reset": the address the token was delivered to, kept for
-	//     consistency even though a password-reset redemption calls
-	//     [Store.UpdateUserPassword], not [Store.MarkEmailVerified], and
-	//     this field plays no role in that check today.
+	//   - "password_reset": the address the token was delivered to — and
+	//     LOAD-BEARING, not a decorative copy. A completed
+	//     [github.com/bernardoforcillo/authlayer/auth.Service.ResetPassword]
+	//     compares this field against the account's CURRENT Email and stamps
+	//     UserBase.EmailVerifiedAt via [Store.MarkEmailVerified] only if they
+	//     match, then passes this exact value to that method — so a backend
+	//     that stores this un-normalized breaks the guard silently: the
+	//     comparison fails for a case or whitespace variant that is in fact
+	//     the same address (no stamp, a user left unable to satisfy
+	//     WithRequireVerifiedEmail), and, worse, a normalized row compared
+	//     against an un-normalized stored value is no longer a comparison of
+	//     the address the token was DELIVERED to. That comparison is the
+	//     only thing standing between a reset and certifying an address
+	//     nobody proved control of.
 	//
 	// This field MUST NOT be conditionally populated by Purpose. It used to
 	// be named NewEmail and was documented empty for every Purpose but
@@ -444,14 +474,18 @@ type Store interface {
 	// reintroduced silently through the gap between one flow's
 	// UpdateUserEmail call and its own following MarkEmailVerified call.
 	// Requiring and checking email turns that race into a loud
-	// ErrEmailMismatch instead of a silent false verification: this is the
-	// redemption step for a "signup"-purpose Verification, and the step an
-	// "email_change" redemption calls immediately after UpdateUserEmail —
-	// in both cases, the caller passes Verification.Email, the exact address
-	// the token was minted for regardless of Purpose (see that field's own
-	// doc — it is never conditionally populated, precisely so this check has
-	// something real to compare against for every Purpose, not only
-	// email_change), and the store refuses to certify anything else.
+	// ErrEmailMismatch instead of a silent false verification. Three service
+	// call sites reach it, one per Purpose: the redemption step for a
+	// "signup" Verification; the step an "email_change" redemption calls
+	// immediately after UpdateUserEmail; and the address stamp a completed
+	// "password_reset" performs
+	// ([github.com/bernardoforcillo/authlayer/auth.Service.ResetPassword] —
+	// see UserBase.EmailVerifiedAt). In all three the caller passes
+	// Verification.Email, the exact address the token was minted for
+	// regardless of Purpose (see that field's own doc — it is never
+	// conditionally populated, precisely so this check has something real to
+	// compare against for every Purpose), and the store refuses to certify
+	// anything else.
 	MarkEmailVerified(ctx context.Context, userID, email string, now time.Time) error
 	// UpdateUserPassword overwrites PasswordHash and stamps UpdatedAt with
 	// now on the user identified by userID, returning ErrUserNotFound when

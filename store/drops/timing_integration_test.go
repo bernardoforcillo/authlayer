@@ -278,7 +278,7 @@ func us(d time.Duration) string {
 // because it is dominated by write latency and that varies with whatever
 // else the host and its storage stack are doing. Six runs on one machine
 // (Windows host, PostgreSQL in a container, loopback) gave known medians
-// between 4060µs and 8699µs against unknown medians between 486µs and
+// between 3254µs and 8699µs against unknown medians between 486µs and
 // 1006µs — a delta between 2.8ms and 8.0ms, a ratio between 5.5x and
 // 12.3x. What held on EVERY run, and is the durable claim, is the shape:
 // the known branch's 5th percentile above the unknown branch's 95th, and

@@ -2378,7 +2378,7 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 //     against the unknown branch's 95th — so on a quiet, same-host network
 //     a single sample already separates them more often than not. Six runs
 //     on one machine (Windows host, PostgreSQL in a container, loopback)
-//     put the known-address median between 4.1ms and 8.7ms against an
+//     put the known-address median between 3.3ms and 8.7ms against an
 //     unknown-address median between 0.5ms and 1.0ms: Δ≈2.8-8.0ms, roughly
 //     5.5-12×. The disjointness held on every run; the absolute figures did
 //     not, and a different machine will produce different ones — the ratio

@@ -508,7 +508,7 @@ decide `ErrEmailTaken` from the same attempt that performs the write, and
 single `SignUp` call into an "is this address registered?" oracle from inside
 the store, where no amount of care in `SignUp` itself can see it.
 
-**One demands the opposite of the other five: an *extra* read, and
+**One demands the opposite of the other six: an *extra* read, and
 serialization.** `DeleteSessionsByFamily` carries two **MUST**s that apply to
 any backend whose `CreateSuccessorSession` holds a row-level lock on the
 predecessor for a transaction's duration — the shape `store/drops` uses.
@@ -655,6 +655,14 @@ stays database-free:
 ```sh
 AUTHLAYER_TEST_DSN='postgres://…?sslmode=disable' go test -tags integration ./store/drops/
 ```
+
+> **This lane is destructive and wants the database to itself.** It `DROP`s
+> the auth, RBAC and invite tables in the target database on the way in and
+> rebuilds them, so point `AUTHLAYER_TEST_DSN` at a scratch database, never at
+> anything you care about. It also expects **exclusive** use of it: two copies
+> running at once — or anything else writing those tables — will fail each
+> other in ways that look like product bugs (`relation ... does not exist`
+> mid-run, timing measurements polluted by the other client's writes).
 
 ## Custom scopes
 
@@ -1136,7 +1144,9 @@ superuser console, never a per-request handler. The cutoff is literal: a
   `S_a`, then calls `Logout(R)` removed the very row the victim's replay
   would have tripped over, so the victim got a benign `ErrTokenInvalid`, the
   family was never revoked, and `S_a` rotated on indefinitely.
-- `LogoutAll` revokes every family a user has.
+- `LogoutAll` revokes every family a user has, and is the only session path
+  that also invalidates the account's pending `password_reset` and
+  `email_change` verifications — see [the password lifecycle](#the-password-lifecycle).
 - `RevokeSession` takes a session id but revokes that session's **family**,
   and only if the id belongs to the named user — another user's session is
   still reported identically to a nonexistent one. A family is one login's
@@ -1292,24 +1302,50 @@ moved forward by every unrelated reset, and an account whose address changed
 since the token was minted is not certified at all — the proof is about the
 address the token was *delivered* to, and `Store.MarkEmailVerified` re-checks
 that atomically rather than trusting whatever the row now holds.
-`RequestEmailChange` mints an `email_change` token; the address is checked for
-uniqueness atomically at redemption, not before, because a pre-check would be
-an unrate-limited "is this registered?" oracle for any authenticated caller.
+`RequestEmailChange` mints an `email_change` token, and **requires the current
+password** to do it — the same check `ChangePassword` makes, with the same
+timing discipline (an account with no password credential spends a comparable
+`Dummy` and gets the same `ErrInvalidCredentials`, and a caller who fails the
+check is not even told whether the address they proposed was well-formed).
+Arming a rotation of the account's login identifier is the same kind of act as
+rotating its password, and `VerifyEmail` then redeems the result with no
+authentication at all; without the check, a briefly-held session or a leaked
+15-minute access token bought a 24-hour account takeover. The new address is
+checked for uniqueness atomically at redemption, not before, because a
+pre-check would be an unrate-limited "is this registered?" oracle for any
+authenticated caller.
 
-Both `ChangePassword` and `ResetPassword` also invalidate every outstanding
-`password_reset` **and** `email_change` token for the account, which closes two
-real side doors. The reset one: an attacker who requested a reset link and
-waited would otherwise keep a working way in for that token's whole hour, even
-after the victim changed their password — the one thing a user does on
-suspecting compromise. The `email_change` one is stronger and was the half
-left open for a while: that token lives 24 hours rather than one by default
-(both are options — see the lifetimes table above), needs no
-current password to mint (`RequestEmailChange` takes a user id, so a
-briefly-stolen access token is enough), and `VerifyEmail` redeems it with no
-authentication at all — moving the account to the attacker's address, after
-which the victim cannot recover, because `Login` and `RequestPasswordReset`
-both look accounts up *by email*. A credential rotation that leaves that armed
-has not rotated the credential that matters.
+`ChangePassword`, `ResetPassword` and `LogoutAll` each invalidate every
+outstanding `password_reset` **and** `email_change` token for the account,
+which closes two real side doors. The reset one: an attacker who requested a
+reset link and waited would otherwise keep a working way in for that token's
+whole hour, even after the victim changed their password — the one thing a
+user does on suspecting compromise. The `email_change` one is stronger: that
+token lives 24 hours rather than one by default (both are options — see the
+lifetimes table above) and `VerifyEmail` redeems it with no authentication at
+all — moving the account to the attacker's address, after which the victim
+cannot recover, because `Login` and `RequestPasswordReset` both look accounts
+up *by email*. A credential rotation that leaves that armed has not rotated
+the credential that matters, and neither has a sign-out-everywhere.
+
+`LogoutAll` is in that list because "sign out of every device" is precisely
+what a user clicks on spotting an intruder; sweeping only on the two
+credential paths meant the takeover survived it. `Logout` and `RevokeSession`
+sweep **nothing**, deliberately: they are per-device and routine, and sweeping
+there would break a flow with no attacker in it — request an email change on a
+desktop, sign that desktop out, click the link that arrives on a phone.
+
+The mirror holds too: **redeeming an `email_change` invalidates the account's
+outstanding `password_reset` tokens.** A reset link is deliverable to exactly
+one address, so moving the account away from that address — often precisely
+because the mailbox is no longer trustworthy — must not leave a link sitting
+in the abandoned mailbox able to reset the credential of the account at its
+new one. That redemption does *not* revoke sessions: `VerifyEmail` is
+unauthenticated by construction, so giving it a sign-out-everywhere effect
+would hand a denial-of-service lever to anyone who obtains the link, and
+arming the token already cost the current password. `LogoutAll` is the
+authenticated control for that, and an application wanting "changing your
+address signs you out everywhere" composes the two.
 
 **Both sweeps are sequential-only.** Nothing orders them against a
 `RequestPasswordReset` or `RequestEmailChange` whose own `CreateVerification`
@@ -1347,7 +1383,7 @@ branch has no user row to perform. The durable finding is that the two
 distributions are **disjoint at the known branch's 5th percentile against the
 unknown branch's 95th**: on a quiet same-host network one sample already
 separates them more often than not. Six runs on one machine (Windows host,
-PostgreSQL in a container, loopback) put the known median at 4.1–8.7 ms
+PostgreSQL in a container, loopback) put the known median at 3.3–8.7 ms
 against an unknown median of 0.5–1.0 ms — Δ≈2.8–8.0 ms, roughly 5.5–12×. The
 disjointness held on every run; the absolute numbers did not — the same
 machine reported 9.5–16.7 ms on a different day — and yours will differ, which
@@ -1549,7 +1585,7 @@ the `Store` on a lookup or a constraint, the rest by the service:
 | `ErrVerificationNotFound` | No verification with that id or token hash | 404 |
 | `ErrInvalidCredentials` | `Login` failed — unknown address, no password credential, or wrong password, deliberately indistinguishable | 401 |
 | `ErrTokenInvalid` | The refresh token is unknown or its session has expired. The family is **not** revoked | 401 |
-| `ErrTokenReuse` | A rotated-away refresh token was presented again; the whole family is already revoked | 401 |
+| `ErrTokenReuse` | A rotated-away refresh token was presented again. Returned **alone**, the whole family is already revoked; wrapped around a second error, a replay was detected and the family may still be live — see the note under this table | 401 |
 | `ErrSessionRevoked` | `Refresh` won the rotation, but the family was revoked before the successor could be persisted | 401 |
 | `ErrEmailNotVerified` | `WithRequireVerifiedEmail` is on and the address is unconfirmed — checked only after the password verifies | 403 |
 | `ErrEmailTaken` | Another user already holds this normalized address | 409 |
@@ -1561,7 +1597,7 @@ the `Store` on a lookup or a constraint, the rest by the service:
 | `ErrEmailRequired` | `RequestEmailChange` was given an address that is empty once normalized | 400 |
 | `ErrRateLimited` | The IP-keyed `RateLimiter` refused. Never returned for the address-keyed reset limiter — see [Rate limiting](#rate-limiting) | 429 |
 | `ErrMissingIP` | `Login` or `RequestPasswordReset` was called with an empty ip — a wiring bug, not caller input | 500 |
-| `ErrStoreContract` | A `Store` returned a value its own contract forbids, where continuing would silently degrade a security control. One trigger today: `MarkRotated` reporting a replay but returning no `FamilyID`, leaving `Refresh` no family to revoke | 500 |
+| `ErrStoreContract` | A `Store` returned a value its own contract forbids, where continuing would silently degrade a security control. Every trigger today is one condition — a `Session` handed back with no `FamilyID`, leaving nothing to revoke — reached from `Refresh` (on a reported replay), `Logout` (of a superseded token) and `RevokeSession` | 500 |
 
 `SignUp` is the one method that reports a duplicate address without an error
 at all; see [Enumeration-safe sign-up](#enumeration-safe-sign-up).
@@ -1610,6 +1646,21 @@ rules and `Verify` returns a bool, so there is nothing to compare with
 | [`examples/auth`](examples/auth/) | Runnable, database-free tour of `auth` + `org` + `invite` wired together. |
 
 Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
+
+### Checks
+
+```sh
+gofmt -l .                      # must print nothing
+go vet ./... && go vet -tags integration ./...
+go test ./... -count=1          # database-free
+golangci-lint run ./...         # v2 required; the config is .golangci.yml
+go run ./examples/basic && go run ./examples/auth
+```
+
+`.golangci.yml` is a v2 config and runs clean at zero issues. It lints the
+`integration`-tagged files too (`run.build-tags`), which is otherwise about
+3.5k lines of the suite no static check would see. Every exclusion in it
+carries the reason it is there.
 
 `internal/uid` is not importable — it is the RFC 9562 UUIDv7 generator
 authlayer uses for every id it mints (containers, roles, users, sessions,
