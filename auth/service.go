@@ -1387,7 +1387,16 @@ func (s *Service[U, PU]) RevokeSession(ctx context.Context, userID, sessionID st
 //  4. next is validated against the configured [password.Rules];
 //     [ErrWeakPassword] on failure.
 //  5. next is hashed and persisted via [Store.UpdateUserPassword].
-//  6. Every session NOT sharing currentSessionID's family is revoked via
+//  6. Any outstanding "password_reset" [Verification] for this account is
+//     invalidated via [Store.DeleteVerificationsByUserAndPurpose]. Without
+//     this, an attacker holding a still-valid reset link (requested before,
+//     or concurrently with, this call) could redeem it AFTER the account
+//     owner used THIS method to change their password — the one action a
+//     user takes when they suspect compromise — and take the account right
+//     back for the remainder of the reset token's TTL. [Service.ResetPassword]
+//     closes the same side door for its own, differently-triggered path;
+//     see that method's doc.
+//  7. Every session NOT sharing currentSessionID's family is revoked via
 //     [Store.DeleteSessionsByFamily], one call per distinct OTHER family —
 //     the same "list, then delete per distinct family" shape
 //     [Service.LogoutAll] uses, so a rotated-but-unexpired predecessor row
@@ -1420,6 +1429,11 @@ func (s *Service[U, PU]) ChangePassword(ctx context.Context, userID, currentSess
 
 	now := s.cfg.clock()
 	if err := s.store.UpdateUserPassword(ctx, userID, hash, now); err != nil {
+		return err
+	}
+
+	// Close the reset-token side door — see the method doc's point 6.
+	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposePasswordReset); err != nil {
 		return err
 	}
 
@@ -1474,32 +1488,55 @@ func (s *Service[U, PU]) ChangePassword(ctx context.Context, userID, currentSess
 //
 // This method has the same shape as [Service.SignUp] and is held to the
 // same standard — see that method's doc for the full discipline. This
-// section states how each of its points lands here specifically.
+// section states how each of its points lands here specifically, corrected
+// against actual measurement rather than assumption (see point 5 — an
+// earlier version of this doc understated this method's residual timing
+// channel and overstated why a symmetric alternative wasn't available;
+// both are corrected below rather than softened).
 //
-//  1. Identical calls, identical order — with one necessary, disclosed
-//     exception. The ip check, the IP [RateLimiter], email normalization,
+//  1. Identical calls, identical order — with two necessary, disclosed
+//     exceptions. The ip check, the IP [RateLimiter], email normalization,
 //     the address [RateLimiter] (keyed by the normalized address whether or
 //     not it identifies anyone — the limiter is never told which), and
 //     [Store.FindUserByEmail] all run in the SAME order on every call,
 //     regardless of outcome. [token.GenerateOpaque] runs unconditionally
 //     too, right after the lookup, on every call, whether or not its result
-//     is ever used. Only [Store.CreateVerification] is branch-exclusive,
-//     and it has to be: unlike SignUp, where [Store.CreateUser]'s own
-//     attempt IS the new-vs-duplicate signal and leaves a real [UserBase]
-//     row on BOTH branches for every later step to run against, this
-//     method never writes a user — an unknown address has no row at all to
-//     attach a Verification's UserID to, and fabricating one to preserve
-//     symmetry would be a vastly worse hole than the one it closes: an
-//     anonymous, unauthenticated request to "reset a password" would
-//     silently create an account. So this method's enumeration safety
-//     holds BY ARGUMENT for this one call, not by construction: a single
-//     extra local Store write is a far weaker, noisier timing signal than
-//     the bcrypt cost [Service.Login]'s Dummy/Verify pairing is about, and
-//     this is the same residual, accepted channel every "forgot password"
-//     implementation without an async mail queue lives with. Point 3 below
-//     covers the other half of the argument — even when that write IS
-//     reached, its failure must not become a louder oracle than its timing
-//     already is.
+//     is ever used.
+//
+//     Two Store writes are branch-exclusive:
+//     [Store.DeleteVerificationsByUserAndPurpose] (invalidating any earlier
+//     "password_reset" token for this user — honouring that method's own
+//     documented contract on [Store] — before minting a new one) and
+//     [Store.CreateVerification] itself. Both require a real UserID, so
+//     unlike SignUp — where [Store.CreateUser]'s own attempt IS the
+//     new-vs-duplicate signal and leaves a real [UserBase] row on BOTH
+//     branches for every later step to run against — this method has no
+//     row on the unknown branch to run either write against. [s.cfg.clock]
+//     and [s.cfg.idGen] are pulled in by those same two writes and so are
+//     branch-exclusive too; neither can fail, so neither adds anything to
+//     point 3's error-set argument, but a caller-injected [WithIDGenerator]
+//     with an observable side effect or its own cost (a shared counter, an
+//     external ID service) would run only on the known branch — the
+//     default, [github.com/bernardoforcillo/authlayer/internal/uid.NewV7],
+//     is a pure local computation and carries no such risk.
+//
+//     This does NOT mean no symmetric alternative exists — an earlier
+//     version of this doc claimed exactly that, and it was wrong. Neither
+//     [github.com/bernardoforcillo/authlayer/store/drops] nor
+//     [github.com/bernardoforcillo/authlayer/store/memory] declares a
+//     foreign key between verifications and users, so an unconditional
+//     [Store.CreateVerification] (and, for the delete, an unconditional
+//     [Store.DeleteVerificationsByUserAndPurpose]) keyed on a reserved,
+//     synthetic UserID on the unknown branch too WOULD run an identical
+//     call on both branches, closing point 5's timing gap entirely. This
+//     implementation deliberately does not do that: the trade is letting an
+//     unauthenticated caller grow the verifications table at will — bounded
+//     by the IP limiter, and self-cleaning via [Store.PurgeExpired] against
+//     this method's own TTL — in exchange for closing the gap. That is
+//     genuinely defensible either way; this implementation keeps the
+//     asymmetric shape and documents its real cost (point 5) rather than
+//     claiming the symmetric option doesn't exist.
+//
 //  2. Rate limiting by IP is a plain [ErrRateLimited], exactly like Login,
 //     because it is decided before any address-specific behaviour runs at
 //     all. Rate limiting by ADDRESS is NOT: a denial there returns ("",
@@ -1509,26 +1546,63 @@ func (s *Service[U, PU]) ChangePassword(ctx context.Context, userID, currentSess
 //     THAT address have run — folding it into the success-shaped "no" the
 //     unknown branch already uses closes that regardless of how many
 //     requests are sent.
+//
 //  3. The error sets are identical too, by different means for different
 //     calls. The ip check, the IP limiter, the address limiter, and
 //     [Store.FindUserByEmail] itself all run on EVERY call, so a real
 //     failure from any of them is symmetric by construction and returned
 //     as-is — [Service.SignUp]'s stance on its own branch-independent
-//     calls. [Store.CreateVerification], the one branch-exclusive call
-//     (point 1), is handled differently ON PURPOSE: its failure is NOT
-//     returned as an error. It is folded into the same ("", false, nil) an
-//     unknown address gets. Surfacing it as a real error would be
-//     reachable ONLY on the known-address branch by construction — exactly
-//     the "any store failure reachable on one branch only is a binary
-//     oracle" trap, reached this time through a write's FAILURE rather
-//     than a write's presence. Masking it costs the caller a clean signal
-//     that the verifications table specifically is unhealthy — a real,
-//     disclosed trade-off — but the alternative hands back exactly the
-//     address oracle this method exists to deny.
+//     calls. Both branch-exclusive writes from point 1 —
+//     [Store.DeleteVerificationsByUserAndPurpose] and
+//     [Store.CreateVerification] — are handled the same way ON PURPOSE:
+//     neither failure is returned as an error. Both are folded into the
+//     same ("", false, nil) an unknown address gets. Surfacing either as a
+//     real error would be reachable ONLY on the known-address branch by
+//     construction — exactly the "any store failure reachable on one
+//     branch only is a binary oracle" trap, reached this time through a
+//     write's FAILURE rather than a write's presence. Masking them costs
+//     the caller a clean signal that the verifications table specifically
+//     is unhealthy — a real, disclosed trade-off — but the alternative
+//     hands back exactly the address oracle this method exists to deny.
+//
 //  4. Never an error purely for an unknown address: confirmed structurally
 //     above — the ErrUserNotFound branch falls straight through to the
 //     same return every other "deny" path in this method uses, ("", false,
 //     nil), never propagated as ErrUserNotFound or anything else.
+//
+//  5. Timing is the channel that remains, and it is measured, not merely
+//     theoretical. Against a live PostgreSQL-backed [Store]
+//     ([github.com/bernardoforcillo/authlayer/store/drops]), 400 samples
+//     per branch measured a known-address median of 1510µs against an
+//     unknown-address median of 308µs — Δ≈1.2ms, roughly 5×, with the two
+//     distributions nearly disjoint under low-jitter, same-host
+//     measurement. Point 1's second branch-exclusive write (added to honour
+//     [Store]'s DeleteVerificationsByUserAndPurpose contract) widens this
+//     further; it was one extra local write when first measured; it is two
+//     now. Over realistic WAN jitter this needs on the order of 10² to 10³
+//     samples against the SAME address to resolve reliably — practical for
+//     a targeted check against one suspected address, not for bulk
+//     enumeration across many candidates, but real, and this doc will not
+//     call it "far weaker, noisier" without a number behind that claim.
+//     [WithPasswordResetRateLimiter] is the control that bounds it: it caps
+//     how many samples an attacker can collect against any ONE address,
+//     which is the resource this timing channel actually needs. An
+//     operator who wants the channel closed rather than merely bounded
+//     should set a tight per-address limit, or take the symmetric
+//     synthetic-row alternative point 1 describes and this implementation
+//     does not; this package does not close it structurally on its own.
+//
+// The response-SHAPE duty stated above the numbered list — that whatever
+// wraps this method must return the same status/body regardless of ok —
+// extends to TIMING too, after point 5: a caller that awaits this method's
+// return and then performs address-dependent work before responding (a real
+// email send, say) can reopen point 5's channel at the transport layer even
+// though this method's own two possible outcomes already take measurably
+// different time to produce internally. A caller that cares should either
+// accept point 5's channel as documented and bounded by
+// [WithPasswordResetRateLimiter], or normalize its OWN response timing
+// independently (a fixed delay, a queued/async send) — this package does
+// not attempt that on a caller's behalf.
 //
 // [Service.SignUp]'s two Store obligations (CreateUser deciding
 // ErrEmailTaken from the write itself, FindUserByEmail reading its own
@@ -1587,6 +1661,18 @@ func (s *Service[U, PU]) RequestPasswordReset(ctx context.Context, email, ip str
 	}
 
 	now := s.cfg.clock()
+
+	// Invalidate any earlier "password_reset" token for this user before
+	// minting the new one — honouring [Store.DeleteVerificationsByUserAndPurpose]'s
+	// own documented contract. Branch-exclusive, like CreateVerification
+	// below — see the method doc's "The enumeration property, again",
+	// points 1 and 3.
+	if derr := s.store.DeleteVerificationsByUserAndPurpose(ctx, u.ID, PurposePasswordReset); derr != nil {
+		// See point 3: a failure reachable ONLY on this branch must not be
+		// surfaced as a distinguishable error.
+		return "", false, nil
+	}
+
 	if _, cerr := s.store.CreateVerification(ctx, Verification{
 		ID:        s.cfg.idGen(),
 		UserID:    u.ID,
@@ -1648,12 +1734,21 @@ func (s *Service[U, PU]) RequestPasswordReset(ctx context.Context, email, ip str
 // AFTER the token is irrevocably burned is a write already known to hold
 // valid input.
 //
-// After [Store.UpdateUserPassword] succeeds, every session belonging to the
-// verification's UserID is revoked — one [Store.DeleteSessionsByFamily]
-// call per distinct family, the same "list, then delete per distinct
-// family" shape [Service.LogoutAll] uses, so rotated-but-unexpired
-// predecessor rows are swept too, not just each family's currently-live
-// session.
+// After [Store.UpdateUserPassword] succeeds,
+// [Store.DeleteVerificationsByUserAndPurpose] invalidates any OTHER
+// outstanding "password_reset" token for the same user — the token THIS
+// call redeemed is already gone via the claim above, but a second,
+// still-live token from an earlier (or concurrent)
+// [Service.RequestPasswordReset] call is not, and would otherwise still
+// grant a full password reset after this one already completed. This is
+// the same side door [Service.ChangePassword] closes for its own,
+// differently-triggered path — see that method's doc.
+//
+// Only THEN is every session belonging to the verification's UserID
+// revoked — one [Store.DeleteSessionsByFamily] call per distinct family,
+// the same "list, then delete per distinct family" shape
+// [Service.LogoutAll] uses, so rotated-but-unexpired predecessor rows are
+// swept too, not just each family's currently-live session.
 //
 // A Store or Hasher error at any step is returned as-is — see the
 // package's "Fail closed" constraint. In particular, a
@@ -1695,6 +1790,11 @@ func (s *Service[U, PU]) ResetPassword(ctx context.Context, plainToken, next str
 		return err
 	}
 
+	// Close the reset-token side door — see the method doc above.
+	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposePasswordReset); err != nil {
+		return err
+	}
+
 	sessions, err := s.store.ListSessionsByUser(ctx, v.UserID)
 	if err != nil {
 		return err
@@ -1731,22 +1831,33 @@ func (s *Service[U, PU]) ResetPassword(ctx context.Context, plainToken, next str
 //     rather than being folded into some enumeration-safe shape — an
 //     invalid userID here is a caller bug (a stale or forged id), not an
 //     anonymous probe.
-//  2. newEmail (normalized — see [NormalizeEmail]) is checked against
-//     [Store.FindUserByEmail]: if it already belongs to a DIFFERENT user,
-//     this returns [ErrEmailTaken] immediately, without minting anything.
-//     This is a courtesy, not the enforcement point — [Store.UpdateUserEmail]
-//     re-checks the same condition atomically at REDEMPTION time regardless
-//     (see that method's doc), which is what actually closes the
-//     two-callers-racing-the-same-address race; this early check only
-//     spares the caller a token that redemption is already destined to
-//     reject, burning it for nothing. Requesting a change to the account's
-//     OWN current address is not an error: the lookup finds the same user
-//     back, and the mint proceeds normally.
-//  3. A fresh [Verification] is minted with Purpose [PurposeEmailChange]
-//     and Email set to newEmail (never the account's OLD address — see
-//     [Verification.Email]'s doc for why this field always carries the NEW
-//     address for this purpose specifically), using the same
-//     defaultVerificationTTL as a signup token.
+//  2. A fresh [Verification] is minted with Purpose [PurposeEmailChange]
+//     and Email set to newEmail (normalized — see [NormalizeEmail]; never
+//     the account's OLD address — see [Verification.Email]'s doc for why
+//     this field always carries the NEW address for this purpose
+//     specifically), using the same defaultVerificationTTL as a signup
+//     token.
+//
+// This method does NOT pre-check whether newEmail already belongs to a
+// DIFFERENT user before minting — an earlier version did, returning
+// [ErrEmailTaken] immediately. That check was removed: it turned this
+// method into an un-rate-limited "is this address registered?" oracle for
+// ANY authenticated caller — one signup buys unlimited queries against
+// arbitrary addresses, with no [RateLimiter] of any kind gating it, unlike
+// [Service.RequestPasswordReset]'s carefully-bounded equivalent. The
+// pre-check was never the actual enforcement point: [Store.UpdateUserEmail]
+// re-checks the identical condition atomically at REDEMPTION time
+// regardless (see that method's doc), which is what genuinely closes the
+// two-callers-racing-the-same-address race. Removing the pre-check costs a
+// caller nothing but the timing of discovery: a request for an
+// already-taken address still mints a token exactly like any other, and
+// [Service.VerifyEmail] surfaces [ErrEmailTaken] at redemption instead —
+// the one-time token is burned for nothing in that case, the same
+// already-accepted cost [Service.VerifyEmail]'s "claims before applies"
+// ordering imposes for every other doomed redemption. Requesting a change
+// to the account's OWN current address is not an error either way: at
+// redemption, [Store.UpdateUserEmail]'s uniqueness check excludes the
+// caller's own row.
 //
 // A Store or [token.GenerateOpaque] error at any step is returned as-is.
 func (s *Service[U, PU]) RequestEmailChange(ctx context.Context, userID, newEmail string) (string, error) {
@@ -1755,15 +1866,6 @@ func (s *Service[U, PU]) RequestEmailChange(ctx context.Context, userID, newEmai
 	}
 
 	normalized := NormalizeEmail(newEmail)
-	existing, err := s.store.FindUserByEmail(ctx, normalized)
-	switch {
-	case errors.Is(err, ErrUserNotFound):
-		// Address available; fall through to mint.
-	case err != nil:
-		return "", err
-	case existing.ID != userID:
-		return "", ErrEmailTaken
-	}
 
 	now := s.cfg.clock()
 	plainToken, tokenHash, err := token.GenerateOpaque()

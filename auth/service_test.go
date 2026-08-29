@@ -2457,6 +2457,37 @@ func TestChangePasswordUnknownUserPropagatesNotFound(t *testing.T) {
 	}
 }
 
+// TestChangePasswordInvalidatesOutstandingResetToken is the mandatory
+// mutation-anchor test for review FIX 1 (ChangePassword side): a
+// still-valid "password_reset" token requested BEFORE a credentialed
+// ChangePassword call must not survive it. Before the fix, this was
+// demonstrated by execution: the pre-existing token still redeemed
+// successfully after ChangePassword, letting an attacker who merely holds
+// an old reset link take the account right back even after the legitimate
+// owner changed their password specifically because they suspected
+// compromise.
+func TestChangePasswordInvalidatesOutstandingResetToken(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "iris2@example.com", validPassword)
+
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "iris2@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+
+	if err := svc.ChangePassword(ctx, user.ID, "", validPassword, "Changed-Valid-Pass13!"); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(resetTok)); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(reset token) after ChangePassword err = %v, want ErrVerificationNotFound", ferr)
+	}
+	if err := svc.ResetPassword(ctx, resetTok, "Attacker-Chosen-Pass14!"); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("ResetPassword(pre-existing token) after ChangePassword err = %v, want ErrVerificationNotFound — the reset token must not survive a credentialed password change", err)
+	}
+}
+
 // ============================================================
 // RequestPasswordReset
 // ============================================================
@@ -2643,6 +2674,38 @@ func TestRequestPasswordResetCreateVerificationFailureNotDistinguishable(t *test
 	}
 }
 
+// TestRequestPasswordResetInvalidatesEarlierToken is the coverage for
+// review FIX 2: requesting a second password-reset token for the same
+// address must invalidate the FIRST one — honouring
+// [auth.Store.DeleteVerificationsByUserAndPurpose]'s own documented
+// contract ("so requesting a new password-reset email invalidates any
+// earlier one instead of leaving both redeemable"), which
+// RequestPasswordReset did not call at all before this fix.
+func TestRequestPasswordResetInvalidatesEarlierToken(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	mustSignUp(t, svc, "kian@example.com", validPassword)
+
+	tok1, ok1, err := svc.RequestPasswordReset(ctx, "kian@example.com", "1.2.3.4")
+	if err != nil || !ok1 {
+		t.Fatalf("first RequestPasswordReset: ok=%v err=%v", ok1, err)
+	}
+	tok2, ok2, err := svc.RequestPasswordReset(ctx, "kian@example.com", "1.2.3.4")
+	if err != nil || !ok2 {
+		t.Fatalf("second RequestPasswordReset: ok=%v err=%v", ok2, err)
+	}
+	if tok1 == tok2 {
+		t.Fatal("both RequestPasswordReset calls returned the SAME token")
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(tok1)); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(tok1) after re-requesting err = %v, want ErrVerificationNotFound — the earlier token must be invalidated", ferr)
+	}
+	if err := svc.ResetPassword(ctx, tok2, "Second-Valid-Pass17!"); err != nil {
+		t.Fatalf("ResetPassword(tok2, the current one): %v, want success", err)
+	}
+}
+
 // ============================================================
 // ResetPassword
 // ============================================================
@@ -2825,6 +2888,60 @@ func TestResetPasswordWeakNextPasswordNotClaimed(t *testing.T) {
 	}
 }
 
+// TestResetPasswordInvalidatesSiblingResetToken is the mandatory
+// mutation-anchor test for review FIX 1 (ResetPassword side): a SECOND,
+// independently-existing "password_reset" token for the same account must
+// not survive a completed reset performed with a DIFFERENT token. Before
+// the fix, this was demonstrated by execution: a sibling token still reset
+// the account again after the first reset had already completed.
+//
+// The sibling is seeded directly on the store (not via a second
+// RequestPasswordReset call) so this test isolates ResetPassword's OWN
+// cleanup specifically from RequestPasswordReset's separate reissue-time
+// cleanup — see TestRequestPasswordResetInvalidatesEarlierToken for that
+// one, which a call-request-twice version of this test would have
+// conflated: the second RequestPasswordReset call would itself invalidate
+// the first token before ResetPassword ever ran, which is a different
+// mechanism than the one this test targets.
+func TestResetPasswordInvalidatesSiblingResetToken(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "jonah@example.com", validPassword)
+
+	tok1, ok1, err := svc.RequestPasswordReset(ctx, "jonah@example.com", "1.2.3.4")
+	if err != nil || !ok1 {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok1, err)
+	}
+
+	tok2Plain, tok2Hash, err := token.GenerateOpaque()
+	if err != nil {
+		t.Fatalf("GenerateOpaque: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := store.CreateVerification(ctx, auth.Verification{
+		ID:        "verif-sibling-reset-1",
+		UserID:    user.ID,
+		TokenHash: tok2Hash,
+		Purpose:   auth.PurposePasswordReset,
+		Email:     "jonah@example.com",
+		ExpiresAt: now.Add(time.Hour),
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed CreateVerification: %v", err)
+	}
+
+	if err := svc.ResetPassword(ctx, tok1, "First-Valid-Pass15!"); err != nil {
+		t.Fatalf("ResetPassword(tok1): %v", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, tok2Hash); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(sibling) after redeeming tok1 err = %v, want ErrVerificationNotFound", ferr)
+	}
+	if err := svc.ResetPassword(ctx, tok2Plain, "Second-Valid-Pass16!"); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("ResetPassword(sibling token) err = %v, want ErrVerificationNotFound — a sibling reset token must not survive a completed reset", err)
+	}
+}
+
 // ============================================================
 // RequestEmailChange
 // ============================================================
@@ -2868,18 +2985,46 @@ func TestRequestEmailChangeMintsRedeemableToken(t *testing.T) {
 	}
 }
 
-func TestRequestEmailChangeTakenEmailRejected(t *testing.T) {
-	svc, _ := newTestService(t)
+// TestRequestEmailChangeTakenEmailDeferredToRedemption pins FIX 3 from the
+// review: the early ErrEmailTaken pre-check was removed (it was an
+// un-rate-limited registered-address oracle available to any authenticated
+// caller — one signup bought unlimited "is this address registered?"
+// queries). Requesting a change to an address already taken by a DIFFERENT
+// user now succeeds at mint time exactly like any other request; the
+// conflict only surfaces at VerifyEmail redemption time via
+// Store.UpdateUserEmail's own atomic check, burning the token in the
+// process — the same cost VerifyEmail's "claims before applies" ordering
+// already imposes for every other doomed redemption.
+func TestRequestEmailChangeTakenEmailDeferredToRedemption(t *testing.T) {
+	svc, store := newTestService(t)
 	ctx := context.Background()
 	userA := mustSignUp(t, svc, "finn@example.com", validPassword)
 	mustSignUp(t, svc, "gwen@example.com", validPassword)
 
 	tok, err := svc.RequestEmailChange(ctx, userA.ID, "gwen@example.com")
-	if !errors.Is(err, auth.ErrEmailTaken) {
-		t.Fatalf("err = %v, want ErrEmailTaken", err)
+	if err != nil {
+		t.Fatalf("RequestEmailChange: %v, want success — the taken-email check is deferred to redemption", err)
 	}
-	if tok != "" {
-		t.Fatalf("token = %q, want empty when the email is taken", tok)
+	if tok == "" {
+		t.Fatal("token is empty, want a real mint even for an address already taken by someone else")
+	}
+
+	if _, err := svc.VerifyEmail(ctx, tok); !errors.Is(err, auth.ErrEmailTaken) {
+		t.Fatalf("VerifyEmail(taken-email token) err = %v, want ErrEmailTaken", err)
+	}
+	// The token is burned regardless of the failure, matching VerifyEmail's
+	// documented ordering — it must not be redeemable a second time.
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(tok)); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(after a failed redemption) err = %v, want ErrVerificationNotFound", ferr)
+	}
+
+	// userA's own address must be untouched by the failed redemption.
+	stillOwn, err := store.FindUserByID(ctx, userA.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stillOwn.Email != "finn@example.com" {
+		t.Fatalf("userA.Email = %q after a failed redemption, want unchanged \"finn@example.com\"", stillOwn.Email)
 	}
 }
 
