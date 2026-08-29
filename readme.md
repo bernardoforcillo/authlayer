@@ -1147,11 +1147,11 @@ superuser console, never a per-request handler. The cutoff is literal: a
   listing grouped by `FamilyID` shows one device where two are in use.
   Revoking the family is still right — it signs the thief out too.
   `ListSessions` returns rotation *history*, not a device list — one device
-  refreshing at
-  the 15-minute default accumulates about 97 rows a day, 96 superseded — so
-  revoking the single row a user picked off such a listing used to delete a
-  superseded entry, return `nil`, and leave the device signed in. Group by
-  `FamilyID` to build the listing; any row of a family revokes it.
+  refreshing at the 15-minute default accumulates about 97 rows a day, 96
+  superseded — so revoking the single row a user picked off such a listing
+  used to delete a superseded entry, return `nil`, and leave the device
+  signed in. Group by `FamilyID` to build the listing; any row of a family
+  revokes it.
 
 ### Verifying an access token
 
