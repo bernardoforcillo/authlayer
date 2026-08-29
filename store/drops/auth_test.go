@@ -670,6 +670,94 @@ func TestMarkRotatedPropagatesQueryError(t *testing.T) {
 	}
 }
 
+// ── CreateSuccessorSession: retry-attempt isolation (FIX 3) ────────────────
+
+// retryCommitFailsOnceDriver is a bespoke drops.Driver, local to this test,
+// for FIX 3's regression: pg.DB.WithRetry re-invokes InTx's ENTIRE closure
+// on a retryable transaction failure (see pg.RetryPolicy's own doc), so
+// this driver's FIRST Commit fails with a retryable sentinel — forcing
+// exactly one retry — and every Commit after that succeeds. Exec always
+// succeeds (the successor INSERT). Query always returns the same shared
+// rows value; since store_test.go's fakeRows cursor is stateful and
+// exhausts after being scanned through once (the same mechanism this
+// package's own markRotatedWinSQL/TestMarkRotatedAlreadyRotatedReturnsExistingSessionOkFalse
+// rely on elsewhere), the FIRST attempt's SELECT finds the predecessor row,
+// and the SECOND (retried) attempt's own SELECT legitimately finds none —
+// a plausible outcome (something else revoked the family between the first
+// attempt's rollback and the second attempt's fresh snapshot), not a driver
+// artifact.
+type retryCommitFailsOnceDriver struct {
+	rows        drops.Rows
+	commitCalls int
+}
+
+func (d *retryCommitFailsOnceDriver) Exec(context.Context, string, ...any) (drops.Result, error) {
+	return fakeResult{1}, nil
+}
+func (d *retryCommitFailsOnceDriver) Query(context.Context, string, ...any) (drops.Rows, error) {
+	return d.rows, nil
+}
+func (d *retryCommitFailsOnceDriver) Begin(context.Context) (drops.Tx, error) {
+	return &retryCommitFailsOnceTx{d}, nil
+}
+
+type retryCommitFailsOnceTx struct{ d *retryCommitFailsOnceDriver }
+
+func (t *retryCommitFailsOnceTx) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	return t.d.Exec(ctx, sql, args...)
+}
+func (t *retryCommitFailsOnceTx) Query(ctx context.Context, sql string, args ...any) (drops.Rows, error) {
+	return t.d.Query(ctx, sql, args...)
+}
+func (t *retryCommitFailsOnceTx) Begin(ctx context.Context) (drops.Tx, error) {
+	return t.d.Begin(ctx)
+}
+func (t *retryCommitFailsOnceTx) Commit(context.Context) error {
+	t.d.commitCalls++
+	if t.d.commitCalls == 1 {
+		return pg.ErrSerializationFailure
+	}
+	return nil
+}
+func (t *retryCommitFailsOnceTx) Rollback(context.Context) error { return nil }
+
+// TestCreateSuccessorSessionResetsPerRetryAttempt is FIX 3's regression
+// test: created and won are declared OUTSIDE the InTx closure, so they must
+// be reset as its first statement on every invocation, not just assumed
+// zero once at the top of CreateSuccessorSession. This driver makes attempt
+// 1 genuinely find the predecessor and insert successfully (which would set
+// won = true), then fails ONLY that attempt's COMMIT with a retryable
+// error, forcing pg.DB.WithRetry to re-run the closure. That second attempt
+// legitimately finds no predecessor row and takes the early ErrNoRows
+// return, which reports ok=false — but without the reset, the stale
+// won=true (and the now-rolled-back created) from attempt 1 would survive
+// into this second attempt's return value, since the overall InTx call
+// still reports success (nil error) and CreateSuccessorSession trusts
+// created/won unconditionally once InTx returns.
+func TestCreateSuccessorSessionResetsPerRetryAttempt(t *testing.T) {
+	predRow := &fakeRows{cols: []string{"id"}, data: [][]any{{"pred1"}}}
+	drv := &retryCommitFailsOnceDriver{rows: predRow}
+	db := pg.New(drv).WithRetry(pg.RetryPolicy{
+		MaxAttempts: 3,
+		Errors:      []error{pg.ErrSerializationFailure},
+	})
+	st := NewAuthStore(db)
+
+	got, ok, err := st.CreateSuccessorSession(context.Background(), "pred1", auth.Session{ID: "succ1", TokenHash: "hash-succ"})
+	if err != nil {
+		t.Fatalf("CreateSuccessorSession err = %v, want nil — the retried attempt's own ErrNoRows classification is not itself a failure", err)
+	}
+	if ok {
+		t.Fatal("CreateSuccessorSession ok = true, want false — the SECOND (retried) attempt found no predecessor and must not report a stale win carried over from the FIRST, rolled-back attempt")
+	}
+	if got != (auth.Session{}) {
+		t.Fatalf("CreateSuccessorSession returned %+v, want the zero value — a rolled-back attempt's session must not leak through a later attempt's ok=false return", got)
+	}
+	if drv.commitCalls != 2 {
+		t.Fatalf("commit called %d times, want exactly 2 (attempt 1 fails, attempt 2 succeeds) — otherwise this test is not exercising the retry path it claims to", drv.commitCalls)
+	}
+}
+
 // ── Verifications ────────────────────────────────────────────────────────
 
 func TestCreateVerificationNormalizesEmailAndInserts(t *testing.T) {

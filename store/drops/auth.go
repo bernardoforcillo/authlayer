@@ -654,6 +654,19 @@ func (st *AuthStore) CreateSuccessorSession(ctx context.Context, predecessorID s
 	won := false
 
 	err := st.db.InTx(ctx, func(txdb *pg.DB) error {
+		// Reset on every invocation of this closure, not just once outside
+		// it: pg.DB.WithRetry (a RetryPolicy an application can install on
+		// the *pg.DB passed to NewAuthStore) re-runs this ENTIRE closure on
+		// a retryable transaction failure. Without this reset, an attempt
+		// that finds the predecessor and inserts (setting won = true) but
+		// then fails its COMMIT with a retryable error would leave that
+		// stale true — and the now-rolled-back created — in place for a
+		// later attempt that legitimately takes the ErrNoRows early return
+		// below, making that attempt's success (nil error from InTx) report
+		// ok=true for a row that was never actually persisted.
+		created = auth.Session{}
+		won = false
+
 		var predecessor struct {
 			ID string `drop:"id"`
 		}
@@ -664,7 +677,28 @@ func (st *AuthStore) CreateSuccessorSession(ctx context.Context, predecessorID s
 			One(ctx, &predecessor)
 		if errors.Is(selErr, pg.ErrNoRows) {
 			// The predecessor is already gone: the family was revoked out
-			// from under this rotation. Commit having done nothing further.
+			// from under this rotation. sess.ID's own uniqueness is still
+			// checked here, independent of predecessorID's existence — see
+			// [auth.Store.CreateSuccessorSession]'s own doc: ErrIDTaken must
+			// be reported "as part of the same atomic step, independent of
+			// predecessorID's own existence." Without this check, an id
+			// collision on this path would be silently masked as an
+			// ordinary ok=false lost race instead of being reported.
+			var existing struct {
+				ID string `drop:"id"`
+			}
+			idErr := txdb.Select(st.s.sessions.col("id")).
+				From(st.s.Sessions).
+				Where(st.s.sessions.eq("id", sess.ID)).
+				One(ctx, &existing)
+			if idErr == nil {
+				return auth.ErrIDTaken
+			}
+			if !errors.Is(idErr, pg.ErrNoRows) {
+				return idErr
+			}
+			// Neither the predecessor nor a colliding id exists. Commit
+			// having done nothing further.
 			return nil
 		}
 		if selErr != nil {

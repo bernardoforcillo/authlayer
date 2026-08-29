@@ -740,6 +740,160 @@ func TestCreateSuccessorSessionDuplicateIDFailsLive(t *testing.T) {
 	}
 }
 
+// TestCreateSuccessorSessionIDTakenCheckedEvenWhenPredecessorGoneLive is
+// FIX 4's live regression test: auth.Store's own contract on
+// CreateSuccessorSession requires s.ID's uniqueness to be "checked as part
+// of the same atomic step, independent of predecessorID's own existence" —
+// store/memory's TestCreateSuccessorSessionIDTakenCheckedEvenWhenPredecessorGone
+// pins this already; this is the live counterpart against a real server.
+// Unlike TestCreateSuccessorSessionDuplicateIDFailsLive above (whose
+// predecessor DOES exist, so the id collision is caught by the real
+// server's own PRIMARY KEY constraint on the INSERT attempt), this test
+// deliberately has NO predecessor row at all: before this fix, that made
+// AuthStore's SELECT ... FOR UPDATE return pg.ErrNoRows and short-circuit
+// straight to (zero, false, nil) — masking the id collision entirely rather
+// than reporting auth.ErrIDTaken.
+func TestCreateSuccessorSessionIDTakenCheckedEvenWhenPredecessorGoneLive(t *testing.T) {
+	st := newLiveAuthStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	userID := uid.NewV7()
+
+	existing, err := st.CreateSession(ctx, auth.Session{
+		ID: uid.NewV7(), UserID: userID, TokenHash: "csx-idtaken-existing",
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(existing): %v", err)
+	}
+
+	_, ok, err := st.CreateSuccessorSession(ctx, uid.NewV7() /* no such predecessor */, auth.Session{
+		ID: existing.ID, UserID: userID, TokenHash: "csx-idtaken-new",
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	})
+	if !errors.Is(err, auth.ErrIDTaken) {
+		t.Fatalf("CreateSuccessorSession err = %v, want ErrIDTaken — the id collision must be reported even though the predecessor never existed at all", err)
+	}
+	if ok {
+		t.Fatal("CreateSuccessorSession ok = true despite ErrIDTaken")
+	}
+
+	// The original row must be untouched by the rolled-back transaction.
+	got, err := st.FindSessionByHash(ctx, "csx-idtaken-existing")
+	if err != nil || got.ID != existing.ID {
+		t.Fatalf("original row disturbed: got=%+v err=%v", got, err)
+	}
+}
+
+// TestCreateSuccessorSessionForUpdateBlocksUncommittedDeleteLive is FIX 1's
+// mandatory regression test: it pins that .ForUpdate() on
+// CreateSuccessorSession's own predecessor SELECT is load-bearing, not
+// decorative. In the InTx-then-SELECT-then-INSERT shape this method uses,
+// FOR UPDATE is the ONLY thing that makes the check-then-insert behave
+// correctly against a concurrently in-flight (uncommitted) DELETE targeting
+// the same predecessor row: without it, a plain SELECT answers from its own
+// statement snapshot under READ COMMITTED and cannot see an uncommitted
+// DELETE at all — it reports the predecessor present and the INSERT
+// proceeds, resurrecting a family a concurrent revocation is in the middle
+// of removing, even though that revocation ultimately commits and wins.
+//
+// This is driven against raw SQL on a second, dedicated connection — not
+// through [dropsstore.AuthStore.DeleteSessionsByFamily] itself, which,
+// after FIX 2, takes its own SELECT ... FOR UPDATE lock and would therefore
+// block trying to acquire the very same row this test's own held
+// transaction already locks, rather than staying simply "in flight,
+// uncommitted" the way this test needs to stage. BEGIN; DELETE FROM
+// sessions WHERE family_id = $1, held open without COMMIT, is exactly "a
+// DELETE that has not yet committed" — the scenario FOR UPDATE exists to
+// make CreateSuccessorSession wait for.
+func TestCreateSuccessorSessionForUpdateBlocksUncommittedDeleteLive(t *testing.T) {
+	sqlDB, db := openLiveDB(t)
+	st := dropsstore.NewAuthStore(db)
+	ctx := context.Background()
+	dropAuthTables(t, db, st)
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema: %v", err)
+	}
+	t.Cleanup(func() { dropAuthTables(t, db, st) })
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	userID := uid.NewV7()
+	familyID := uid.NewV7()
+	rotatedAt := now
+	pred, err := st.CreateSession(ctx, auth.Session{
+		ID: uid.NewV7(), UserID: userID, TokenHash: "fu-pred-1", FamilyID: familyID,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now, RotatedAt: &rotatedAt,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(predecessor): %v", err)
+	}
+
+	// A second, dedicated raw connection: BEGIN a transaction and DELETE the
+	// family, but never commit it yet — an uncommitted delete in flight.
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		t.Fatalf("sqlDB.Conn: %v", err)
+	}
+	defer conn.Close()
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	// Rollback is a safe no-op once Commit has already succeeded below (it
+	// returns sql.ErrTxDone, discarded here) — this guarantees the raw
+	// transaction never lingers open if a t.Fatal[f] on any path between
+	// here and the real Commit call below short-circuits this goroutine via
+	// runtime.Goexit, which would otherwise leave an uncommitted
+	// transaction holding a lock that t.Cleanup's own DROP TABLE (a
+	// DIFFERENT connection) would then block on indefinitely.
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM sessions WHERE family_id = $1", familyID); err != nil {
+		t.Fatalf("raw DELETE: %v", err)
+	}
+
+	succ := auth.Session{
+		ID: uid.NewV7(), UserID: userID, TokenHash: "fu-succ-1", FamilyID: familyID,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	}
+	type result struct {
+		sess auth.Session
+		ok   bool
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		s, ok, cerr := st.CreateSuccessorSession(ctx, pred.ID, succ)
+		done <- result{s, ok, cerr}
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("CreateSuccessorSession returned before the concurrent, uncommitted DELETE was committed — .ForUpdate() is not blocking on the locked predecessor row")
+	case <-time.After(200 * time.Millisecond):
+		// Still blocked, as expected — the predecessor row is locked by the
+		// uncommitted raw DELETE above.
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit raw DELETE: %v", err)
+	}
+
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("CreateSuccessorSession err = %v, want nil (a lost race is not a failure)", r.err)
+	}
+	if r.ok {
+		t.Fatal("CreateSuccessorSession ok = true after the family was deleted out from under it — this is the resurrection FIX 1 exists to prevent")
+	}
+	if r.sess != (auth.Session{}) {
+		t.Fatalf("CreateSuccessorSession returned %+v, want the zero value", r.sess)
+	}
+
+	if _, err := st.FindSessionByHash(ctx, "fu-succ-1"); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("FindSessionByHash(successor) err = %v, want ErrSessionNotFound — no resurrection", err)
+	}
+}
+
 // TestDeleteSessionsByFamilyRemovesConcurrentlyMintedSuccessorLive is FIX
 // 2's mandatory live regression test — the CRITICAL closed this round. It
 // reproduces the exact lock ordering the review measured directly:
