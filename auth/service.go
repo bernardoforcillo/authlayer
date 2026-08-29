@@ -1441,34 +1441,60 @@ func (s *Service[U, PU]) RevokeSession(ctx context.Context, userID, sessionID st
 //  4. next is validated against the configured [password.Rules];
 //     [ErrWeakPassword] on failure.
 //  5. next is hashed and persisted via [Store.UpdateUserPassword].
-//  6. Any outstanding "password_reset" [Verification] for this account is
-//     invalidated via [Store.DeleteVerificationsByUserAndPurpose]. Without
-//     this, an attacker holding a still-valid reset link — one whose
-//     [Service.RequestPasswordReset] call ran and returned BEFORE this
-//     call started — could redeem it AFTER the account owner used THIS
-//     method to change their password — the one action a user takes when
-//     they suspect compromise — and take the account right back for the
-//     remainder of the reset token's TTL. This guarantee is SEQUENTIAL
-//     ONLY: nothing orders this sweep against a concurrently-running
-//     [Service.RequestPasswordReset] call. If that other call's own
-//     [Store.CreateVerification] has not yet committed at the instant this
-//     sweep runs, the sweep finds nothing, the concurrent mint proceeds
-//     moments later, and the resulting token survives — demonstrated
-//     deterministically by parking an in-flight RequestPasswordReset at
-//     CreateVerification, running ChangePassword to completion (the sweep
-//     finds nothing), then releasing the mint: the token redeems, and the
-//     attacker's password logs in. Closing that window for real would need
-//     a transaction spanning both the sweep and the mint, which [Store]
-//     does not offer today — this method does not claim to close it, only
-//     the strictly-sequential case. [Service.ResetPassword] closes the same
-//     side door, with the same sequential-only scope, for its own,
-//     differently-triggered path; see that method's doc.
+//  6. Every outstanding "password_reset" AND "email_change" [Verification]
+//     for this account is invalidated, via two
+//     [Store.DeleteVerificationsByUserAndPurpose] calls — one per purpose,
+//     both fail-closed. See "Why both purposes, and what the sweep does
+//     not cover" below.
 //  7. Every session NOT sharing currentSessionID's family is revoked via
 //     [Store.DeleteSessionsByFamily], one call per distinct OTHER family —
 //     the same "list, then delete per distinct family" shape
 //     [Service.LogoutAll] uses, so a rotated-but-unexpired predecessor row
 //     in another family is swept too, not just the currently-live session
 //     in that family.
+//
+// # Why both purposes, and what the sweep does not cover
+//
+// A password change is the one action a user takes when they suspect
+// compromise, so it must leave nothing armed that can quietly undo it.
+// Two verification purposes can:
+//
+// A still-valid reset link — one whose [Service.RequestPasswordReset] call
+// ran and returned BEFORE this call started — would otherwise stay
+// redeemable AFTER the owner changed their password, taking the account
+// right back for the remainder of the reset token's TTL.
+//
+// A still-valid "email_change" token is the STRONGER of the two, and
+// sweeping only the reset one left the stronger door open: it lives
+// defaultVerificationTTL (24h) rather than the reset token's 1h,
+// [Service.RequestEmailChange] mints one with no current password at all
+// (so a briefly-stolen access token — which, per "What revocation does not
+// revoke" above, outlives even [Service.LogoutAll] for up to its own TTL —
+// suffices to arm it), and [Service.VerifyEmail] redeems it with NO
+// authentication whatsoever, moving the address to the attacker's via
+// [Store.UpdateUserEmail]. After that the victim cannot recover:
+// [Service.Login] and [Service.RequestPasswordReset] both look accounts up
+// BY email. Purpose-scoping the sweep is still right — an "email_change"
+// token is not a "password_reset" token, and this method deliberately does
+// not touch "signup" tokens, which grant nothing over the credential — but
+// purpose-scoping was never a reason to leave a credential-rotation bypass
+// armed.
+//
+// Both sweeps carry the SAME guarantee, and it is SEQUENTIAL ONLY: nothing
+// orders either against a concurrently-running [Service.RequestPasswordReset]
+// or [Service.RequestEmailChange] call. If that other call's own
+// [Store.CreateVerification] has not yet committed at the instant the sweep
+// runs, the sweep finds nothing, the concurrent mint proceeds moments
+// later, and the resulting token survives — demonstrated deterministically
+// by parking an in-flight RequestPasswordReset at CreateVerification,
+// running ChangePassword to completion (the sweep finds nothing), then
+// releasing the mint: the token redeems, and the attacker's password logs
+// in. Closing that window for real would need a transaction spanning both
+// the sweep and the mint, which [Store] does not offer today — this method
+// does not claim to close it, only the strictly-sequential case.
+// [Service.ResetPassword] closes the same two side doors, with the same
+// sequential-only scope, for its own, differently-triggered path; see that
+// method's doc.
 //
 // A Store or Hasher error at any step is returned as-is — see the
 // package's "Fail closed" constraint.
@@ -1499,8 +1525,13 @@ func (s *Service[U, PU]) ChangePassword(ctx context.Context, userID, currentSess
 		return err
 	}
 
-	// Close the reset-token side door — see the method doc's point 6.
+	// Close BOTH token side doors — see the method doc's point 6. The
+	// email_change sweep is not a tidier variant of the reset one; it is
+	// the stronger of the two doors.
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposePasswordReset); err != nil {
+		return err
+	}
+	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeEmailChange); err != nil {
 		return err
 	}
 
@@ -1806,19 +1837,34 @@ func (s *Service[U, PU]) RequestPasswordReset(ctx context.Context, email, ip str
 // AFTER the token is irrevocably burned is a write already known to hold
 // valid input.
 //
-// After [Store.UpdateUserPassword] succeeds,
-// [Store.DeleteVerificationsByUserAndPurpose] invalidates any OTHER
-// outstanding "password_reset" token for the same user — the token THIS
-// call redeemed is already gone via the claim above, but a second,
-// still-live token from an earlier [Service.RequestPasswordReset] call
-// that already ran and returned BEFORE this call started is not, and would
-// otherwise still grant a full password reset after this one already
-// completed. This is the same side door [Service.ChangePassword] closes
-// for its own, differently-triggered path, with the identical
-// SEQUENTIAL-ONLY scope that method's doc discloses: nothing orders this
-// sweep against a [Service.RequestPasswordReset] call whose own
-// [Store.CreateVerification] is genuinely concurrent with this one, and a
-// token minted by such a call can still survive and later redeem — see
+// After [Store.UpdateUserPassword] succeeds, two
+// [Store.DeleteVerificationsByUserAndPurpose] calls — one per purpose, both
+// fail-closed — invalidate every OTHER outstanding "password_reset" token
+// AND every outstanding "email_change" token for the same user.
+//
+// The reset sweep: the token THIS call redeemed is already gone via the
+// claim above, but a second, still-live token from an earlier
+// [Service.RequestPasswordReset] call that already ran and returned BEFORE
+// this call started is not, and would otherwise still grant a full password
+// reset after this one already completed.
+//
+// The email_change sweep closes the stronger of the two doors, and sweeping
+// only the reset one left it open: an "email_change" token lives
+// defaultVerificationTTL (24h) rather than this token's 1h, is minted with
+// no current password at all by [Service.RequestEmailChange], and is
+// redeemed by [Service.VerifyEmail] with NO authentication whatsoever —
+// moving the account to the attacker's address, after which the victim
+// cannot recover, since [Service.Login] and [Service.RequestPasswordReset]
+// both look accounts up BY email. A reset is a credential rotation, most
+// often performed precisely because the account may be compromised, so it
+// must not leave that armed.
+//
+// These are the same two side doors [Service.ChangePassword] closes for its
+// own, differently-triggered path, with the identical SEQUENTIAL-ONLY scope
+// that method's doc discloses: nothing orders either sweep against a
+// [Service.RequestPasswordReset] or [Service.RequestEmailChange] call whose
+// own [Store.CreateVerification] is genuinely concurrent with this one, and
+// a token minted by such a call can still survive and later redeem — see
 // [Service.ChangePassword]'s doc, point 6, for the deterministic
 // demonstration and why closing that window would need a transaction
 // [Store] does not offer.
@@ -1869,8 +1915,13 @@ func (s *Service[U, PU]) ResetPassword(ctx context.Context, plainToken, next str
 		return err
 	}
 
-	// Close the reset-token side door — see the method doc above.
+	// Close BOTH token side doors — see the method doc above. The
+	// email_change sweep is not a tidier variant of the reset one; it is
+	// the stronger of the two doors.
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposePasswordReset); err != nil {
+		return err
+	}
+	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposeEmailChange); err != nil {
 		return err
 	}
 

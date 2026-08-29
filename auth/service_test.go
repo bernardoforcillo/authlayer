@@ -309,6 +309,26 @@ func (s *usersTableWritesFailStore) CreateUser(context.Context, auth.UserBase) (
 	return auth.UserBase{}, errWriteBoom
 }
 
+// purposeSweepFailStore fails DeleteVerificationsByUserAndPurpose for ONE
+// nominated purpose and delegates every other call — including a sweep of
+// any other purpose — to a healthy store. Unlike deleteVerificationsFailStore
+// (which fails the method wholesale, so a test using it cannot tell WHICH
+// sweep propagated), this isolates a single sweep: pointing it at
+// "email_change" leaves the long-standing "password_reset" sweep succeeding,
+// so a failure reaching the caller can only have come from the email_change
+// sweep the credential-rotation fix added.
+type purposeSweepFailStore struct {
+	*memory.AuthStore
+	failPurpose string
+}
+
+func (s *purposeSweepFailStore) DeleteVerificationsByUserAndPurpose(ctx context.Context, userID, purpose string) error {
+	if purpose == s.failPurpose {
+		return errWriteBoom
+	}
+	return s.AuthStore.DeleteVerificationsByUserAndPurpose(ctx, userID, purpose)
+}
+
 const validPassword = "Correct-Horse-Battery-9!"
 
 // ============================================================
@@ -2488,6 +2508,68 @@ func TestChangePasswordInvalidatesOutstandingResetToken(t *testing.T) {
 	}
 }
 
+// TestChangePasswordInvalidatesOutstandingEmailChangeToken pins the OTHER
+// half of the same side door. An "email_change" verification is a stronger
+// primitive than a reset token, not a weaker one: it lives 24h rather than
+// 1h, [Service.RequestEmailChange] needs no current password to mint one
+// (a briefly-stolen access token is enough), and [Service.VerifyEmail]
+// redeems it with NO authentication at all, moving the account to the
+// attacker's address. After that the victim cannot recover — [Service.Login]
+// and [Service.RequestPasswordReset] both look accounts up BY email — so a
+// pending email_change surviving the one action a user takes on suspecting
+// compromise is a full, unrecoverable takeover held open for a day.
+func TestChangePasswordInvalidatesOutstandingEmailChangeToken(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "iris3@example.com", validPassword)
+
+	// The attacker, holding a stolen session, arms the takeover.
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "attacker@evil.example")
+	if err != nil {
+		t.Fatalf("RequestEmailChange: %v", err)
+	}
+
+	// The victim responds to the suspected compromise.
+	if err := svc.ChangePassword(ctx, user.ID, "", validPassword, "Changed-Valid-Pass17!"); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(changeTok)); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(email_change token) after ChangePassword err = %v, want ErrVerificationNotFound", ferr)
+	}
+	if _, err := svc.VerifyEmail(ctx, changeTok); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("VerifyEmail(pre-existing email_change token) after ChangePassword err = %v, want ErrVerificationNotFound — the address takeover must not survive a credentialed password change", err)
+	}
+
+	// The account must still be reachable at its original address.
+	stored, err := store.FindUserByID(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.Email != "iris3@example.com" {
+		t.Fatalf("stored email = %q, want %q — the account was moved to the attacker's address", stored.Email, "iris3@example.com")
+	}
+}
+
+// TestChangePasswordFailsClosedWhenEmailChangeSweepFails proves the new
+// sweep is not fire-and-forget: it fails closed exactly as the
+// password_reset sweep beside it does. The double fails ONLY the
+// email_change purpose, so the reset sweep still succeeds and this error
+// can only be the new one propagating.
+func TestChangePasswordFailsClosedWhenEmailChangeSweepFails(t *testing.T) {
+	store := &purposeSweepFailStore{AuthStore: memory.NewAuthStore(), failPurpose: auth.PurposeEmailChange}
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "iris4@example.com", validPassword)
+
+	if err := svc.ChangePassword(ctx, user.ID, "", validPassword, "Changed-Valid-Pass18!"); !errors.Is(err, errWriteBoom) {
+		t.Fatalf("ChangePassword err = %v, want the store's own error — a failed email_change sweep must not be swallowed", err)
+	}
+}
+
 // ============================================================
 // RequestPasswordReset
 // ============================================================
@@ -2939,6 +3021,67 @@ func TestResetPasswordInvalidatesSiblingResetToken(t *testing.T) {
 	}
 	if err := svc.ResetPassword(ctx, tok2Plain, "Second-Valid-Pass16!"); !errors.Is(err, auth.ErrVerificationNotFound) {
 		t.Fatalf("ResetPassword(sibling token) err = %v, want ErrVerificationNotFound — a sibling reset token must not survive a completed reset", err)
+	}
+}
+
+// TestResetPasswordInvalidatesOutstandingEmailChangeToken is the
+// ResetPassword half of the same door TestChangePasswordInvalidatesOutstandingEmailChangeToken
+// closes for ChangePassword — see that test for why an outstanding
+// email_change token is the stronger of the two primitives a credential
+// rotation must sweep.
+func TestResetPasswordInvalidatesOutstandingEmailChangeToken(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "jonah2@example.com", validPassword)
+
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "attacker2@evil.example")
+	if err != nil {
+		t.Fatalf("RequestEmailChange: %v", err)
+	}
+
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "jonah2@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	if err := svc.ResetPassword(ctx, resetTok, "Recovered-Valid-Pass19!"); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(changeTok)); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(email_change token) after ResetPassword err = %v, want ErrVerificationNotFound", ferr)
+	}
+	if _, err := svc.VerifyEmail(ctx, changeTok); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("VerifyEmail(pre-existing email_change token) after ResetPassword err = %v, want ErrVerificationNotFound — the address takeover must not survive a completed reset", err)
+	}
+
+	stored, err := store.FindUserByID(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.Email != "jonah2@example.com" {
+		t.Fatalf("stored email = %q, want %q — the account was moved to the attacker's address", stored.Email, "jonah2@example.com")
+	}
+}
+
+// TestResetPasswordFailsClosedWhenEmailChangeSweepFails is the ResetPassword
+// counterpart of TestChangePasswordFailsClosedWhenEmailChangeSweepFails: the
+// double fails only the email_change purpose, so the password_reset sweep
+// still succeeds and a propagated error can only be the new sweep's.
+func TestResetPasswordFailsClosedWhenEmailChangeSweepFails(t *testing.T) {
+	store := &purposeSweepFailStore{AuthStore: memory.NewAuthStore(), failPurpose: auth.PurposeEmailChange}
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	ctx := context.Background()
+	mustSignUp(t, svc, "jonah3@example.com", validPassword)
+
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "jonah3@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	if err := svc.ResetPassword(ctx, resetTok, "Changed-Valid-Pass20!"); !errors.Is(err, errWriteBoom) {
+		t.Fatalf("ResetPassword err = %v, want the store's own error — a failed email_change sweep must not be swallowed", err)
 	}
 }
 

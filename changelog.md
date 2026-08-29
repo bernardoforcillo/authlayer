@@ -332,12 +332,17 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `currentSessionID` revokes everything — the fail-closed direction);
   `ResetPassword` claims the verification before applying it, so a failure
   after the claim burns the token rather than leaving it redeemable twice,
-  and then revokes every session. Both also invalidate any outstanding
-  `password_reset` token for the account, closing the door where an attacker
-  who requested a reset link and waited keeps a way in for its whole TTL even
-  after the victim changes their password. **That sweep is sequential only:**
-  nothing orders it against a `RequestPasswordReset` whose own
-  `CreateVerification` is genuinely concurrent, and such a token can still
+  and then revokes every session. Both also invalidate every outstanding
+  `password_reset` **and** `email_change` token for the account, closing two
+  doors: the attacker who requested a reset link and waited keeps a way in for
+  its whole TTL even after the victim changes their password, and — the
+  stronger of the two — an `email_change` token lives 24 hours rather than
+  one, needs no current password to mint, and is redeemed by `VerifyEmail`
+  with no authentication at all, moving the account to an address from which
+  the victim cannot recover, since `Login` and `RequestPasswordReset` both
+  look accounts up by email. **Both sweeps are sequential only:** nothing
+  orders them against a `RequestPasswordReset` or `RequestEmailChange` whose
+  own `CreateVerification` is genuinely concurrent, and such a token can still
   survive and later redeem; closing that would need a transaction spanning
   both, which the `Store` port does not offer. `RequestEmailChange` performs
   no address pre-check — uniqueness is enforced atomically at redemption

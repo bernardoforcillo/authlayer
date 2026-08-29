@@ -1124,18 +1124,27 @@ leaving it redeemable twice), then revokes every session the account has.
 uniqueness atomically at redemption, not before, because a pre-check would be
 an unrate-limited "is this registered?" oracle for any authenticated caller.
 
-Both `ChangePassword` and `ResetPassword` also invalidate any outstanding
-`password_reset` token for the account, which closes a real side door: an
-attacker who requested a reset link and waited would otherwise keep a working
-way in for the token's whole TTL, even after the victim changed their password
-— the one thing a user does on suspecting compromise. **That sweep is
-sequential-only.** Nothing orders it against a `RequestPasswordReset` whose
-own `CreateVerification` is genuinely concurrent with it: park such a mint,
-run a full `ChangePassword` (the sweep finds nothing), release the mint, and
-the resulting token survives and later redeems. Closing that window for real
-needs a transaction spanning both, which the `Store` port does not offer. The
-sequential case is closed; the concurrent one is not, and this is stated
-rather than papered over.
+Both `ChangePassword` and `ResetPassword` also invalidate every outstanding
+`password_reset` **and** `email_change` token for the account, which closes two
+real side doors. The reset one: an attacker who requested a reset link and
+waited would otherwise keep a working way in for the token's whole TTL, even
+after the victim changed their password — the one thing a user does on
+suspecting compromise. The `email_change` one is stronger and was the half
+left open for a while: that token lives 24 hours rather than one, needs no
+current password to mint (`RequestEmailChange` takes a user id, so a
+briefly-stolen access token is enough), and `VerifyEmail` redeems it with no
+authentication at all — moving the account to the attacker's address, after
+which the victim cannot recover, because `Login` and `RequestPasswordReset`
+both look accounts up *by email*. A credential rotation that leaves that armed
+has not rotated the credential that matters.
+
+**Both sweeps are sequential-only.** Nothing orders them against a
+`RequestPasswordReset` or `RequestEmailChange` whose own `CreateVerification`
+is genuinely concurrent: park such a mint, run a full `ChangePassword` (the
+sweep finds nothing), release the mint, and the resulting token survives and
+later redeems. Closing that window for real needs a transaction spanning both,
+which the `Store` port does not offer. The sequential case is closed; the
+concurrent one is not, and this is stated rather than papered over.
 
 `password.DefaultRules()` is the default policy — 12 characters, upper, lower,
 digit, and one character that is neither a letter, a digit, nor whitespace, so
