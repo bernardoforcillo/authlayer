@@ -681,13 +681,16 @@ func (s *Service[C, M, PC, PM]) RevokeLink(ctx context.Context, id string) error
 // "One-time" bounds how many times the token pays out, not who it pays out
 // to.
 //
-// This is not an oversight to be patched here. authlayer stores no users and
-// has no notion of a subject's verified address, so there is nothing for it
+// This is not an oversight to be patched here. This package stores no users
+// and takes no dependency on
+// [github.com/bernardoforcillo/authlayer/auth] — [scope] carries a user id
+// as an opaque value and nothing else — so there is no verified address here
 // to compare against; [EmailInvite].Email is a delivery hint and an audit
 // record. An application that needs the invitation bound to its recipient
 // must enforce that itself, before calling AcceptInvite — read the invited
 // address out of the token with [Service.PreviewInvite], which consumes
-// nothing, and compare it to the authenticated user's own verified address.
+// nothing, and compare it to the authenticated user's own verified address
+// (auth.UserBase.EmailVerifiedAt, if that is where the account lives).
 //
 // # Ordering, and why
 //

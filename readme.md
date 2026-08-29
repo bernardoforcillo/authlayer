@@ -4,17 +4,21 @@ Reusable authentication & authorization for Go, built on
 [`drops`](https://github.com/bernardoforcillo/drops) — so you stop rewriting the
 same authz logic in every project.
 
-> **Status: early.** Milestone 1 ships **scope RBAC**: code-defined permission
-> statements, hybrid default + custom roles, permission checks, a
+> **Status: early.** Milestone 1 shipped **scope RBAC**: code-defined
+> permission statements, hybrid default + custom roles, permission checks, a
 > privilege-escalation guard, lifecycle hooks, and query-level guards.
-> Authentication (credentials, sessions, OAuth) comes later.
+> Milestone 2 adds [invitations](#invitations) and the
+> [authentication core](#authentication) — users, password credentials,
+> revocable sessions with refresh-token rotation, and email verification.
+> OAuth is not here yet.
 
 ```sh
 go get github.com/bernardoforcillo/authlayer
 ```
 
-Requires Go 1.26+. The `access` package is standard-library only; everything
-else pulls in `drops` (and `pgx/v5` for the PostgreSQL store).
+Requires Go 1.26+. `access` and `token` are standard-library only; `password`
+(and so `auth`) adds `golang.org/x/crypto` for bcrypt and nothing else; the
+RBAC engine pulls in `drops`, and `pgx/v5` comes with the PostgreSQL store.
 
 ## Contents
 
@@ -26,8 +30,9 @@ else pulls in `drops` (and `pgx/v5` for the PostgreSQL store).
 - [Privilege escalation](#the-privilege-escalation-guard) ·
   [Policy](#policy) · [Hooks & events](#hooks--events) · [Options](#options)
 - [Query-level filtering](#query-level-filtering) · [Storage](#storage) ·
-  [Custom scopes](#custom-scopes) · [Nested scopes](#nested-scopes) ·
-  [Invitations](#invitations) · [Errors](#errors) · [Packages](#packages)
+  [Custom scopes](#custom-scopes) · [Nested scopes](#nested-scopes)
+- [Invitations](#invitations) · [Authentication](#authentication) ·
+  [Errors](#errors) · [Packages](#packages)
 
 ## The model
 
@@ -49,12 +54,21 @@ else pulls in `drops` (and `pgx/v5` for the PostgreSQL store).
 - **Two enforcement points.** An in-memory decision (`Can` / `Authorize` /
   `HasPermission`) *and* a drops `pg.Guard` that filters rows at the database.
   Both read the acting subject and the active scope from the same `context`.
-- **No user table.** authlayer stores no users and declares no foreign key to
-  yours — a user id is a value it carries, never one it validates against a
-  schema of its own. The one thing that does check it is PostgreSQL: the drops
-  store types user-id columns `uuid` by default, because authlayer generates
-  UUIDv7 user ids. Bring your own non-UUID ids with
-  `dropsstore.WithTextUserIDs()`.
+- **Users are opt-in, and still your type.** The RBAC half — `scope`, `org`,
+  `team`, `invite` — stores no users and declares no foreign key to yours: a
+  user id is a value it carries, never one it validates against a schema of
+  its own. [`auth`](#authentication) is the half that *does* own a `users`
+  table (plus `sessions` and `verifications`), and it owns it the same way the
+  engine owns containers: generic over your type, which supplies its own
+  fields and embeds `auth.UserBase` — id, email, verification stamp, password
+  hash, timestamps — exactly as a container embeds `scope.ContainerBase` and a
+  membership embeds `scope.MemberBase`. authlayer persists the `UserBase`-shaped
+  part and nothing else, so the rest of your profile stays in your own tables.
+  Use the RBAC half alone and nothing about users changes. Ids authlayer mints
+  are UUIDv7 and their columns are `uuid`;
+  `dropsstore.WithTextUserIDs()` remains the escape hatch for pointing the
+  **RBAC** store at a non-UUID user table of your own, and the auth store has
+  no such option, because there it owns the `users` table being referenced.
 
 ## Quick start
 
@@ -466,13 +480,33 @@ owe the engine is the right sentinel error when a lookup finds nothing —
 `ErrNotMember` rather than a generic not-found — because the engine branches on
 those. Each method's contract is documented on the interface.
 
+`invite.Store` and `auth.Store` are separate ports with the same discipline,
+and both backends implement all three. `auth.Store` is the strictest of them.
+Four of its eighteen methods — `MarkRotated`, `CreateSuccessorSession`,
+`MarkEmailVerified` and `UpdateUserEmail` — carry an explicit atomicity
+**MUST**, each naming the failure it prevents, because splitting any of them
+into a read and a later write reopens a security hole rather than merely
+narrowing a race. Two more carry obligations `SignUp`'s enumeration safety
+leans on: `CreateUser` must decide `ErrEmailTaken` from the same attempt that
+performs the write, and `FindUserByEmail` must read its own writes. All six
+are written on the interface as requirements with their consequences spelled
+out, because they constrain any third-party backend as much as the two shipped
+ones — see [Authentication](#enumeration-safe-sign-up).
+
 ### `store/memory`
 
 An in-process, generic store backed by maps. Zero dependencies, concurrency
 safe, and the reference implementation of the contract — use it for development,
 tests, and examples. It does not enforce uniqueness of your own fields (a slug,
 say), and its `WithTx` approximates a transaction by snapshot-and-restore under
-a mutex.
+a mutex. `memory.NewInviteStore()` and `memory.NewAuthStore()` are the
+`invite.Store` and `auth.Store` counterparts. The auth one enforces exactly
+two of the uniqueness constraints its port describes — one account per
+normalized email, and no id collision on any `Create*` — and, like the invite
+store, defers the `token_hash` uniqueness `auth.Store` requires of a backend
+to `store/drops`. It satisfies every atomicity MUST the port states by holding
+one mutex for each method's entire body, so no check-then-write can be split
+by a concurrent call.
 
 ### `store/drops`
 
@@ -529,7 +563,37 @@ columns or constraints is left as it stands, so `CreateSchema` will not migrate
 an existing schema forward. `st.Schema()` exposes the table definitions if you
 would rather generate the DDL.
 
-No foreign key to a users table is declared, because authlayer does not own one.
+`dropsstore.NewInviteStore(db)` and `dropsstore.NewAuthStore(db)` are separate
+stores over their own tables, each with its own `CreateSchema` and `Schema()`.
+The auth one owns three:
+
+```
+users          id PK (uuid), email UNIQUE, email_verified_at, password_hash,
+               created_at, updated_at
+sessions       id PK, user_id, token_hash UNIQUE, family_id, expires_at,
+               created_at, rotated_at, user_agent, ip, INDEX (family_id)
+verifications  id PK, user_id, token_hash UNIQUE, purpose, email, expires_at,
+               created_at
+```
+
+All three UNIQUE constraints are load-bearing. `UNIQUE (email)` is what
+`SignUp` reads "already registered" off, so without it the duplicate branch
+never fires and enumeration safety has nothing to be safe about; the two
+`token_hash` constraints keep a hash lookup single-row and turn a generation
+bug into a loud error instead of an ambiguous multi-row match. `email` is
+declared *both* inline and as a named `ALTER TABLE`, because
+`CREATE TABLE IF NOT EXISTS` is a no-op against a table that already exists —
+so the guarded `ALTER` is what self-heals a users table created by an older
+version or by hand. The `family_id` index is not decoration either: every
+family revocation reads and locks by it, and `LogoutAll` runs one transaction
+per family. `AuthNames` / `WithAuthNames` rename the three tables if `users`
+is already taken in your database. Unlike the RBAC and invite stores, this one
+has no text-user-id option — it owns the `users` table its `user_id` columns
+point at, so `uuid` is the only self-consistent choice.
+
+No foreign keys are declared — not to a users table from the RBAC side, which
+authlayer does not own, and not between the three auth tables either, matching
+every other schema here.
 
 A live end-to-end test lives behind a build tag, so the default `go test ./...`
 stays database-free:
@@ -795,13 +859,15 @@ invitation is simply gone.
 presents the token, at the invited role; it never compares the accepting
 subject to `EmailInvite.Email`. "One-time" bounds how many times the token pays
 out, not who it pays out to, so a forwarded or intercepted invitation email
-admits whoever clicks it. That is not something authlayer can check for you:
-it stores no users and has no notion of a subject's verified address (see
-[The model](#the-model)), so `Email` is a delivery hint and an audit record
-rather than an authorization test. If your application needs the invitation
-bound to its recipient, enforce it yourself before calling `AcceptInvite` —
-`PreviewInvite` reads the invited address out of a token without consuming it,
-so compare that against the authenticated user's own verified address.
+admits whoever clicks it. That is not something `invite` can check for you: it
+stores no users and takes no dependency on [`auth`](#authentication) — `scope`
+carries a user id as an opaque value and nothing else — so `Email` is a
+delivery hint and an audit record rather than an authorization test. If your
+application needs the invitation bound to its recipient, enforce it yourself
+before calling `AcceptInvite` — `PreviewInvite` reads the invited address out
+of a token without consuming it, so compare that against the authenticated
+user's own verified address (`auth.UserBase.EmailVerifiedAt`, if that is where
+your accounts live).
 
 **An existing member is idempotent, but not symmetrically.** If the ctx
 subject already has standing in the link's container, `JoinViaLink` returns
@@ -861,6 +927,324 @@ acceptance needs to hand one back. Like `Standing` and `HasPermission`, neither
 reads anything from the context nor checks that the caller is entitled to
 ask — do not expose either directly to end users.
 
+## Authentication
+
+`auth` owns identity: the user record, its password credential, revocable
+server-side sessions, and the one-time tokens that confirm an address or reset
+a password. It sits on two smaller packages — [`token`](token/), which mints
+the opaque refresh tokens and the HS256 access tokens, and
+[`password`](password/), the hashing port with a bcrypt default. Together they
+replace the sign-up, login and refresh-rotation code an application would
+otherwise write by hand.
+
+**What authlayer does not own.** No transport: no HTTP handlers, no cookies,
+no middleware, no base URL. No email delivery — `SignUp`,
+`RequestPasswordReset` and `RequestEmailChange` each return a plaintext token
+exactly once and putting it in a message is entirely yours, the same division
+[`invite`](#invitations) already draws. And no user profile beyond what you
+embed: the `Store` persists the `auth.UserBase`-shaped part of your type and
+nothing else, so a `Plan` or `DisplayName` field of your own is yours to load
+and save (`WithClaimsExtender`'s doc has the worked example).
+
+### Sign-up, verification, login
+
+```go
+key := []byte("32-bytes-or-more-from-your-vault") // the HS256 floor, RFC 7518 §3.2
+svc := auth.New[auth.UserBase](memory.NewAuthStore(), // swap for drops
+    auth.WithJWT([][]byte{key}, 15*time.Minute), // access-token TTL
+    auth.WithRefreshTTL(30*24*time.Hour),        // session lifetime
+    auth.WithRequireVerifiedEmail(true))
+
+ctx := context.Background()
+res, _ := svc.SignUp(ctx, "  Bob@Example.com ", "Correct-Horse-Battery-7")
+fmt.Println(res.Created, res.User.Email) // true bob@example.com
+// deliver res.VerifyToken yourself — authlayer owns no transport
+
+_, err := svc.VerifyEmail(ctx, res.VerifyToken)
+fmt.Println(err) // <nil>
+
+user, access, refresh, err := svc.Login(ctx,
+    "bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+fmt.Println(user.ID != "", access != "", refresh != "", err) // true true true <nil>
+```
+
+`U` is your own type embedding `auth.UserBase`, exactly as a container embeds
+`scope.ContainerBase`; `auth.UserBase` itself is a fine `U` when you have no
+extra fields. Every address is passed through `auth.NormalizeEmail` (trim,
+lowercase) on every read and write, which is why the trailing space and the
+capitals above vanish and why `BOB@example.com` cannot become a second
+account. `ip` must be non-empty — a blank one would put every caller that
+omits it into a single shared rate-limit bucket, so it is `ErrMissingIP`
+rather than a tolerated "unknown".
+
+### Rotation, reuse detection, and family revocation
+
+A login mints two credentials. The **access token** is a short-lived HS256 JWT
+the server never stores. The **refresh token** is a 32-byte opaque bearer
+token whose sha256 becomes a `Session` row — the plaintext is never persisted,
+so a database leak cannot be replayed into a session, the same stance
+`invite.EmailInvite.TokenHash` takes.
+
+Refreshing rotates: the presented token is marked superseded and a successor
+is minted in the same **family** (every session descending from one login
+shares a `FamilyID`). Presenting a token that has already been rotated away is
+a **replay**, and authlayer cannot tell an attacker replaying a stolen token
+from a client retrying a raced request — so it treats every replay as
+compromise and revokes the whole family. Continuing from above:
+
+```go
+next, err := svc.Refresh(ctx, refresh)
+fmt.Println(next.RefreshToken != refresh, err) // true <nil>
+
+_, err = svc.Refresh(ctx, refresh) // the token we already rotated away
+fmt.Println(errors.Is(err, auth.ErrTokenReuse)) // true
+
+_, err = svc.Refresh(ctx, next.RefreshToken) // died with its family
+fmt.Println(errors.Is(err, auth.ErrTokenInvalid)) // true
+
+live, _ := svc.ListSessions(ctx, user.ID)
+fmt.Println(len(live)) // 0
+```
+
+The successor is gone too: revocation takes the family, not merely the token
+that was replayed, because a successor an attacker had already rotated into
+would otherwise survive the alarm that detected them. That is a
+security-first trade — a genuine race between a client and its own retry
+signs that user out everywhere — and it is deliberate.
+
+Two things make it hold under concurrency, and both live on the `Store` port
+as atomicity obligations rather than as advice. `MarkRotated` is a
+compare-and-set: of however many callers present the same refresh token at
+once, exactly one sees `ok=true`, and only that result authorizes minting —
+never a `RotatedAt` value read a moment earlier, which is stale the instant
+the goroutine yields. `CreateSuccessorSession` then inserts the successor only
+if the predecessor row still exists, so a family revoked in the window between
+the two is not resurrected by a winner still in flight — `Refresh` returns
+`ErrSessionRevoked` instead of minting. Both windows are closed only insofar
+as the backend honours the atomicity the port demands of it; both shipped
+stores do, and the requirement is written on the interface for anyone writing
+a third. An expired refresh token is ordinary end-of-life, not evidence of
+theft: it is `ErrTokenInvalid` and leaves the family intact.
+
+Rotated-but-unexpired rows are kept on purpose — they are what makes replay
+detectable at all — and `Store.PurgeExpired` is the cron that sweeps expired
+sessions and verifications later. `Logout` revokes one session and is
+idempotent; `LogoutAll` revokes every family a user has; `RevokeSession`
+deletes one session by id but only if it belongs to the named user, reporting
+another user's session identically to a nonexistent one.
+
+### What "revocable" actually means
+
+**Revoking a session does not invalidate an access token already issued for
+it.** The access token is a stateless JWT: `token.Parse` checks its signature
+and its expiry and looks nothing up. A device holding one keeps working until
+that token expires — up to 15 minutes with the default TTL — no matter what
+`Refresh`, `Logout`, `LogoutAll`, `RevokeSession`, `ChangePassword` or
+`ResetPassword` did to the session behind it. Continuing the example above,
+where reuse detection has just revoked the entire family:
+
+```go
+claims, err := token.Parse(next.AccessToken, key)
+fmt.Println(err, claims.Subject == user.ID) // <nil> true — still valid
+
+sessions, _ := svc.ListSessions(ctx, claims.Subject)
+fmt.Println(claims.SessionID != "", len(sessions)) // true 0
+```
+
+Zero sessions, and a token that still parses. So "revocable sessions" means
+the refresh side is revocable *instantly* and the access side is revocable
+*within one TTL*. Read every "signs out every device" sentence in this section
+and in the package docs with that bound attached; it applies to all of them
+without exception.
+
+The hook for closing the gap is the `sid` claim (`token.Claims.SessionID`),
+stamped by `Login` and `Refresh` with the id of the session that minted the
+token. An application that needs another device's access to stop being
+honoured sooner than the TTL must look `sid` up in the `Store` on every
+request — the same per-request read `Refresh` and `RevokeSession` already do —
+rather than trusting a parsed, still-unexpired JWT on its own. That is a real
+cost (a database round trip per request) for a real property, and authlayer
+does not make the choice for you: it puts `sid` in the token so the choice
+exists. Shortening the access TTL through `WithJWT` narrows the window without
+closing it.
+
+### Enumeration-safe sign-up
+
+A library that returns a token cannot fake "we emailed the account already on
+file", so `SignUp` does not try: a duplicate address is **not an error**. Both
+outcomes return `(SignUpResult, nil)`, and `Created` is the only field that
+tells them apart.
+
+```go
+again, err := svc.SignUp(ctx, "BOB@example.com", "Some-Other-Password-9")
+fmt.Println(again.Created, again.VerifyToken == "", err) // false true <nil>
+fmt.Println(again.User.Email, again.User.PasswordHash == "") // bob@example.com true
+
+weak, err := svc.SignUp(ctx, "carol@example.com", "short")
+fmt.Println(weak.Created, errors.Is(err, auth.ErrWeakPassword)) // false true
+```
+
+The property holds *by construction* rather than by argument: the password is
+validated before the address is even looked up, and every `Store` call after
+`CreateUser` — the read-back and the verification mint — runs on **both**
+branches with its result discarded on the duplicate one, so there is no call,
+and therefore no failure, that one branch can reach and the other cannot. A
+probe never touches the real accountholder's pending verification either; the
+duplicate branch's mint is purely additive, so nobody can destroy a victim's
+emailed link by "signing up" as them. The duplicate branch never hands back
+credential material: `PasswordHash` is cleared on both branches (and carries
+`json:"-"` at the type level).
+
+**The caller's obligation.** None of this survives a handler that returns a
+different status code, a different body, or a measurably different latency
+depending on `Created`. Use `VerifyToken` — non-empty only when `Created` is
+true — to decide whether to send mail, never to decide what to tell the HTTP
+client. The property is enforced up to the boundary of the function and no
+further.
+
+Two `Store` obligations are load-bearing here and are documented as
+requirements on the port: `CreateUser` must decide `ErrEmailTaken` from the
+same attempt that performs the write (never from a cheaper read first), and
+`FindUserByEmail` must read its own writes. `store/memory` and `store/drops`
+both honour them; a third-party backend that does not reopens the oracle from
+inside the store. This is a joint property, not one `SignUp` can guarantee
+alone.
+
+### The password lifecycle
+
+`ChangePassword(ctx, userID, currentSessionID, current, next)` requires the
+current password, then revokes every session **except** the caller's own
+family — pass the `sid` from the access token that authenticated the request;
+an empty or foreign id revokes everything, which is the fail-closed direction.
+`RequestPasswordReset` returns `(token, ok, nil)` and never errors merely
+because an address is unknown. `ResetPassword` claims the verification first
+and applies second (a failure after the claim burns the token rather than
+leaving it redeemable twice), then revokes every session the account has.
+`RequestEmailChange` mints an `email_change` token; the address is checked for
+uniqueness atomically at redemption, not before, because a pre-check would be
+an unrate-limited "is this registered?" oracle for any authenticated caller.
+
+Both `ChangePassword` and `ResetPassword` also invalidate any outstanding
+`password_reset` token for the account, which closes a real side door: an
+attacker who requested a reset link and waited would otherwise keep a working
+way in for the token's whole TTL, even after the victim changed their password
+— the one thing a user does on suspecting compromise. **That sweep is
+sequential-only.** Nothing orders it against a `RequestPasswordReset` whose
+own `CreateVerification` is genuinely concurrent with it: park such a mint,
+run a full `ChangePassword` (the sweep finds nothing), release the mint, and
+the resulting token survives and later redeems. Closing that window for real
+needs a transaction spanning both, which the `Store` port does not offer. The
+sequential case is closed; the concurrent one is not, and this is stated
+rather than papered over.
+
+`password.DefaultRules()` is the default policy — 12 characters, upper, lower,
+digit, and one character that is neither a letter, a digit, nor whitespace, so
+padding a short password with spaces cannot satisfy it. `password.Validate`
+returns the names of the failed rules (`min_length`, `upper`, `lower`,
+`digit`, `special`) so a handler can render a stable message. Swap the
+algorithm with `WithHasher`; `password.Hasher` is a three-method port, and its
+`Dummy` method exists solely to spend comparable bcrypt time on a
+user-not-found path — deleting it because "the result is discarded" silently
+reinstates a timing oracle.
+
+### Enumeration safety is bounded, not absolute
+
+`SignUp` and `RequestPasswordReset` equalise the *sequence of calls* and the
+*set of errors* each branch can produce. Neither equalises the wall clock, and
+on `RequestPasswordReset` the residual has been measured rather than assumed:
+against a live PostgreSQL store, a known address answers roughly 1.7–2.9 ms
+slower than an unknown one — about 4–6×, distributions nearly disjoint under
+low-jitter same-host measurement — because the known branch performs two extra
+local writes (invalidate the previous token, mint the new one) that the
+unknown branch has no user row to perform. Over WAN jitter that needs on the
+order of 10²–10³ samples against one address to resolve: practical against a
+single suspected address, impractical for bulk enumeration, and real either
+way.
+
+`WithPasswordResetRateLimiter` is what bounds it, by capping how many samples
+an attacker can collect against any one address. It earns its keep twice over,
+because the re-issue behaviour it gates has a second cost: since each request
+invalidates the account's previous reset token, anyone who merely knows an
+address — no credential, no relationship to the account — can kill a victim's
+genuine pending reset link by looping calls. That falls out of the re-issue
+contract itself, and the address limiter is what bounds how often it can
+happen. There is no default; the bucket size is an operator decision.
+
+A caller can also reopen the channel from outside: if your handler awaits
+`RequestPasswordReset` and then does address-dependent work before responding
+— a real mail send, say — the transport leaks what the function bounded.
+Normalise your own response timing, or accept the documented channel.
+
+### Rate limiting
+
+`RateLimiter` is a one-method port. `WithRateLimiter` wires the IP-keyed
+limiter `Login` and `RequestPasswordReset` both consult;
+`WithPasswordResetRateLimiter` wires the address-keyed one only
+`RequestPasswordReset` consults. Keying login on IP and never on email is
+deliberate: an email-keyed bucket lets an attacker lock a victim out of their
+own account by exhausting the victim's bucket, never their own.
+
+There is **no default limiter** — the zero configuration rate-limits nothing,
+because authlayer has no idea what your traffic looks like, and a wrong
+default here is an outage. Wiring one is your job. Once wired, it fails
+**closed**: a limiter that returns an error has failed to make a decision, and
+an authentication decision that cannot be made must deny, so the error
+propagates and the call is refused rather than admitted. The one deliberate
+exception is *shape*, not stance: a denial from the address-keyed reset
+limiter returns the same `("", false, nil)` an unknown address gets instead of
+`ErrRateLimited`, because a distinguishable error reachable only once enough
+requests for *that* address had run would itself be the existence oracle the
+method exists to close.
+
+### The JWT, and why hand-rolling it is defensible
+
+The two classic JWT vulnerabilities — `alg: none`, and RS256/HS256 confusion
+where a public key is fed to an HMAC verifier — both need the same enabling
+mistake: a parser that takes its algorithm *from the token* and dispatches on
+it. `token.Parse` does not. It supports exactly one algorithm and compares the
+header's `alg` to the literal string `"HS256"` before it verifies a signature
+or decodes a payload; every other value, a missing field and a lower-case
+`hs256` included, is rejected through that one line with
+`ErrUnsupportedAlgorithm`. There is no `none` branch to reach and no second
+algorithm to confuse it with. That single check is the whole justification for
+not taking a dependency — and it is why generalising this package to a second
+algorithm would bring both vulnerabilities back.
+
+The same reasoning covers the key. An empty or undersized HMAC key is `alg:
+none` reached through the key parameter instead of the header — the realistic
+failure being `[]byte(os.Getenv("JWT_SECRET"))` with the variable unset — so
+`Issue` and `Parse` both refuse anything under 32 bytes, the floor RFC 7518
+§3.2 sets for HS256. `Parse` refuses the whole call if *any* key in the list
+is short, rather than quietly skipping it. Signature comparison is
+`hmac.Equal`, and every segment is decoded with strict base64, so one token
+has exactly one valid encoding and the raw string is usable as a denylist key.
+
+`Parse` takes a list of keys and tries each; `Issue` always signs with the
+first, which is how a signing key is rotated. `WithClaimsExtender` adds
+application claims, and they nest under one `"ext"` object rather than merging
+into the top level — structurally, not by denylist, so an extender cannot
+shadow a reserved claim:
+
+```go
+_, err = token.Issue(token.Claims{Subject: "u1"}, []byte("too-short"), time.Minute)
+fmt.Println(errors.Is(err, token.ErrKeyTooShort)) // true
+
+ext := auth.New[auth.UserBase](memory.NewAuthStore(),
+    auth.WithJWT([][]byte{key}, 15*time.Minute),
+    auth.WithClaimsExtender(func(u auth.UserBase) map[string]any {
+        return map[string]any{"plan": "pro", "sub": "victim"}
+    }))
+_, _ = ext.SignUp(ctx, "dana@example.com", "Correct-Horse-Battery-7")
+dana, accessToken, _, _ := ext.Login(ctx,
+    "dana@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+
+c, err := token.Parse(accessToken, key)
+fmt.Println(err, c.Subject == dana.ID)       // <nil> true
+fmt.Println(c.Extra["plan"], c.Extra["sub"]) // pro victim
+```
+
+The extender's `"sub"` lands at `ext.sub` and the real subject is untouched.
+
 ## Errors
 
 Compare with `errors.Is`, never by string. `org` re-exports these as *aliases*,
@@ -914,6 +1298,53 @@ that step to also report which of three conditions applied would require a
 second, separate read, which is exactly the race atomicity rules out — and
 `JoinViaLink` re-reads the link afterwards to tell them apart.
 
+[`auth`](#authentication) adds seventeen, split the same way — some raised by
+the `Store` on a lookup or a constraint, the rest by the service:
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrUserNotFound` | No user with that id or email | 404 |
+| `ErrSessionNotFound` | No session with that id or token hash | 404 |
+| `ErrVerificationNotFound` | No verification with that id or token hash | 404 |
+| `ErrInvalidCredentials` | `Login` failed — unknown address, no password credential, or wrong password, deliberately indistinguishable | 401 |
+| `ErrTokenInvalid` | The refresh token is unknown or its session has expired. The family is **not** revoked | 401 |
+| `ErrTokenReuse` | A rotated-away refresh token was presented again; the whole family is already revoked | 401 |
+| `ErrSessionRevoked` | `Refresh` won the rotation, but the family was revoked before the successor could be persisted | 401 |
+| `ErrEmailNotVerified` | `WithRequireVerifiedEmail` is on and the address is unconfirmed — checked only after the password verifies | 403 |
+| `ErrEmailTaken` | Another user already holds this normalized address | 409 |
+| `ErrIDTaken` | A `Create*` was given an id that already identifies a row of that kind | 409 |
+| `ErrEmailMismatch` | `MarkEmailVerified` was asked to certify an address that is not the user's current one | 409 |
+| `ErrVerificationExpired` | The verification's `ExpiresAt` has passed — checked before the claim, so the token is not burned | 410 |
+| `ErrWeakPassword` | Fails the configured `password.Rules`; wraps the failed rule names | 400 |
+| `ErrVerificationPurpose` | Right token, wrong flow — a `password_reset` token at `VerifyEmail`, say | 400 |
+| `ErrEmailRequired` | `RequestEmailChange` was given an address that is empty once normalized | 400 |
+| `ErrRateLimited` | The IP-keyed `RateLimiter` refused. Never returned for the address-keyed reset limiter — see [Rate limiting](#rate-limiting) | 429 |
+| `ErrMissingIP` | `Login` or `RequestPasswordReset` was called with an empty ip — a wiring bug, not caller input | 500 |
+
+`SignUp` is the one method that reports a duplicate address without an error
+at all; see [Enumeration-safe sign-up](#enumeration-safe-sign-up).
+`ErrTokenReuse` must be checked *before* testing whether an error wraps a
+store error of its own: when the family revocation that responds to a
+detected replay itself fails, `Refresh` wraps both, so the alarm is never lost
+to the housekeeping failure.
+
+[`token`](token/) adds six. The first four are what a caller gets from
+`Parse`; the last two are misconfiguration, surfaced from `Issue`, and no
+request can trigger them:
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrMalformedToken` | Not a valid JWS compact serialization — wrong segment count, non-canonical base64, or a segment that is not JSON | 401 |
+| `ErrUnsupportedAlgorithm` | The header's `alg` is not exactly `"HS256"`. Returned before any signature is verified | 401 |
+| `ErrInvalidSignature` | No key in the list produced a matching signature | 401 |
+| `ErrExpiredToken` | The signature verified but `exp` is not in the future — checked after verification, so it cannot probe for a valid signature on forged claims | 401 |
+| `ErrKeyTooShort` | An HMAC key under 32 bytes was passed to `Issue`, or appears anywhere in `Parse`'s key list | 500 |
+| `ErrInvalidTTL` | `Issue` was given a zero or negative ttl | 500 |
+
+`password` defines no sentinels: `Validate` returns the names of the failed
+rules and `Verify` returns a bool, so there is nothing to compare with
+`errors.Is`.
+
 ## Packages
 
 | Package | What it is |
@@ -923,15 +1354,28 @@ second, separate read, which is exactly the race atomicity rules out — and
 | [`org`](org/) | Organization RBAC — `scope` with the type parameters fixed and the names spelled "organization". |
 | [`team`](team/) | Team RBAC nested inside `org` via `scope.WithParent` — the worked example of [nesting](#nested-scopes). |
 | [`invite`](invite/) | [Invitations](#invitations) — email tokens and reusable links admitting a user with no standing yet, via `scope.Service.GrantMembership`. |
-| [`store/memory`](store/memory/) | In-memory `Store` for dev, tests, and examples. |
-| [`store/drops`](store/drops/) | PostgreSQL `Store` built on drops (composite-key membership). |
+| [`auth`](auth/) | [Authentication](#authentication) — `Service[U]` over your own user type, its `Store` port, and the user/session/verification records. Sign-up, login, email verification, refresh rotation, and the password lifecycle. |
+| [`token`](token/) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled, [single-algorithm](#the-jwt-and-why-hand-rolling-it-is-defensible) HS256 JWT. Standard library only. |
+| [`password`](password/) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` for a strength policy. The only package that pulls in `golang.org/x/crypto`. |
+| [`store/memory`](store/memory/) | In-memory `scope.Store`, `invite.Store` and `auth.Store` for dev, tests, and examples. |
+| [`store/drops`](store/drops/) | PostgreSQL stores built on drops — RBAC (composite-key membership), invitations, and the three auth tables. |
 | [`examples/basic`](examples/basic/) | Runnable, database-free tour. |
 
 Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
 
+`internal/uid` is not importable — it is the RFC 9562 UUIDv7 generator
+authlayer uses for every id it mints (containers, roles, users, sessions,
+verifications), written out rather than depended on so the module stays at
+three requirements. `WithIDGenerator` overrides it wherever you would rather
+supply your own.
+
 ## Roadmap
 
-- Authentication: credentials, revocable server-side sessions, OAuth.
+- **OAuth** — social and enterprise identity providers, and the `identities`
+  table linking them to a user. Not shipped; the rest of the authentication
+  core (credentials, email verification, revocable server-side sessions with
+  refresh-token rotation) is, and is documented under
+  [Authentication](#authentication).
 
 Released versions are recorded in [changelog.md](changelog.md).
 

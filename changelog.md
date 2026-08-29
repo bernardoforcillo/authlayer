@@ -211,6 +211,165 @@ once a 1.0 is cut. Until then, minor versions may break API.
   needs to hand one back. Like `Standing` and `HasPermission`, neither reads
   anything from the context nor checks that the caller is entitled to ask —
   do not expose either directly to end users.
+- **`token`** (`authlayer/token`) — opaque bearer tokens and a hand-rolled,
+  single-algorithm HS256 JWT, standard library only. `GenerateOpaque` draws
+  32 bytes from `crypto/rand` and returns the hex plaintext alongside its hex
+  sha256, so a session row stores only what `HashOpaque` recomputes from a
+  presented token and a database read cannot be replayed into a credential.
+  `Issue`/`Parse` are deliberately not a general-purpose JWT library: `Parse`
+  supports exactly one algorithm and compares the header's `alg` to the
+  literal `"HS256"` before verifying a signature or decoding a payload, so
+  neither `alg: none` nor RS256/HS256 key confusion has a dispatch to
+  exploit. That single check is the entire justification for hand-rolling
+  rather than taking a dependency, and generalising this package to a second
+  algorithm brings both attacks back. The same reasoning covers the key: both
+  functions refuse an HMAC key under 32 bytes (RFC 7518 §3.2) with
+  `ErrKeyTooShort`, nil and empty included, because an unset `JWT_SECRET` is
+  `alg: none` reached through the key parameter instead of the header — and
+  `Parse` refuses the whole call if *any* key in its list is short rather
+  than quietly skipping it. Signatures are compared with `hmac.Equal`, and
+  every segment is decoded with strict (canonical) base64, so one token has
+  exactly one valid encoding and the raw string is usable as a denylist or
+  replay-cache key. `Parse` accepts a list of keys and tries each while
+  `Issue` always signs with the first, which is how a signing key rotates.
+  `Claims.Extra` nests application-defined claims under a single `"ext"`
+  object rather than merging them into the top level, so an extender cannot
+  shadow `sub`, `sid`, `email`, `iat` or `exp` — structurally, not by
+  denylist. Six sentinel errors: `ErrMalformedToken`,
+  `ErrUnsupportedAlgorithm`, `ErrInvalidSignature`, `ErrExpiredToken`,
+  `ErrKeyTooShort`, `ErrInvalidTTL`.
+- **`password`** (`authlayer/password`) — the `Hasher` port
+  (`Hash` / `Verify` / `Dummy`) with a bcrypt implementation, plus `Rules`,
+  `DefaultRules` and `Validate` for a strength policy. `Verify` returns false
+  rather than panicking for an empty, truncated or foreign hash, so whatever
+  a datastore returns can be passed through unvalidated. `Dummy` runs a real
+  bcrypt comparison against a throwaway hash and discards the outcome; its
+  only purpose is to spend comparable time on a user-not-found path so
+  response latency does not reveal whether an address is registered.
+  Discarding the result is the point — deleting the call because "it does
+  nothing" silently reinstates the timing oracle. `DefaultRules` is 12
+  characters requiring an uppercase letter, a lowercase letter, a digit, and
+  one character that is neither a letter, a digit, nor whitespace; whitespace
+  remains legal anywhere in a password but does not satisfy `RequireSpecial`,
+  so padding a three-character password with spaces cannot certify it
+  compliant. `Validate` returns the names of the failed rules
+  (`min_length`, `upper`, `lower`, `digit`, `special`) in a fixed order
+  rather than an error, and this package defines no sentinels. `Bcrypt(0)`
+  means bcrypt's own default cost; any other value passes through, so
+  bcrypt's rules apply — 1–3 are silently promoted to the default by the
+  library, above 31 is an error from `Hash`.
+- **`auth`** (`authlayer/auth`) — authlayer now owns identity: a user record,
+  its password credential, revocable server-side sessions, and the one-time
+  tokens for signup confirmation, email change and password reset. **This
+  ends the "authlayer stores no users" invariant** — but only for consumers
+  that use this package. `scope`, `org`, `team` and `invite` are unchanged
+  and still carry a user id as an opaque value with no foreign key to
+  anything. `Service[U]` is generic over the application's own user type,
+  which embeds `auth.UserBase` (id, normalized email, `EmailVerifiedAt`,
+  password hash, timestamps) exactly as a container embeds
+  `scope.ContainerBase`; only the `UserBase`-shaped part is persisted, so the
+  rest of a profile stays in the application's own tables.
+  `auth.NormalizeEmail` (trim, lowercase) is applied on every read and write,
+  so a case or whitespace variant can neither create a duplicate nor slip
+  past a uniqueness check. The surface is `SignUp`, `VerifyEmail`, `Login`,
+  `Refresh`, `Logout`, `LogoutAll`, `ListSessions`, `RevokeSession`,
+  `ChangePassword`, `RequestPasswordReset`, `ResetPassword` and
+  `RequestEmailChange`, configured through `WithHasher`, `WithRules`,
+  `WithJWT`, `WithRefreshTTL`, `WithClock`, `WithIDGenerator`,
+  `WithRateLimiter`, `WithPasswordResetRateLimiter`,
+  `WithRequireVerifiedEmail` and `WithClaimsExtender`.
+  **What "revocable" does and does not mean:** revoking a session removes the
+  refresh token's row, so `Refresh` on it fails immediately and
+  `ListSessions` stops reporting it — but it does **not** invalidate an
+  access token already issued for that session. That token is a stateless
+  JWT this package never looks up, so a device holding one keeps working
+  until it expires, up to 15 minutes on the default TTL. Every "signs out
+  every device" guarantee in this package — `LogoutAll`, `RevokeSession`,
+  `ChangePassword`, `ResetPassword`, and reuse-triggered family revocation —
+  carries that bound. The `sid` claim (`token.Claims.SessionID`) is the hook
+  for closing it: an application needing sooner-than-TTL revocation looks
+  `sid` up in the `Store` per request, which this package deliberately leaves
+  as the caller's choice rather than imposing a round trip on every request.
+  **Refresh rotation with reuse detection:** each refresh supersedes the
+  presented token and mints a successor in the same `FamilyID`; presenting an
+  already-rotated token is a replay, and since a stolen token being replayed
+  and a client retrying a raced request are indistinguishable here, every
+  replay revokes the **entire family** and returns `ErrTokenReuse`. An
+  *expired* token is ordinary end-of-life, is `ErrTokenInvalid`, and leaves
+  the family intact. Two `Store` methods carry the atomicity that makes this
+  hold under concurrency, each documented as a MUST with the failure it
+  prevents: `MarkRotated` is a compare-and-set exactly one concurrent caller
+  wins, and its result — never a `RotatedAt` read a moment earlier — is what
+  authorizes minting; `CreateSuccessorSession` then persists the successor
+  only if the predecessor row still exists, so `Refresh` returns
+  `ErrSessionRevoked` rather than resurrecting a family revoked in the window
+  between the two. Both windows stay closed only insofar as the backend
+  honours the atomicity the port demands; both shipped stores do.
+  **Enumeration-safe sign-up:** `SignUp` returns
+  `(SignUpResult{Created: false}, nil)` for an address already registered —
+  never an error — and holds the property by construction rather than by
+  argument: the password is validated before the address is looked up, and
+  every `Store` call after `CreateUser` runs on both branches with its result
+  discarded on the duplicate one, so no failure is reachable on one branch
+  only. A probe never disturbs the real accountholder's pending verification,
+  and `PasswordHash` is cleared on both branches (and carries `json:"-"` on
+  `UserBase`). The caller must return a byte-identical response regardless of
+  `Created`, or the property is lost at the transport layer.
+  `RequestPasswordReset` returns `(token, ok, nil)` and never errors merely
+  because an address is unknown; a denial from the address-keyed limiter
+  returns that same shape rather than `ErrRateLimited`, which would itself be
+  an oracle. What remains is timing: a known address answers roughly
+  1.7–2.9 ms slower than an unknown one (about 4–6×, measured against a live
+  PostgreSQL store) because the known branch performs two extra local writes.
+  `WithPasswordResetRateLimiter` is what bounds that sampling, and it also
+  bounds the flip side of re-issue invalidation — anyone who knows an address
+  can destroy that account's pending reset link by looping requests. There is
+  no default limiter of either kind: the zero configuration rate-limits
+  nothing, and a wired limiter that returns an error denies, since an
+  authentication decision that cannot be made must fail closed.
+  **The password lifecycle:** `ChangePassword` requires the current password
+  and spares only the caller's own session family (an empty or foreign
+  `currentSessionID` revokes everything — the fail-closed direction);
+  `ResetPassword` claims the verification before applying it, so a failure
+  after the claim burns the token rather than leaving it redeemable twice,
+  and then revokes every session. Both also invalidate any outstanding
+  `password_reset` token for the account, closing the door where an attacker
+  who requested a reset link and waited keeps a way in for its whole TTL even
+  after the victim changes their password. **That sweep is sequential only:**
+  nothing orders it against a `RequestPasswordReset` whose own
+  `CreateVerification` is genuinely concurrent, and such a token can still
+  survive and later redeem; closing that would need a transaction spanning
+  both, which the `Store` port does not offer. `RequestEmailChange` performs
+  no address pre-check — uniqueness is enforced atomically at redemption
+  instead, because a pre-check was an unrate-limited "is this registered?"
+  oracle for any authenticated caller. Seventeen sentinel errors:
+  `ErrUserNotFound`, `ErrEmailTaken`, `ErrIDTaken`, `ErrSessionNotFound`,
+  `ErrVerificationNotFound`, `ErrEmailMismatch`, `ErrWeakPassword`,
+  `ErrInvalidCredentials`, `ErrEmailNotVerified`, `ErrRateLimited`,
+  `ErrMissingIP`, `ErrVerificationExpired`, `ErrVerificationPurpose`,
+  `ErrTokenInvalid`, `ErrTokenReuse`, `ErrSessionRevoked`,
+  `ErrEmailRequired`. `store/memory` and `store/drops` each ship a reference
+  `auth.Store`; `Store.PurgeExpired` sweeps expired sessions and
+  verifications for a cron, and never removes users.
+- **Auth persistence** (`authlayer/store/memory`, `authlayer/store/drops`) —
+  `memory.NewAuthStore()` is the reference in-process implementation: every
+  method holds one mutex for its entire body, so every atomicity MUST the port
+  states is satisfied and no check-then-write can be split, and it enforces
+  one-account-per-normalized-email plus the id-collision contract on every
+  `Create*`. Like `NewInviteStore` it defers the `token_hash` uniqueness the
+  port requires of a backend to the SQL store. `dropsstore.NewAuthStore(db)` persists three
+  tables — `users` (`UNIQUE (email)`), `sessions`
+  (`UNIQUE (token_hash)`, `INDEX (family_id)`) and `verifications`
+  (`UNIQUE (token_hash)`) — renameable via `WithAuthNames`, with its own
+  `CreateSchema` and `Schema()`. All three constraints are load-bearing:
+  `UNIQUE (email)` is what `SignUp` reads "already registered" off, and the
+  two hash constraints keep a token lookup single-row. `email` is declared
+  both inline and as a named guarded `ALTER TABLE`, because
+  `CREATE TABLE IF NOT EXISTS` is a no-op against a pre-existing table and
+  the `ALTER` is what self-heals one created by hand or by an older version.
+  Unlike the RBAC and invite stores this one offers no text-user-id option —
+  it owns the `users` table its `user_id` columns reference. No foreign keys
+  are declared between the three tables.
 
 ### Changed
 
@@ -288,6 +447,18 @@ once a 1.0 is cut. Until then, minor versions may break API.
   statements, so it stays safe to re-run. Databases created by an earlier
   version need the constraints added by hand — re-running `CreateSchema` does
   it, once any duplicate rows are cleared.
+
+### Dependencies
+
+- **`golang.org/x/crypto` v0.55.0 — new, and the only addition.** Pulled in by
+  `password` for bcrypt, and by nothing else: `go list -deps ./auth` reaches
+  `golang.org/x/crypto/bcrypt` and its `blowfish` package and no further, so
+  `auth` and `password` add no drops or pgx dependency of their own. `token`
+  and `access` remain standard library only. The JWT and the UUIDv7 generator
+  are hand-written specifically so no JWT or UUID library enters the graph.
+- `github.com/bernardoforcillo/drops` v0.6.0 (was v0.5.0 at 0.0.1).
+- `github.com/jackc/pgx/v5` v5.10.0 (PostgreSQL stores only), unchanged.
+- Go 1.26+.
 
 ## [0.0.1] - 2026-07-25
 

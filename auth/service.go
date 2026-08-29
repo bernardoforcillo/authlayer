@@ -69,16 +69,16 @@ const (
 	// [Store.UpdateUserEmail] before marking it verified.
 	PurposeEmailChange = "email_change"
 	// PurposePasswordReset marks a Verification minted for a password-reset
-	// flow. Not redeemable through [Service.VerifyEmail] — a later task's
-	// password-reset method owns this purpose's redemption, and
+	// flow. Not redeemable through [Service.VerifyEmail] —
+	// [Service.ResetPassword] owns this purpose's redemption, and
 	// VerifyEmail refuses it with [ErrVerificationPurpose] rather than
 	// silently accepting it and burning the token for nothing.
 	PurposePasswordReset = "password_reset"
 )
 
 // defaultVerificationTTL is how long a [Service.SignUp]-minted "signup"
-// verification stays redeemable. Not exposed as an Option — this task's
-// option surface is fixed (see [New]) — but chosen generously (a day) since
+// verification stays redeemable. Not exposed as an Option (see [New] for the
+// full option surface), but chosen generously (a day) since
 // an email that never arrives, or arrives late, must not force a whole new
 // sign-up.
 const defaultVerificationTTL = 24 * time.Hour
@@ -129,9 +129,9 @@ var (
 	ErrVerificationExpired = errors.New("authlayer/auth: verification token has expired")
 	// ErrVerificationPurpose: [Service.VerifyEmail] was presented a token
 	// whose Purpose it does not redeem — currently only
-	// [PurposePasswordReset], reserved for a later task's dedicated
-	// password-reset method. Checked before the claim, so a
-	// wrongly-presented token is not burned either.
+	// [PurposePasswordReset], which [Service.ResetPassword] redeems
+	// instead. Checked before the claim, so a wrongly-presented token is
+	// not burned either.
 	ErrVerificationPurpose = errors.New("authlayer/auth: verification token is not valid for this operation")
 	// ErrTokenInvalid: [Service.Refresh] was presented a refresh token this
 	// Store has never heard of ([Store.FindSessionByHash] returning
@@ -344,8 +344,9 @@ func WithIDGenerator(gen func() string) Option {
 // [Service.RequestPasswordReset] both consult, keyed by IP, before touching
 // the Store or the Hasher — see that interface's doc for why IP and never
 // email. The default is nil, meaning neither method imposes a rate limit at
-// all. [Service.SignUp] never consults it: this task's brief scopes rate
-// limiting to Login (and, in a later task, RequestPasswordReset) only.
+// all. [Service.SignUp] never consults it — rate limiting is scoped to the
+// two methods named above, and no other method in this package consults a
+// limiter of any kind.
 func WithRateLimiter(l RateLimiter) Option {
 	return func(c *config) { c.limiter = l }
 }
@@ -948,7 +949,7 @@ func (s *Service[U, PU]) signingKey() []byte {
 // [github.com/bernardoforcillo/authlayer/invite.Service.AcceptInvite]'s
 // identical stance on an expired EmailInvite. A token minted for
 // [PurposePasswordReset] is [ErrVerificationPurpose] — this method does not
-// redeem that purpose (a later task's dedicated method does) — checked
+// redeem that purpose ([Service.ResetPassword] does) — checked
 // before the claim too, so presenting the wrong kind of token here does not
 // burn it.
 //
@@ -1125,7 +1126,11 @@ func (s *Service[U, PU]) VerifyEmail(ctx context.Context, plainToken string) (U,
 // check-and-insert, this time gated on "does the family this session
 // belongs to still exist" rather than "did I win the compare-and-set" —
 // see that method's own doc on [Store] for the exact contract, including
-// the one narrower race it does not claim to close.
+// the atomicity it requires of a backend, the shapes that satisfy that
+// requirement, and why a read-then-write implementation leaves open the
+// very window the method exists to close. Like every other atomicity MUST
+// on [Store], this window is closed only insofar as the backend in use
+// honours it.
 //
 // # Fail closed
 //

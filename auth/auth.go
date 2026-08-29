@@ -10,7 +10,8 @@
 // [github.com/bernardoforcillo/authlayer/password]'s Hasher hashes and
 // verifies the password credential. A Store only persists and retrieves the
 // records those layers hand it; the service layer that wires them together —
-// Login, Refresh, Signup, and so on — comes in a later task.
+// [Service], with SignUp, Login, Refresh and the rest — lives in
+// service.go, alongside this file.
 //
 // # Sessions, families, and rotation
 //
