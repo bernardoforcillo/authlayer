@@ -2555,6 +2555,128 @@ func TestRevokeSessionCannotRevokeAnotherUsersFamily(t *testing.T) {
 	}
 }
 
+// --- emptyFamilyIDStore: wraps a real auth.Store and strips FamilyID from
+// every Session it hands back — the shape [auth.Store]'s own prose forbids
+// but nothing in the port enforces. It records every DeleteSessionsByFamily
+// argument so a test can prove the service never issued a revocation keyed
+// on the empty family id. Same technique as emptyFamilyOnReplayStore above,
+// applied to the two READ paths Logout and RevokeSession resolve a family
+// through. ---
+
+type emptyFamilyIDStore struct {
+	auth.Store
+	mu           sync.Mutex
+	familyDelete []string
+}
+
+func (s *emptyFamilyIDStore) FindSessionByHash(ctx context.Context, tokenHash string) (auth.Session, error) {
+	sess, err := s.Store.FindSessionByHash(ctx, tokenHash)
+	sess.FamilyID = ""
+	return sess, err
+}
+
+func (s *emptyFamilyIDStore) ListSessionsByUser(ctx context.Context, userID string) ([]auth.Session, error) {
+	sessions, err := s.Store.ListSessionsByUser(ctx, userID)
+	for i := range sessions {
+		sessions[i].FamilyID = ""
+	}
+	return sessions, err
+}
+
+func (s *emptyFamilyIDStore) DeleteSessionsByFamily(ctx context.Context, familyID string) error {
+	s.mu.Lock()
+	s.familyDelete = append(s.familyDelete, familyID)
+	s.mu.Unlock()
+	return s.Store.DeleteSessionsByFamily(ctx, familyID)
+}
+
+func (s *emptyFamilyIDStore) familyDeletes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.familyDelete...)
+}
+
+// TestLogoutFailsClosedWhenRotatedSessionCarriesNoFamilyID extends
+// [Service.Refresh]'s guard to the other path that responds to a superseded
+// token by revoking a whole family.
+//
+// Logout of a rotated token is reuse detection's response, reached through a
+// different door (see the method doc's "A superseded token revokes the
+// family"). A Store handing back a Session with no FamilyID would make it
+// call DeleteSessionsByFamily(ctx, ""), which matches no rows: nil comes
+// back, the caller believes every device was signed out, and nothing was.
+// Reporting success having revoked nothing is the one outcome a revocation
+// primitive must never produce.
+func TestLogoutFailsClosedWhenRotatedSessionCarriesNoFamilyID(t *testing.T) {
+	store := memory.NewAuthStore()
+	ctx := context.Background()
+	seed := auth.New(store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	mustSignUp(t, seed, "quinn@example.com", validPassword)
+	login, err := seed.Login(ctx, "quinn@example.com", validPassword, "1.2.3.4", "")
+	if err != nil {
+		t.Fatalf("seeding Login: %v", err)
+	}
+	refresh1 := login.RefreshToken
+	if _, err := seed.Refresh(ctx, refresh1); err != nil {
+		t.Fatalf("seeding rotation: %v", err)
+	}
+
+	violating := &emptyFamilyIDStore{Store: store}
+	svc := auth.New(violating,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+
+	err = svc.Logout(ctx, refresh1)
+	if !errors.Is(err, auth.ErrStoreContract) {
+		t.Fatalf("Logout err = %v, want ErrStoreContract — reporting nil having revoked nothing is worse than failing", err)
+	}
+	if got := violating.familyDeletes(); len(got) != 0 {
+		t.Fatalf("DeleteSessionsByFamily called with %q; want no call at all — revoking on an empty family id is a silent no-op dressed up as containment", got)
+	}
+}
+
+// TestRevokeSessionFailsClosedWhenSessionCarriesNoFamilyID is the same guard
+// on the "your devices" control, where the stakes are highest: this method
+// resolves the id the user picked to its FAMILY and revokes that. An empty
+// FamilyID turns the whole thing into DeleteSessionsByFamily(ctx, ""), which
+// matches nothing and returns nil — a revocation UI reporting "signed out"
+// while the device keeps refreshing. That is the exact failure the
+// family-not-row fix existed to end, reachable again through a Store bug.
+func TestRevokeSessionFailsClosedWhenSessionCarriesNoFamilyID(t *testing.T) {
+	store := memory.NewAuthStore()
+	ctx := context.Background()
+	seed := auth.New(store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	user := mustSignUp(t, seed, "rhea@example.com", validPassword)
+	if _, err := seed.Login(ctx, "rhea@example.com", validPassword, "1.2.3.4", ""); err != nil {
+		t.Fatalf("seeding Login: %v", err)
+	}
+	sessions, err := seed.ListSessions(ctx, user.ID)
+	if err != nil || len(sessions) == 0 {
+		t.Fatalf("seeding ListSessions: %d sessions, err %v", len(sessions), err)
+	}
+
+	violating := &emptyFamilyIDStore{Store: store}
+	svc := auth.New(violating,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+
+	err = svc.RevokeSession(ctx, user.ID, sessions[0].ID)
+	if !errors.Is(err, auth.ErrStoreContract) {
+		t.Fatalf("RevokeSession err = %v, want ErrStoreContract — a revocation that matches no rows must not report success", err)
+	}
+	if got := violating.familyDeletes(); len(got) != 0 {
+		t.Fatalf("DeleteSessionsByFamily called with %q; want no call at all", got)
+	}
+}
+
 // TestRefreshRotatedRowRetainedUntilPurgeExpired pins that a
 // rotated-but-unexpired session row is NOT deleted at rotation time — it is
 // retained (that is what makes reuse detection possible at all — see
@@ -3641,6 +3763,70 @@ func TestResetPasswordRevokesAllSessions(t *testing.T) {
 	}
 }
 
+// --- markVerifiedFailsStore: wraps a real auth.Store and fails ONLY
+// MarkEmailVerified. Everything else — the password write, the sweeps, the
+// session revocation — is delegated to a healthy store, so a test can ask
+// exactly one question: when the optional address stamp blows up, has the
+// mandatory session revocation already happened? ---
+
+var errMarkVerifiedBoom = errors.New("boom: simulated MarkEmailVerified outage")
+
+type markVerifiedFailsStore struct {
+	auth.Store
+}
+
+func (s *markVerifiedFailsStore) MarkEmailVerified(context.Context, string, string, time.Time) error {
+	return errMarkVerifiedBoom
+}
+
+// TestResetPasswordRevokesSessionsBeforeStampingEmailVerified pins the
+// ordering of the two post-commit steps against each other.
+//
+// The password is already rotated and committed by this point. The
+// EmailVerifiedAt stamp is a nicety — it exists so a verified-email
+// requirement has a way out (see ResetPassword's "Why a completed reset
+// verifies the address") — while the session revocation is the security
+// half of the reset: it is what takes the account back from whoever the
+// user is resetting because of. Running the stamp first meant a
+// FindUserByID or MarkEmailVerified failure returned an error with the
+// credential rotated and every session, the thief's included, still
+// refreshing. The nicety must never be able to strand the necessity.
+func TestResetPasswordRevokesSessionsBeforeStampingEmailVerified(t *testing.T) {
+	store := memory.NewAuthStore()
+	ctx := context.Background()
+	seed := auth.New(store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	mustSignUp(t, seed, "sasha@example.com", validPassword)
+	// A live session — the one the thief is holding.
+	login, err := seed.Login(ctx, "sasha@example.com", validPassword, "1.2.3.4", "")
+	if err != nil {
+		t.Fatalf("seeding Login: %v", err)
+	}
+	resetTok, ok, err := seed.RequestPasswordReset(ctx, "sasha@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+
+	failing := &markVerifiedFailsStore{Store: store}
+	svc := auth.New(failing,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+
+	err = svc.ResetPassword(ctx, resetTok, "Recovered-Valid-Pass23!")
+	if !errors.Is(err, errMarkVerifiedBoom) {
+		t.Fatalf("ResetPassword err = %v, want the store's own error — the stamp failing must still fail the call", err)
+	}
+
+	// The point of the test: the credential rotated, so the sessions MUST
+	// be gone, whatever the stamp did afterwards.
+	if _, rerr := seed.Refresh(ctx, login.RefreshToken); !errors.Is(rerr, auth.ErrTokenInvalid) {
+		t.Fatalf("Refresh of a pre-reset session after a failed stamp = %v, want ErrTokenInvalid — the password rotated and the session survived it", rerr)
+	}
+}
+
 // TestResetPasswordClaimsBeforeApplyOrdering is the mandatory
 // mutation-anchor test for ordering: reverse ResetPassword's claim/apply
 // order and this must fail. Mirrors
@@ -4339,6 +4525,75 @@ func TestVerifyAccessTokenAcceptsEveryConfiguredKey(t *testing.T) {
 	)
 	if _, err := retired.VerifyAccessToken(login.AccessToken); !errors.Is(err, token.ErrInvalidSignature) {
 		t.Fatalf("VerifyAccessToken once the old key is dropped = %v, want token.ErrInvalidSignature", err)
+	}
+}
+
+// TestWithJWTRejectsAKeyListContainingAShortKey pins the whole-list check.
+//
+// [token.Issue] validates only the key it signs with (keys[0]), while
+// [token.Parse] refuses the entire call if ANY key in the list is under the
+// 32-byte HS256 floor. A list whose first key is fine and whose second is
+// not therefore produced a Service that MINTED tokens it could never verify:
+// every login succeeded, every subsequent request failed, and nothing said
+// why. Fail-closed, but a total, self-inflicted auth outage with no
+// diagnosis at the point of the mistake.
+//
+// WithJWT now applies the same floor Parse does, to the whole list, and
+// ignores a list that does not clear it — leaving the signing key unset,
+// which is the option's own documented behaviour for a nil or empty keys
+// and produces token.ErrKeyTooShort at the first attempt to issue or verify.
+// The misconfiguration surfaces on the operator's first login, not on their
+// users' next request.
+func TestWithJWTRejectsAKeyListContainingAShortKey(t *testing.T) {
+	shortKey := bytes.Repeat([]byte("s"), 31)
+	for name, keys := range map[string][][]byte{
+		"short key second": {testSigningKey, shortKey},
+		"short key first":  {shortKey, testSigningKey},
+		"nil key second":   {testSigningKey, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := auth.New(memory.NewAuthStore(),
+				auth.WithHasher(password.Bcrypt(testCost)),
+				auth.WithJWT(keys, 15*time.Minute),
+			)
+			ctx := context.Background()
+			mustSignUp(t, svc, "yuri@example.com", validPassword)
+
+			res, err := svc.Login(ctx, "yuri@example.com", validPassword, "1.2.3.4", "")
+			if err == nil {
+				// The invariant that matters, stated directly: a Service
+				// must never hand out an access token it cannot itself
+				// verify.
+				if _, verr := svc.VerifyAccessToken(res.AccessToken); verr != nil {
+					t.Fatalf("Login succeeded but VerifyAccessToken on its own token failed: %v — this Service issues tokens it can never honour", verr)
+				}
+				t.Fatalf("Login succeeded with a key list containing an unusable key; want token.ErrKeyTooShort")
+			}
+			if !errors.Is(err, token.ErrKeyTooShort) {
+				t.Fatalf("Login err = %v, want token.ErrKeyTooShort", err)
+			}
+		})
+	}
+}
+
+// TestWithJWTAcceptsAFullyValidKeyList is the positive control for the check
+// above: rotation with several conforming keys is the supported case and
+// must keep working, signing with the first and verifying against any.
+func TestWithJWTAcceptsAFullyValidKeyList(t *testing.T) {
+	second := bytes.Repeat([]byte("2"), 32)
+	svc := auth.New(memory.NewAuthStore(),
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey, second}, 15*time.Minute),
+	)
+	ctx := context.Background()
+	mustSignUp(t, svc, "yuri2@example.com", validPassword)
+
+	res, err := svc.Login(ctx, "yuri2@example.com", validPassword, "1.2.3.4", "")
+	if err != nil {
+		t.Fatalf("Login with two valid keys: %v", err)
+	}
+	if _, err := svc.VerifyAccessToken(res.AccessToken); err != nil {
+		t.Fatalf("VerifyAccessToken: %v", err)
 	}
 }
 

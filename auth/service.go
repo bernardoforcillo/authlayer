@@ -203,17 +203,35 @@ var (
 	// package cannot validate every Store response — most of the port's
 	// obligations (the atomicity MUSTs, the enumeration obligations) are
 	// unobservable from here — so this sentinel is deliberately narrow, not
-	// a general "the Store misbehaved" channel. It has exactly one trigger
-	// today: [Service.Refresh] detecting a replay ([Store.MarkRotated]
-	// returning ok=false) but being handed a [Session] with an empty
-	// FamilyID, which leaves it no family to revoke. See Refresh's doc,
-	// "Why the whole family, not just the presented session", for why
-	// proceeding there would fire the alarm while containment did nothing.
+	// a general "the Store misbehaved" channel. Every trigger it has today
+	// is the same one condition, reached from each of the three methods
+	// that revoke a whole session family: a [Session] handed back with an
+	// empty FamilyID, which leaves nothing to revoke.
 	//
-	// It is always wrapped alongside the sentinel describing what the
-	// caller's own request did — ErrTokenReuse in that one case — so a
-	// caller matching on the request-level outcome keeps working and an
-	// operator gets the diagnosis.
+	//   - [Service.Refresh] detecting a replay ([Store.MarkRotated]
+	//     returning ok=false) and being handed a Session with no FamilyID.
+	//     See Refresh's doc, "Why the whole family, not just the presented
+	//     session", for why proceeding there would fire the alarm while
+	//     containment did nothing.
+	//   - [Service.Logout] presented a SUPERSEDED token — the same signal,
+	//     reached through a different door — and finding no FamilyID on it.
+	//   - [Service.RevokeSession] resolving the caller's chosen session id
+	//     to a Session with no FamilyID.
+	//
+	// In all three, DeleteSessionsByFamily(ctx, "") would match no rows and
+	// return nil: the method would report success having revoked nothing,
+	// which is the one outcome a revocation primitive must never produce.
+	// Neither proceeding with a meaningless key nor silently skipping the
+	// revocation is acceptable, so each fails closed and says which
+	// contract was broken.
+	//
+	// Where the caller's own request has an outcome worth preserving, this
+	// is wrapped ALONGSIDE the sentinel that names it — ErrTokenReuse in
+	// Refresh's case, because a replay was still detected and that fact
+	// must not be lost — so a caller matching on the request-level outcome
+	// keeps working and an operator still gets the diagnosis. Logout and
+	// RevokeSession have no such second signal: the request simply could
+	// not be carried out, and they return this alone.
 	ErrStoreContract = errors.New("authlayer/auth: store violated its documented contract")
 )
 
@@ -310,6 +328,27 @@ func WithRules(r password.Rules) Option {
 // from a zero-length one for that check. ttl <= 0 is ignored, leaving the
 // default (15 minutes) or a prior option in place.
 //
+// # The whole list is checked, not just the signing key
+//
+// A keys where ANY entry is unusable is ignored in full, exactly like a nil
+// or empty one, leaving the signing key unset.
+//
+// This is not tidiness. [token.Issue] validates only the key it signs with,
+// while [token.Parse] refuses the ENTIRE call if any key in the list is
+// under the floor — so a list whose first key is fine and whose second is
+// not used to build a Service that minted access tokens it could never
+// verify: every login succeeded, every subsequent request failed
+// token.ErrKeyTooShort, and nothing pointed at the misconfiguration. Fail
+// closed, but a total, self-inflicted auth outage discovered by users
+// rather than by the operator. Rejecting the list here moves that to the
+// operator's first Login, where the "no signing key configured" path
+// already reports it.
+//
+// "Unusable" is not defined here: each key is checked by asking
+// [token.Issue] to mint a throwaway token with it, so the floor lives in
+// exactly one place — the token package — and this option cannot drift from
+// it or miss a constraint added there later.
+//
 // There is no default signing key — an application MUST call this before
 // any successful Login, by design: silently minting tokens under a
 // zero-value or generated-on-the-fly key would be the exact "alg: none
@@ -317,13 +356,28 @@ func WithRules(r password.Rules) Option {
 // warns about.
 func WithJWT(keys [][]byte, ttl time.Duration) Option {
 	return func(c *config) {
-		if len(keys) > 0 {
+		if len(keys) > 0 && keysUsable(keys) {
 			c.signingKey = keys
 		}
 		if ttl > 0 {
 			c.accessTTL = ttl
 		}
 	}
+}
+
+// keysUsable reports whether every key in keys is one [token.Issue] will
+// sign with and [token.Parse] will accept. It asks the token package rather
+// than re-stating its rules: a throwaway Issue exercises exactly the checks
+// a real mint would, so there is no second copy of the HS256 key floor to
+// fall out of step. Claims{} and a positive ttl leave the key as the only
+// thing that can fail.
+func keysUsable(keys [][]byte) bool {
+	for _, k := range keys {
+		if _, err := token.Issue(token.Claims{}, k, time.Minute); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // WithRefreshTTL sets how long a session minted by [Service.Login] remains
@@ -1621,8 +1675,20 @@ func (s *Service) Refresh(ctx context.Context, refreshPlain string) (LoginResult
 		// UserAgent/IP: inherited from the predecessor. Refresh takes no
 		// ip/userAgent parameters of its own — the ladder in this method's
 		// doc has no step for updating them — so the successor's audit
-		// fields describe the login that started this family, not
-		// necessarily the device that just rotated it.
+		// fields describe the login that STARTED this family, never the
+		// device that just rotated it. A thief rotating a stolen token
+		// therefore appears in the victim's family wearing the victim's
+		// fingerprint.
+		//
+		// Dropping the inheritance instead (leaving both fields empty)
+		// would not make the listing more honest and would make it far less
+		// useful: at the 15-minute default access TTL every live session is
+		// a successor within minutes of login, so a "your devices" screen
+		// would show blank device and location for essentially every row,
+		// while a blank row identifies a thief no better than an inherited
+		// one does. An application that needs the rotating device recorded
+		// per-refresh needs Refresh to TAKE ip/userAgent, which is a
+		// signature this package does not offer today.
 		UserAgent: rotated.UserAgent,
 		IP:        rotated.IP,
 	})
@@ -1722,6 +1788,15 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 		// disagree about what it means — see the method doc's "A
 		// superseded token" section. Revoke the whole family rather than
 		// deleting the tripwire row this session is.
+		//
+		// The same family-id guard [Service.Refresh] carries, for the same
+		// reason: a Store handing back a Session with no FamilyID would
+		// turn this into DeleteSessionsByFamily(ctx, ""), which matches no
+		// rows and returns nil — this method would report success having
+		// revoked nothing. See [ErrStoreContract].
+		if sess.FamilyID == "" {
+			return fmt.Errorf("%w: FindSessionByHash returned a rotated Session with no FamilyID, leaving no family to revoke", ErrStoreContract)
+		}
 		if err := s.store.DeleteSessionsByFamily(ctx, sess.FamilyID); err != nil {
 			return err
 		}
@@ -1869,7 +1944,11 @@ func (s *Service) LogoutAll(ctx context.Context, userID string) error {
 // only the currently-presentable sessions filters on RotatedAt == nil and
 // ExpiresAt.After(now) itself, and a caller wanting one entry per LOGIN
 // groups by FamilyID — every row sharing a FamilyID descends from the same
-// login on the same device.
+// login by rotation. One entry per login is NOT the same as one entry per
+// device: [Service.Refresh] inherits UserAgent and IP from the row it
+// rotates, so a stolen token rotated by a thief keeps showing the victim's
+// own fingerprint inside the victim's family. See [Service.RevokeSession]'s
+// doc, "Why a family, not a row".
 //
 // [Service.RevokeSession] takes a Session.ID but revokes that session's
 // whole FAMILY, precisely so a handler built from this listing signs the
@@ -1898,12 +1977,23 @@ func (s *Service) ListSessions(ctx context.Context, userID string) ([]Session, e
 //
 // # Why a family, not a row
 //
-// A family is one login on one device — every row sharing a FamilyID
-// descends from it by rotation — so "revoke the family" is exactly what a
-// "sign this device out" control means, and every other revocation path in
-// this package ([Service.LogoutAll], [Service.ChangePassword],
-// [Service.ResetPassword], and [Service.Refresh]'s own reuse response)
-// already works per family.
+// A family is one login's rotation chain: every row sharing a FamilyID
+// descends from a single [Service.Login] by successive refreshes. So
+// "revoke the family" is what a "sign this device out" control has to
+// mean, and every other revocation path in this package
+// ([Service.LogoutAll], [Service.ChangePassword], [Service.ResetPassword],
+// and [Service.Refresh]'s own reuse response) already works per family.
+//
+// "One login" is not the same as "one device", and the difference is the
+// theft case. [Service.Refresh] copies the predecessor's UserAgent and IP
+// into every successor it mints (see that method's own note on those
+// fields), so a thief who rotates a stolen refresh token joins the victim's
+// family carrying the VICTIM's audit fingerprint: a listing grouped by
+// FamilyID shows one device where two are in use, and neither the row nor
+// the grouping reveals the second. Revoking the family remains the right
+// response — it signs the thief out along with the victim's own device,
+// which is the safe direction — but a caller must not read a family as
+// proof that exactly one device holds it.
 //
 // Deleting the single named row instead silently failed to sign anything
 // out, in the most common way this method is called.
@@ -1951,6 +2041,16 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 		if sess.ID == sessionID {
 			// Resolve the named session to its FAMILY and revoke that —
 			// see the method doc's "Why a family, not a row" section.
+			//
+			// The same family-id guard [Service.Refresh] and
+			// [Service.Logout] carry: an empty FamilyID would make this
+			// DeleteSessionsByFamily(ctx, ""), which matches no rows and
+			// returns nil — the "your devices" screen reports the device
+			// signed out and it keeps refreshing, the exact failure the
+			// family-not-row fix exists to end. See [ErrStoreContract].
+			if sess.FamilyID == "" {
+				return fmt.Errorf("%w: ListSessionsByUser returned the named Session with no FamilyID, leaving no family to revoke", ErrStoreContract)
+			}
 			return s.store.DeleteSessionsByFamily(ctx, sess.FamilyID)
 		}
 	}
@@ -2543,11 +2643,26 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 // guards above are therefore an optimization of intent, not the
 // enforcement point; the enforcement point is in the Store.
 //
-// Only THEN is every session belonging to the verification's UserID
-// revoked — one [Store.DeleteSessionsByFamily] call per distinct family,
-// the same "list, then delete per distinct family" shape
-// [Service.LogoutAll] uses, so rotated-but-unexpired predecessor rows are
-// swept too, not just each family's currently-live session.
+// # Why the revocation comes before the stamp
+//
+// Every session belonging to the verification's UserID is revoked — one
+// [Store.DeleteSessionsByFamily] call per distinct family, the same "list,
+// then delete per distinct family" shape [Service.LogoutAll] uses, so
+// rotated-but-unexpired predecessor rows are swept too, not just each
+// family's currently-live session — and that happens BEFORE the
+// [Store.FindUserByID] read and [Store.MarkEmailVerified] stamp described
+// above, not after.
+//
+// The order matters because the password write is already committed by
+// this point. The stamp is a nicety: it exists so a deployment running
+// [WithRequireVerifiedEmail](true) has a way out. The revocation is the
+// security half of a reset — it is what takes the account back from
+// whoever the user is resetting because of. Running the stamp first meant a
+// FindUserByID or MarkEmailVerified failure returned an error with the
+// credential rotated and every session, a thief's included, still
+// refreshing: an optional step able to strand a mandatory one. Now a
+// failure in the stamp leaves the reset's security guarantees fully in
+// place and only the audit field unset.
 //
 // A Store or Hasher error at any step is returned as-is — see the
 // package's "Fail closed" constraint. In particular, a
@@ -2599,6 +2714,25 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 		return err
 	}
 
+	// Revoke every session BEFORE the address stamp below — see the method
+	// doc's "Why the revocation comes before the stamp". The credential is
+	// already rotated and committed; nothing optional may run ahead of the
+	// step that takes the account back.
+	sessions, err := s.store.ListSessionsByUser(ctx, v.UserID)
+	if err != nil {
+		return err
+	}
+	done := make(map[string]bool, len(sessions))
+	for _, sess := range sessions {
+		if done[sess.FamilyID] {
+			continue
+		}
+		done[sess.FamilyID] = true
+		if err := s.store.DeleteSessionsByFamily(ctx, sess.FamilyID); err != nil {
+			return err
+		}
+	}
+
 	// Redeeming this token proved control of the address it was delivered
 	// to — see the method doc's "Why a completed reset verifies the
 	// address" section. Stamp it if, and only if, it is not already
@@ -2612,21 +2746,6 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 	}
 	if u.EmailVerifiedAt == nil && u.Email == v.Email {
 		if err := s.store.MarkEmailVerified(ctx, v.UserID, v.Email, now); err != nil {
-			return err
-		}
-	}
-
-	sessions, err := s.store.ListSessionsByUser(ctx, v.UserID)
-	if err != nil {
-		return err
-	}
-	done := make(map[string]bool, len(sessions))
-	for _, sess := range sessions {
-		if done[sess.FamilyID] {
-			continue
-		}
-		done[sess.FamilyID] = true
-		if err := s.store.DeleteSessionsByFamily(ctx, sess.FamilyID); err != nil {
 			return err
 		}
 	}

@@ -317,9 +317,12 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `ResetPassword`, `RevokeSession` and reuse detection all revoke whole
   session families, because rotated-but-unexpired rows are retained and are
   what makes a replay detectable. `RevokeSession` takes a session id but
-  revokes that id's family — a family is one login on one device, and
+  revokes that id's family — a family is one login's rotation chain, and
   `ListSessions` returns rotation history (about 97 rows per device per day
-  at the default TTL), so revoking one listed row signed nobody out.
+  at the default TTL), so revoking one listed row signed nobody out. A
+  family is not a guarantee of one *device*: `Refresh` inherits the
+  predecessor's `UserAgent`/`IP`, so a rotated stolen token wears the
+  victim's fingerprint inside the victim's own family.
   `Logout` presented a *superseded* token likewise revokes the family rather
   than deleting the row a replay would trip over; presented a current token
   it stays a single-session logout.

@@ -1139,9 +1139,15 @@ superuser console, never a per-request handler. The cutoff is literal: a
 - `LogoutAll` revokes every family a user has.
 - `RevokeSession` takes a session id but revokes that session's **family**,
   and only if the id belongs to the named user — another user's session is
-  still reported identically to a nonexistent one. A family is one login on
-  one device, so this is precisely "sign this device out". `ListSessions`
-  returns rotation *history*, not a device list — one device refreshing at
+  still reported identically to a nonexistent one. A family is one login's
+  rotation chain, which is what "sign this device out" has to revoke — but
+  it is not a promise about *devices*: `Refresh` copies the predecessor's
+  `UserAgent`/`IP` into every successor, so a thief who rotates a stolen
+  token joins the victim's family wearing the victim's fingerprint and a
+  listing grouped by `FamilyID` shows one device where two are in use.
+  Revoking the family is still right — it signs the thief out too.
+  `ListSessions` returns rotation *history*, not a device list — one device
+  refreshing at
   the 15-minute default accumulates about 97 rows a day, 96 superseded — so
   revoking the single row a user picked off such a listing used to delete a
   superseded entry, return `nil`, and leave the device signed in. Group by
