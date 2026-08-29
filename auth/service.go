@@ -1241,11 +1241,61 @@ func (s *Service) PurgeExpired(ctx context.Context, before time.Time) (int, erro
 //
 // One consequence worth stating plainly, matching AcceptInvite's own: this
 // is NOT safe to retry with the same token. A failure after the claim
-// succeeds (MarkEmailVerified or UpdateUserEmail returning an error) burns
-// the verification anyway — the row is already gone. That is the safe
-// direction: under-verifying (the caller must request a fresh token) rather
-// than leaving a claimed-but-not-yet-applied token redeemable by a second
-// presentation.
+// succeeds (MarkEmailVerified, UpdateUserEmail, or the sweep below
+// returning an error) burns the verification anyway — the row is already
+// gone. That is the safe direction: under-verifying (the caller must
+// request a fresh token) rather than leaving a claimed-but-not-yet-applied
+// token redeemable by a second presentation.
+//
+// # An address rotation invalidates the reset tokens
+//
+// After an "email_change" redemption — and only that branch — every
+// outstanding "password_reset" [Verification] for the account is
+// invalidated via [Store.DeleteVerificationsByUserAndPurpose], fail-closed
+// like every other sweep in this package.
+//
+// A reset token is only ever deliverable to the ONE address it was minted
+// for (that is the whole basis on which [Service.ResetPassword] treats
+// redeeming one as proof of control). Moving the account's address away
+// from there — often precisely because that mailbox is no longer
+// trustworthy — would otherwise leave a link sitting in the abandoned
+// mailbox able to reset the password of the account at its NEW address,
+// for the rest of [WithPasswordResetTTL]'s window. This is the mirror of
+// the sweep [Service.ChangePassword] and [Service.ResetPassword] already
+// perform in the other direction, where rotating the CREDENTIAL
+// invalidates the pending identifier change.
+//
+// The sweep does not run on the "signup" branch: that redemption certifies
+// the address the account already holds and rotates nothing, so a reset
+// token for that same mailbox is still a token for that same mailbox.
+//
+// Its scope is SEQUENTIAL ONLY, exactly as [Service.ChangePassword]'s doc
+// (point 6) discloses for its own: a [Service.RequestPasswordReset] whose
+// [Store.CreateVerification] is genuinely concurrent with this call can
+// still mint a token that survives it.
+//
+// # What this does NOT revoke
+//
+// Sessions. An "email_change" redemption leaves every [Session] belonging
+// to the account exactly as it found it — a device signed in before the
+// change keeps refreshing afterwards, now under the new address. That is a
+// deliberate decision, not an omission:
+//
+//   - This method is UNAUTHENTICATED by construction: it is redeemed by
+//     whoever holds the link, typically on a device with no session at all.
+//     Giving an unauthenticated endpoint a sign-out-every-device effect
+//     would hand a denial-of-service lever to anyone who obtains the link —
+//     a forwarded mail, a shared mailbox, a URL left in a browser history —
+//     without ever knowing the password.
+//   - [Service.RequestEmailChange] requires the current password to arm the
+//     token (see its doc), so a redemption is not on its own evidence that
+//     the account's live sessions became untrustworthy. The one-time token
+//     the sweep above destroys is a different matter: it is a credential
+//     that outlives the mailbox it was sent to.
+//   - The application keeps the choice. "Changing your address signs you
+//     out everywhere" composes from [Service.LogoutAll], which is
+//     authenticated, is an unambiguous security action, and sweeps both
+//     verification purposes of its own.
 func (s *Service) VerifyEmail(ctx context.Context, plainToken string) (UserBase, error) {
 	var zero UserBase
 
@@ -1280,6 +1330,15 @@ func (s *Service) VerifyEmail(ctx context.Context, plainToken string) (UserBase,
 	}
 	if err := s.store.MarkEmailVerified(ctx, v.UserID, v.Email, now); err != nil {
 		return zero, err
+	}
+	if v.Purpose == PurposeEmailChange {
+		// The identifier just moved, so every credential-recovery token
+		// issued against the OLD one has to go — see the method doc's
+		// "An address rotation invalidates the reset tokens". Fail-closed,
+		// like every other sweep in this package.
+		if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposePasswordReset); err != nil {
+			return zero, err
+		}
 	}
 
 	u, err := s.store.FindUserByID(ctx, v.UserID)
@@ -1619,9 +1678,24 @@ func (s *Service) Refresh(ctx context.Context, refreshPlain string) (LoginResult
 //
 // # What this does not revoke
 //
-// Either way — one row or the whole family — "revoked" means the [Session]
-// row is gone, so the REFRESH token cannot be presented again. It does NOT
-// invalidate an ACCESS token already issued for that session: a short-lived
+// Two things, and both are deliberate.
+//
+// First, VERIFICATIONS. Logout sweeps none: a pending "password_reset" or
+// "email_change" [Verification] survives it untouched and stays redeemable
+// for the rest of its own TTL. This is a per-device, routine action — a
+// browser signing itself out — and sweeping here would break a legitimate
+// flow with no attacker in it: request an email change on a desktop, log
+// out of that desktop, click the link that arrives on a phone.
+// [Service.LogoutAll] is the unambiguous "something is wrong" control and
+// it DOES sweep both purposes; [Service.ChangePassword] and
+// [Service.ResetPassword] sweep them too. A caller that wants a single
+// device's logout to invalidate those tokens must call LogoutAll instead —
+// this method will not do it for them.
+//
+// Second, ACCESS TOKENS. Either way — one row or the whole family —
+// "revoked" means the [Session] row is gone, so the REFRESH token cannot be
+// presented again. It does NOT invalidate an ACCESS token already issued
+// for that session: a short-lived
 // HS256 JWT (see [WithJWT] — 15 minutes by default) is stateless, and this
 // package never looks a presented one up in the [Store] (see [token.Parse]).
 // A device holding one keeps working, on whatever its access token alone
@@ -1667,17 +1741,60 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 
 // LogoutAll revokes every session belonging to userID, across every
 // family — every device and browser this user is currently signed in on,
-// bounded by "What this does not revoke" below. A user with none is not an
-// error.
+// bounded by "What this does not revoke" below — and invalidates every
+// outstanding "password_reset" and "email_change" [Verification] for that
+// account. A user with neither is not an error.
 //
-// This is implemented as one [Store.DeleteSessionsByFamily] call per
-// DISTINCT family among the user's sessions, rather than one
+// The revocation is implemented as one [Store.DeleteSessionsByFamily] call
+// per DISTINCT family among the user's sessions, rather than one
 // [Store.DeleteSession] call per row returned by
 // [Store.ListSessionsByUser]: DeleteSessionsByFamily also removes that
 // family's rotated-but-unexpired predecessors (see auth.go's package doc
 // for why those rows are retained rather than deleted at rotation time),
 // not merely whichever rows happened to still exist at the instant the
-// list was read.
+// list was read. The sweep is two [Store.DeleteVerificationsByUserAndPurpose]
+// calls, one per purpose, both fail-closed, and both run AFTER the
+// revocation: see the section below.
+//
+// # Why this sweeps verifications, and why Logout and RevokeSession do not
+//
+// "Sign out everywhere" is an unambiguous security action — the control a
+// user reaches for on spotting an intruder — not routine navigation. Like
+// [Service.ChangePassword] and [Service.ResetPassword], it must therefore
+// leave nothing armed that can quietly undo it. Two verification purposes
+// can:
+//
+// A still-live "password_reset" token grants a full credential rotation to
+// whoever holds it, for the remainder of [WithPasswordResetTTL]'s window.
+//
+// A still-live "email_change" token is the stronger of the two: it lives
+// [WithVerificationTTL]'s window (24h by default), and [Service.VerifyEmail]
+// redeems it with NO authentication whatsoever, moving the account to
+// another address — after which the victim cannot recover, because
+// [Service.Login] and [Service.RequestPasswordReset] both look accounts up
+// BY email. Arming one now costs the current password (see
+// [Service.RequestEmailChange]), but a token armed before the credential
+// leaked, or armed by the user themselves and then regretted, is exactly
+// what this sweep is for.
+//
+// [Service.Logout] and [Service.RevokeSession] deliberately sweep NOTHING.
+// They are per-device and routine — a browser signing itself out, a device
+// dropped from a "your devices" listing — and sweeping there would break a
+// legitimate flow with no attacker in it: request an email change on a
+// desktop, log out of that desktop, click the link that arrives on a phone.
+// Each of those methods says so in its own doc.
+//
+// The sweep is purpose-scoped, like every other sweep in this package: a
+// "signup" verification grants nothing over the credential or the address,
+// and destroying it would strand a user who signed out everywhere before
+// confirming their address, since this package exposes no resend path.
+//
+// Both sweeps carry the SAME guarantee, and it is SEQUENTIAL ONLY: nothing
+// orders either against a concurrently-running [Service.RequestPasswordReset]
+// or [Service.RequestEmailChange] whose own [Store.CreateVerification] has
+// not yet committed — see [Service.ChangePassword]'s doc, point 6, for the
+// deterministic demonstration and for why closing that window would need a
+// transaction [Store] does not offer.
 //
 // # What this does not revoke
 //
@@ -1720,6 +1837,19 @@ func (s *Service) LogoutAll(ctx context.Context, userID string) error {
 		if err := s.store.DeleteSessionsByFamily(ctx, sess.FamilyID); err != nil {
 			return err
 		}
+	}
+
+	// Then close BOTH token side doors — see the method doc's "Why this
+	// sweeps verifications, and why Logout and RevokeSession do not". The
+	// revocation runs FIRST, deliberately: it is what this caller actually
+	// asked for, so a sweep failure still leaves every session gone and an
+	// error telling the caller to retry, rather than leaving the intruder
+	// the live sessions this call exists to cut.
+	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposePasswordReset); err != nil {
+		return err
+	}
+	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeEmailChange); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1787,10 +1917,22 @@ func (s *Service) ListSessions(ctx context.Context, userID string) ([]Session, e
 //
 // # What this does not revoke
 //
-// "Sign this device out" is a claim about [Session] rows, which is to say
-// about the family's REFRESH tokens: they are gone, and [Service.Refresh]
-// on any of them fails immediately. It does NOT invalidate an ACCESS token
-// the device was already issued. That token is a stateless HS256 JWT (see
+// Two things, and both are deliberate.
+//
+// First, VERIFICATIONS. Like [Service.Logout] and unlike
+// [Service.LogoutAll], this method sweeps none: a pending "password_reset"
+// or "email_change" [Verification] survives it and stays redeemable for the
+// rest of its own TTL. Dropping one device from a listing is routine, not a
+// declaration that the account is compromised, and sweeping here would
+// break a legitimate flow with no attacker in it — request an email change
+// on a desktop, drop that desktop from the device list, click the link that
+// arrives on a phone. [Service.LogoutAll] is the control that means "sign
+// out everywhere, something is wrong", and it sweeps both purposes.
+//
+// Second, ACCESS TOKENS. "Sign this device out" is a claim about [Session]
+// rows, which is to say about the family's REFRESH tokens: they are gone,
+// and [Service.Refresh] on any of them fails immediately. It does NOT
+// invalidate an ACCESS token the device was already issued. That token is a stateless HS256 JWT (see
 // [WithJWT] — 15 minutes by default) this package never looks up in the
 // [Store], only verifies (see [token.Parse]), so the revoked device keeps
 // whatever its access token alone authorizes for up to the remainder of

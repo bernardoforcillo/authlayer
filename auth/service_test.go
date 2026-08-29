@@ -1398,6 +1398,133 @@ func TestVerifyEmailChangeUpdatesAddressAndVerifies(t *testing.T) {
 	}
 }
 
+// TestVerifyEmailChangeInvalidatesOutstandingResetToken pins the mirror of
+// the sweep [Service.ChangePassword] and [Service.ResetPassword] already
+// carry, in the direction nobody had closed.
+//
+// A password reset token is delivered to ONE address, and redeeming an
+// email_change moves the account AWAY from that address — often precisely
+// because the old mailbox is no longer trustworthy. Left alone, a reset
+// link sitting in the abandoned mailbox still reset the password of the
+// account at its NEW address for the remainder of [WithPasswordResetTTL].
+// Rotating the identifier must therefore invalidate the credential-recovery
+// tokens issued against the old one.
+func TestVerifyEmailChangeInvalidatesOutstandingResetToken(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "wren@example.com", validPassword)
+
+	// A reset link is issued to the address the user is about to leave.
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "wren@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "wren-new@example.com")
+	if err != nil {
+		t.Fatalf("RequestEmailChange: %v", err)
+	}
+	if _, err := svc.VerifyEmail(ctx, changeTok); err != nil {
+		t.Fatalf("VerifyEmail(email_change): %v", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(resetTok)); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(reset token) after an email change err = %v, want ErrVerificationNotFound", ferr)
+	}
+	if err := svc.ResetPassword(ctx, resetTok, "Old-Mailbox-Pass22!"); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("ResetPassword(token delivered to the OLD address) after the change err = %v, want ErrVerificationNotFound — a link in the mailbox the user just left must not reset the credential of the account at its new address", err)
+	}
+	// The password genuinely did not move.
+	if _, err := svc.Login(ctx, "wren-new@example.com", validPassword, "1.2.3.4", ""); err != nil {
+		t.Fatalf("Login with the ORIGINAL password after the failed reset: %v, want success", err)
+	}
+}
+
+// TestVerifyEmailSignupDoesNotSweepResetTokens keeps the new sweep scoped
+// to the branch that earns it. A "signup" redemption certifies the address
+// the account ALREADY holds; it rotates no identifier, so a reset token
+// issued to that same address is still a token for the same mailbox and
+// must survive.
+func TestVerifyEmailSignupDoesNotSweepResetTokens(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	signup, err := svc.SignUp(ctx, "wren2@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "wren2@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	if _, err := svc.VerifyEmail(ctx, signup.VerifyToken); err != nil {
+		t.Fatalf("VerifyEmail(signup): %v", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(resetTok)); ferr != nil {
+		t.Fatalf("reset verification after a SIGNUP redemption: %v, want it still present — nothing rotated, so nothing to sweep", ferr)
+	}
+}
+
+// TestVerifyEmailChangeFailsClosedWhenResetSweepFails proves the new sweep
+// is not fire-and-forget either: a store failure reaches the caller rather
+// than being swallowed after the address has already moved.
+func TestVerifyEmailChangeFailsClosedWhenResetSweepFails(t *testing.T) {
+	store := &purposeSweepFailStore{AuthStore: memory.NewAuthStore(), failPurpose: auth.PurposePasswordReset}
+	svc := auth.New(store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "wren3@example.com", validPassword)
+
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "wren3-new@example.com")
+	if err != nil {
+		t.Fatalf("RequestEmailChange: %v", err)
+	}
+	if _, err := svc.VerifyEmail(ctx, changeTok); !errors.Is(err, errWriteBoom) {
+		t.Fatalf("VerifyEmail err = %v, want the store's own error — a failed password_reset sweep must not be swallowed", err)
+	}
+}
+
+// TestVerifyEmailChangeLeavesSessionsAlone pins the decision NOT to revoke
+// sessions when an email change is redeemed, which is as deliberate as the
+// sweep beside it.
+//
+// VerifyEmail is unauthenticated: it is redeemed by whoever holds the link,
+// usually on a device with no session at all. Giving an unauthenticated
+// endpoint a sign-out-every-device effect would hand a denial-of-service
+// lever to anyone who obtains the link — a forwarded mail, a shared
+// mailbox, a URL in a browser history — without ever knowing the password.
+// And since [Service.RequestEmailChange] now requires the current password
+// to arm the token, the redemption itself is not evidence that the
+// account's live sessions became untrustworthy. An application that wants
+// "changing your address signs you out everywhere" composes it from
+// [Service.LogoutAll], which is authenticated and sweeps both verification
+// purposes.
+func TestVerifyEmailChangeLeavesSessionsAlone(t *testing.T) {
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "xena@example.com", validPassword)
+	_, _, refresh := mustLogin(t, svc, "xena@example.com", validPassword)
+
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "xena-new@example.com")
+	if err != nil {
+		t.Fatalf("RequestEmailChange: %v", err)
+	}
+	if _, err := svc.VerifyEmail(ctx, changeTok); err != nil {
+		t.Fatalf("VerifyEmail: %v", err)
+	}
+
+	got, err := svc.Refresh(ctx, refresh)
+	if err != nil {
+		t.Fatalf("Refresh after an email change: %v, want success — VerifyEmail deliberately revokes nothing", err)
+	}
+	if got.User.Email != "xena-new@example.com" {
+		t.Fatalf("refreshed user email = %q, want the NEW address %q", got.User.Email, "xena-new@example.com")
+	}
+}
+
 // TestVerifyEmailClaimsBeforeApplyOrderingSignup is the direct, structural
 // pin for the brief's fourth mandatory mutation: reverse the claim/apply
 // order inside VerifyEmail (apply — MarkEmailVerified/UpdateUserEmail —
@@ -2090,6 +2217,159 @@ func TestLogoutAllRevokesEveryFamilyIncludingRotatedPredecessors(t *testing.T) {
 	}
 	if len(sessions) != 0 {
 		t.Fatalf("ListSessionsByUser returned %d session(s) after LogoutAll; want 0 (every family, every row)", len(sessions))
+	}
+}
+
+// TestLogoutAllInvalidatesOutstandingResetAndEmailChangeTokens pins the
+// sweep this method carries and the two per-device paths ([Service.Logout],
+// [Service.RevokeSession]) deliberately do not.
+//
+// "Sign out everywhere" is the control a user reaches for on spotting an
+// intruder, so it must leave nothing armed that quietly undoes it. Before
+// this, a user who noticed a stolen session and signed out of every device
+// still lost the account: the pending "email_change" token the intruder had
+// armed stayed redeemable for the rest of [WithVerificationTTL]'s 24-hour
+// window, and [Service.VerifyEmail] redeems one with no authentication at
+// all, moving the address somewhere [Service.Login] and
+// [Service.RequestPasswordReset] can no longer reach the victim at. The
+// password_reset token is the same door one storey down.
+func TestLogoutAllInvalidatesOutstandingResetAndEmailChangeTokens(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	signup, err := svc.SignUp(ctx, "una@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	user := signup.User
+
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "una@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "attacker@evil.example")
+	if err != nil {
+		t.Fatalf("RequestEmailChange: %v", err)
+	}
+
+	if err := svc.LogoutAll(ctx, user.ID); err != nil {
+		t.Fatalf("LogoutAll: %v", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(resetTok)); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(reset token) after LogoutAll err = %v, want ErrVerificationNotFound", ferr)
+	}
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(changeTok)); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(email_change token) after LogoutAll err = %v, want ErrVerificationNotFound", ferr)
+	}
+	if err := svc.ResetPassword(ctx, resetTok, "Attacker-Chosen-Pass21!"); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("ResetPassword(pre-existing token) after LogoutAll err = %v, want ErrVerificationNotFound", err)
+	}
+	if _, err := svc.VerifyEmail(ctx, changeTok); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("VerifyEmail(pre-existing email_change token) after LogoutAll err = %v, want ErrVerificationNotFound — the takeover must not survive a sign-out-everywhere", err)
+	}
+
+	// The sweep stays purpose-scoped: a "signup" token grants nothing over
+	// the credential or the address, and destroying it would lock a user
+	// who signed out everywhere before confirming their address out of the
+	// only confirmation link they have.
+	if _, err := svc.VerifyEmail(ctx, signup.VerifyToken); err != nil {
+		t.Fatalf("VerifyEmail(signup token) after LogoutAll: %v, want success — LogoutAll must not sweep \"signup\" verifications", err)
+	}
+
+	// And the account is still reachable at its own address.
+	stored, err := store.FindUserByID(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.Email != "una@example.com" {
+		t.Fatalf("stored email = %q, want %q", stored.Email, "una@example.com")
+	}
+}
+
+// TestLogoutAllFailsClosedWhenASweepFails proves neither sweep is
+// fire-and-forget: each fails closed exactly as ChangePassword's and
+// ResetPassword's do. The double fails ONE purpose at a time, so the error
+// reaching the caller can only be that sweep propagating.
+func TestLogoutAllFailsClosedWhenASweepFails(t *testing.T) {
+	for _, purpose := range []string{auth.PurposePasswordReset, auth.PurposeEmailChange} {
+		t.Run(purpose, func(t *testing.T) {
+			store := &purposeSweepFailStore{AuthStore: memory.NewAuthStore(), failPurpose: purpose}
+			svc := auth.New(store,
+				auth.WithHasher(password.Bcrypt(testCost)),
+				auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+			)
+			ctx := context.Background()
+			user := mustSignUp(t, svc, "una2@example.com", validPassword)
+
+			if err := svc.LogoutAll(ctx, user.ID); !errors.Is(err, errWriteBoom) {
+				t.Fatalf("LogoutAll err = %v, want the store's own error — a failed %s sweep must not be swallowed", err, purpose)
+			}
+		})
+	}
+}
+
+// TestLogoutAndRevokeSessionLeavePendingVerificationsAlone pins the OTHER
+// half of the doctrine, and it is a deliberate non-sweep, not an omission.
+//
+// Logout and RevokeSession are per-device and routine — a browser closing a
+// tab, a "sign out" button, a device dropped from a listing. Sweeping
+// pending verifications from them would break a legitimate flow with no
+// attacker in it: request an email change on a desktop, log out of that
+// desktop, click the link that arrives on a phone. Only LogoutAll is an
+// unambiguous "something is wrong" signal, so only LogoutAll sweeps.
+func TestLogoutAndRevokeSessionLeavePendingVerificationsAlone(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "vic@example.com", validPassword)
+	_, _, refresh := mustLogin(t, svc, "vic@example.com", validPassword)
+
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "vic-new@example.com")
+	if err != nil {
+		t.Fatalf("RequestEmailChange: %v", err)
+	}
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "vic@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+
+	// The desktop signs itself out.
+	if err := svc.Logout(ctx, refresh); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(changeTok)); ferr != nil {
+		t.Fatalf("email_change verification after Logout: %v, want it still present — a per-device logout must not break the desktop-request/phone-confirm flow", ferr)
+	}
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(resetTok)); ferr != nil {
+		t.Fatalf("password_reset verification after Logout: %v, want it still present", ferr)
+	}
+
+	// Same again through the "your devices" control.
+	_, _, refresh2 := mustLogin(t, svc, "vic@example.com", validPassword)
+	sessions, err := svc.ListSessions(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) == 0 {
+		t.Fatal("no sessions to revoke")
+	}
+	if err := svc.RevokeSession(ctx, user.ID, sessions[0].ID); err != nil {
+		t.Fatalf("RevokeSession: %v", err)
+	}
+	_ = refresh2
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(changeTok)); ferr != nil {
+		t.Fatalf("email_change verification after RevokeSession: %v, want it still present", ferr)
+	}
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(resetTok)); ferr != nil {
+		t.Fatalf("password_reset verification after RevokeSession: %v, want it still present", ferr)
+	}
+
+	// The phone still completes the change the desktop asked for.
+	got, err := svc.VerifyEmail(ctx, changeTok)
+	if err != nil {
+		t.Fatalf("VerifyEmail after Logout/RevokeSession: %v, want success", err)
+	}
+	if got.Email != "vic-new@example.com" {
+		t.Fatalf("email after redemption = %q, want %q", got.Email, "vic-new@example.com")
 	}
 }
 
