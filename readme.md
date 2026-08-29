@@ -1235,15 +1235,34 @@ reinstates a timing oracle.
 
 `SignUp` and `RequestPasswordReset` equalise the *sequence of calls* and the
 *set of errors* each branch can produce. Neither equalises the wall clock, and
-on `RequestPasswordReset` the residual has been measured rather than assumed:
-against a live PostgreSQL store, a known address answers roughly 1.7–2.9 ms
-slower than an unknown one — about 4–6×, distributions nearly disjoint under
-low-jitter same-host measurement — because the known branch performs two extra
-local writes (invalidate the previous token, mint the new one) that the
-unknown branch has no user row to perform. Over WAN jitter that needs on the
-order of 10²–10³ samples against one address to resolve: practical against a
-single suspected address, impractical for bulk enumeration, and real either
-way.
+on `RequestPasswordReset` the residual is measured rather than assumed — by a
+harness in the tree, so it can be re-derived and re-checked after any change:
+
+```
+AUTHLAYER_TEST_DSN=... go test -tags integration ./store/drops/ -run TimingChannel -v
+```
+
+Against a live PostgreSQL store a known address answers **several times
+slower** than an unknown one, because the known branch performs two extra
+writes — invalidate the previous token, mint the new one — that the unknown
+branch has no user row to perform. The durable finding is that the two
+distributions are **disjoint at the known branch's 5th percentile against the
+unknown branch's 95th**: on a quiet same-host network one sample already
+separates them more often than not. Six runs on one machine (Windows host,
+PostgreSQL in a container, loopback) put the known median at 9.5–16.7 ms
+against an unknown median of 0.7–0.9 ms — Δ≈8.7–16 ms, roughly 12–25×. The
+disjointness held on every run; the absolute numbers did not, and yours will
+differ, which is why the harness reports rather than asserting a threshold.
+
+Two things make a deployment's channel *wider* than that. `store/drops` has no
+index on `verifications (user_id, purpose)` — only `UNIQUE (token_hash)` — so
+the invalidating `DELETE` scans the whole table, and its cost grows with how
+many pending tokens you hold for *all* users; the harness measures a table
+with one live row. Unreclaimed dead tuples add to the same scan.
+
+Over WAN jitter this needs on the order of 10²–10³ samples against one address
+to resolve: practical against a single suspected address, impractical for bulk
+enumeration, and real either way.
 
 `WithPasswordResetRateLimiter` is what bounds it, by capping how many samples
 an attacker can collect against any one address. It earns its keep twice over,

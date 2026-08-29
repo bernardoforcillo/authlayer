@@ -1854,18 +1854,44 @@ func (s *Service[U, PU]) ChangePassword(ctx context.Context, userID, currentSess
 //     nil), never propagated as ErrUserNotFound or anything else.
 //
 //  5. Timing is the channel that remains, and it is measured, not merely
-//     theoretical. Against a live PostgreSQL-backed [Store]
-//     ([github.com/bernardoforcillo/authlayer/store/drops]), 400 samples
-//     per branch first measured a known-address median of 1510µs against
-//     an unknown-address median of 308µs — Δ≈1.2ms, roughly 5×, with the
-//     two distributions nearly disjoint under low-jitter, same-host
-//     measurement. Point 1's second branch-exclusive write (added to honour
-//     [Store]'s DeleteVerificationsByUserAndPurpose contract) widened it:
-//     re-measured after that write, the known-address median ran 2276-3453µs
-//     against an unknown-address 556-576µs — Δ≈1.7-2.9ms, roughly 4-6×,
-//     disjoint at the known branch's 5th percentile against the unknown
-//     branch's 95th. The channel got wider, not narrower, and the number
-//     here is the post-write one. Over realistic WAN jitter this needs on the order of 10² to 10³
+//     theoretical. The harness that measures it is in the tree —
+//     TestRequestPasswordResetTimingChannelLive in
+//     [github.com/bernardoforcillo/authlayer/store/drops]'s integration
+//     lane — so every figure below can be re-derived, and re-checked after
+//     any change that touches this method:
+//
+//     AUTHLAYER_TEST_DSN=... go test -tags integration ./store/drops/ -run TimingChannel -v
+//
+//     It reports; it asserts no threshold, because absolute latencies are a
+//     property of a machine and a flaky security test gets deleted.
+//
+//     What it measures, against a live PostgreSQL-backed [Store]: the known
+//     branch is several times slower than the unknown one, and the two
+//     distributions are DISJOINT at the known branch's 5th percentile
+//     against the unknown branch's 95th — so on a quiet, same-host network
+//     a single sample already separates them more often than not. Six runs
+//     on one machine (Windows host, PostgreSQL in a container, loopback)
+//     put the known-address median between 9.5ms and 16.7ms against an
+//     unknown-address median between 0.7ms and 0.9ms: Δ≈8.7-16ms, roughly
+//     12-25×. The disjointness held on every run; the absolute figures did
+//     not, and a different machine will produce different ones — the ratio
+//     and the disjointness are the durable findings, not the microseconds.
+//     The unknown branch is the stable half; the known branch's spread is
+//     write latency, which is whatever the host's storage stack is doing.
+//
+//     Two things make a real deployment's channel WIDER than that, never
+//     narrower. The drops schema carries no index on verifications
+//     (user_id, purpose) — only UNIQUE (token_hash) — so the
+//     DeleteVerificationsByUserAndPurpose in point 1 scans the whole
+//     verifications table, and its cost therefore grows with how many
+//     pending tokens the deployment holds for ALL its users; the harness
+//     runs against a table holding one live row. And dead tuples the
+//     server's autovacuum has not yet reclaimed add to that same scan: an
+//     early version of the harness, vacuuming nothing, watched its own
+//     churn take the known-address median from 6.3ms over 400 calls to
+//     31.8ms over 1500.
+//
+//     Over realistic WAN jitter this needs on the order of 10² to 10³
 //     samples against the SAME address to resolve reliably — practical for
 //     a targeted check against one suspected address, not for bulk
 //     enumeration across many candidates, but real, and this doc will not
