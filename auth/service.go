@@ -2104,25 +2104,34 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 //     against the unknown branch's 95th — so on a quiet, same-host network
 //     a single sample already separates them more often than not. Six runs
 //     on one machine (Windows host, PostgreSQL in a container, loopback)
-//     put the known-address median between 9.5ms and 16.7ms against an
-//     unknown-address median between 0.7ms and 0.9ms: Δ≈8.7-16ms, roughly
-//     12-25×. The disjointness held on every run; the absolute figures did
+//     put the known-address median between 4.1ms and 8.7ms against an
+//     unknown-address median between 0.5ms and 1.0ms: Δ≈2.8-8.0ms, roughly
+//     5.5-12×. The disjointness held on every run; the absolute figures did
 //     not, and a different machine will produce different ones — the ratio
 //     and the disjointness are the durable findings, not the microseconds.
 //     The unknown branch is the stable half; the known branch's spread is
 //     write latency, which is whatever the host's storage stack is doing.
+//     The same machine, running the same code on a different day, reported
+//     known medians of 9.5-16.7ms; treat any absolute here as an order of
+//     magnitude, not a figure.
 //
-//     Two things make a real deployment's channel WIDER than that, never
-//     narrower. The drops schema carries no index on verifications
-//     (user_id, purpose) — only UNIQUE (token_hash) — so the
-//     DeleteVerificationsByUserAndPurpose in point 1 scans the whole
-//     verifications table, and its cost therefore grows with how many
-//     pending tokens the deployment holds for ALL its users; the harness
-//     runs against a table holding one live row. And dead tuples the
-//     server's autovacuum has not yet reclaimed add to that same scan: an
-//     early version of the harness, vacuuming nothing, watched its own
-//     churn take the known-address median from 6.3ms over 400 calls to
-//     31.8ms over 1500.
+//     What still makes a real deployment's channel WIDER than that is dead
+//     tuples the server's autovacuum has not yet reclaimed: an early
+//     version of the harness, vacuuming nothing, watched its own churn take
+//     the known-address median from 6.3ms over 400 calls to 31.8ms over
+//     1500 calls. TABLE SIZE no longer does.
+//     [github.com/bernardoforcillo/authlayer/store/drops] indexes
+//     verifications on (user_id, purpose), so the
+//     DeleteVerificationsByUserAndPurpose in point 1 reads this user's own
+//     rows instead of scanning every pending token the deployment is
+//     holding for everybody. That was measured rather than assumed, in both
+//     directions: seeding 40,000 other users' pending tokens moved the
+//     known branch's floor from 2.3-2.5ms to 4.7-5.0ms WITHOUT the index
+//     and left it at 2.4-2.8ms WITH it. A backend that omits the index —
+//     any third-party [Store], or a deployment that owns these tables
+//     through its own migrations — re-opens that growth term, which is why
+//     the index is a security-relevant part of the schema and not only a
+//     performance one.
 //
 //     Over realistic WAN jitter this needs on the order of 10² to 10³
 //     samples against the SAME address to resolve reliably — practical for

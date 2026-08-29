@@ -612,8 +612,17 @@ users          id PK (uuid), email UNIQUE, email_verified_at, password_hash,
 sessions       id PK, user_id, token_hash UNIQUE, family_id, expires_at,
                created_at, rotated_at, user_agent, ip, INDEX (family_id)
 verifications  id PK, user_id, token_hash UNIQUE, purpose, email, expires_at,
-               created_at
+               created_at, INDEX (user_id, purpose)
 ```
+
+Both indexes are load-bearing too. `sessions (family_id)` is what keeps
+`DeleteSessionsByFamily`'s two statements — and therefore every `LogoutAll`
+iteration — off a table scan. `verifications (user_id, purpose)` is what keeps
+`DeleteVerificationsByUserAndPurpose` off one, and that one is a *security*
+index: it runs on every `RequestPasswordReset`, so without it the residual
+timing channel above grows with the number of pending tokens held for all
+users. `CreateSchema` emits both as `CREATE INDEX IF NOT EXISTS`, so it
+self-heals a table missing one.
 
 All three UNIQUE constraints are load-bearing. `UNIQUE (email)` is what
 `SignUp` reads "already registered" off, so without it the duplicate branch
@@ -1313,16 +1322,22 @@ branch has no user row to perform. The durable finding is that the two
 distributions are **disjoint at the known branch's 5th percentile against the
 unknown branch's 95th**: on a quiet same-host network one sample already
 separates them more often than not. Six runs on one machine (Windows host,
-PostgreSQL in a container, loopback) put the known median at 9.5–16.7 ms
-against an unknown median of 0.7–0.9 ms — Δ≈8.7–16 ms, roughly 12–25×. The
-disjointness held on every run; the absolute numbers did not, and yours will
-differ, which is why the harness reports rather than asserting a threshold.
+PostgreSQL in a container, loopback) put the known median at 4.1–8.7 ms
+against an unknown median of 0.5–1.0 ms — Δ≈2.8–8.0 ms, roughly 5.5–12×. The
+disjointness held on every run; the absolute numbers did not — the same
+machine reported 9.5–16.7 ms on a different day — and yours will differ, which
+is why the harness reports rather than asserting a threshold.
 
-Two things make a deployment's channel *wider* than that. `store/drops` has no
-index on `verifications (user_id, purpose)` — only `UNIQUE (token_hash)` — so
-the invalidating `DELETE` scans the whole table, and its cost grows with how
-many pending tokens you hold for *all* users; the harness measures a table
-with one live row. Unreclaimed dead tuples add to the same scan.
+What still makes a deployment's channel *wider* than that is unreclaimed dead
+tuples: the harness measures a freshly vacuumed table, and an unvacuumed
+version of it watched its own churn take the known median from 6.3 ms to
+31.8 ms. **Table size no longer does.** `store/drops` indexes `verifications
+(user_id, purpose)`, so the invalidating `DELETE` reads your own rows rather
+than scanning every pending token held for *all* users. That was measured, not
+assumed: seeding 40,000 other users' pending tokens moved the known branch's
+floor from 2.3–2.5 ms to 4.7–5.0 ms *without* the index and left it at
+2.4–2.8 ms *with* it. A backend that omits that index — a third-party `Store`,
+or your own migrations owning these tables — puts the growth term back.
 
 Over WAN jitter this needs on the order of 10²–10³ samples against one address
 to resolve: practical against a single suspected address, impractical for bulk

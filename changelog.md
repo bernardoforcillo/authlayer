@@ -366,11 +366,14 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `TestRequestPasswordResetTimingChannelLive` in `store/drops`' integration
   lane reports it — and what reproduces is the shape: the two distributions
   are disjoint at the known branch's 5th percentile against the unknown
-  branch's 95th. On one machine that was a 9.5–16.7 ms known median against
-  0.7–0.9 ms, roughly 12–25×; absolute figures vary by host, and a
-  deployment's gap is wider still, since `verifications` carries no
-  `(user_id, purpose)` index and the invalidating `DELETE` therefore scans
-  the whole table.
+  branch's 95th. On one machine that was a 4.1–8.7 ms known median against
+  0.5–1.0 ms, roughly 5.5–12×; absolute figures vary by host and even by day
+  on the same host, and a deployment's gap is wider still to the extent
+  autovacuum is behind. Table size does not widen it: `verifications` carries
+  an index on `(user_id, purpose)`, so the invalidating `DELETE` reads one
+  user's rows instead of scanning the table — 40,000 other users' pending
+  tokens moved the known branch's floor from 2.3–2.5 ms to 4.7–5.0 ms without
+  that index and left it unchanged with it.
   `WithPasswordResetRateLimiter` is what bounds that sampling, and it also
   bounds the flip side of re-issue invalidation — anyone who knows an address
   can destroy that account's pending reset link by looping requests. There is
@@ -423,10 +426,15 @@ once a 1.0 is cut. Until then, minor versions may break API.
   port requires of a backend to the SQL store. `dropsstore.NewAuthStore(db)` persists three
   tables — `users` (`UNIQUE (email)`), `sessions`
   (`UNIQUE (token_hash)`, `INDEX (family_id)`) and `verifications`
-  (`UNIQUE (token_hash)`) — renameable via `WithAuthNames`, with its own
-  `CreateSchema` and `Schema()`. All three constraints are load-bearing:
-  `UNIQUE (email)` is what `SignUp` reads "already registered" off, and the
-  two hash constraints keep a token lookup single-row. `email` is declared
+  (`UNIQUE (token_hash)`, `INDEX (user_id, purpose)`) — renameable via
+  `WithAuthNames`, with its own `CreateSchema` and `Schema()`. All three
+  constraints are load-bearing: `UNIQUE (email)` is what `SignUp` reads
+  "already registered" off, and the two hash constraints keep a token lookup
+  single-row. So are both indexes: `family_id` keeps every `LogoutAll`
+  iteration off a table scan, and `(user_id, purpose)` keeps
+  `RequestPasswordReset`'s invalidating `DELETE` off one — the second is a
+  security index, since a scan there widens that method's disclosed timing
+  channel in proportion to the pending tokens held for every user. `email` is declared
   both inline and as a named guarded `ALTER TABLE`, because
   `CREATE TABLE IF NOT EXISTS` is a no-op against a pre-existing table and
   the `ALTER` is what self-heals one created by hand or by an older version.

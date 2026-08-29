@@ -137,10 +137,11 @@ func TestAuthStoreCreateSchemaEmitsUniqueConstraints(t *testing.T) {
 	}
 
 	// 3 CREATE TABLE + 3 ALTER TABLE ADD CONSTRAINT (users, sessions,
-	// verifications) + 1 CREATE INDEX IF NOT EXISTS (sessions.family_id —
-	// see [NewAuthSchema]'s own comment on that registration).
-	if len(fd.execs) != 7 {
-		t.Fatalf("CreateSchema issued %d statements, want 7:\n%s",
+	// verifications) + 2 CREATE INDEX IF NOT EXISTS (sessions.family_id and
+	// verifications (user_id, purpose) — see [NewAuthSchema]'s own comments
+	// on those two registrations).
+	if len(fd.execs) != 8 {
+		t.Fatalf("CreateSchema issued %d statements, want 8:\n%s",
 			len(fd.execs), strings.Join(fd.execs, "\n--\n"))
 	}
 
@@ -150,6 +151,7 @@ func TestAuthStoreCreateSchemaEmitsUniqueConstraints(t *testing.T) {
 		`ALTER TABLE "sessions" ADD CONSTRAINT "sessions_token_hash" UNIQUE ("token_hash");`,
 		`ALTER TABLE "verifications" ADD CONSTRAINT "verifications_token_hash" UNIQUE ("token_hash");`,
 		`CREATE INDEX IF NOT EXISTS "sessions_family_id_idx" ON "sessions" ("family_id")`,
+		`CREATE INDEX IF NOT EXISTS "verifications_user_id_purpose_idx" ON "verifications" ("user_id", "purpose")`,
 	} {
 		if !strings.Contains(all, w) {
 			t.Fatalf("CreateSchema never emitted:\n%s\ngot:\n%s", w, all)

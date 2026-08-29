@@ -41,6 +41,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,6 +64,80 @@ func timingSamples(t *testing.T) int {
 		return n
 	}
 	return 100
+}
+
+// timingBackgroundRows is how many verification rows belonging to OTHER
+// users the harness seeds before measuring. It defaults to 0, which is the
+// configuration every shipped figure was produced under, so a plain run
+// stays comparable to the disclosure in
+// auth.Service.RequestPasswordReset's doc.
+//
+// Set AUTHLAYER_TIMING_BACKGROUND_ROWS to a large number to measure the one
+// thing a default run cannot: how the known branch's cost scales with the
+// size of the verifications table. The known branch's
+// DeleteVerificationsByUserAndPurpose filters on (user_id, purpose); with
+// the index NewAuthSchema registers on that pair the cost is a function of
+// this user's own rows, and with the index dropped it is a function of the
+// whole table. Running the harness at 0 and at, say, 40000 — and again with
+// the index dropped — is what turns "a deployment's channel is wider than
+// this" into a measured statement instead of an assumption.
+func timingBackgroundRows(t *testing.T) int {
+	t.Helper()
+	raw := os.Getenv("AUTHLAYER_TIMING_BACKGROUND_ROWS")
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		t.Fatalf("AUTHLAYER_TIMING_BACKGROUND_ROWS = %q, want a non-negative integer", raw)
+	}
+	return n
+}
+
+// seedBackgroundVerifications inserts n verification rows spread over n/4
+// synthetic users, none of them the address under measurement. They are
+// what a real deployment's verifications table holds and the harness's
+// otherwise-empty one does not: other people's pending tokens. Inserted in
+// one multi-row statement per chunk, since 40000 round trips would dominate
+// the test's runtime without teaching anything.
+func seedBackgroundVerifications(t *testing.T, sqlDB *sql.DB, table string, n int) {
+	t.Helper()
+	if n <= 0 {
+		return
+	}
+	ctx := context.Background()
+	const chunk = 1000
+	purposes := []string{"signup", "email_change", "password_reset", "password_reset"}
+	now := time.Now().UTC()
+	for done := 0; done < n; done += chunk {
+		size := chunk
+		if rem := n - done; rem < size {
+			size = rem
+		}
+		var b strings.Builder
+		b.WriteString("INSERT INTO " + table + " (id, user_id, token_hash, purpose, email, expires_at, created_at) VALUES ")
+		args := make([]any, 0, size*7)
+		user := ""
+		for i := 0; i < size; i++ {
+			if i%4 == 0 {
+				user = uid.NewV7()
+			}
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			o := i * 7
+			fmt.Fprintf(&b, "($%d,$%d,$%d,$%d,$%d,$%d,$%d)", o+1, o+2, o+3, o+4, o+5, o+6, o+7)
+			args = append(args,
+				uid.NewV7(), user, uid.NewV7()+uid.NewV7(), purposes[i%4],
+				"bg-"+uid.NewV7()+"@example.com", now.Add(time.Hour), now)
+		}
+		if _, err := sqlDB.ExecContext(ctx, b.String(), args...); err != nil {
+			t.Fatalf("seeding background verifications: %v", err)
+		}
+	}
+	if _, err := sqlDB.ExecContext(ctx, "ANALYZE "+table); err != nil {
+		t.Fatalf("ANALYZE %s: %v", table, err)
+	}
 }
 
 // timingWarmup batches are run and DISCARDED before any sample is kept, per
@@ -203,13 +278,18 @@ func us(d time.Duration) string {
 // because it is dominated by write latency and that varies with whatever
 // else the host and its storage stack are doing. Six runs on one machine
 // (Windows host, PostgreSQL in a container, loopback) gave known medians
-// between 9527µs and 16741µs against unknown medians between 679µs and
-// 924µs — a delta between 8.7ms and 16.1ms, a ratio between 11.5x and
-// 24.7x. What held on EVERY run, and is the durable claim, is the shape:
+// between 4060µs and 8699µs against unknown medians between 486µs and
+// 1006µs — a delta between 2.8ms and 8.0ms, a ratio between 5.5x and
+// 12.3x. What held on EVERY run, and is the durable claim, is the shape:
 // the known branch's 5th percentile above the unknown branch's 95th, and
 // the control indistinguishable from the unknown branch. Anyone quoting an
 // absolute figure from this harness should quote a range over several runs
-// and name the machine, not a single median.
+// and name the machine, not a single median. The same machine reported
+// known medians of 9527µs to 16741µs on an earlier occasion with the same
+// code, which is the strongest available warning against reading a single
+// median as a property of this package: the host moved further between
+// sittings than adding an index to the schema moved the measurement (see
+// timingBackgroundRows).
 //
 // # The control
 //
@@ -232,6 +312,11 @@ func TestRequestPasswordResetTimingChannelLive(t *testing.T) {
 	knownEmail := "timing-known-" + uid.NewV7() + "@example.com"
 	unknownEmail := "timing-unknown-" + uid.NewV7() + "@example.com"
 	controlEmail := "timing-control-" + uid.NewV7() + "@example.com"
+
+	if bg := timingBackgroundRows(t); bg > 0 {
+		seedBackgroundVerifications(t, sqlDB, st.Schema().Verifications.Name(), bg)
+		t.Logf("BACKGROUND seeded %d verification rows for other users — see timingBackgroundRows", bg)
+	}
 
 	res, err := svc.SignUp(ctx, knownEmail, liveTestPassword)
 	if err != nil {
@@ -375,11 +460,11 @@ func calibrate(t *testing.T, granularity, perCall time.Duration) int {
 // verifications table. Without any vacuuming the known branch's cost climbs
 // monotonically through the run — 6283µs median over 400 calls against
 // 31772µs over 1500, with a within-run p25→p95 of 25535µs→50734µs — because
-// every known-branch call leaves another dead tuple in a table whose DELETE
-// has no index to use (see vacuumer). That is the harness measuring its own
-// churn. 5 keeps the table near its steady state without letting VACUUM's
-// own I/O land on top of every single timed batch; the DRIFT line reports
-// whether it worked.
+// every known-branch call leaves another dead tuple behind for the DELETE
+// to walk past (see vacuumer). That is the harness measuring its own churn.
+// 5 keeps the table near its steady state without letting VACUUM's own I/O
+// land on top of every single timed batch; the DRIFT line reports whether
+// it worked.
 const vacuumEvery = 5
 
 // vacuumer returns a function that VACUUMs the verifications table, run
@@ -389,15 +474,17 @@ const vacuumEvery = 5
 // itself.
 //
 // This is restoring realism, not hiding a cost. The known branch's two
-// writes are a DELETE and an INSERT on verifications for the same user, and
-// the drops schema carries no index on (user_id, purpose) — only UNIQUE
-// (token_hash) — so DeleteVerificationsByUserAndPurpose is a sequential
-// scan. Hammering one address as fast as a loop can therefore leaves a dead
-// tuple per call in a table nothing is reclaiming, and the scan gets slower
-// every iteration: an unvacuumed version of this harness measured a KNOWN
-// median of 31772µs over 1500 calls against 6283µs over 400, with a
-// within-run p25→p95 spread of 25535µs→50734µs. That is the harness
-// measuring its own churn, not the branch.
+// writes are a DELETE and an INSERT on verifications for the same user, so
+// hammering one address as fast as a loop can leaves a dead tuple per call
+// in a table nothing is reclaiming, and every later DELETE walks past them.
+// The measurements in this paragraph predate the (user_id, purpose) index
+// NewAuthSchema now registers, when the DELETE was a sequential scan of the
+// whole table and this effect was at its worst: an unvacuumed version of
+// this harness measured a KNOWN median of 31772µs over 1500 calls against
+// 6283µs over 400, with a within-run p25→p95 spread of 25535µs→50734µs.
+// That is the harness measuring its own churn, not the branch. The index
+// scopes the effect to this user's own dead entries rather than every
+// user's; it does not remove it, so the vacuuming stays.
 //
 // A live server runs autovacuum; it simply does not trigger at this
 // harness's rate against a table this small. Vacuuming every iteration puts
@@ -406,14 +493,16 @@ const vacuumEvery = 5
 // third of the run disagree materially, the run was not stationary and the
 // median is not a property of the branch.
 //
-// That makes the reported delta a FLOOR rather than a typical value. The
-// missing (user_id, purpose) index means the known branch's DELETE scans
-// the WHOLE verifications table, so its cost — and therefore the width of
-// the timing channel this harness exists to measure — grows with however
-// many pending tokens a real deployment is holding for all its users, plus
-// whatever dead tuples autovacuum has not yet reclaimed. This harness runs
-// against a table holding a single live row. A deployment's channel is
-// wider than what it reports here, never narrower.
+// That makes the reported delta a FLOOR rather than a typical value: this
+// harness runs against a table holding a single live row and nothing
+// unreclaimed, which is the cheapest the known branch's DELETE can
+// possibly be. What the index changed is which term of that gap grows.
+// Measured on this machine at a background of 40000 other users' pending
+// tokens (AUTHLAYER_TIMING_BACKGROUND_ROWS), the known branch's floor —
+// its minimum sample, the statistic least contaminated by host noise —
+// went 2347–2481µs to 4708–5005µs WITHOUT the index and 2389–2816µs to
+// 2386–2574µs WITH it. So table size no longer widens the channel;
+// unreclaimed dead tuples for the address under attack still do.
 func vacuumer(t *testing.T, sqlDB *sql.DB, st *dropsstore.AuthStore) func(context.Context) {
 	t.Helper()
 	table := st.Schema().Verifications.Name()

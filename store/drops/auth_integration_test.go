@@ -38,6 +38,7 @@ import (
 	"github.com/bernardoforcillo/authlayer/internal/uid"
 	"github.com/bernardoforcillo/authlayer/password"
 	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
+	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
 	"github.com/bernardoforcillo/drops/stdlib"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -1568,6 +1569,19 @@ func TestAuthStoreCreateSchemaLandsConstraintsOnRealPostgres(t *testing.T) {
 		t.Fatalf("sessions_family_id_idx definition = %q, want it to index (family_id)", idxDef)
 	}
 	t.Logf("sessions_family_id_idx           i  %s", idxDef)
+
+	err = sqlDB.QueryRowContext(ctx,
+		`SELECT indexdef FROM pg_indexes WHERE tablename = 'verifications' AND indexname = $1`,
+		"verifications_user_id_purpose_idx").Scan(&idxDef)
+	if err != nil {
+		t.Fatalf("verifications_user_id_purpose_idx: %v", err)
+	}
+	// Column ORDER is asserted, not just membership: (purpose, user_id)
+	// would be a different, far less selective index for the same query.
+	if !strings.Contains(idxDef, "(user_id, purpose)") {
+		t.Fatalf("verifications_user_id_purpose_idx definition = %q, want it to index (user_id, purpose) in that order", idxDef)
+	}
+	t.Logf("verifications_user_id_purpose_idx i  %s", idxDef)
 }
 
 // TestAuthPurgeExpiredLive mirrors invite_integration_test.go's
@@ -1770,4 +1784,158 @@ func TestResetPasswordStampsEmailVerifiedLive(t *testing.T) {
 	if _, err := svc.Login(ctx, "live-locked@example.com", recovered, "203.0.113.9", "agent"); err != nil {
 		t.Fatalf("Login after the reset: %v", err)
 	}
+}
+
+// recordingDriver wraps a real drops driver and keeps every statement it
+// executes, so a test can recover the EXACT SQL a store method issued and
+// then EXPLAIN that same string. Writing the DELETE out by hand in the test
+// instead would EXPLAIN a query the store does not actually run, and would
+// keep passing if the store's predicate ever changed.
+type recordingDriver struct {
+	drops.Driver
+	execs []string
+}
+
+func (d *recordingDriver) Exec(ctx context.Context, sql string, args ...any) (drops.Result, error) {
+	d.execs = append(d.execs, sql)
+	return d.Driver.Exec(ctx, sql, args...)
+}
+
+func (d *recordingDriver) last() string {
+	if len(d.execs) == 0 {
+		return ""
+	}
+	return d.execs[len(d.execs)-1]
+}
+
+// explain returns the plan for sql with args bound, as one newline-joined
+// string.
+func explain(t *testing.T, sqlDB *sql.DB, sql string, args ...any) string {
+	t.Helper()
+	rows, err := sqlDB.QueryContext(context.Background(), "EXPLAIN "+sql, args...)
+	if err != nil {
+		t.Fatalf("EXPLAIN %s: %v", sql, err)
+	}
+	defer rows.Close()
+	var lines []string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatalf("scan plan row: %v", err)
+		}
+		lines = append(lines, line)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("EXPLAIN rows: %v", err)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// TestDeleteVerificationsByUserAndPurposeUsesTheIndexLive proves the
+// verifications (user_id, purpose) index registered by NewAuthSchema is one
+// the PLANNER ACTUALLY PICKS, not merely one that exists. An index the
+// planner ignores is not a fix, and this is the one index in the schema
+// whose absence is a documented SECURITY cost rather than only a
+// performance one: DeleteVerificationsByUserAndPurpose runs on every
+// auth.Service.RequestPasswordReset, so a sequential scan there makes the
+// residual enumeration timing channel that method's doc (point 5) discloses
+// grow with the number of pending tokens held for ALL users.
+//
+// The test carries its own CONTROL: it drops the index, re-EXPLAINs, and
+// requires the plan to become a sequential scan. Without that step a
+// planner that had chosen a seq scan anyway — or an assertion matching
+// something that appears in every plan — would pass silently, and the test
+// would prove nothing about the index. CreateSchema then puts the index
+// back, which also re-exercises its self-healing property against a real
+// server.
+func TestDeleteVerificationsByUserAndPurposeUsesTheIndexLive(t *testing.T) {
+	sqlDB, rawDB := openLiveDB(t)
+	rec := &recordingDriver{Driver: stdlib.New(sqlDB)}
+	db := pg.New(rec)
+	st := dropsstore.NewAuthStore(db)
+	ctx := context.Background()
+
+	dropAuthTables(t, rawDB, st)
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema: %v", err)
+	}
+	t.Cleanup(func() { dropAuthTables(t, rawDB, st) })
+
+	// Seed enough rows, spread over enough distinct users, that an index
+	// scan is the cheaper plan. On a table of a handful of rows PostgreSQL
+	// correctly prefers a sequential scan whatever indexes exist, so a
+	// near-empty table cannot answer the question this test asks.
+	const users, perUser = 300, 4
+	purposes := []string{"signup", "email_change", "password_reset", "password_reset"}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	var probeUser string
+	for i := 0; i < users; i++ {
+		userID := uid.NewV7()
+		if i == users/2 {
+			probeUser = userID
+		}
+		for j := 0; j < perUser; j++ {
+			_, err := st.CreateVerification(ctx, auth.Verification{
+				ID: uid.NewV7(), UserID: userID,
+				TokenHash: uid.NewV7() + uid.NewV7(),
+				Purpose:   purposes[j],
+				Email:     "explain-" + uid.NewV7() + "@example.com",
+				ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+			})
+			if err != nil {
+				t.Fatalf("CreateVerification: %v", err)
+			}
+		}
+	}
+	if _, err := sqlDB.ExecContext(ctx, "ANALYZE "+st.Schema().Verifications.Name()); err != nil {
+		t.Fatalf("ANALYZE: %v", err)
+	}
+
+	// Recover the store's own DELETE by running it against a user id that
+	// owns no rows: the statement is issued and recorded, and the table's
+	// contents and statistics are left exactly as ANALYZE saw them.
+	if err := st.DeleteVerificationsByUserAndPurpose(ctx, uid.NewV7(), "password_reset"); err != nil {
+		t.Fatalf("DeleteVerificationsByUserAndPurpose: %v", err)
+	}
+	stmt := rec.last()
+	if !strings.Contains(stmt, "DELETE") || !strings.Contains(stmt, "user_id") || !strings.Contains(stmt, "purpose") {
+		t.Fatalf("recorded statement is not the delete under test: %q", stmt)
+	}
+	t.Logf("STATEMENT %s", stmt)
+
+	withIndex := explain(t, sqlDB, stmt, probeUser, "password_reset")
+	t.Logf("PLAN with the index:\n%s", withIndex)
+	idx := st.Schema().Verifications.Name() + "_user_id_purpose_idx"
+	if !strings.Contains(withIndex, idx) {
+		t.Fatalf("the planner did not use %s — an index it ignores is not a fix. Plan:\n%s", idx, withIndex)
+	}
+	if strings.Contains(withIndex, "Seq Scan on "+st.Schema().Verifications.Name()) {
+		t.Fatalf("plan still contains a sequential scan of the verifications table:\n%s", withIndex)
+	}
+
+	// The control: without the index the same statement on the same data
+	// must fall back to a sequential scan. If it does not, the assertion
+	// above was not measuring the index.
+	if _, err := sqlDB.ExecContext(ctx, "DROP INDEX "+idx); err != nil {
+		t.Fatalf("DROP INDEX %s: %v", idx, err)
+	}
+	withoutIndex := explain(t, sqlDB, stmt, probeUser, "password_reset")
+	t.Logf("PLAN without the index (control):\n%s", withoutIndex)
+	if !strings.Contains(withoutIndex, "Seq Scan on "+st.Schema().Verifications.Name()) {
+		t.Fatalf("control failed: dropping %s did not produce a sequential scan, so the plan above proves nothing about the index. Plan:\n%s",
+			idx, withoutIndex)
+	}
+
+	// CreateSchema self-heals the index back onto the existing table, the
+	// same way it self-heals a missing UNIQUE constraint.
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema (self-heal after DROP INDEX): %v", err)
+	}
+	var def string
+	if err := sqlDB.QueryRowContext(ctx,
+		`SELECT indexdef FROM pg_indexes WHERE tablename = $1 AND indexname = $2`,
+		st.Schema().Verifications.Name(), idx).Scan(&def); err != nil {
+		t.Fatalf("index %s did not come back after CreateSchema: %v", idx, err)
+	}
+	t.Logf("SELF-HEAL %s", def)
 }

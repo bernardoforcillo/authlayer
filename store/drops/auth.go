@@ -57,7 +57,8 @@ func WithAuthNames(n AuthNames) AuthOption {
 //	                 created_at, rotated_at, user_agent, ip,
 //	                 UNIQUE (token_hash), INDEX (family_id)
 //	<verifications>  id PK, user_id, token_hash, purpose, email, expires_at,
-//	                 created_at, UNIQUE (token_hash)
+//	                 created_at, UNIQUE (token_hash),
+//	                 INDEX (user_id, purpose)
 //
 // All three UNIQUE constraints are load-bearing, not decoration — see
 // [auth.UserBase.Email], [auth.Session.TokenHash] and
@@ -158,6 +159,27 @@ func NewAuthSchema(opts ...AuthOption) *AuthSchema {
 	// emits this the same idempotent, self-healing way it emits the UNIQUE
 	// constraints above.
 	s.Sessions.AddIndex(pg.NewIndex(names.Sessions+"_family_id_idx", s.Sessions, s.sessions.col("family_id")))
+	// (user_id, purpose) is the composite every
+	// [AuthStore.DeleteVerificationsByUserAndPurpose] filters on, and that
+	// method is called on every
+	// [github.com/bernardoforcillo/authlayer/auth.Service.RequestPasswordReset],
+	// twice per ChangePassword, twice per ResetPassword and once per
+	// RequestEmailChange. Without it the DELETE seq-scans the whole
+	// verifications table, so its cost — and therefore the width of the
+	// residual enumeration timing channel RequestPasswordReset's doc
+	// (point 5) discloses — grows with how many pending tokens the
+	// deployment is holding for ALL its users, not just this one. That is
+	// a security-relevant index, not only a performance one. Column order
+	// is (user_id, purpose) rather than the reverse because user_id is the
+	// selective half: a deployment has few purposes and many users, so a
+	// purpose-leading index would leave the scan reading roughly a third
+	// of the table. Non-unique on purpose — a user legitimately holds
+	// several tokens of one purpose at once until the next call sweeps
+	// them.
+	s.Verifications.AddIndex(pg.NewIndex(
+		names.Verifications+"_user_id_purpose_idx", s.Verifications,
+		s.verifications.col("user_id"), s.verifications.col("purpose"),
+	))
 
 	return s
 }
@@ -188,8 +210,9 @@ func (st *AuthStore) Schema() *AuthSchema { return st.s }
 // statements — see [AuthSchema]'s doc for why email's is registered this
 // way too, not only the two TokenHash ones CREATE TABLE could never carry
 // in the first place — and then CREATE INDEX IF NOT EXISTS for every index
-// registered on a table (currently just sessions.family_id — see
-// [NewAuthSchema]'s own comment on that registration). Every statement is
+// registered on a table (sessions.family_id and verifications
+// (user_id, purpose) — see [NewAuthSchema]'s own comments on those two
+// registrations). Every statement is
 // idempotent, so the call is safe to re-run and self-heals a pre-existing
 // table missing a constraint or index; like [Store.CreateSchema] and
 // [InviteStore.CreateSchema] it adds what is missing and never alters what
