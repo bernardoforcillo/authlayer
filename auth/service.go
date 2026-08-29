@@ -1121,6 +1121,48 @@ func (s *Service) User(ctx context.Context, userID string) (UserBase, error) {
 	return u, nil
 }
 
+// PurgeExpired deletes every [Session] and [Verification] expired strictly
+// before `before` — both by ExpiresAt — and returns how many rows were
+// removed in total, across both kinds. It is a direct pass-through to
+// [Store.PurgeExpired], matching
+// [github.com/bernardoforcillo/authlayer/invite.Service.PurgeExpired]'s own
+// relationship to its Store. It exists on Service because a caller
+// ordinarily holds only the *Service, and this package REQUIRES the
+// housekeeping: rotated-but-unexpired session rows are retained on purpose
+// (they are what makes a replay detectable — see auth.go's package doc), so
+// nothing else ever removes them, and one device refreshing at the
+// 15-minute default accumulates about 97 rows a day.
+//
+// It is housekeeping, not a security boundary: an expired session or
+// verification is already unusable through every lookup, rotation and
+// redemption path in this package before it is ever purged — [Service.Refresh]
+// rejects an expired session with [ErrTokenInvalid], and [Service.VerifyEmail]
+// and [Service.ResetPassword] reject an expired token with
+// [ErrVerificationExpired], all without consulting this method. Purging
+// reclaims storage and keeps the tables (and therefore the scans over them
+// — see [Service.RequestPasswordReset]'s doc, point 5) small. UserBase rows
+// are never purged; users do not expire.
+//
+// Like invite's, it performs NO authorization and reads nothing from the
+// context: a single call spans every user the Store holds, and deleting an
+// already-dead row confers no standing on anyone. That does not make it
+// safe to expose to an end user, though — an unauthenticated or
+// under-privileged caller who could trigger it at will gets a
+// denial-of-service knob against the whole deployment. Call it only from a
+// trusted context: a cron job, a superuser console, never a per-request
+// handler wired to caller input.
+//
+// The cutoff is taken literally and is not clamped to the present: `before`
+// is compared against ExpiresAt, so a future value removes rows that have
+// not expired yet — signing out live sessions and voiding live tokens.
+// Ordinarily pass the current time. The Service clock ([WithClock]) is
+// deliberately not consulted here, matching invite's signature: the caller
+// scheduling this housekeeping is the one that decides its cutoff, and a
+// job that means "everything older than a week ago" says so directly.
+func (s *Service) PurgeExpired(ctx context.Context, before time.Time) (int, error) {
+	return s.store.PurgeExpired(ctx, before)
+}
+
 // VerifyEmail redeems plainToken: a "signup" token marks the account's
 // current email verified; an "email_change" token overwrites the account's
 // email to the address the token was minted for (see

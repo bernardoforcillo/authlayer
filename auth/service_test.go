@@ -4208,3 +4208,60 @@ func TestWithPasswordResetTTLShortensTheRedeemableWindow(t *testing.T) {
 		t.Fatalf("the expired token was burned by the failed attempt (%v); expiry is checked before the claim", err)
 	}
 }
+
+// ============================================================
+// PurgeExpired
+// ============================================================
+
+// TestPurgeExpiredDelegatesToStore pins the pass-through: it removes
+// expired sessions AND expired verifications, counts both, and leaves live
+// rows alone. Matching invite.Service.PurgeExpired's own test, it drives
+// the expiry with short TTLs rather than a stubbed store, so the count
+// covers both tables the way a caller's cron job would see it.
+func TestPurgeExpiredDelegatesToStore(t *testing.T) {
+	now := time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
+	clock := now
+	svc, store := newTestService(t,
+		auth.WithClock(func() time.Time { return clock }),
+		auth.WithRefreshTTL(time.Minute),
+		auth.WithVerificationTTL(time.Minute),
+	)
+	ctx := context.Background()
+
+	res, err := svc.SignUp(ctx, "purge@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	if _, err := svc.Login(ctx, "purge@example.com", validPassword, "1.2.3.4", "agent"); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	// Nothing has expired yet.
+	n, err := svc.PurgeExpired(ctx, now)
+	if err != nil {
+		t.Fatalf("PurgeExpired: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("PurgeExpired removed %d row(s) before anything expired; want 0", n)
+	}
+
+	clock = now.Add(2 * time.Minute)
+	n, err = svc.PurgeExpired(ctx, clock)
+	if err != nil {
+		t.Fatalf("PurgeExpired: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("PurgeExpired removed %d row(s); want 2 (one session, one verification)", n)
+	}
+
+	if sessions, err := store.ListSessionsByUser(ctx, res.User.ID); err != nil || len(sessions) != 0 {
+		t.Fatalf("ListSessionsByUser = (%d rows, %v), want 0 rows and no error", len(sessions), err)
+	}
+	if _, err := store.FindVerificationByHash(ctx, token.HashOpaque(res.VerifyToken)); !errors.Is(err, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash after purge = %v, want ErrVerificationNotFound", err)
+	}
+	// The user row is untouched: users do not expire.
+	if _, err := svc.User(ctx, res.User.ID); err != nil {
+		t.Fatalf("User after purge: %v, want the account still present", err)
+	}
+}
