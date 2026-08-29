@@ -411,8 +411,8 @@ func (s inclusivePurge) PurgeExpired(_ context.Context, before time.Time) (int, 
 
 // sharedTokenHashes lets two rows of the same kind hold one token hash — the
 // uniqueness MUST [auth.Session.TokenHash] and [auth.Verification.TokenHash]
-// state on the record types, which [RunTokenHashUniquenessContract] is the
-// entry point for.
+// state on the record types, checked by "CreateSession/TokenHashIsUnique"
+// and "CreateVerification/TokenHashIsUnique" inside [RunStoreContract].
 type sharedTokenHashes struct{ *refStore }
 
 func (s sharedTokenHashes) CreateSession(_ context.Context, sess auth.Session) (auth.Session, error) {
@@ -478,9 +478,11 @@ func runCheck(c check, st auth.Store) []string {
 	return append([]string(nil), r.failures...)
 }
 
-// allChecks is every check either exported entry point runs.
+// allChecks is every check [RunStoreContract] runs. It stays a named helper
+// rather than a direct call so the negative-control loop below reads as
+// "run the whole suite against this defective store".
 func allChecks() []check {
-	return append(storeContractChecks(), tokenHashUniquenessChecks()...)
+	return storeContractChecks()
 }
 
 func findCheck(t *testing.T, name string) check {
@@ -495,12 +497,11 @@ func findCheck(t *testing.T, name string) check {
 }
 
 // TestTheReferenceStorePassesTheContract is the control on the controls
-// below. [refStore] is a correct store, so both exported entry points must
-// pass it end to end; if they did not, a non-compliant double failing a check
-// would prove nothing about the defect injected into it.
+// below. [refStore] is a correct store, so [RunStoreContract] must pass it
+// end to end; if it did not, a non-compliant double failing a check would
+// prove nothing about the defect injected into it.
 func TestTheReferenceStorePassesTheContract(t *testing.T) {
 	RunStoreContract(t, func(*testing.T) auth.Store { return newRefStore() })
-	RunTokenHashUniquenessContract(t, func(*testing.T) auth.Store { return newRefStore() })
 }
 
 // TestTheContractRejectsNonCompliantStores is what makes this suite worth
@@ -603,12 +604,12 @@ func TestTheContractRejectsNonCompliantStores(t *testing.T) {
 		},
 		{
 			defect:   "two sessions may share one token hash",
-			check:    "Session/TokenHashIsUnique",
+			check:    "CreateSession/TokenHashIsUnique",
 			newStore: func() auth.Store { return sharedTokenHashes{newRefStore()} },
 		},
 		{
 			defect:   "two verifications may share one token hash",
-			check:    "Verification/TokenHashIsUnique",
+			check:    "CreateVerification/TokenHashIsUnique",
 			newStore: func() auth.Store { return sharedTokenHashes{newRefStore()} },
 		},
 	}

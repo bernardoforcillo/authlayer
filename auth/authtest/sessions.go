@@ -13,6 +13,7 @@ func sessionChecks() []check {
 	return []check{
 		{"CreateSession/RoundTrip", checkCreateSessionRoundTrip},
 		{"CreateSession/DuplicateIDReturnsErrIDTakenAndKeepsTheRow", checkCreateSessionDuplicateID},
+		{"CreateSession/TokenHashIsUnique", checkSessionTokenHashUnique},
 		{"FindSessionByHash/UnknownHashReturnsErrSessionNotFound", checkFindSessionByHashNotFound},
 		{"ListSessionsByUser/ReturnsEveryStateAndOnlyThatUser", checkListSessionsByUser},
 		{"ListSessionsByUser/UnknownUserIsEmptyNotAnError", checkListSessionsByUserEmpty},
@@ -418,5 +419,36 @@ func checkCreateSuccessorSessionDuplicateIDNoPredecessor(t tb, st auth.Store) {
 	wantErrIs(t, "CreateSuccessorSession with an id already taken and no predecessor", err, auth.ErrIDTaken)
 	if ok {
 		t.Fatalf("CreateSuccessorSession ok = true alongside ErrIDTaken")
+	}
+}
+
+// checkSessionTokenHashUnique asserts [auth.Session.TokenHash]'s uniqueness
+// MUST: a second session under a hash another row already holds must not be
+// stored. Without it MarkRotated's single-winner contract breaks with no
+// atomicity defect at all — two concurrent callers each atomically win a
+// different one of the colliding rows — and FindSessionByHash resolves to
+// whichever row the backend happens to return first.
+//
+// Which error the rejection carries is not asserted: the port classifies
+// only ErrIDTaken on this method and leaves token-hash uniqueness to the
+// backend's own constraint, so an unwrapped driver error is a compliant
+// answer.
+func checkSessionTokenHashUnique(t tb, st auth.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+	userID := newID()
+	first := mustCreateSession(t, st, newSession(userID, newID(), at))
+
+	clash := newSession(userID, newID(), at)
+	clash.TokenHash = first.TokenHash
+	if _, err := st.CreateSession(ctx, clash); err == nil {
+		t.Fatalf("CreateSession with a token hash another session already holds returned nil — auth.Session.TokenHash's uniqueness MUST is not enforced")
+	}
+
+	got, err := st.FindSessionByHash(ctx, first.TokenHash)
+	wantNoErr(t, "FindSessionByHash", err)
+	if got.ID != first.ID {
+		t.Fatalf("FindSessionByHash returned id %q, want the only row that should hold the hash, %q", got.ID, first.ID)
 	}
 }

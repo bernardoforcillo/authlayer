@@ -22,6 +22,7 @@ func verificationChecks() []check {
 	return []check{
 		{"CreateVerification/RoundTripAndNormalizesForEveryPurpose", checkCreateVerification},
 		{"CreateVerification/DuplicateIDReturnsErrIDTakenAndKeepsTheRow", checkCreateVerificationDuplicateID},
+		{"CreateVerification/TokenHashIsUnique", checkVerificationTokenHashUnique},
 		{"FindVerificationByHash/UnknownHashReturnsErrVerificationNotFound", checkFindVerificationByHashNotFound},
 		{"DeleteVerification/RemovesExactlyOneRow", checkDeleteVerification},
 		{"DeleteVerification/UnknownIDReturnsErrVerificationNotFound", checkDeleteVerificationNotFound},
@@ -33,13 +34,6 @@ func verificationChecks() []check {
 func housekeepingChecks() []check {
 	return []check{
 		{"PurgeExpired/CutoffIsStrictAcrossBothKinds", checkPurgeExpired},
-	}
-}
-
-func tokenHashUniquenessChecks() []check {
-	return []check{
-		{"Session/TokenHashIsUnique", checkSessionTokenHashUnique},
-		{"Verification/TokenHashIsUnique", checkVerificationTokenHashUnique},
 	}
 }
 
@@ -237,37 +231,6 @@ func checkPurgeExpired(t tb, st auth.Store) {
 	sort.Strings(want)
 	if !sameIDs(sortedIDs(left), want) {
 		t.Fatalf("ListSessionsByUser after PurgeExpired returned %v, want %v", sortedIDs(left), want)
-	}
-}
-
-// checkSessionTokenHashUnique asserts [auth.Session.TokenHash]'s uniqueness
-// MUST: a second session under a hash another row already holds must not be
-// stored. Without it MarkRotated's single-winner contract breaks with no
-// atomicity defect at all — two concurrent callers each atomically win a
-// different one of the colliding rows — and FindSessionByHash resolves to
-// whichever row the backend happens to return first.
-//
-// Which error the rejection carries is not asserted: the port classifies
-// only ErrIDTaken on this method and leaves token-hash uniqueness to the
-// backend's own constraint, so an unwrapped driver error is a compliant
-// answer.
-func checkSessionTokenHashUnique(t tb, st auth.Store) {
-	t.Helper()
-	ctx := context.Background()
-	at := stamp()
-	userID := newID()
-	first := mustCreateSession(t, st, newSession(userID, newID(), at))
-
-	clash := newSession(userID, newID(), at)
-	clash.TokenHash = first.TokenHash
-	if _, err := st.CreateSession(ctx, clash); err == nil {
-		t.Fatalf("CreateSession with a token hash another session already holds returned nil — auth.Session.TokenHash's uniqueness MUST is not enforced")
-	}
-
-	got, err := st.FindSessionByHash(ctx, first.TokenHash)
-	wantNoErr(t, "FindSessionByHash", err)
-	if got.ID != first.ID {
-		t.Fatalf("FindSessionByHash returned id %q, want the only row that should hold the hash, %q", got.ID, first.ID)
 	}
 }
 

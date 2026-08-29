@@ -1432,7 +1432,6 @@ func TestAuthStoreSatisfiesTheStoreContractLive(t *testing.T) {
 		return st
 	}
 	authtest.RunStoreContract(t, newStore)
-	authtest.RunTokenHashUniquenessContract(t, newStore)
 }
 
 // TestAuthStoreCreateSchemaLandsConstraintsOnRealPostgres proves all three

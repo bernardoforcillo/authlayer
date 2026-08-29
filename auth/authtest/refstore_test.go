@@ -13,9 +13,9 @@ import (
 // each be exactly ONE defect away from a correct store: every one of them
 // embeds a *refStore and overrides a single method, reaching this type's maps
 // directly, which is why it lives here rather than being replaced by
-// store/memory's AuthStore (whose internals are unexported, and which
-// declines the token-hash uniqueness obligation on purpose — this one takes
-// it, so the same reference passes both exported contracts).
+// store/memory's AuthStore (whose internals are unexported, and which is a
+// backend under test by this suite rather than the fixture that defines what
+// passing it looks like).
 //
 // Every method holds mu for its entire body, so no check-then-write in it can
 // be split by a concurrent call. TestTheReferenceStorePassesTheContract is

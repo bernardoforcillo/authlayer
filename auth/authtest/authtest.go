@@ -88,15 +88,27 @@
 // # Token-hash uniqueness
 //
 // [auth.Session.TokenHash] and [auth.Verification.TokenHash] each carry a
-// uniqueness MUST on the record type. It is NOT part of [RunStoreContract]:
-// store/memory deliberately does not enforce it and says so in its own doc,
-// so folding it in would make one of this repository's own backends fail the
-// main suite. It is exported separately as
-// [RunTokenHashUniquenessContract] instead of being dropped, because a
-// backend that satisfies every method obligation and skips this one is still
-// wrong — MarkRotated's single-winner contract breaks with no atomicity
-// defect at all when two rows can share a hash. A backend meant for
-// production should run both.
+// uniqueness MUST on the record type rather than on a method. Both are part
+// of [RunStoreContract] like every other obligation — the checks are named
+// "CreateSession/TokenHashIsUnique" and
+// "CreateVerification/TokenHashIsUnique", after the write paths that have to
+// enforce them.
+//
+// They were briefly a second exported entry point, because store/memory did
+// not enforce them and folding them in would have failed one of this
+// repository's own backends. That was the wrong way round, and the backend
+// changed instead. A shared hash defeats [auth.Store.MarkRotated]'s
+// single-winner contract with no atomicity defect at all — two concurrent
+// callers each atomically win a DIFFERENT one of the colliding rows and both
+// report a successful rotation — so this is the same property refresh-token
+// rotation rests on, reached by another route, not a nicety a backend may
+// decline. Shipping it as an opt-in extra would have told the next in-memory
+// backend author it was optional, and would have let a caller develop
+// against store/memory and meet the constraint for the first time in
+// production against store/drops.
+//
+// What a rejected duplicate returns is still not asserted, for the reason
+// the previous section gives.
 package authtest
 
 import (
@@ -172,32 +184,11 @@ func storeContractChecks() []check {
 // users, sessions or verifications in it; see the package doc for why, and
 // for what this suite deliberately does not assert. It must not return nil.
 //
-// Token-hash uniqueness is not included here — run
-// [RunTokenHashUniquenessContract] as well; the package doc explains why the
-// two are separate entry points.
+// This is the only entry point: every obligation [auth.Store] states is
+// in here, token-hash uniqueness included.
 func RunStoreContract(t *testing.T, newStore func(t *testing.T) auth.Store) {
 	t.Helper()
 	runChecks(t, storeContractChecks(), newStore)
-}
-
-// RunTokenHashUniquenessContract asserts the uniqueness MUST that
-// [auth.Session.TokenHash] and [auth.Verification.TokenHash] state on the
-// record types: no two rows of the same kind may end up sharing a token
-// hash.
-//
-// It is a separate entry point from [RunStoreContract] because store/memory
-// declines this obligation deliberately and documents that it does — see the
-// package doc. Any backend that persists to shared, durable storage should
-// pass it.
-//
-// What a rejected duplicate returns is NOT asserted: the port classifies
-// only ErrIDTaken on the Create* methods and explicitly leaves token-hash
-// uniqueness to the backend's own constraint, so this checks that a second
-// insert with a colliding hash does not succeed, not which error it fails
-// with.
-func RunTokenHashUniquenessContract(t *testing.T, newStore func(t *testing.T) auth.Store) {
-	t.Helper()
-	runChecks(t, tokenHashUniquenessChecks(), newStore)
 }
 
 func runChecks(t *testing.T, checks []check, newStore func(t *testing.T) auth.Store) {

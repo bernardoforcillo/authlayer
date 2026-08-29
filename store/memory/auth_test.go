@@ -913,6 +913,122 @@ func TestCreateSuccessorSessionIDTakenCheckedEvenWhenPredecessorGone(t *testing.
 	}
 }
 
+// --- token-hash uniqueness ---
+//
+// authtest's contract suite already asserts that CreateSession and
+// CreateVerification REFUSE a colliding hash; it deliberately does not
+// assert which error they refuse with, because auth.Store classifies only
+// ErrIDTaken on those methods. These tests pin this store's own answer —
+// memory.ErrTokenHashTaken, matchable with errors.Is — and cover the one
+// insert path the port-level suite cannot reach, CreateSuccessorSession's.
+
+// TestCreateSessionDuplicateTokenHashReturnsErrTokenHashTaken pins both
+// halves of the refusal: the sentinel is ErrTokenHashTaken and NOT
+// auth.ErrIDTaken (the ids differ — only the hash collides, and reporting
+// ErrIDTaken would tell the caller something false about which column
+// collided), and the row that already held the hash is left exactly as it
+// was.
+func TestCreateSessionDuplicateTokenHashReturnsErrTokenHashTaken(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	first := auth.Session{ID: "sess1", UserID: "user1", FamilyID: "fam1", TokenHash: "shared-hash"}
+	if _, err := st.CreateSession(ctx, first); err != nil {
+		t.Fatalf("CreateSession(first): %v", err)
+	}
+
+	_, err := st.CreateSession(ctx, auth.Session{ID: "sess2", UserID: "user2", FamilyID: "fam2", TokenHash: "shared-hash"})
+	if !errors.Is(err, memory.ErrTokenHashTaken) {
+		t.Fatalf("CreateSession(duplicate token hash) err = %v, want ErrTokenHashTaken", err)
+	}
+	if errors.Is(err, auth.ErrIDTaken) {
+		t.Fatalf("CreateSession(duplicate token hash) err = %v, want it NOT to be auth.ErrIDTaken — the ids differ, only the hash collides", err)
+	}
+
+	got, err := st.FindSessionByHash(ctx, "shared-hash")
+	if err != nil {
+		t.Fatalf("FindSessionByHash: %v", err)
+	}
+	if got != first {
+		t.Fatalf("FindSessionByHash = %+v, want the original row %+v — the refused write must not have disturbed it", got, first)
+	}
+}
+
+// TestCreateVerificationDuplicateTokenHashReturnsErrTokenHashTaken is
+// TestCreateSessionDuplicateTokenHashReturnsErrTokenHashTaken's counterpart
+// for the other record kind that carries the same MUST.
+func TestCreateVerificationDuplicateTokenHashReturnsErrTokenHashTaken(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	first := auth.Verification{ID: "ver1", UserID: "user1", Purpose: "signup", Email: "a@example.test", TokenHash: "shared-hash"}
+	if _, err := st.CreateVerification(ctx, first); err != nil {
+		t.Fatalf("CreateVerification(first): %v", err)
+	}
+
+	_, err := st.CreateVerification(ctx, auth.Verification{ID: "ver2", UserID: "user2", Purpose: "signup", Email: "b@example.test", TokenHash: "shared-hash"})
+	if !errors.Is(err, memory.ErrTokenHashTaken) {
+		t.Fatalf("CreateVerification(duplicate token hash) err = %v, want ErrTokenHashTaken", err)
+	}
+	if errors.Is(err, auth.ErrIDTaken) {
+		t.Fatalf("CreateVerification(duplicate token hash) err = %v, want it NOT to be auth.ErrIDTaken", err)
+	}
+
+	got, err := st.FindVerificationByHash(ctx, "shared-hash")
+	if err != nil {
+		t.Fatalf("FindVerificationByHash: %v", err)
+	}
+	if got != first {
+		t.Fatalf("FindVerificationByHash = %+v, want the original row %+v", got, first)
+	}
+}
+
+// TestCreateSuccessorSessionDuplicateTokenHashReturnsErrTokenHashTaken
+// covers the store's other Session insert path. The port-level suite cannot
+// reach it: CreateSuccessorSession is gated on a live predecessor, so a
+// backend-agnostic check cannot separate "refused for the hash" from
+// "refused because the predecessor was gone".
+func TestCreateSuccessorSessionDuplicateTokenHashReturnsErrTokenHashTaken(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateSession(ctx, auth.Session{ID: "pred1", FamilyID: "fam1", TokenHash: "shared-hash"}); err != nil {
+		t.Fatalf("CreateSession(predecessor): %v", err)
+	}
+
+	_, ok, err := st.CreateSuccessorSession(ctx, "pred1", auth.Session{ID: "succ1", FamilyID: "fam1", TokenHash: "shared-hash"})
+	if !errors.Is(err, memory.ErrTokenHashTaken) {
+		t.Fatalf("CreateSuccessorSession(duplicate token hash) err = %v, want ErrTokenHashTaken", err)
+	}
+	if ok {
+		t.Fatal("CreateSuccessorSession ok = true despite a colliding token hash")
+	}
+}
+
+// TestCreateSuccessorSessionPredecessorGoneOutranksTokenHashTaken pins the
+// precedence between this method's two refusals, the way
+// TestCreateSuccessorSessionIDTakenCheckedEvenWhenPredecessorGone pins the
+// other pair. The id check runs first and is independent of the
+// predecessor, as auth.Store requires; the token-hash check runs AFTER the
+// liveness gate, so a rotation that has already lost its family reports
+// that loss — (zero, false, nil), which the service layer reads as a replay
+// — rather than a hash conflict on a row it would never have inserted.
+func TestCreateSuccessorSessionPredecessorGoneOutranksTokenHashTaken(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateSession(ctx, auth.Session{ID: "other", FamilyID: "fam1", TokenHash: "shared-hash"}); err != nil {
+		t.Fatalf("CreateSession(other): %v", err)
+	}
+
+	got, ok, err := st.CreateSuccessorSession(ctx, "no-such-predecessor", auth.Session{ID: "succ1", FamilyID: "fam1", TokenHash: "shared-hash"})
+	if err != nil {
+		t.Fatalf("CreateSuccessorSession err = %v, want nil — a lost race is not a failure, and must not surface as ErrTokenHashTaken", err)
+	}
+	if ok {
+		t.Fatal("CreateSuccessorSession ok = true despite a nonexistent predecessor")
+	}
+	if got != (auth.Session{}) {
+		t.Fatalf("CreateSuccessorSession returned %+v, want the zero value", got)
+	}
+}
+
 // oneWinner reports whether (successes, errs) — a tally of MarkRotated
 // outcomes from some race — satisfies "exactly one winner, no errors". It is
 // a plain boolean predicate, not a t.Fatalf-calling assertion, specifically
@@ -945,11 +1061,11 @@ func oneWinner(successes, errs int) bool {
 // ok=true, the rest ok=false with no error, and a final RotatedAt equal to
 // the shared instant every goroutine raced with.
 //
-// [authtest.RunTokenHashUniquenessContract] is deliberately NOT run here:
-// this store does not enforce Session.TokenHash or Verification.TokenHash
-// uniqueness, on purpose and as its own package doc says, deferring it to
-// store/drops. That is why the uniqueness obligation is a separate entry
-// point in authtest rather than part of RunStoreContract.
+// Session.TokenHash's and Verification.TokenHash's uniqueness MUSTs are
+// part of that suite, and this store enforces them — it did not always, and
+// authtest carried them as a separate opt-in entry point for exactly as long
+// as that was true. See [AuthStore]'s own doc for why deferring them to
+// store/drops did not survive the port's text.
 //
 // What this test does NOT reliably do is catch a broken, split-lock
 // (read-then-write) MarkRotated — read the session under one lock
