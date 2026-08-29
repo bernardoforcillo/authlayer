@@ -17,7 +17,7 @@ once a 1.0 is cut. Until then, minor versions may break API.
   a third-party backend author had no way to check their work. The suite covers
   every one of them plus the ordinary behavioural contract — error
   classification, email normalization on every read and write path, and
-  `PurgeExpired`'s strict cutoff. Six of its fifty checks are races, because the
+  `PurgeExpired`'s strict cutoff. Six of its fifty-two checks are races, because the
   obligations behind them are unreachable sequentially: `MarkRotated`'s single
   winner; `CreateUser`'s and `UpdateUserEmail`'s one-address-one-account
   atomicity, one check each; a `MarkEmailVerified` racing the `UpdateUserEmail`
@@ -36,15 +36,42 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `DeleteSessionsByFamily`'s serialization **MUST** is asserted through its
   consequence, because forcing the lock-order inversion needs backend-specific
   SQL on a second connection. `store/drops` carries that one itself.
-- **`authtest.RunTokenHashUniquenessContract`** — the uniqueness **MUST** on
-  `Session.TokenHash` and `Verification.TokenHash`, as a separate entry point.
-  `store/memory` declines that obligation deliberately (its own doc says so, and
-  defers it to `store/drops`), so folding it into `RunStoreContract` would make
-  an in-tree backend fail the main suite. A backend meant for production should
-  run both; `store/drops` does.
+- **Token-hash uniqueness is part of that suite**, as
+  `CreateSession/TokenHashIsUnique` and `CreateVerification/TokenHashIsUnique`.
+  `Session.TokenHash` and `Verification.TokenHash` carry their **MUST** on the
+  record type rather than on a method, and a backend that satisfies every
+  method obligation and skips these is still wrong: a shared hash defeats
+  `MarkRotated`'s single-winner contract *with no atomicity defect at all*,
+  because two concurrent callers each atomically win a different one of the
+  colliding rows. It shipped briefly as a separate entry point,
+  `RunTokenHashUniquenessContract`, because `store/memory` did not enforce it —
+  the backend changed instead (see below), and the second entry point is gone.
+  What a rejected duplicate *returns* is still not asserted, since the port
+  classifies only `ErrIDTaken` there.
 
 ### Changed
 
+- **`store/memory`'s `AuthStore` now enforces `Session.TokenHash` and
+  `Verification.TokenHash` uniqueness**, which `auth.Store` requires of a
+  backend and which this store previously deferred to `store/drops` (its
+  package doc said so). The port's own text is why that did not hold: a shared
+  hash breaks `MarkRotated`'s single-winner contract with no atomicity defect
+  at all, which is the property refresh rotation rests on, and a caller who
+  developed against `store/memory` and deployed against `store/drops` met the
+  divergence for the first time in production. `CreateSession`,
+  `CreateSuccessorSession` and `CreateVerification` now reject a colliding hash
+  under the same acquisition of `mu` as the write, exactly as `CreateUser`'s
+  email check already worked.
+- **New: `memory.ErrTokenHashTaken`**, what those three methods return on a
+  collision. Deliberately not `auth.ErrIDTaken` and not a new `auth` sentinel:
+  `auth.Store`'s error contract classifies exactly one conflict on the
+  `Create*` methods — an id that already identifies a row of that same kind —
+  and explicitly leaves token-hash uniqueness to the backend's own constraint.
+  `store/drops` answers the same case with the driver's `pg.ErrUniqueViolation`
+  unwrapped; both backends now agree the write must fail, and neither pretends
+  the port classifies it. `invite`'s parallel (`EmailInvite.TokenHash`,
+  `Link.Code`) is unchanged and still deferred: `invite.Store` is a separate
+  port with its own obligations.
 - **`store/drops`' live lane no longer reimplements the `MarkRotated` contract.**
   It ran an independent copy because the original lived in an unexported helper
   in a `_test.go` file, reachable from nowhere else; both backends now run the
