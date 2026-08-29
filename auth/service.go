@@ -76,20 +76,19 @@ const (
 	PurposePasswordReset = "password_reset"
 )
 
-// defaultVerificationTTL is how long a [Service.SignUp]-minted "signup"
-// verification stays redeemable. Not exposed as an Option (see [New] for the
-// full option surface), but chosen generously (a day) since
-// an email that never arrives, or arrives late, must not force a whole new
-// sign-up.
+// defaultVerificationTTL is the default for [WithVerificationTTL]: how long
+// a "signup" or "email_change" [Verification] stays redeemable. Chosen
+// generously (a day) since an email that never arrives, or arrives late,
+// must not force a whole new sign-up.
 const defaultVerificationTTL = 24 * time.Hour
 
-// defaultPasswordResetTTL is how long a [Service.RequestPasswordReset]-minted
-// "password_reset" [Verification] stays redeemable. Deliberately shorter
-// than defaultVerificationTTL's 24 hours: a password-reset link is a more
-// security-sensitive bearer credential than a signup-confirmation link (it
-// grants a full credential change, not merely a "yes, I own this address"
-// attestation), and a short window is the conventional stance this class of
-// flow takes elsewhere.
+// defaultPasswordResetTTL is the default for [WithPasswordResetTTL]: how
+// long a "password_reset" [Verification] stays redeemable. Deliberately
+// shorter than defaultVerificationTTL's 24 hours: a password-reset link is a
+// more security-sensitive bearer credential than a signup-confirmation link
+// (it grants a full credential change, not merely a "yes, I own this
+// address" attestation), and a short window is the conventional stance this
+// class of flow takes elsewhere.
 const defaultPasswordResetTTL = time.Hour
 
 // Sentinel errors returned by Service, layered on top of the ones [Store]
@@ -243,9 +242,13 @@ type config struct {
 	signingKey [][]byte
 	accessTTL  time.Duration
 	refreshTTL time.Duration
-	clock      func() time.Time
-	idGen      func() string
-	limiter    RateLimiter
+	// verificationTTL and passwordResetTTL are the two [Verification]
+	// lifetimes — see [WithVerificationTTL] and [WithPasswordResetTTL].
+	verificationTTL  time.Duration
+	passwordResetTTL time.Duration
+	clock            func() time.Time
+	idGen            func() string
+	limiter          RateLimiter
 	// resetLimiter is the address-keyed [RateLimiter] [Service.RequestPasswordReset]
 	// additionally consults — see [WithPasswordResetRateLimiter]'s doc for
 	// why it is a second, independent config slot rather than reusing
@@ -257,12 +260,14 @@ type config struct {
 
 func defaultConfig() config {
 	return config{
-		hasher:     password.Bcrypt(0),
-		rules:      password.DefaultRules(),
-		accessTTL:  15 * time.Minute,
-		refreshTTL: 30 * 24 * time.Hour,
-		clock:      func() time.Time { return time.Now().UTC() },
-		idGen:      uid.NewV7,
+		hasher:           password.Bcrypt(0),
+		rules:            password.DefaultRules(),
+		accessTTL:        15 * time.Minute,
+		refreshTTL:       30 * 24 * time.Hour,
+		verificationTTL:  defaultVerificationTTL,
+		passwordResetTTL: defaultPasswordResetTTL,
+		clock:            func() time.Time { return time.Now().UTC() },
+		idGen:            uid.NewV7,
 	}
 }
 
@@ -327,6 +332,52 @@ func WithRefreshTTL(d time.Duration) Option {
 	return func(c *config) {
 		if d > 0 {
 			c.refreshTTL = d
+		}
+	}
+}
+
+// WithVerificationTTL sets how long a "signup" or "email_change"
+// [Verification] stays redeemable: [Service.SignUp] and
+// [Service.RequestEmailChange] both stamp ExpiresAt as CreatedAt+d. The
+// default is 24 hours, deliberately generous — an email that never arrives,
+// or arrives late, must not force a whole new sign-up. d <= 0 is ignored,
+// leaving the default (or a prior option) in place, rather than minting a
+// token that is already expired — matching [WithRefreshTTL] and
+// [github.com/bernardoforcillo/authlayer/invite.WithInviteExpiry].
+//
+// It has no effect on password-reset tokens, which carry their own,
+// deliberately shorter lifetime — see [WithPasswordResetTTL].
+//
+// Shortening this shortens the window in which an "email_change" token —
+// the strongest of the three, since [Service.RequestEmailChange] mints one
+// with no current password and [Service.VerifyEmail] redeems it with no
+// authentication at all — remains armed; see [Service.ChangePassword]'s
+// doc, "Why both purposes", for why that window matters.
+func WithVerificationTTL(d time.Duration) Option {
+	return func(c *config) {
+		if d > 0 {
+			c.verificationTTL = d
+		}
+	}
+}
+
+// WithPasswordResetTTL sets how long a "password_reset" [Verification]
+// minted by [Service.RequestPasswordReset] stays redeemable: ExpiresAt is
+// stamped as CreatedAt+d. The default is one hour — shorter than
+// [WithVerificationTTL]'s 24, because a reset link grants a full credential
+// change rather than a "yes, I own this address" attestation. d <= 0 is
+// ignored, leaving the default (or a prior option) in place.
+//
+// A shorter window here is a real hardening, and a deployment that delivers
+// mail promptly can afford one (fifteen minutes is a common choice); the
+// cost is that a user who opens the link late must request another. An
+// expired token is [ErrVerificationExpired] and is never burned by the
+// attempt — see [Service.ResetPassword] — so requesting another is the only
+// consequence.
+func WithPasswordResetTTL(d time.Duration) Option {
+	return func(c *config) {
+		if d > 0 {
+			c.passwordResetTTL = d
 		}
 	}
 }
@@ -681,9 +732,9 @@ func New(store Store, opts ...Option) *Service {
 // lost their password has no reason to look for. So step 4's mint is
 // purely additive: an account's real
 // pending verification, if it has one, is left exactly as it was: an
-// extra, never-returned row that ages out on its own via
-// defaultVerificationTTL, same as any other unredeemed token, and never
-// interferes with the real one being redeemed.
+// extra, never-returned row that ages out on its own after
+// [WithVerificationTTL]'s window, same as any other unredeemed token, and
+// never interferes with the real one being redeemed.
 //
 // A Store failure at any step is returned as-is — SignUp cannot honestly
 // report Created when it does not know, and guessing would risk exactly
@@ -791,7 +842,7 @@ func (s *Service) mintSignupVerification(ctx context.Context, userID, email stri
 		TokenHash: tokenHash,
 		Purpose:   PurposeSignup,
 		Email:     email,
-		ExpiresAt: now.Add(defaultVerificationTTL),
+		ExpiresAt: now.Add(s.cfg.verificationTTL),
 		CreatedAt: now,
 	}); err != nil {
 		return "", err
@@ -1788,7 +1839,8 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //
 // A still-valid "email_change" token is the STRONGER of the two, and
 // sweeping only the reset one left the stronger door open: it lives
-// defaultVerificationTTL (24h) rather than the reset token's 1h,
+// [WithVerificationTTL]'s window (24h by default) rather than the reset
+// token's [WithPasswordResetTTL] one (1h by default),
 // [Service.RequestEmailChange] mints one with no current password at all
 // (so a briefly-stolen access token — which, per "What revocation does not
 // revoke" above, outlives even [Service.LogoutAll] for up to its own TTL —
@@ -2129,7 +2181,7 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 		TokenHash: tokenHash,
 		Purpose:   PurposePasswordReset,
 		Email:     u.Email,
-		ExpiresAt: now.Add(defaultPasswordResetTTL),
+		ExpiresAt: now.Add(s.cfg.passwordResetTTL),
 		CreatedAt: now,
 	}); cerr != nil {
 		// See the method doc, point 3: a failure reachable ONLY on this
@@ -2204,7 +2256,8 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 //
 // The email_change sweep closes the stronger of the two doors, and sweeping
 // only the reset one left it open: an "email_change" token lives
-// defaultVerificationTTL (24h) rather than this token's 1h, is minted with
+// [WithVerificationTTL]'s window (24h by default) rather than this token's
+// [WithPasswordResetTTL] one (1h by default), is minted with
 // no current password at all by [Service.RequestEmailChange], and is
 // redeemed by [Service.VerifyEmail] with NO authentication whatsoever —
 // moving the account to the attacker's address, after which the victim
@@ -2386,7 +2439,7 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 //     and Email set to newEmail (never the account's OLD address — see
 //     [Verification.Email]'s doc for why this field always carries the NEW
 //     address for this purpose specifically), using the same
-//     defaultVerificationTTL as a signup token.
+//     [WithVerificationTTL] window as a signup token.
 //
 // This method does NOT pre-check whether newEmail already belongs to a
 // DIFFERENT user before minting — an earlier version did, returning
@@ -2431,7 +2484,7 @@ func (s *Service) RequestEmailChange(ctx context.Context, userID, newEmail strin
 		TokenHash: tokenHash,
 		Purpose:   PurposeEmailChange,
 		Email:     normalized,
-		ExpiresAt: now.Add(defaultVerificationTTL),
+		ExpiresAt: now.Add(s.cfg.verificationTTL),
 		CreatedAt: now,
 	}); err != nil {
 		return "", err

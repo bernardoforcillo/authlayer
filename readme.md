@@ -1020,22 +1020,23 @@ account. `ip` must be non-empty — a blank one would put every caller that
 omits it into a single shared rate-limit bucket, so it is `ErrMissingIP`
 rather than a tolerated "unknown".
 
-**Two of the four lifetimes are not configurable.** `WithJWT` sets the access
-token's TTL and `WithRefreshTTL` the session's, as above. The two
-`Verification` lifetimes are constants with no `Option` behind them:
+**Four lifetimes, one option each:**
 
-| Token | Minted by | TTL | Configurable |
+| Token | Minted by | TTL | Option |
 |---|---|---|---|
 | access | `Login`, `Refresh` | 15 min default | `WithJWT` |
 | refresh (session) | `Login`, `Refresh` | 30 days default | `WithRefreshTTL` |
-| `signup`, `email_change` | `SignUp`, `RequestEmailChange` | **24 hours** | no |
-| `password_reset` | `RequestPasswordReset` | **1 hour** | no |
+| `signup`, `email_change` | `SignUp`, `RequestEmailChange` | 24 hours default | `WithVerificationTTL` |
+| `password_reset` | `RequestPasswordReset` | 1 hour default | `WithPasswordResetTTL` |
 
-The signup window is generous on purpose — mail that arrives late must not
-force a whole new sign-up — and the reset window is short on purpose, because
-a reset link grants a full credential change rather than an "I own this
-address" attestation. If your deployment needs either changed, that is a
-change to `auth`'s own constants today, not a wiring decision.
+The defaults differ on purpose: the signup window is generous because mail
+that arrives late must not force a whole new sign-up, and the reset window is
+short because a reset link grants a full credential change rather than an "I
+own this address" attestation. Every one of these ignores a non-positive
+duration and keeps its default rather than minting a token that has already
+expired. Shortening the verification TTL also shortens how long an
+`email_change` token stays armed, which is the strongest of the three — see
+the password lifecycle below.
 
 ### Rotation, reuse detection, and family revocation
 
@@ -1227,7 +1228,8 @@ real side doors. The reset one: an attacker who requested a reset link and
 waited would otherwise keep a working way in for that token's whole hour, even
 after the victim changed their password — the one thing a user does on
 suspecting compromise. The `email_change` one is stronger and was the half
-left open for a while: that token lives 24 hours rather than one, needs no
+left open for a while: that token lives 24 hours rather than one by default
+(both are options — see the lifetimes table above), needs no
 current password to mint (`RequestEmailChange` takes a user id, so a
 briefly-stolen access token is enough), and `VerifyEmail` redeems it with no
 authentication at all — moving the account to the attacker's address, after

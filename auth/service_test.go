@@ -4061,3 +4061,150 @@ func TestUserReturnsTheAccountAndPropagatesNotFound(t *testing.T) {
 		t.Fatalf("User(unknown id) = %v, want ErrUserNotFound", err)
 	}
 }
+
+// ============================================================
+// WithVerificationTTL / WithPasswordResetTTL
+// ============================================================
+
+// TestWithVerificationTTLAppliesToBothVerificationPurposes pins that the
+// option reaches both minting paths — SignUp's "signup" token and
+// RequestEmailChange's "email_change" one — since they share one lifetime
+// by design.
+func TestWithVerificationTTLAppliesToBothVerificationPurposes(t *testing.T) {
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	svc, store := newTestService(t,
+		auth.WithClock(func() time.Time { return now }),
+		auth.WithVerificationTTL(90*time.Minute),
+	)
+	ctx := context.Background()
+
+	res, err := svc.SignUp(ctx, "tilda@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	signup, err := store.FindVerificationByHash(ctx, token.HashOpaque(res.VerifyToken))
+	if err != nil {
+		t.Fatalf("FindVerificationByHash(signup): %v", err)
+	}
+	if want := now.Add(90 * time.Minute); !signup.ExpiresAt.Equal(want) {
+		t.Fatalf("signup ExpiresAt = %v, want %v", signup.ExpiresAt, want)
+	}
+
+	changeTok, err := svc.RequestEmailChange(ctx, res.User.ID, "tilda-new@example.com")
+	if err != nil {
+		t.Fatalf("RequestEmailChange: %v", err)
+	}
+	change, err := store.FindVerificationByHash(ctx, token.HashOpaque(changeTok))
+	if err != nil {
+		t.Fatalf("FindVerificationByHash(email_change): %v", err)
+	}
+	if want := now.Add(90 * time.Minute); !change.ExpiresAt.Equal(want) {
+		t.Fatalf("email_change ExpiresAt = %v, want %v", change.ExpiresAt, want)
+	}
+}
+
+// TestWithPasswordResetTTLOverridesDefault pins the reset lifetime, and
+// that it is independent of WithVerificationTTL: an operator shortening the
+// reset window to fifteen minutes must not shorten the signup window with
+// it.
+func TestWithPasswordResetTTLOverridesDefault(t *testing.T) {
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	svc, store := newTestService(t,
+		auth.WithClock(func() time.Time { return now }),
+		auth.WithPasswordResetTTL(15*time.Minute),
+	)
+	ctx := context.Background()
+
+	res, err := svc.SignUp(ctx, "ulla@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	signup, err := store.FindVerificationByHash(ctx, token.HashOpaque(res.VerifyToken))
+	if err != nil {
+		t.Fatalf("FindVerificationByHash(signup): %v", err)
+	}
+	if want := now.Add(24 * time.Hour); !signup.ExpiresAt.Equal(want) {
+		t.Fatalf("signup ExpiresAt = %v, want the untouched 24h default %v", signup.ExpiresAt, want)
+	}
+
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "ulla@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset = (%q, %v, %v), want a token", resetTok, ok, err)
+	}
+	reset, err := store.FindVerificationByHash(ctx, token.HashOpaque(resetTok))
+	if err != nil {
+		t.Fatalf("FindVerificationByHash(password_reset): %v", err)
+	}
+	if want := now.Add(15 * time.Minute); !reset.ExpiresAt.Equal(want) {
+		t.Fatalf("password_reset ExpiresAt = %v, want %v", reset.ExpiresAt, want)
+	}
+}
+
+// TestVerificationTTLOptionsIgnoreNonPositiveDurations pins the same
+// bad-input stance WithRefreshTTL and invite.WithInviteExpiry take: a
+// non-positive duration leaves the default in place rather than minting a
+// token that has already expired.
+func TestVerificationTTLOptionsIgnoreNonPositiveDurations(t *testing.T) {
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	svc, store := newTestService(t,
+		auth.WithClock(func() time.Time { return now }),
+		auth.WithVerificationTTL(0),
+		auth.WithVerificationTTL(-time.Hour),
+		auth.WithPasswordResetTTL(0),
+		auth.WithPasswordResetTTL(-time.Hour),
+	)
+	ctx := context.Background()
+
+	res, err := svc.SignUp(ctx, "vito@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	signup, err := store.FindVerificationByHash(ctx, token.HashOpaque(res.VerifyToken))
+	if err != nil {
+		t.Fatalf("FindVerificationByHash(signup): %v", err)
+	}
+	if want := now.Add(24 * time.Hour); !signup.ExpiresAt.Equal(want) {
+		t.Fatalf("signup ExpiresAt = %v, want the 24h default %v", signup.ExpiresAt, want)
+	}
+
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "vito@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset = (%q, %v, %v), want a token", resetTok, ok, err)
+	}
+	reset, err := store.FindVerificationByHash(ctx, token.HashOpaque(resetTok))
+	if err != nil {
+		t.Fatalf("FindVerificationByHash(password_reset): %v", err)
+	}
+	if want := now.Add(time.Hour); !reset.ExpiresAt.Equal(want) {
+		t.Fatalf("password_reset ExpiresAt = %v, want the 1h default %v", reset.ExpiresAt, want)
+	}
+}
+
+// TestWithPasswordResetTTLShortensTheRedeemableWindow proves the option has
+// the operational effect an operator wants from it, not merely a different
+// stamped value: a token minted with a 15-minute window is refused with
+// ErrVerificationExpired once the clock passes it, and is not burned by the
+// attempt.
+func TestWithPasswordResetTTLShortensTheRedeemableWindow(t *testing.T) {
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	clock := now
+	svc, store := newTestService(t,
+		auth.WithClock(func() time.Time { return clock }),
+		auth.WithPasswordResetTTL(15*time.Minute),
+	)
+	ctx := context.Background()
+	mustSignUp(t, svc, "wren@example.com", validPassword)
+
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "wren@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset = (%q, %v, %v), want a token", resetTok, ok, err)
+	}
+
+	clock = now.Add(16 * time.Minute)
+	if err := svc.ResetPassword(ctx, resetTok, "Another-Valid-Pass22!"); !errors.Is(err, auth.ErrVerificationExpired) {
+		t.Fatalf("ResetPassword after the configured window = %v, want ErrVerificationExpired", err)
+	}
+	if _, err := store.FindVerificationByHash(ctx, token.HashOpaque(resetTok)); err != nil {
+		t.Fatalf("the expired token was burned by the failed attempt (%v); expiry is checked before the claim", err)
+	}
+}
