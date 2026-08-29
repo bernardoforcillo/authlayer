@@ -604,9 +604,10 @@ type Service struct {
 // there is no type argument to get wrong. That is why it returns no error,
 // matching every other constructor in this codebase (scope.New, invite.New).
 // The one configuration this constructor cannot check for you is [WithJWT]:
-// there is no default signing key, so a Service built without one fails
-// closed the first time [Service.Login] tries to issue a token — see that
-// option's doc.
+// there is no default signing key, so a Service built without one — or with
+// one under the 32-byte HS256 floor — fails closed the first time
+// [Service.Login] tries to issue a token, or [Service.VerifyAccessToken] to
+// verify one, with token.ErrKeyTooShort. See that option's doc.
 func New(store Store, opts ...Option) *Service {
 	cfg := defaultConfig()
 	for _, o := range opts {
