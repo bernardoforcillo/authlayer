@@ -180,6 +180,17 @@ var (
 	// Treat it the same as any other authentication failure: the caller
 	// must sign in again.
 	ErrSessionRevoked = errors.New("authlayer/auth: session family was revoked before rotation could complete")
+	// ErrEmailRequired: [Service.RequestEmailChange] was given a newEmail
+	// that is empty once normalized (see [NormalizeEmail] — this also
+	// catches a whitespace-only value, not just a literal ""). Checked
+	// before anything else, including the [Store.FindUserByID] existence
+	// check, so a malformed request never reaches the Store at all. Without
+	// this guard, an empty newEmail minted a redeemable token exactly like
+	// any other, and successful redemption via [Service.VerifyEmail] set
+	// [UserBase.Email] to "" — a self-inflicted account lockout with no
+	// recovery path this package exposes, since [Service.Login] and
+	// [Service.RequestPasswordReset] both look accounts up BY email.
+	ErrEmailRequired = errors.New("authlayer/auth: email must not be empty")
 )
 
 // RateLimiter throttles [Service.Login] attempts by a caller-supplied key.
@@ -352,6 +363,23 @@ func WithRateLimiter(l RateLimiter) Option {
 // point 2, for why: an address-keyed rate limit that surfaced as a
 // distinguishable error would itself become the exact existence oracle this
 // method's whole design exists to close.
+//
+// This limiter is also what this method's own re-issue behaviour depends
+// on for protection, not merely enumeration timing: [Service.RequestPasswordReset]
+// invalidates an address's earlier "password_reset" token every time a new
+// one is minted (see that method's doc, point 1, and [Store]'s own
+// documented contract on [Store.DeleteVerificationsByUserAndPurpose]).
+// Without an address-keyed limit, ANYONE who merely knows an address — no
+// credential, no prior relationship to the account required — can kill a
+// victim's genuine, still-unredeemed reset link at will simply by looping
+// calls to RequestPasswordReset for that address, since each call
+// invalidates whatever the account's most recent token was. That is
+// inherent to the re-issue contract [Store] documents, not a bug this
+// method can avoid while still honouring it, and this package does not
+// configure a default here for exactly the reason [WithRateLimiter]'s own
+// default is nil: the right bucket size is an operator decision. Setting
+// this limiter is what bounds how often that griefing can happen, not just
+// how many timing samples an attacker can collect.
 func WithPasswordResetRateLimiter(l RateLimiter) Option {
 	return func(c *config) { c.resetLimiter = l }
 }
@@ -1350,14 +1378,15 @@ func (s *Service[U, PU]) RevokeSession(ctx context.Context, userID, sessionID st
 //
 // On success, ChangePassword revokes every OTHER session belonging to
 // userID — every other device/browser this account is currently signed in
-// on — while leaving the caller's OWN, currently-in-use session alive, so
-// the very request that changed the password does not itself get logged
-// out. That requires knowing WHICH of userID's sessions belongs to the
-// caller, and a signature of just (ctx, userID, current, next) gives this
-// method nothing to distinguish "the session this request is using" from
-// any of the account's other sessions — so this method's signature adds a
-// fifth parameter, currentSessionID, to close that gap; see the parameter
-// list below.
+// on (see "What revocation does not revoke" below for what that guarantee
+// does NOT include) — while leaving the caller's OWN, currently-in-use
+// session alive, so the very request that changed the password does not
+// itself get logged out. That requires knowing WHICH of userID's sessions
+// belongs to the caller, and a signature of just (ctx, userID, current,
+// next) gives this method nothing to distinguish "the session this request
+// is using" from any of the account's other sessions — so this method's
+// signature adds a fifth parameter, currentSessionID, to close that gap;
+// see the parameter list below.
 //
 // currentSessionID is the [Session.ID] of the caller's own, currently
 // presented session — ordinarily the SessionID claim off the access token
@@ -1370,6 +1399,26 @@ func (s *Service[U, PU]) RevokeSession(ctx context.Context, userID, sessionID st
 // supply its own session id (a service account changing another user's
 // password out-of-band, say) gets exactly that "everywhere" behaviour,
 // which is the safe direction to default to.
+//
+// # What revocation does not revoke
+//
+// "Revoked" above means the [Session] row — the refresh token — is gone:
+// [Service.Refresh] on it now fails, and [Service.ListSessions] stops
+// listing it. It does NOT invalidate an access token ALREADY ISSUED for
+// that session: a short-lived HS256 JWT (see [WithJWT] — 15 minutes by
+// default) is stateless by design, and this package never looks a
+// presented one up in the [Store] to check it is still current, only
+// verifies its signature and expiry (see [token.Parse]). A device holding
+// one keeps working for up to the remainder of its own TTL after this call
+// revokes the [Session] that minted it. This is the same limitation
+// [Service.LogoutAll] already has — inherent to a stateless access token,
+// not a defect specific to this method, but stated here explicitly rather
+// than left for the prose above to imply otherwise. An application that
+// needs another device's access to stop being honoured sooner than that
+// TTL must check the SessionID ("sid") claim (see [token.Claims.SessionID])
+// against the [Store] on every request, the same per-request lookup this
+// package's own [Service.Refresh] and [Service.RevokeSession] already
+// perform, rather than trusting a parsed, still-unexpired JWT alone.
 //
 // # Ordering
 //
@@ -1389,13 +1438,26 @@ func (s *Service[U, PU]) RevokeSession(ctx context.Context, userID, sessionID st
 //  5. next is hashed and persisted via [Store.UpdateUserPassword].
 //  6. Any outstanding "password_reset" [Verification] for this account is
 //     invalidated via [Store.DeleteVerificationsByUserAndPurpose]. Without
-//     this, an attacker holding a still-valid reset link (requested before,
-//     or concurrently with, this call) could redeem it AFTER the account
-//     owner used THIS method to change their password — the one action a
-//     user takes when they suspect compromise — and take the account right
-//     back for the remainder of the reset token's TTL. [Service.ResetPassword]
-//     closes the same side door for its own, differently-triggered path;
-//     see that method's doc.
+//     this, an attacker holding a still-valid reset link — one whose
+//     [Service.RequestPasswordReset] call ran and returned BEFORE this
+//     call started — could redeem it AFTER the account owner used THIS
+//     method to change their password — the one action a user takes when
+//     they suspect compromise — and take the account right back for the
+//     remainder of the reset token's TTL. This guarantee is SEQUENTIAL
+//     ONLY: nothing orders this sweep against a concurrently-running
+//     [Service.RequestPasswordReset] call. If that other call's own
+//     [Store.CreateVerification] has not yet committed at the instant this
+//     sweep runs, the sweep finds nothing, the concurrent mint proceeds
+//     moments later, and the resulting token survives — demonstrated
+//     deterministically by parking an in-flight RequestPasswordReset at
+//     CreateVerification, running ChangePassword to completion (the sweep
+//     finds nothing), then releasing the mint: the token redeems, and the
+//     attacker's password logs in. Closing that window for real would need
+//     a transaction spanning both the sweep and the mint, which [Store]
+//     does not offer today — this method does not claim to close it, only
+//     the strictly-sequential case. [Service.ResetPassword] closes the same
+//     side door, with the same sequential-only scope, for its own,
+//     differently-triggered path; see that method's doc.
 //  7. Every session NOT sharing currentSessionID's family is revoked via
 //     [Store.DeleteSessionsByFamily], one call per distinct OTHER family —
 //     the same "list, then delete per distinct family" shape
@@ -1692,8 +1754,10 @@ func (s *Service[U, PU]) RequestPasswordReset(ctx context.Context, email, ip str
 
 // ResetPassword redeems plainToken — a "password_reset" [Verification]
 // minted by [Service.RequestPasswordReset] — setting the account's password
-// to next and revoking EVERY session it has, on every device: unlike
-// [Service.ChangePassword], there is no "caller's own session" to spare
+// to next and revoking EVERY session it has, on every device (see
+// [Service.ChangePassword]'s doc, "What revocation does not revoke", for
+// what that guarantee does NOT include — the same limitation applies here):
+// unlike [Service.ChangePassword], there is no "caller's own session" to spare
 // here, because presenting a valid reset token is not proof the caller is
 // using any of the account's existing sessions at all — it may be reached
 // from a device that was never signed in, precisely the scenario this flow
@@ -1738,11 +1802,18 @@ func (s *Service[U, PU]) RequestPasswordReset(ctx context.Context, email, ip str
 // [Store.DeleteVerificationsByUserAndPurpose] invalidates any OTHER
 // outstanding "password_reset" token for the same user — the token THIS
 // call redeemed is already gone via the claim above, but a second,
-// still-live token from an earlier (or concurrent)
-// [Service.RequestPasswordReset] call is not, and would otherwise still
-// grant a full password reset after this one already completed. This is
-// the same side door [Service.ChangePassword] closes for its own,
-// differently-triggered path — see that method's doc.
+// still-live token from an earlier [Service.RequestPasswordReset] call
+// that already ran and returned BEFORE this call started is not, and would
+// otherwise still grant a full password reset after this one already
+// completed. This is the same side door [Service.ChangePassword] closes
+// for its own, differently-triggered path, with the identical
+// SEQUENTIAL-ONLY scope that method's doc discloses: nothing orders this
+// sweep against a [Service.RequestPasswordReset] call whose own
+// [Store.CreateVerification] is genuinely concurrent with this one, and a
+// token minted by such a call can still survive and later redeem — see
+// [Service.ChangePassword]'s doc, point 6, for the deterministic
+// demonstration and why closing that window would need a transaction
+// [Store] does not offer.
 //
 // Only THEN is every session belonging to the verification's UserID
 // revoked — one [Store.DeleteSessionsByFamily] call per distinct family,
@@ -1827,16 +1898,26 @@ func (s *Service[U, PU]) ResetPassword(ctx context.Context, plainToken, next str
 // needs to give nothing to. Accordingly it fails loudly and early rather
 // than uniformly:
 //
-//  1. [Store.FindUserByID] loads userID; ErrUserNotFound propagates as-is
+//  1. newEmail is normalized (see [NormalizeEmail]) and, if that leaves it
+//     empty — a literal "", or whitespace-only input — this returns
+//     [ErrEmailRequired] before touching the [Store] at all. Without this,
+//     an empty newEmail minted a token exactly like any other, and a
+//     successful redemption via [Service.VerifyEmail] set [UserBase.Email]
+//     to "": reproduced directly, this bricks the account — [Service.Login]
+//     and [Service.RequestPasswordReset] both look accounts up BY email, so
+//     an account with no email cannot be reached by either again. This was
+//     this method's only input check before this guard was added; removing
+//     it (see the ErrEmailTaken discussion below, which removed the OTHER
+//     check) would have left newEmail entirely unvalidated.
+//  2. [Store.FindUserByID] loads userID; ErrUserNotFound propagates as-is
 //     rather than being folded into some enumeration-safe shape — an
 //     invalid userID here is a caller bug (a stale or forged id), not an
 //     anonymous probe.
-//  2. A fresh [Verification] is minted with Purpose [PurposeEmailChange]
-//     and Email set to newEmail (normalized — see [NormalizeEmail]; never
-//     the account's OLD address — see [Verification.Email]'s doc for why
-//     this field always carries the NEW address for this purpose
-//     specifically), using the same defaultVerificationTTL as a signup
-//     token.
+//  3. A fresh [Verification] is minted with Purpose [PurposeEmailChange]
+//     and Email set to newEmail (never the account's OLD address — see
+//     [Verification.Email]'s doc for why this field always carries the NEW
+//     address for this purpose specifically), using the same
+//     defaultVerificationTTL as a signup token.
 //
 // This method does NOT pre-check whether newEmail already belongs to a
 // DIFFERENT user before minting — an earlier version did, returning
@@ -1861,11 +1942,14 @@ func (s *Service[U, PU]) ResetPassword(ctx context.Context, plainToken, next str
 //
 // A Store or [token.GenerateOpaque] error at any step is returned as-is.
 func (s *Service[U, PU]) RequestEmailChange(ctx context.Context, userID, newEmail string) (string, error) {
+	normalized := NormalizeEmail(newEmail)
+	if normalized == "" {
+		return "", ErrEmailRequired
+	}
+
 	if _, err := s.store.FindUserByID(ctx, userID); err != nil {
 		return "", err
 	}
-
-	normalized := NormalizeEmail(newEmail)
 
 	now := s.cfg.clock()
 	plainToken, tokenHash, err := token.GenerateOpaque()

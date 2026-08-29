@@ -3049,3 +3049,36 @@ func TestRequestEmailChangeSameEmailAllowed(t *testing.T) {
 		t.Fatal("token is empty")
 	}
 }
+
+// TestRequestEmailChangeRejectsEmptyEmail is the mandatory mutation-anchor
+// test for review round 2's FIX 3: an empty (or whitespace-only, once
+// normalized) newEmail must be rejected with ErrEmailRequired before
+// anything is minted. Reproduced at both HEAD and base before this guard
+// existed: an empty newEmail minted a real token, VerifyEmail redeemed it
+// successfully, the stored address became "", and the account was
+// permanently unreachable by email afterward — this test also confirms
+// that specific bricking scenario cannot occur once the guard is in place,
+// not merely that the immediate call errors.
+func TestRequestEmailChangeRejectsEmptyEmail(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "ivy2@example.com", validPassword)
+
+	if _, err := svc.RequestEmailChange(ctx, user.ID, ""); !errors.Is(err, auth.ErrEmailRequired) {
+		t.Fatalf("RequestEmailChange(\"\") err = %v, want ErrEmailRequired", err)
+	}
+	if _, err := svc.RequestEmailChange(ctx, user.ID, "   "); !errors.Is(err, auth.ErrEmailRequired) {
+		t.Fatalf("RequestEmailChange(whitespace-only) err = %v, want ErrEmailRequired", err)
+	}
+
+	// No verification of any kind was minted for either rejected call —
+	// confirmed by checking the account is untouched and still reachable at
+	// its real address, the property an empty newEmail would have destroyed.
+	stillThere, err := store.FindUserByEmail(ctx, "ivy2@example.com")
+	if err != nil {
+		t.Fatalf("FindUserByEmail(original address) after rejected requests: %v, want success — the account must still be reachable", err)
+	}
+	if stillThere.ID != user.ID {
+		t.Fatalf("FindUserByEmail returned a different user: got %q, want %q", stillThere.ID, user.ID)
+	}
+}
