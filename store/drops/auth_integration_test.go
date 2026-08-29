@@ -26,6 +26,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -41,6 +42,7 @@ import (
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
 	"github.com/bernardoforcillo/drops/stdlib"
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -2021,4 +2023,53 @@ func TestUpdateUserEmailConcurrentSameAddressExactlyOneWinnerLive(t *testing.T) 
 	if holders != 1 {
 		t.Fatalf("%d users hold %q after the race, want exactly 1", holders, target)
 	}
+}
+
+// TestNonUUIDIDGeneratorFailsAgainstDropsLive pins the backend constraint
+// auth.WithIDGenerator and scope.WithIDGenerator both document: an id
+// generator whose output PostgreSQL's uuid parser rejects fails against this
+// store, at the STORE and on the FIRST write, not at construction.
+//
+// It asserts the SQLSTATE rather than merely "an error", because the exact
+// code is what the two doc comments name and what a reader hitting it in
+// production will search for. And it asserts the failing VALUE is in the
+// message, since that is what tells a reader which knob produced it.
+//
+// Its counterpart in the auth package,
+// TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore, shows the same generator
+// working end to end against store/memory. Together they pin the shape of
+// the trap: it is invisible until deployment.
+//
+// The auth half is asserted here rather than the scope half only because
+// this file already has the auth fixtures; the cause is common to both, and
+// is that store/drops types every id this library mints for itself as uuid
+// unconditionally. WithTextUserIDs does not reach those columns — it types
+// user ids supplied from OUTSIDE the library.
+func TestNonUUIDIDGeneratorFailsAgainstDropsLive(t *testing.T) {
+	st := newLiveAuthStore(t)
+	n := 0
+	svc := auth.New(st,
+		auth.WithHasher(password.Bcrypt(bcrypt.MinCost)),
+		auth.WithJWT([][]byte{bytes.Repeat([]byte("k"), 32)}, 15*time.Minute),
+		auth.WithIDGenerator(func() string {
+			n++
+			return fmt.Sprintf("usr_readable_%03d", n)
+		}),
+	)
+
+	_, err := svc.SignUp(context.Background(), "readable@example.com", liveTestPassword)
+	if err == nil {
+		t.Fatal("SignUp succeeded with a non-UUID id generator — store/drops types users.id as uuid, so if this now works the constraint documented on auth.WithIDGenerator and scope.WithIDGenerator is stale and must be revisited")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("SignUp err = %v (%T), want a *pgconn.PgError", err, err)
+	}
+	if pgErr.Code != "22P02" {
+		t.Fatalf("SignUp err SQLSTATE = %s, want 22P02 (invalid_text_representation): %v", pgErr.Code, err)
+	}
+	if !strings.Contains(err.Error(), "usr_readable_") {
+		t.Fatalf("SignUp err does not name the rejected id, so a reader cannot tell which knob produced it: %v", err)
+	}
+	t.Logf("SQLSTATE %s: %v", pgErr.Code, err)
 }

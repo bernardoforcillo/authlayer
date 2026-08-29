@@ -399,10 +399,38 @@ func WithClock(now func() time.Time) Option {
 
 // WithIDGenerator sets the id generator used for users, sessions, and
 // verifications. The default is UUIDv7 (internal/uid.NewV7, not importable
-// from outside this module) — matching
-// [github.com/bernardoforcillo/authlayer/scope.WithIDGenerator]'s own
-// rationale. A nil generator is ignored, leaving the default (or a prior
-// option) in place.
+// from outside this module): time-ordered, so ids minted later sort later
+// and a b-tree index on a primary key stays dense. A nil generator is
+// ignored, leaving the default (or a prior option) in place.
+//
+// # A generator MUST produce UUID-parseable ids to use store/drops
+//
+// This is not a general "any id scheme you like" knob against the shipped
+// PostgreSQL backend.
+// [github.com/bernardoforcillo/authlayer/store/drops] types users.id,
+// sessions.id and verifications.id as PostgreSQL uuid unconditionally, and
+// offers NO option to make them text — the escape hatch that exists there,
+// [github.com/bernardoforcillo/authlayer/store/drops.WithTextUserIDs], types
+// the columns that hold a user id supplied from OUTSIDE this library
+// (user_id, owner_id, invited_by, created_by), never the ids this library
+// mints for itself.
+//
+// So a generator returning anything PostgreSQL's uuid parser rejects — a
+// ULID, a database sequence, a readable "usr_a1b2c3" — fails the very first
+// [Service.SignUp] with SQLSTATE 22P02 (invalid_text_representation). It
+// fails at the Store, not at construction, and
+// [github.com/bernardoforcillo/authlayer/store/memory] accepts any string
+// happily: a service developed and tested entirely against the memory store
+// with such a generator passes every test and breaks on its first real
+// sign-up. Both halves of that are pinned by test —
+// TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore in this package, and
+// TestNonUUIDIDGeneratorFailsAgainstDropsLive in store/drops's integration
+// lane, which asserts the 22P02 specifically.
+//
+// Against a Store of your own the only requirement is that ids are unique
+// and stable; use whatever that schema accepts.
+// [github.com/bernardoforcillo/authlayer/scope.WithIDGenerator] carries the
+// identical constraint, for the identical reason.
 func WithIDGenerator(gen func() string) Option {
 	return func(c *config) {
 		if gen != nil {

@@ -31,14 +31,21 @@ once a 1.0 is cut. Until then, minor versions may break API.
 - **UUIDv7 identifiers** (`authlayer/internal/uid`) — a dependency-free RFC 9562
   generator, now the default for containers and custom roles. Time-ordered, so
   ids sort in creation order and a primary-key index stays dense.
-  `WithIDGenerator` still overrides it.
+  `WithIDGenerator` still overrides it — but only with a generator whose
+  output PostgreSQL's `uuid` parser accepts, if `store/drops` is the backend;
+  see the `store/drops` entry below.
 - **Generic PostgreSQL store** (`authlayer/store/drops`) — `Store[C, M]` derives
   its columns from the `drop:` tags of the container and member types and takes
   its table names from `WithNames`, so a new scope instance needs no new store.
   `WithTextUserIDs` keeps the user-id columns — `user_id`, `owner_id`,
   `invited_by`, `created_by` — as `text` for consumers using only the RBAC half
   against a non-UUID user table. The ids authlayer mints for itself (`id`,
-  `container_id`, `parent_id`) stay `uuid` either way. A container or member
+  `container_id`, `parent_id`) stay `uuid` either way, which is the constraint
+  `scope.WithIDGenerator` and `auth.WithIDGenerator` inherit: a generator
+  returning a ULID or a sequence number fails the first write with
+  `SQLSTATE 22P02`, at the store rather than at construction, and `store/memory`
+  accepts it happily — so it is invisible until deployment. Both docs now say
+  so, and both behaviours are pinned by test. A container or member
   type missing a required `drop:` tag, or carrying an unsupported field type, is
   now rejected at construction with the type and the tag named, rather than
   nil-dereferencing at the first query.

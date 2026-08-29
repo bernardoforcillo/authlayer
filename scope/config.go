@@ -35,12 +35,39 @@ type Option func(*config)
 // WithIDGenerator sets the id generator used for containers and custom roles.
 //
 // The default is UUIDv7 (RFC 9562) — time-ordered, so ids minted later sort
-// later and a b-tree index on the primary key stays dense. Override it for
-// ULIDs, a database sequence, or whatever your schema expects; the engine only
-// requires that ids are unique and stable. A nil generator is ignored, leaving
-// the default in place.
+// later and a b-tree index on the primary key stays dense. The engine itself
+// only requires that ids are unique and stable. A nil generator is ignored,
+// leaving the default in place.
 //
-//	org.New(ac, store, org.WithIDGenerator(func() string { return ulid.Make().String() }))
+// # A generator MUST produce UUID-parseable ids to use store/drops
+//
+// The engine's own indifference is not the whole story, and an earlier
+// version of this doc — "override it for ULIDs, a database sequence, or
+// whatever your schema expects" — promised flexibility the shipped
+// PostgreSQL backend does not have.
+// [github.com/bernardoforcillo/authlayer/store/drops] types every id this
+// library mints for itself — a container's id, a role's id, and the
+// container_id / parent_id columns that reference them — as PostgreSQL uuid
+// unconditionally.
+//
+// [github.com/bernardoforcillo/authlayer/store/drops.WithTextUserIDs] does
+// NOT cover this, despite the name's apparent reach: it types the columns
+// holding a user id supplied from OUTSIDE this library (user_id, owner_id,
+// invited_by, created_by), so that the RBAC half can sit on an existing
+// non-UUID user table. Built with it and a ULID generator, the first
+// CreateContainer still fails with SQLSTATE 22P02
+// (invalid_text_representation), at the Store rather than at construction —
+// and [github.com/bernardoforcillo/authlayer/store/memory] accepts any
+// string, so a service tested only against that one passes everything and
+// breaks on deployment. Pinned by
+// TestNonUUIDIDGeneratorFailsAgainstDropsLive in store/drops's integration
+// lane.
+//
+// Against a Store of your own, use whatever that schema accepts.
+// [github.com/bernardoforcillo/authlayer/auth.WithIDGenerator] carries the
+// identical constraint, for the identical reason.
+//
+//	org.New(ac, store, org.WithIDGenerator(func() string { return uuid.NewString() }))
 func WithIDGenerator(gen func() string) Option {
 	return func(c *config) {
 		if gen != nil {

@@ -380,7 +380,7 @@ goroutine; the first error stops the chain.
 | `WithPolicy(p)` | Replace the authorization policy. |
 | `WithHooks(h...)` | Append lifecycle hooks (accumulates across calls). |
 | `WithClock(fn)` | Timestamp source; default `time.Now().UTC()`. Inject a fixed clock for deterministic tests. |
-| `WithIDGenerator(fn)` | Id source for containers and custom roles; default is UUIDv7 from `crypto/rand`. Swap in ULIDs or whatever your schema expects. |
+| `WithIDGenerator(fn)` | Id source for containers and custom roles; default is UUIDv7 from `crypto/rand`. **Must stay UUID-parseable against `store/drops`** — see [Ids](#ids). |
 | `WithParent(p, inherit)` | [Nest](#nested-scopes) this scope inside another, resolving standing through `p` and projecting it with `inherit`. |
 | `WithContainerResource(res)` | Name this scope's own container resource, so a [nested](#nested-scopes) `CreateContainer` knows what `<res>:create` to check for in the parent. |
 
@@ -588,7 +588,8 @@ columns holding a user id — `owner_id` as much as `user_id` — since authlaye
 generates user ids too. If you use only the RBAC half against an existing user
 table whose ids are not UUIDs, pass `dropsstore.WithTextUserIDs()`: it retypes
 every user-id column at once, and leaves the ids authlayer mints for itself
-(`id`, `container_id`, `parent_id`) as `uuid`.
+(`id`, `container_id`, `parent_id`) as `uuid`. That last clause is why it is
+not an escape hatch for `WithIDGenerator` — see [Ids](#ids).
 
 The unique constraints are load-bearing: they are what turn a concurrent
 double-insert into `ErrSlugTaken`, `ErrAlreadyMember` or `ErrRoleKeyTaken`
@@ -1555,8 +1556,36 @@ Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
 `internal/uid` is not importable — it is the RFC 9562 UUIDv7 generator
 authlayer uses for every id it mints (containers, roles, users, sessions,
 verifications), written out rather than depended on so the module stays at
-three requirements. `WithIDGenerator` overrides it wherever you would rather
-supply your own.
+three requirements. `scope.WithIDGenerator` and `auth.WithIDGenerator` override
+it — within the limit [Ids](#ids) describes.
+
+### Ids
+
+`scope.WithIDGenerator` and `auth.WithIDGenerator` replace the id source for
+everything authlayer mints. Against a `Store` of your own, the only requirement
+is that ids are unique and stable.
+
+**Against `store/drops` they must be UUID-parseable.** Every id the library
+mints for itself — a container's `id`, a role's `id`, `container_id`,
+`parent_id`, and `users`/`sessions`/`verifications` `id` — is a PostgreSQL
+`uuid` column, unconditionally. A ULID, a sequence number, or a readable
+`usr_a1b2c3` fails the first `CreateOrganization` or `SignUp` with
+`SQLSTATE 22P02` (`invalid_text_representation`).
+
+`WithTextUserIDs` is **not** the escape hatch for this, despite the name's
+apparent reach. It types the columns holding a user id supplied from *outside*
+the library — `user_id`, `owner_id`, `invited_by`, `created_by` — so the RBAC
+half can sit on an existing non-UUID user table. It does not touch the ids
+authlayer mints. `New[...](db, WithTextUserIDs())` with a ULID generator still
+fails on the first write.
+
+The failure lands at the store, on the first write, and `store/memory` accepts
+any string — so a service developed and tested entirely against the memory
+store with a non-UUID generator passes every test and breaks on deployment.
+Both halves are pinned by test:
+`TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore` in `auth`, and
+`TestNonUUIDIDGeneratorFailsAgainstDropsLive` in `store/drops`' integration
+lane, which asserts the `22P02` specifically.
 
 ## Roadmap
 

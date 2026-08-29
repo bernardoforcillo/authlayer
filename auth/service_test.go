@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -4263,5 +4264,59 @@ func TestPurgeExpiredDelegatesToStore(t *testing.T) {
 	// The user row is untouched: users do not expire.
 	if _, err := svc.User(ctx, res.User.ID); err != nil {
 		t.Fatalf("User after purge: %v, want the account still present", err)
+	}
+}
+
+// TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore is one half of the pair
+// pinning WithIDGenerator's documented backend constraint; the other half,
+// TestNonUUIDIDGeneratorFailsAgainstDropsLive, lives in store/drops's
+// integration lane and asserts the SQLSTATE 22P02 the same generator
+// produces there.
+//
+// This half exists to pin the TRAP rather than the failure: a service built
+// over store/memory with a readable, non-UUID generator works perfectly —
+// sign up, verify, log in — so a caller who develops and tests entirely
+// against the memory store gets no signal at all before deploying onto
+// store/drops. If this test ever starts failing because the memory store
+// gained an id-shape opinion of its own, WithIDGenerator's doc (and the
+// readme's) has to be revisited, because the trap it warns about would no
+// longer exist.
+func TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore(t *testing.T) {
+	ctx := context.Background()
+	n := 0
+	svc, store := newTestService(t, auth.WithIDGenerator(func() string {
+		n++
+		return fmt.Sprintf("usr_readable_%03d", n)
+	}))
+
+	res, err := svc.SignUp(ctx, "readable@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	if !strings.HasPrefix(res.User.ID, "usr_readable_") {
+		t.Fatalf("SignUp minted User.ID = %q, want the configured generator's shape", res.User.ID)
+	}
+	if _, err := svc.VerifyEmail(ctx, res.VerifyToken); err != nil {
+		t.Fatalf("VerifyEmail: %v", err)
+	}
+	login, err := svc.Login(ctx, "readable@example.com", validPassword, "203.0.113.9", "agent")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if !strings.HasPrefix(login.User.ID, "usr_readable_") {
+		t.Fatalf("Login returned User.ID = %q, want the configured generator's shape", login.User.ID)
+	}
+
+	// Sessions and verifications take their ids from the same generator, so
+	// every id the Store was handed is non-UUID — which is exactly what
+	// store/drops's uuid columns reject.
+	sessions, err := store.ListSessionsByUser(ctx, res.User.ID)
+	if err != nil || len(sessions) == 0 {
+		t.Fatalf("ListSessionsByUser = (%d rows, %v), want at least one row", len(sessions), err)
+	}
+	for _, sess := range sessions {
+		if !strings.HasPrefix(sess.ID, "usr_readable_") {
+			t.Fatalf("session id = %q, want the configured generator's shape", sess.ID)
+		}
 	}
 }
