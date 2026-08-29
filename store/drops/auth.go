@@ -481,11 +481,58 @@ func (st *AuthStore) DeleteSession(ctx context.Context, id string) error {
 
 // DeleteSessionsByFamily removes every session sharing familyID. Deleting
 // zero rows is not an error.
+//
+// # Lock, then delete — and why a single autocommit DELETE is not enough
+//
+// This is composed as two statements inside one [pg.DB.InTx] transaction —
+// SELECT ... FOR UPDATE over every row in the family, THEN the DELETE — not
+// the single autocommit DELETE an earlier version of this method used.
+// [AuthStore.CreateSuccessorSession] takes its own FOR UPDATE lock on the
+// predecessor row for the duration of ITS transaction (see that method's own
+// doc), so when this DELETE call is the reuse-detection response racing a
+// concurrent successor insert, the SELECT here blocks until that other
+// transaction commits or rolls back — exactly the serialization
+// CreateSuccessorSession's own doc describes from the other side.
+//
+// The DELETE that follows is what makes the wait worth taking: PostgreSQL
+// gives every statement in READ COMMITTED its own fresh snapshot, so the
+// DELETE re-snapshots AFTER the SELECT's wait has ended, and sees whatever
+// CreateSuccessorSession committed while this call was blocked — including a
+// successor row that did not exist when this call started. A single
+// autocommit DELETE has no such second statement: its own (only) snapshot is
+// taken BEFORE any wait it might do acquiring row locks, so once unblocked it
+// removes only the rows visible in that original snapshot — the predecessor,
+// never the successor a concurrent CreateSuccessorSession inserted and
+// committed while this call was blocked on the predecessor's lock. That gap
+// is not hypothetical: measured live, a single-statement DeleteSessionsByFamily
+// racing a lock-holding CreateSuccessorSession removed exactly the
+// predecessor and left the freshly-minted successor as the family's sole
+// survivor — resurrection through the OTHER side of the same race
+// [AuthStore.CreateSuccessorSession] was written to close. See this
+// package's own integration test for the live reproduction and the fix's
+// confirmation.
+//
+// No advisory lock, and no family-level lock, is needed for this: the row
+// locks SELECT ... FOR UPDATE takes here already cover every session in the
+// family, which is exactly the set CreateSuccessorSession's own predecessor
+// lock is a member of.
 func (st *AuthStore) DeleteSessionsByFamily(ctx context.Context, familyID string) error {
-	_, err := st.db.Delete(st.s.Sessions).
-		Where(st.s.sessions.eq("family_id", familyID)).
-		Exec(ctx)
-	return err
+	return st.db.InTx(ctx, func(txdb *pg.DB) error {
+		var locked []struct {
+			ID string `drop:"id"`
+		}
+		if err := txdb.Select(st.s.sessions.col("id")).
+			From(st.s.Sessions).
+			Where(st.s.sessions.eq("family_id", familyID)).
+			ForUpdate().
+			All(ctx, &locked); err != nil {
+			return err
+		}
+		_, err := txdb.Delete(st.s.Sessions).
+			Where(st.s.sessions.eq("family_id", familyID)).
+			Exec(ctx)
+		return err
+	})
 }
 
 // MarkRotated implements auth.Store's central compare-and-set as one
@@ -581,24 +628,27 @@ func (st *AuthStore) MarkRotated(ctx context.Context, tokenHash string, now time
 // starts — with certainty: PostgreSQL's row lock guarantees a DELETE
 // targeting a row this transaction holds FOR UPDATE cannot proceed until
 // this transaction ends, and a DELETE that has ALREADY committed leaves
-// nothing for the SELECT to find. It does NOT close a narrower window
-// where this transaction's FOR UPDATE lock is acquired (and this
-// transaction commits, inserting sess) BEFORE a concurrent DeleteSessionsByFamily
-// statement has even taken ITS OWN read snapshot: PostgreSQL's per-statement
-// MVCC snapshot means that DELETE can still correctly remove the
-// predecessor (a row already within its snapshot, re-checked via
-// EvalPlanQual once unblocked) while never seeing sess at all, since sess
-// did not exist under a snapshot taken before this transaction committed —
-// leaving sess as the family's sole survivor. Closing that fully would need
-// a family-level lock (an advisory lock keyed by family_id, held by every
-// mutator of that family) rather than a per-row one; not implemented here,
-// because it is a materially narrower window than the one this method was
-// written to close (this call's several preceding steps — FindUserByID,
-// GenerateOpaque, token.Issue — make it, in practice, arrive well after a
-// racing replay's own near-immediate DeleteSessionsByFamily has already
-// taken its snapshot) and widening the fix to a family-level lock was not
-// requested. See this package's own integration test for the scenario this
-// DOES close deterministically.
+// nothing for the SELECT to find.
+//
+// A narrower window remains at THIS method's own level: this transaction's
+// FOR UPDATE lock can be acquired, and this transaction can commit
+// (inserting sess), BEFORE a concurrent DeleteSessionsByFamily statement has
+// even taken ITS OWN read snapshot. An earlier round of this fix left that
+// window open with no defense at all, reasoning that
+// [github.com/bernardoforcillo/authlayer/auth.Service.Refresh]'s own call
+// shape (FindUserByID, GenerateOpaque, token.Issue all separate a winning
+// MarkRotated from this method) makes it vanishingly rare in practice — but
+// "rare" is not "closed", and a follow-up review measured it reproducing
+// live. The actual fix lives on the OTHER method: see
+// [AuthStore.DeleteSessionsByFamily]'s own doc, "Lock, then delete" — it is
+// no longer a single autocommit DELETE, so even when ITS SELECT ... FOR
+// UPDATE starts after this transaction has already committed, its DELETE
+// re-snapshots afterward and still catches sess. No family-level (advisory)
+// lock was needed to close this fully; per-row locking on both sides,
+// composed with DeleteSessionsByFamily's extra re-snapshotting statement,
+// is enough. See this package's own integration tests for both scenarios
+// this now closes deterministically — including the ordering where THIS
+// method wins the row lock first.
 func (st *AuthStore) CreateSuccessorSession(ctx context.Context, predecessorID string, sess auth.Session) (auth.Session, bool, error) {
 	var created auth.Session
 	won := false

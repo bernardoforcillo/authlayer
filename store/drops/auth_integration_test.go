@@ -740,6 +740,109 @@ func TestCreateSuccessorSessionDuplicateIDFailsLive(t *testing.T) {
 	}
 }
 
+// TestDeleteSessionsByFamilyRemovesConcurrentlyMintedSuccessorLive is FIX
+// 2's mandatory live regression test — the CRITICAL closed this round. It
+// reproduces the exact lock ordering the review measured directly:
+// CreateSuccessorSession wins the predecessor's FOR UPDATE lock FIRST and,
+// while holding it (about to insert but not yet committed), a concurrent
+// DeleteSessionsByFamily call blocks trying to acquire that same row's
+// lock. Once the lock holder commits (inserting the successor and
+// releasing the lock), the review measured DeleteSessionsByFamily's PRIOR,
+// single-autocommit-DELETE implementation removing exactly one row — the
+// predecessor — and leaving the freshly-minted successor as the family's
+// sole survivor: no SERIAL ordering of the two calls produces that outcome
+// (either DeleteSessionsByFamily's DELETE runs entirely before the SELECT
+// that finds the predecessor — nothing to insert against — or entirely
+// after the INSERT commits — both rows exist for the DELETE to remove), so
+// this is a genuine concurrency anomaly, not a benign reordering.
+//
+// Against the fixed, lock-then-delete DeleteSessionsByFamily this must
+// instead remove BOTH rows: its own DELETE statement re-snapshots only
+// AFTER its SELECT ... FOR UPDATE has finished waiting on the row lock, by
+// which point the successor is already committed and visible.
+//
+// Driven the same way as the FIX 1 test above: a second, dedicated raw
+// connection stands in for "CreateSuccessorSession has won the lock and is
+// about to insert, but has not committed yet" by taking the SELECT ... FOR
+// UPDATE and the successor's own INSERT directly, with the commit withheld
+// until after this test has confirmed the real DeleteSessionsByFamily call
+// is genuinely blocked on the still-held lock.
+func TestDeleteSessionsByFamilyRemovesConcurrentlyMintedSuccessorLive(t *testing.T) {
+	sqlDB, db := openLiveDB(t)
+	st := dropsstore.NewAuthStore(db)
+	ctx := context.Background()
+	dropAuthTables(t, db, st)
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema: %v", err)
+	}
+	t.Cleanup(func() { dropAuthTables(t, db, st) })
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	userID := uid.NewV7()
+	familyID := uid.NewV7()
+	rotatedAt := now
+	pred, err := st.CreateSession(ctx, auth.Session{
+		ID: uid.NewV7(), UserID: userID, TokenHash: "lo-pred-1", FamilyID: familyID,
+		ExpiresAt: now.Add(time.Hour), CreatedAt: now, RotatedAt: &rotatedAt,
+	})
+	if err != nil {
+		t.Fatalf("CreateSession(predecessor): %v", err)
+	}
+
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		t.Fatalf("sqlDB.Conn: %v", err)
+	}
+	defer conn.Close()
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	// Same reasoning as TestCreateSuccessorSessionForUpdateBlocksUncommittedDeleteLive's
+	// own identical defer: guarantees this raw transaction never lingers
+	// open (holding the predecessor's row lock) across a t.Fatal[f] on any
+	// path below, which would otherwise deadlock t.Cleanup's own DROP TABLE.
+	defer func() { _ = tx.Rollback() }()
+	var lockedID string
+	if err := tx.QueryRowContext(ctx, "SELECT id FROM sessions WHERE id = $1 FOR UPDATE", pred.ID).Scan(&lockedID); err != nil {
+		t.Fatalf("raw SELECT ... FOR UPDATE: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- st.DeleteSessionsByFamily(ctx, familyID) }()
+
+	select {
+	case derr := <-done:
+		t.Fatalf("DeleteSessionsByFamily returned (err=%v) before the concurrent, uncommitted successor insert was committed — its own SELECT ... FOR UPDATE is not blocking on the locked predecessor row", derr)
+	case <-time.After(200 * time.Millisecond):
+		// Still blocked, as expected.
+	}
+
+	// Insert the successor — exactly what CreateSuccessorSession's own
+	// insertSession would do — and commit, releasing the predecessor lock.
+	succHash := "lo-succ-1"
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO sessions (id, user_id, token_hash, family_id, expires_at, created_at, rotated_at, user_agent, ip)
+		 VALUES ($1,$2,$3,$4,$5,$6,NULL,'','')`,
+		uid.NewV7(), userID, succHash, familyID, now.Add(time.Hour), now); err != nil {
+		t.Fatalf("raw INSERT(successor): %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit raw tx: %v", err)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("DeleteSessionsByFamily: %v", err)
+	}
+
+	if _, err := st.FindSessionByHash(ctx, pred.TokenHash); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("predecessor survived DeleteSessionsByFamily: err = %v, want ErrSessionNotFound", err)
+	}
+	if _, err := st.FindSessionByHash(ctx, succHash); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("concurrently-minted successor survived DeleteSessionsByFamily: err = %v, want ErrSessionNotFound — this is the resurrection FIX 2 closes", err)
+	}
+}
+
 // newLiveAuthStoreWarmed is newLiveAuthStore's counterpart for a
 // concurrency test that needs the connection pool already holding n live
 // connections before the race starts — see

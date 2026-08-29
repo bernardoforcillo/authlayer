@@ -478,6 +478,20 @@ type Store interface {
 	// many there are. This is the reuse-detection response: see the package
 	// doc's "Sessions, families, and rotation" section for when the service
 	// layer calls it. Deleting zero rows is not an error.
+	//
+	// On a backend where [Store.CreateSuccessorSession] takes a row-level
+	// lock on the predecessor for its transaction's duration (see that
+	// method's doc), a single autocommit DELETE here is NOT sufficient: its
+	// snapshot is taken before any wait it does acquiring that same row's
+	// lock, so once unblocked it sees only what existed at that earlier
+	// instant — the predecessor, never a successor CreateSuccessorSession
+	// committed while this call was waiting. Such a backend MUST re-snapshot
+	// AFTER the wait — a SELECT ... FOR UPDATE (or equivalent lock) over the
+	// family's rows followed by the DELETE, inside one transaction, is the
+	// shape [github.com/bernardoforcillo/authlayer/store/drops.AuthStore]
+	// uses. A backend whose CreateSuccessorSession takes no such lock (e.g.
+	// store/memory's single-mutex design, where the lock spans both methods'
+	// entire bodies) has no such gap to close.
 	DeleteSessionsByFamily(ctx context.Context, familyID string) error
 	// MarkRotated atomically marks the session identified by tokenHash as
 	// superseded, if and only if it is not already. ok reports whether THIS
