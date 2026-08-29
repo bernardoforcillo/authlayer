@@ -1141,6 +1141,22 @@ an empty or foreign id revokes everything, which is the fail-closed direction.
 because an address is unknown. `ResetPassword` claims the verification first
 and applies second (a failure after the claim burns the token rather than
 leaving it redeemable twice), then revokes every session the account has.
+
+**A completed reset also verifies the address.** A reset token is only ever
+deliverable to the address it was minted for, so redeeming one *is* proof of
+control of that address — the same proof a signup token carries, arriving
+through a different door. `ResetPassword` therefore stamps `EmailVerifiedAt`
+when it is not already set. Without that, `WithRequireVerifiedEmail(true)` —
+which the quick start above enables — had no way out, because authlayer
+exposes no verification resend path: someone who signed up with an address
+they did not own permanently denied the real owner that address (the owner
+could prove control through a reset and *still* not log in), and a user whose
+signup mail was lost was locked out for good. Two guards keep it honest: an
+already-verified address keeps its original timestamp rather than having it
+moved forward by every unrelated reset, and an account whose address changed
+since the token was minted is not certified at all — the proof is about the
+address the token was *delivered* to, and `Store.MarkEmailVerified` re-checks
+that atomically rather than trusting whatever the row now holds.
 `RequestEmailChange` mints an `email_change` token; the address is checked for
 uniqueness atomically at redemption, not before, because a pre-check would be
 an unrate-limited "is this registered?" oracle for any authenticated caller.

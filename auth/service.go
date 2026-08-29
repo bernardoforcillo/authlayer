@@ -673,9 +673,13 @@ func (s *Service[U, PU]) wrap(b UserBase) U {
 // on that basis meant an anonymous, unauthenticated prober — the entire
 // audience this method exists to give nothing to — could permanently
 // invalidate a real accountholder's already-delivered verification link
-// merely by "signing up" with their address, locking them out of their
-// own account under [WithRequireVerifiedEmail] with no resend path this
-// package exposes. So step 4's mint is purely additive: an account's real
+// merely by "signing up" with their address, shutting them out of their
+// own account under [WithRequireVerifiedEmail] — this package still
+// exposes no verification resend path, so the only way back would be the
+// password-reset detour [Service.ResetPassword] provides (see "Why a
+// completed reset verifies the address" there), which a user who never
+// lost their password has no reason to look for. So step 4's mint is
+// purely additive: an account's real
 // pending verification, if it has one, is left exactly as it was: an
 // extra, never-returned row that ages out on its own via
 // defaultVerificationTTL, same as any other unredeemed token, and never
@@ -1900,7 +1904,9 @@ func (s *Service[U, PU]) RequestPasswordReset(ctx context.Context, email, ip str
 
 // ResetPassword redeems plainToken — a "password_reset" [Verification]
 // minted by [Service.RequestPasswordReset] — setting the account's password
-// to next and revoking EVERY session it has, on every device (see
+// to next, certifying the address the token was delivered to if it is not
+// already certified (see "Why a completed reset verifies the address"
+// below), and revoking EVERY session the account has, on every device (see
 // [Service.ChangePassword]'s doc, "What revocation does not revoke", for
 // what that guarantee does NOT include — the same limitation applies here):
 // unlike [Service.ChangePassword], there is no "caller's own session" to spare
@@ -1976,6 +1982,45 @@ func (s *Service[U, PU]) RequestPasswordReset(ctx context.Context, email, ip str
 // demonstration and why closing that window would need a transaction
 // [Store] does not offer.
 //
+// # Why a completed reset verifies the address
+//
+// A reset token is only ever deliverable to the address it was minted for,
+// so redeeming one IS proof of control of that address — the same proof a
+// "signup" token carries, arriving through a different door. A successful
+// reset therefore stamps [UserBase.EmailVerifiedAt] via
+// [Store.MarkEmailVerified] when it is not already set.
+//
+// Without this, [WithRequireVerifiedEmail](true) — which the readme's own
+// quick start enables — had no way out, because this package exposes no
+// verification resend path: an attacker who signed up with an address they
+// did not own permanently denied the real owner that address (the owner
+// could prove control through a reset and STILL could not log in), and any
+// user whose signup email was lost was locked out for good.
+//
+// Two guards keep the stamp honest, and both are why this reads the user
+// row rather than stamping unconditionally:
+//
+//   - Already verified: EmailVerifiedAt is left exactly as it was.
+//     [Store.MarkEmailVerified] is idempotent and would happily re-stamp
+//     it to now, but that field records WHEN control was first proven, and
+//     moving it forward on every unrelated password reset would falsify an
+//     audit value for no gain.
+//   - A different address: the proof is about [Verification.Email], the
+//     address this token was DELIVERED to, not whatever the row happens to
+//     hold at redemption time. If the account's address changed in between
+//     (and was left unverified, as [Store.UpdateUserEmail] leaves it),
+//     nothing is stamped — the reset still resets the password and
+//     certifies nothing.
+//
+// The read and the stamp are two calls, not one atomic step, and that is
+// safe HERE specifically: a concurrent [Store.UpdateUserEmail] landing
+// between them cannot produce a false verification, because
+// MarkEmailVerified re-checks the address against the row's CURRENT value
+// as one atomic step of its own (see its doc) and returns ErrEmailMismatch
+// rather than certifying an address nobody proved control of. The two
+// guards above are therefore an optimization of intent, not the
+// enforcement point; the enforcement point is in the Store.
+//
 // Only THEN is every session belonging to the verification's UserID
 // revoked — one [Store.DeleteSessionsByFamily] call per distinct family,
 // the same "list, then delete per distinct family" shape
@@ -2030,6 +2075,23 @@ func (s *Service[U, PU]) ResetPassword(ctx context.Context, plainToken, next str
 	}
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposeEmailChange); err != nil {
 		return err
+	}
+
+	// Redeeming this token proved control of the address it was delivered
+	// to — see the method doc's "Why a completed reset verifies the
+	// address" section. Stamp it if, and only if, it is not already
+	// stamped and the account still holds that same address. Both fields
+	// are normalized by the Store on the way in (see [Store.CreateUser],
+	// [Store.UpdateUserEmail] and [Store.CreateVerification]), so this
+	// compares like with like.
+	u, err := s.store.FindUserByID(ctx, v.UserID)
+	if err != nil {
+		return err
+	}
+	if u.EmailVerifiedAt == nil && u.Email == v.Email {
+		if err := s.store.MarkEmailVerified(ctx, v.UserID, v.Email, now); err != nil {
+			return err
+		}
 	}
 
 	sessions, err := s.store.ListSessionsByUser(ctx, v.UserID)

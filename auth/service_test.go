@@ -3133,7 +3133,11 @@ func TestResetPasswordClaimsBeforeApplyOrdering(t *testing.T) {
 	}
 
 	got := store.snapshot()
-	want := []string{"DeleteVerification", "UpdateUserPassword"}
+	// MarkEmailVerified is part of the APPLY, not a third phase: a
+	// completed reset certifies the address its token was delivered to
+	// (see ResetPassword's "Why a completed reset verifies the address").
+	// It must still come after the claim, like every other applied effect.
+	want := []string{"DeleteVerification", "UpdateUserPassword", "MarkEmailVerified"}
 	if !equalStrings(got, want) {
 		t.Fatalf("call order = %v, want %v (claim must happen before apply)", got, want)
 	}
@@ -3265,6 +3269,130 @@ func TestResetPasswordInvalidatesSiblingResetToken(t *testing.T) {
 	}
 	if err := svc.ResetPassword(ctx, tok2Plain, "Second-Valid-Pass16!"); !errors.Is(err, auth.ErrVerificationNotFound) {
 		t.Fatalf("ResetPassword(sibling token) err = %v, want ErrVerificationNotFound — a sibling reset token must not survive a completed reset", err)
+	}
+}
+
+// TestResetPasswordStampsEmailVerifiedClosingTheLockout pins that a
+// successful reset certifies the address the token was delivered to, and
+// the lockout that closes.
+//
+// Under WithRequireVerifiedEmail(true) — which the readme's own quick start
+// enables — this package exposes no resend path, so an unverified address
+// was a dead end in two directions: an attacker who signed up with an
+// address they did not own permanently denied the real owner that address
+// (the owner could prove control through a password reset and STILL could
+// not log in), and any user whose signup email was lost was locked out for
+// good. Redeeming a password_reset token IS proof of control of the
+// address it was delivered to, so a completed reset stamps
+// EmailVerifiedAt.
+func TestResetPasswordStampsEmailVerifiedClosingTheLockout(t *testing.T) {
+	svc, store := newTestService(t, auth.WithRequireVerifiedEmail(true))
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "locked@example.com", validPassword)
+
+	// The address is unverified, so the owner cannot get in at all.
+	if _, _, _, err := svc.Login(ctx, "locked@example.com", validPassword, "1.2.3.4", "agent"); !errors.Is(err, auth.ErrEmailNotVerified) {
+		t.Fatalf("Login before the reset err = %v, want ErrEmailNotVerified — the premise of this test", err)
+	}
+
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "locked@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	if err := svc.ResetPassword(ctx, resetTok, "Recovered-Valid-Pass22!"); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	stored, err := store.FindUserByID(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.EmailVerifiedAt == nil {
+		t.Fatal("EmailVerifiedAt is still nil after a completed reset — redeeming a token delivered to the address is proof of control, and without stamping it the owner stays locked out with no resend path")
+	}
+	if _, _, _, err := svc.Login(ctx, "locked@example.com", "Recovered-Valid-Pass22!", "1.2.3.4", "agent"); err != nil {
+		t.Fatalf("Login after the reset: %v — proving control of the address must actually let the owner in", err)
+	}
+}
+
+// TestResetPasswordDoesNotRestampAnAlreadyVerifiedAddress pins the "if it
+// is not already set" half: an account that verified its address long ago
+// must keep that original timestamp, not have it moved forward by every
+// unrelated password reset. EmailVerifiedAt records WHEN control was first
+// proven and is a field applications display and audit.
+func TestResetPasswordDoesNotRestampAnAlreadyVerifiedAddress(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	store := memory.NewAuthStore()
+	svc := auth.New[testUser](store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+		auth.WithClock(func() time.Time { return now }),
+	)
+	ctx := context.Background()
+
+	res, err := svc.SignUp(ctx, "early@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	if _, err := svc.VerifyEmail(ctx, res.VerifyToken); err != nil {
+		t.Fatalf("VerifyEmail: %v", err)
+	}
+	verifiedAt := now
+
+	// Six months later, an ordinary password reset.
+	now = now.AddDate(0, 6, 0)
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "early@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	if err := svc.ResetPassword(ctx, resetTok, "Rotated-Valid-Pass23!"); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	stored, err := store.FindUserByID(ctx, res.User.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.EmailVerifiedAt == nil {
+		t.Fatal("EmailVerifiedAt was cleared by a reset")
+	}
+	if !stored.EmailVerifiedAt.Equal(verifiedAt) {
+		t.Fatalf("EmailVerifiedAt = %v, want the original %v — a reset must not re-stamp an already-verified address", *stored.EmailVerifiedAt, verifiedAt)
+	}
+}
+
+// TestResetPasswordDoesNotVerifyAnAddressTheTokenWasNotSentTo pins the
+// other guard: the proof a redeemed token carries is proof of control of
+// the address it was DELIVERED to, which is [Verification.Email] — not of
+// whatever address the row happens to hold when the token is redeemed. If
+// the account's address changed in between (and was left unverified, as
+// [Store.UpdateUserEmail] leaves it), the reset still resets the password
+// and certifies nothing.
+func TestResetPasswordDoesNotVerifyAnAddressTheTokenWasNotSentTo(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "moved-from@example.com", validPassword)
+
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "moved-from@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+
+	// The account's address moves, out of band, and is left unverified —
+	// exactly what UpdateUserEmail does on its own.
+	if err := store.UpdateUserEmail(ctx, user.ID, "moved-to@example.com", time.Now().UTC()); err != nil {
+		t.Fatalf("UpdateUserEmail: %v", err)
+	}
+
+	if err := svc.ResetPassword(ctx, resetTok, "Rotated-Valid-Pass24!"); err != nil {
+		t.Fatalf("ResetPassword err = %v, want nil — the reset itself must still succeed", err)
+	}
+	stored, err := store.FindUserByID(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.EmailVerifiedAt != nil {
+		t.Fatalf("EmailVerifiedAt = %v, want nil — the token proved control of %q, not of the account's current address %q", *stored.EmailVerifiedAt, "moved-from@example.com", stored.Email)
 	}
 }
 

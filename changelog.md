@@ -347,7 +347,15 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `currentSessionID` revokes everything — the fail-closed direction);
   `ResetPassword` claims the verification before applying it, so a failure
   after the claim burns the token rather than leaving it redeemable twice,
-  and then revokes every session. Both also invalidate every outstanding
+  and then revokes every session. A completed reset also stamps
+  `EmailVerifiedAt` when it is not already set: a reset token is only ever
+  deliverable to the address it was minted for, so redeeming one proves
+  control of that address. That is the only way out of
+  `WithRequireVerifiedEmail(true)` for an address whose signup mail was lost
+  or was claimed by someone who does not own it, since authlayer exposes no
+  resend path. An already-verified address keeps its original timestamp, and
+  an account whose address changed since the token was minted is not
+  certified at all. Both also invalidate every outstanding
   `password_reset` **and** `email_change` token for the account, closing two
   doors: the attacker who requested a reset link and waited keeps a way in for
   its whole TTL even after the victim changes their password, and — the

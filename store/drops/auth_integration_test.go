@@ -1723,3 +1723,49 @@ func TestRevokeSessionRevokesWholeFamilyLive(t *testing.T) {
 		t.Fatalf("Refresh(device B): %v — revocation must not spill across families", err)
 	}
 }
+
+// TestResetPasswordStampsEmailVerifiedLive confirms against a real server
+// that a completed reset certifies the address its token was delivered to,
+// closing the WithRequireVerifiedEmail lockout. The service-level unit test
+// (auth's TestResetPasswordStampsEmailVerifiedClosingTheLockout) proves the
+// logic; this proves the two Store calls it now makes — FindUserByID and
+// the conditional MarkEmailVerified — behave the same over PostgreSQL,
+// where MarkEmailVerified's address check is a WHERE clause rather than a
+// map comparison.
+func TestResetPasswordStampsEmailVerifiedLive(t *testing.T) {
+	st := newLiveAuthStore(t)
+	ctx := context.Background()
+	svc := auth.New[auth.UserBase](st,
+		auth.WithHasher(password.Bcrypt(bcrypt.MinCost)),
+		auth.WithJWT([][]byte{bytes.Repeat([]byte("k"), 32)}, 15*time.Minute),
+		auth.WithRequireVerifiedEmail(true),
+	)
+
+	res, err := svc.SignUp(ctx, "live-locked@example.com", liveTestPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	if _, _, _, err := svc.Login(ctx, "live-locked@example.com", liveTestPassword, "203.0.113.9", "agent"); !errors.Is(err, auth.ErrEmailNotVerified) {
+		t.Fatalf("Login before the reset err = %v, want ErrEmailNotVerified", err)
+	}
+
+	tok, ok, err := svc.RequestPasswordReset(ctx, "live-locked@example.com", "203.0.113.9")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	const recovered = "Recovered-Valid-Pass22!"
+	if err := svc.ResetPassword(ctx, tok, recovered); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	stored, err := st.FindUserByID(ctx, res.User.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.EmailVerifiedAt == nil {
+		t.Fatal("EmailVerifiedAt is still nil after a completed reset")
+	}
+	if _, _, _, err := svc.Login(ctx, "live-locked@example.com", recovered, "203.0.113.9", "agent"); err != nil {
+		t.Fatalf("Login after the reset: %v", err)
+	}
+}
