@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once a 1.0 is cut. Until then, minor versions may break API.
 
+## [Unreleased]
+
+### Added
+
+- **`auth/authtest` — an exported contract-test suite for `auth.Store`**
+  (`authtest.RunStoreContract(t, newStore)`). `auth.Store` is an eighteen-method
+  port, seven of whose methods carry a normative **MUST**; until now those were
+  enforced by prose and by the two backends this repository happens to ship, so
+  a third-party backend author had no way to check their work. The suite covers
+  every one of them plus the ordinary behavioural contract — error
+  classification, email normalization on every read and write path, and
+  `PurgeExpired`'s strict cutoff — and drives the three obligations that only
+  appear under concurrency as real races: `MarkRotated`'s single winner,
+  `CreateUser`'s and `UpdateUserEmail`'s one-address-one-account atomicity, a
+  `MarkEmailVerified` racing an `UpdateUserEmail`, and a `CreateSuccessorSession`
+  racing the family revocation that must not leave it alive. Points the port
+  leaves unspecified are deliberately not asserted. Fifteen negative controls —
+  each a store exactly one defect away from a correct one, paired into nineteen
+  defect/check cases — assert the suite *fails* a non-compliant implementation;
+  without them a suite that passes everything would look identical to one that
+  works.
+- **`authtest.RunTokenHashUniquenessContract`** — the uniqueness **MUST** on
+  `Session.TokenHash` and `Verification.TokenHash`, as a separate entry point.
+  `store/memory` declines that obligation deliberately (its own doc says so, and
+  defers it to `store/drops`), so folding it into `RunStoreContract` would make
+  an in-tree backend fail the main suite. A backend meant for production should
+  run both; `store/drops` does.
+
+### Changed
+
+- **`store/drops`' live lane no longer reimplements the `MarkRotated` contract.**
+  It ran an independent copy because the original lived in an unexported helper
+  in a `_test.go` file, reachable from nowhere else; both backends now run the
+  same exported suite. The backend-specific live tests — the ones that stage a
+  lock ordering with raw SQL on a second connection, which no port-level suite
+  can express — are unchanged.
+
 ## [0.1.0] - 2026-08-29
 
 ### Added

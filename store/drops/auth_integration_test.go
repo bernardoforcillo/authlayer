@@ -9,16 +9,17 @@
 // Without the tag and DSN it is not built, so the default `go test ./...`
 // stays database-free.
 //
-// markRotatedContract (store/memory/auth_test.go) is NOT reused here: it is
-// unexported and lives in a _test.go file (package memory_test), and Go
-// test files are never part of a package's importable surface regardless of
-// export — nothing outside store/memory can reach it by any name, exported
-// or not. TestMarkRotatedConcurrencyExactlyOneWinnerLive below is therefore
-// an independent implementation, deliberately shaped like
-// raceMarkRotated/markRotatedContract and like this file's own
-// TestConsumeLinkConcurrencyExactlyOneWinnerLive counterpart in
-// invite_integration_test.go, rather than a re-derived approximation of a
-// different contract.
+// The auth.Store contract itself is no longer reimplemented here.
+// TestAuthStoreSatisfiesTheStoreContractLive below runs the exported
+// authlayer/auth/authtest suite — the same checks store/memory runs, driven
+// against a live server. That suite exists because the previous arrangement
+// could not be shared: the contract lived in markRotatedContract, unexported
+// and in a _test.go file (package memory_test), and Go test files are never
+// part of a package's importable surface regardless of export, so this file
+// had to carry an independent implementation of the same property. Tests
+// that remain BACKEND-SPECIFIC — the ones that reach for raw SQL on a second
+// connection to stage a lock ordering no port-level suite can express — stay
+// here, and are called out individually below.
 package dropsstore_test
 
 import (
@@ -42,6 +43,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/auth/authtest"
 	"github.com/bernardoforcillo/authlayer/internal/uid"
 	"github.com/bernardoforcillo/authlayer/password"
 	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
@@ -74,7 +76,7 @@ func newLiveAuthService(st *dropsstore.AuthStore) *auth.Service {
 // store/drops/integration_test.go's dropAll and
 // invite_integration_test.go's newLiveInviteStore for the same pattern.
 // Returns the raw *sql.DB too, since a handful of tests need it directly —
-// connection-pool tuning ([newLiveAuthStoreWarmed]) or issuing DDL/queries
+// connection-pool tuning ([warmPool]) or issuing DDL/queries
 // drops has no builder for.
 func openLiveDB(t *testing.T) (*sql.DB, *pg.DB) {
 	t.Helper()
@@ -1176,7 +1178,7 @@ func TestDeleteSessionsByFamilyOppositeLockOrderRequiresAdvisoryLockLive(t *test
 	const seedRows = 300
 	sqlDB, db := openLiveDB(t)
 	// Warm the pool to at least 2 live connections before the race, the
-	// same reasoning as [newLiveAuthStoreWarmed]'s own doc: call A's pool
+	// same reasoning as [warmPool]'s own doc: call A's pool
 	// checkout (inside DeleteSessionsByFamily's InTx) and call B's own
 	// sqlDB.Conn below must both be satisfied from an already-open
 	// connection, not a fresh TCP + auth round trip — an unwarmed pool lets
@@ -1336,36 +1338,20 @@ func TestDeleteSessionsByFamilyOppositeLockOrderRequiresAdvisoryLockLive(t *test
 	}
 }
 
-// newLiveAuthStoreWarmed is newLiveAuthStore's counterpart for a
-// concurrency test that needs the connection pool already holding n live
-// connections before the race starts — see
-// TestMarkRotatedConcurrencyExactlyOneWinnerLive's doc for why an unwarmed
-// pool badly undercounts how often a broken, split-lock MarkRotated gets
-// caught. database/sql's default MaxIdleConns is 2, so SetMaxOpenConns /
-// SetMaxIdleConns must both be raised to n BEFORE warming — otherwise
-// opening n connections and returning them idle would just have the pool
-// close all but 2 of them again immediately.
-func newLiveAuthStoreWarmed(t *testing.T, n int) *dropsstore.AuthStore {
+// warmPool primes sqlDB with n live connections: n goroutines each force
+// database/sql to hand them a connection (opening one if the pool doesn't
+// already have an idle one), then return it to the idle pool. Once this
+// completes, a race's first real query per goroutine is a pool checkout that
+// is already satisfied, not a fresh TCP + auth round trip — see
+// TestAuthStoreSatisfiesTheStoreContractLive's own doc for why that
+// distinction is what makes the difference.
+//
+// The caller must have raised SetMaxOpenConns and SetMaxIdleConns to at
+// least n first; database/sql's default MaxIdleConns of 2 would otherwise
+// close all but 2 of the connections the instant they are returned idle.
+func warmPool(t *testing.T, sqlDB *sql.DB, n int) {
 	t.Helper()
-	sqlDB, db := openLiveDB(t)
-	sqlDB.SetMaxOpenConns(n)
-	sqlDB.SetMaxIdleConns(n)
-
-	st := dropsstore.NewAuthStore(db)
 	ctx := context.Background()
-	dropAuthTables(t, db, st)
-	if err := st.CreateSchema(ctx); err != nil {
-		t.Fatalf("CreateSchema: %v", err)
-	}
-	t.Cleanup(func() { dropAuthTables(t, db, st) })
-
-	// Prime the pool: n goroutines each force database/sql to hand them a
-	// connection (opening one if the pool doesn't already have an idle
-	// one), then return it to the now-larger idle pool. Once this
-	// completes, the actual race's first real query per goroutine is a
-	// pool checkout that is already satisfied, not a fresh TCP + auth
-	// round trip — see the concurrency test's own doc for why that
-	// distinction is what makes the difference.
 	var wg sync.WaitGroup
 	wg.Add(n)
 	for i := 0; i < n; i++ {
@@ -1378,100 +1364,75 @@ func newLiveAuthStoreWarmed(t *testing.T, n int) *dropsstore.AuthStore {
 		}()
 	}
 	wg.Wait()
-
-	return st
 }
 
-// TestMarkRotatedConcurrencyExactlyOneWinnerLive is the live-Postgres proof
-// the task exists to produce: a fake driver has no lock contention or wire
-// round trips to interleave, so it cannot demonstrate atomicity — only a
-// real server's row lock can. N goroutines race MarkRotated against one
-// fresh, unrotated session; PostgreSQL's row-level lock under the single
-// "UPDATE ... WHERE token_hash = $1 AND rotated_at IS NULL RETURNING ..."
-// statement must admit exactly one of them. Shaped like
-// invite_integration_test.go's TestConsumeLinkConcurrencyExactlyOneWinnerLive
-// and store/memory/auth_test.go's raceMarkRotated — see this file's own
-// top-of-file doc for why that function itself could not be reused
-// directly.
+// TestAuthStoreSatisfiesTheStoreContractLive runs the exported
+// authlayer/auth/authtest suite against a real server: every documented
+// obligation of auth.Store, including the MarkRotated single-winner race
+// this file used to reimplement, plus the token-hash uniqueness contract
+// this backend — unlike store/memory — does enforce.
 //
-// The pool is pre-warmed to N connections before the race starts (see
-// [newLiveAuthStoreWarmed]) rather than left to grow on demand. Measured
-// over 45 runs at N=100 against an UNWARMED pool, a deliberately broken
-// read-then-write MarkRotated (SELECT the session, decide, then a separate
-// UPDATE by id with no compare-and-set guard) was caught only ~40-70% of
-// the time: opening a fresh connection is comparatively slow and uneven,
-// so goroutines trickle into the actual UPDATE across a wide window instead
-// of arriving together, which sharply reduces how often two of them
-// genuinely race for the same row. Pre-warming closes that gap: 10/10 runs
-// caught the same mutation, and 10/10 runs passed clean against the real,
-// atomic implementation (see the task report for the exact mutation and
-// counts). This project has already learned twice — Plan 4's ConsumeLink,
-// and this exact MarkRotated contract's own store/memory concurrency test
-// — that a probabilistic detector on a single-winner invariant is not
-// trustworthy as a regression net; an occasional green run on a broken
-// implementation is worse than a slower test.
+// A fake driver has no lock contention or wire round trips to interleave, so
+// it cannot demonstrate atomicity; only a real server's row lock can. That
+// is why the suite is run here as well as against store/memory, and it is
+// why this test warms the pool ([warmPool]) before anything runs: the pool
+// is pre-warmed to authtest.RaceGoroutines connections before any race
+// starts, rather than left to grow on demand.
 //
-// shared is computed ONCE, before any goroutine starts, and every
-// goroutine's MarkRotated call races with that identical instant rather
-// than each computing its own time.Now(). The final assertion checks the
-// winning row's RotatedAt against this exact known value, not merely that
-// it is non-nil — pinning that the winner's write actually persisted the
-// instant it was asked to, not some other value a subtler bug might have
-// substituted while still leaving "successes == 1" true.
-func TestMarkRotatedConcurrencyExactlyOneWinnerLive(t *testing.T) {
-	const n = 100
-	st := newLiveAuthStoreWarmed(t, n)
+// The warming is load-bearing, measured directly when this file still
+// carried its own copy of the race at N=100. Against an UNWARMED pool, over
+// 45 runs, a deliberately broken read-then-write MarkRotated (SELECT the
+// session, decide, then a separate UPDATE by id with no compare-and-set
+// guard) was caught only ~40-70% of the time: opening a fresh connection is
+// comparatively slow and uneven, so goroutines trickle into the actual
+// UPDATE across a wide window instead of arriving together, which sharply
+// reduces how often two of them genuinely race for the same row.
+// Pre-warming closed that gap: 10/10 runs caught the same mutation, and
+// 10/10 runs passed clean against the real, atomic implementation. This
+// project has already learned twice — Plan 4's ConsumeLink, and this exact
+// MarkRotated contract's own store/memory concurrency test — that a
+// probabilistic detector on a single-winner invariant is not trustworthy as
+// a regression net; an occasional green run on a broken implementation is
+// worse than a slower test.
+//
+// The suite calls the factory once per check and requires the store it gets
+// back to be EMPTY: several checks assert counts over the whole table
+// (ListSessionsByUser, PurgeExpired's total across both kinds), which mean
+// nothing against leftover rows. TRUNCATE, not a drop-and-recreate, is what
+// gives them that here.
+func TestAuthStoreSatisfiesTheStoreContractLive(t *testing.T) {
+	// One pool and one schema, prepared once and shared by every check —
+	// not a fresh, separately warmed pool and a drop-and-recreate per check.
+	// The suite calls the factory around fifty times, and both of those cost
+	// real time against a live server (~0.2s of DDL each, plus
+	// authtest.RaceGoroutines fresh connections each) for no added isolation:
+	// what a check needs isolated is the DATA. TRUNCATE gives it that, and
+	// the pool being warm is what makes the races in the suite actually
+	// contend rather than trickle.
+	sqlDB, db := openLiveDB(t)
+	sqlDB.SetMaxOpenConns(authtest.RaceGoroutines)
+	sqlDB.SetMaxIdleConns(authtest.RaceGoroutines)
+	warmPool(t, sqlDB, authtest.RaceGoroutines)
+
+	st := dropsstore.NewAuthStore(db)
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Microsecond)
+	dropAuthTables(t, db, st)
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema: %v", err)
+	}
+	t.Cleanup(func() { dropAuthTables(t, db, st) })
 
-	sess, err := st.CreateSession(ctx, auth.Session{
-		ID: uid.NewV7(), UserID: uid.NewV7(), TokenHash: "race-hash", FamilyID: uid.NewV7(),
-		ExpiresAt: now.Add(time.Hour), CreatedAt: now,
-	})
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
+	s := st.Schema()
+	truncate := fmt.Sprintf("TRUNCATE %s, %s, %s",
+		s.Users.Name(), s.Sessions.Name(), s.Verifications.Name())
+	newStore := func(t *testing.T) auth.Store {
+		if _, err := sqlDB.ExecContext(ctx, truncate); err != nil {
+			t.Fatalf("%s: %v", truncate, err)
+		}
+		return st
 	}
-
-	shared := now.Add(time.Minute)
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	successes, errs := 0, 0
-
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func() {
-			defer wg.Done()
-			<-start
-			_, ok, err := st.MarkRotated(ctx, sess.TokenHash, shared)
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				errs++
-				return
-			}
-			if ok {
-				successes++
-			}
-		}()
-	}
-	close(start)
-	wg.Wait()
-
-	if errs != 0 {
-		t.Fatalf("got %d unexpected errors from MarkRotated", errs)
-	}
-	if successes != 1 {
-		t.Fatalf("got %d successful MarkRotated calls against one session, want exactly 1 — MarkRotated is not atomic", successes)
-	}
-
-	got, err := st.FindSessionByHash(ctx, sess.TokenHash)
-	if err != nil {
-		t.Fatalf("FindSessionByHash: %v", err)
-	}
-	if got.RotatedAt == nil || !got.RotatedAt.Equal(shared) {
-		t.Fatalf("final RotatedAt = %v, want the shared instant every goroutine raced with, %v", got.RotatedAt, shared)
-	}
+	authtest.RunStoreContract(t, newStore)
+	authtest.RunTokenHashUniquenessContract(t, newStore)
 }
 
 // TestAuthStoreCreateSchemaLandsConstraintsOnRealPostgres proves all three
@@ -2035,10 +1996,13 @@ func TestDeleteVerificationsByUserAndPurposeUsesTheIndexLive(t *testing.T) {
 // demonstrate: many connections, no shared lock, and the UNIQUE (email)
 // constraint as the only arbiter.
 //
-// It is written independently rather than shared with the memory test for
-// the reason recorded at the top of this file about markRotatedContract:
-// that helper is unexported and lives in package memory_test, so nothing
-// outside store/memory can reach it.
+// The shared suite (see TestAuthStoreSatisfiesTheStoreContractLive) now
+// covers this obligation for every backend, this one included. This test is
+// kept alongside it because it is the ONE place the property is pinned at
+// this scale against a real server with a deliberately hostile fixture —
+// n=24 distinct connections and rows contending for one address — which is
+// what originally reproduced the defect; the suite's own version runs
+// smaller, uniformly, everywhere.
 func TestUpdateUserEmailConcurrentSameAddressExactlyOneWinnerLive(t *testing.T) {
 	st := newLiveAuthStore(t)
 	ctx := context.Background()

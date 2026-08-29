@@ -664,6 +664,70 @@ AUTHLAYER_TEST_DSN='postgres://…?sslmode=disable' go test -tags integration ./
 > other in ways that look like product bugs (`relation ... does not exist`
 > mid-run, timing measurements polluted by the other client's writes).
 
+### Writing your own `auth.Store`
+
+`auth.Store` is the strictest port in this library — seven of its eighteen
+methods carry a **MUST**, and the [Storage](#storage) section above says what
+each one costs when it is violated. Those requirements bind a third-party
+backend exactly as much as the two shipped ones, so they ship as an executable
+suite rather than as prose alone:
+
+```go
+import "github.com/bernardoforcillo/authlayer/auth/authtest"
+
+func TestMyStoreSatisfiesTheAuthContract(t *testing.T) {
+    authtest.RunStoreContract(t, func(t *testing.T) auth.Store {
+        return myStoreWithEmptyTables(t)   // called once per check
+    })
+    authtest.RunTokenHashUniquenessContract(t, func(t *testing.T) auth.Store {
+        return myStoreWithEmptyTables(t)
+    })
+}
+```
+
+The factory must hand back a store with **no** users, sessions or verifications
+in it — several checks assert counts over the whole table — and may register
+teardown with `t.Cleanup` or call `t.Skip`. Ids are UUIDv7 and every address is
+unique per call, so the suite runs unchanged against a backend that types its id
+columns as `uuid`. If your store opens connections on demand, raise your pool
+limits and warm it to `authtest.RaceGoroutines` connections first: goroutines
+that trickle in across a connection-setup window never actually contend, which
+silently weakens every race in the suite.
+
+Three obligations only exist under concurrency, so the suite drives them as real
+races — `MarkRotated`'s single winner, `CreateUser`'s and `UpdateUserEmail`'s
+one-address-one-account atomicity, a `MarkEmailVerified` racing an
+`UpdateUserEmail`, and a `CreateSuccessorSession` racing the family revocation
+that must not leave it alive. Each asserts a *linearizability* property rather
+than a timing guess: for the last two, the end state the suite rejects is one no
+serial order of the two calls can produce.
+
+Two things it does **not** do, stated here rather than left to be discovered:
+
+- `CreateUser`'s MUST is that `ErrEmailTaken` comes from the same attempt that
+  performs the write, so a condition denying writes but not reads cannot make a
+  duplicate address answer faster than a new one. Whether your backend consulted
+  a separate read first is invisible to a caller — the port itself permits an
+  in-process map to check first, precisely because its write cannot fail on its
+  own. The suite asserts the observable consequence (two concurrent creates of
+  one address, one winner); the read-authorization half is for review, not test.
+- `DeleteSessionsByFamily`'s serialization MUST is asserted only through its
+  consequence: concurrent calls on one family must all succeed and leave no
+  survivors. Forcing the lock-order inversion needs backend-specific SQL on a
+  second connection, which no port-level suite can write. `store/drops` carries
+  that test itself.
+
+`RunTokenHashUniquenessContract` is separate because `store/memory` declines
+that obligation on purpose and defers it to `store/drops`. A backend persisting
+to shared, durable storage should run it.
+
+The suite's own tests include fifteen deliberately non-compliant stores — one
+whose `MarkRotated` lets every caller win, one whose `CreateUser` checks then
+writes non-atomically, one whose `DeleteSessionsByFamily` snapshots the family
+before it waits — paired into nineteen defect/check cases, each asserted to
+**fail** the check that covers it. A contract suite that passes everything is
+worthless, and that is not visible without controls.
+
 ## Custom scopes
 
 `org` fixes the container type to `Organization` and the member type to `Member`.
