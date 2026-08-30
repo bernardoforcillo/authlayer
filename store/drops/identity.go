@@ -329,6 +329,23 @@ func (st *IdentityStore) TouchIdentity(ctx context.Context, id string, now time.
 	return affectedOrErr(res, err, auth.ErrIdentityNotFound)
 }
 
+// DeleteIdentity removes the one row named by id — a single DELETE keyed on
+// the primary key — reporting auth.ErrIdentityNotFound when it affects no
+// row.
+//
+// It is deliberately NOT the transaction [IdentityStore.DeleteIdentityIfNotLast]
+// is, because it decides nothing: there is no reachability question here to
+// be read under one snapshot and written under another, so a bare statement
+// satisfies the port's contract outright. See auth.IdentityStore.DeleteIdentity
+// for which callers may use it and why removing a credential without a check
+// is correct for each of them.
+func (st *IdentityStore) DeleteIdentity(ctx context.Context, id string) error {
+	res, err := st.db.Delete(st.s.Identities).
+		Where(st.s.identities.eq("id", id)).
+		Exec(ctx)
+	return affectedOrErr(res, err, auth.ErrIdentityNotFound)
+}
+
 // DeleteIdentityIfNotLast removes every one of userID's identities at
 // provider, but only when the account stays reachable afterwards — either
 // another identity survives the delete or userHasPassword is true. Otherwise

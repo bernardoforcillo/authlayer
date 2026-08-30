@@ -21,7 +21,8 @@ Two rungs, tried strictly in this order.
     `Identity.Email`, or `SignInRequest.FallbackEmail` when the provider
     returned none, normalized either way. No local account at that address →
     **provision** one, with an empty `PasswordHash`. A local account exists →
-    link to it only if the [linking policy](/oauth/linking) allows.
+    link to it only if the address came from the **provider** and the
+    [linking policy](/oauth/linking) allows.
   </Step>
 </Steps>
 
@@ -110,10 +111,22 @@ On a miss at both rungs, `SignInWith` creates the account:
   verified;
 - `Created` is `true`.
 
-Unlike `SignUpResult.Created`, this one is safe to branch on in a public
-handler: reaching it takes a provider's assertion about a specific external
-account, which an anonymous prober does not have, so it is not the enumeration
-oracle [sign-up's would be](/authentication/sign-up).
+`Created` is what you branch on to run first-run onboarding.
+
+<Warning>
+**It is not free of disclosure, and an earlier version of this page said it
+was.** Reaching it takes a *completed* dance at a configured provider, so it is
+not the freely pollable oracle [sign-up's would
+be](/authentication/sign-up) — but on the `FallbackEmail` path the address is
+the caller's, so the outcome answers a question about it: unregistered →
+provisioned, registered → `ErrLinkRequiresVerification`.
+
+The signal is the error rather than the field, and the cost is one throwaway
+provider account per probe (a reused subject resolves on rung 1 and never
+consults an address) plus a junk local account left behind on every miss. That
+is a real cost, not a wall. `SignInWith` consults no rate limiter, so
+**rate-limit your callback**, where the dance already lives.
+</Warning>
 
 ## When the provider returns no address
 
@@ -154,6 +167,61 @@ none, the claim is about nothing. Letting it certify an address your
 application supplied would let a verification of some entirely different
 address stand in for this one.
 </Note>
+
+<Note>
+**Addresses are normalized — trimmed and lowercased — on both sides.** So a
+provider's verification of `MIKE@EXAMPLE.COM` is credited to
+`mike@example.com`, and Unicode simple lowercasing maps a few non-ASCII runes
+onto ASCII ones (`U+212A KELVIN SIGN` → `k`). With the case-insensitive
+providers everyone actually configures those are the same mailbox and nothing
+is bridged; with a case-**sensitive** OIDC provider, or an SMTPUTF8 deployment
+issuing both as distinct mailboxes, they need not be. This is an accepted,
+documented limitation — `go doc ./auth NormalizeEmail` carries the full
+reasoning and the remedy.
+</Note>
+
+### It can provision, and it can never link
+
+When the address you supply already belongs to a local account, the sign-in is
+refused — under **every** linking policy, `LinkAlways` included:
+
+{/* verify:main */}
+```go
+// erin@example.com is a real, verified account here — provisioned at the top
+// of this page. A fresh subject at a provider that returned no address now
+// names it.
+_, err = svc.SignInWith(ctx, auth.SignInRequest{
+	Identity:      auth.ExternalIdentity{Provider: "github", Subject: "3003", EmailVerified: true},
+	FallbackEmail: "erin@example.com",
+})
+fmt.Println(errors.Is(err, auth.ErrLinkRequiresVerification))
+```
+
+```
+true
+```
+
+<Warning>
+The provider vouched for **no address at all** on this path, so the one being
+matched is a string your caller supplied. Linking on it would attach an
+external account to somebody else's local account on the strength of that
+string — anyone able to finish a dance at any configured provider, with any
+throwaway account, names a victim's address and is signed in as them.
+
+`LinkAlways`'s own justification is about a provider *you* operate and whose
+assertions you trust. It says nothing about a path with no assertion in it, so
+the rule sits **above** the policy rather than inside it.
+</Warning>
+
+Provisioning stays allowed because nobody holds the address: there is no
+account to take over, and refusing would strand every user whose provider keeps
+their address private — the case `FallbackEmail` exists for.
+
+The practical consequence, worth designing your callback around: **a user whose
+provider hides their address cannot reach an account they already hold by
+typing its address.** They sign in with their password (or a
+[reset](/authentication/passwords)) and connect the provider afterwards with
+`LinkIdentity`.
 
 ## A blank provider or subject is refused first
 
@@ -254,20 +322,60 @@ a link: "it exists now, so link to it" would skip the policy for precisely the
 caller who lost the race. A retry from your application re-enters the ladder at
 the top, which is the right outcome either way.
 
-<Warning>
-**One window is not closed.** The linking decision reads the local account and
-then writes the identity, and `auth.Store` and `auth.IdentityStore` may be
-different backends with **no transaction spanning them** — that is the point of
-the split port.
+### The link window, and how it is closed without a transaction
 
-A concurrent `UpdateUserEmail` landing in between can therefore leave a link
-decided on an `EmailVerifiedAt` the account no longer has. The decision was
-correct as of the read, the address changed under it rather than the
-authorization being forged, and closing it would require a transaction the port
-deliberately does not offer.
+The linking decision reads the local account from `auth.Store` and then writes
+the identity to `auth.IdentityStore`, and the two may be different backends
+with **no transaction spanning them** — that is the point of the split port. A
+concurrent `UpdateUserEmail` landing in between would otherwise leave the
+identity attached to an account that no longer holds the asserted address at
+all, and rung 1 would then resolve that subject to it **forever**, never
+consulting an address again.
+
+Closing that needs no transaction, and it is closed: after the write the
+account is **re-read**, and the row is deleted when the address it was matched
+on is no longer the account's. The call then returns
+`ErrLinkRequiresVerification`, and a retry re-enters the ladder at the top,
+where the account at the *current* address is the one the policy is applied to.
+
+<Note>
+Re-reading the **address** also covers the `EmailVerifiedAt` the decision stood
+on. Nothing in `Service` can clear that field without also moving the address:
+`UpdateUserEmail` is its only clearer and changes the address by definition,
+and `VerifyEmail`'s email-change path re-stamps the new address before it
+returns. An application calling `Store.UpdateUserEmail` itself with the address
+the row already holds is the exception, and it is the same "going around
+`Service`" escape hatch documented everywhere else here.
+</Note>
+
+What remains: a retraction whose own delete fails leaves the row, and says so
+with an error. A caller must never read "your sign-in failed" as "nothing was
+written".
+
+<Warning>
+**One window is disclosed rather than closed.** On the *provisioning* branch
+`Store.CreateUser` commits before `CreateIdentity` runs, so a transient
+identity-backend failure leaves a user row holding the address with **no
+password and no identity**.
+
+When the provider did not assert the address verified, every retry of the
+identical assertion then finds that account and is refused with
+`ErrLinkRequiresVerification` — the sign-in cannot succeed however many times
+it is tried.
+
+It is not an address lost for good. `RequestPasswordReset` → `ResetPassword`
+gives that account a password **and** certifies the address, after which
+`Login` works and a later verified assertion links normally.
+`TestSignInWithLeavesTheProvisionedUserWhenTheIdentityWriteFails` pins both
+halves, so this disclosure is checked rather than asserted.
+
+Compensating would mean deleting the just-created user, and `auth.Store` has no
+method that deletes one — adding a nineteenth to a port that shipped in
+`v0.1.0` would break every third-party backend, which is the same constraint
+that made `IdentityStore` separate in the first place.
 </Warning>
 
-{/* verify:stdout "<nil> true erin@example.com\n<nil> false true erin@example.com\ntrue\n<nil> true true\ntrue" */}
+{/* verify:stdout "<nil> true erin@example.com\n<nil> false true erin@example.com\ntrue\n<nil> true true\ntrue\ntrue" */}
 
 ## Next
 

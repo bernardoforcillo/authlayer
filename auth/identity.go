@@ -141,11 +141,26 @@ type SignInRequest struct {
 	Identity ExternalIdentity
 	// FallbackEmail is the address to use when the provider returned none
 	// (Identity.Email empty). It is the application's own value — collected
-	// from the user, or already known — and it is used ONLY to resolve or
-	// provision a local account, never as evidence of verification: an
-	// address supplied here is unverified by construction, whatever
-	// Identity.EmailVerified says about the address the provider did not
-	// return.
+	// from the user, or already known — and it is used ONLY to PROVISION a
+	// local account, never as evidence of verification: an address supplied
+	// here is unverified by construction, whatever Identity.EmailVerified
+	// says about the address the provider did not return.
+	//
+	// # It can provision, and it can never link
+	//
+	// When the address supplied here already belongs to a local account,
+	// [Service.SignInWith] refuses with [ErrLinkRequiresVerification] — under
+	// EVERY [Linking] policy, [LinkAlways] included. The provider vouched for
+	// no address here, so linking on this one would attach an external
+	// account to somebody else's local account on the strength of a string
+	// the caller typed. The application's remedy is the usual one:
+	// authenticate the user by some other means and call
+	// [Service.LinkIdentity].
+	//
+	// The practical consequence, worth designing your callback around: a user
+	// whose provider keeps their address private cannot reach an account they
+	// already hold by typing its address here. They sign in with their
+	// password (or a reset) first, and connect the provider afterwards.
 	//
 	// With both this and Identity.Email empty there is no address to key a
 	// local account on, and provisioning one would write an empty string
@@ -163,13 +178,36 @@ type SignInRequest struct {
 // this very call.
 type SignInResult struct {
 	// Created reports whether this sign-in provisioned a brand-new local
-	// account (true) or signed in an existing one (false).
+	// account (true) or signed in an existing one (false). Use it to run
+	// first-run onboarding.
 	//
-	// Unlike [SignUpResult.Created], this one is safe to act on: reaching
-	// it requires a provider's assertion about a specific external account,
-	// which an anonymous prober does not have, so it is not the enumeration
-	// oracle SignUpResult.Created would be. Use it to run first-run
-	// onboarding.
+	// # What it discloses, stated rather than smoothed over
+	//
+	// Reaching this field at all takes a COMPLETED dance at a configured
+	// provider, so it is not the freely pollable oracle
+	// [SignUpResult.Created] would be. It is not free of disclosure either,
+	// and an earlier version of this doc claimed it was.
+	//
+	// On the [SignInRequest.FallbackEmail] path the address is the CALLER's,
+	// so the outcome answers a question about it: an unregistered address
+	// provisions (nil error, Created true), and a registered one is refused
+	// with [ErrLinkRequiresVerification]. The distinguishing signal is the
+	// error, not this field — after that refusal there is no SignInResult at
+	// all — but an application that branches on Created is branching on the
+	// same fact.
+	//
+	// The cost to a prober is one fresh (provider, subject) pair per probe,
+	// since a reused subject resolves on rung 1 and never consults an
+	// address: that means a throwaway account at a configured provider each
+	// time, and a junk local account left behind on every miss. That is a
+	// real cost, not a wall. [Service.SignInWith] consults no [RateLimiter]
+	// (see its "Three deliberate differences from Login"), so rate limiting
+	// this belongs at your callback, where the dance already lives.
+	//
+	// On the provider-asserted path the same refusal exists but the address
+	// is not the caller's to choose: probing it means making the provider
+	// assert each address, which is the assumption the whole [Linking] policy
+	// already rests on.
 	Created bool
 	// User is the signed-in account, freshly loaded. PasswordHash is always
 	// cleared to "" here, matching every other Service method that hands
@@ -226,8 +264,9 @@ const (
 	// Every link must then be made explicitly, by an application that has
 	// authenticated the user by some other means first.
 	LinkNever
-	// LinkAlways links implicitly on an email match alone, trusting the
-	// provider's assertion unconditionally.
+	// LinkAlways links implicitly whenever the PROVIDER asserted the
+	// matching address, trusting that assertion unconditionally — verified
+	// or not, and whatever the local account's own verification state is.
 	//
 	// It is UNSAFE for any provider you do not fully control: it is exactly
 	// the "an email match is authentication" behaviour [Linking]'s own doc
@@ -235,6 +274,14 @@ const (
 	// first-party identity provider that you operate, whose verification
 	// semantics you know, and which no third party can make assert an
 	// arbitrary address.
+	//
+	// That justification is about a provider's assertions, and it is the
+	// exact boundary of what this mode permits. It does NOT extend to
+	// [SignInRequest.FallbackEmail], where the provider asserted no address
+	// at all and the one being matched is the application's own value: a
+	// fallback address may provision a new account under every policy, and
+	// may link to an existing one under none, including this one. See
+	// [Service.SignInWith]'s "A caller-supplied address never links".
 	LinkAlways
 )
 
@@ -282,18 +329,44 @@ var (
 	// simply a malformed request, so it is refused as one.
 	ErrProviderSubjectRequired = errors.New("authlayer/auth: external identity requires a provider and a subject")
 	// ErrLinkRequiresVerification: an external sign-in resolved to an
-	// existing local account by email address, but the configured [Linking]
-	// policy refused to link them — see [LinkVerified] and [LinkNever].
+	// existing local account by email address, and the identity was not
+	// attached to it. Three conditions produce it, and they share one remedy,
+	// which is why they share one sentinel rather than getting three:
 	//
-	// This is a "not like this" refusal, not a dead end: the account exists
-	// and the user may well own it. The remedy is for the application to
-	// authenticate the user locally (password, or a reset if they have no
-	// password) and then link the identity explicitly.
+	//  1. The configured [Linking] policy refused — see [LinkVerified] and
+	//     [LinkNever].
+	//  2. The address came from [SignInRequest.FallbackEmail], so the
+	//     provider asserted no address at all and the one being matched is
+	//     the caller's. Refused under every policy, [LinkAlways] included.
+	//     Naming this one separately was considered and rejected: a sentinel
+	//     names the remedy, not the cause, and the remedy here is identical.
+	//     It is also a strict case of what this one already says — "verified
+	//     on both sides" is unsatisfiable when one side asserted nothing.
+	//  3. The account's address MOVED between the linking decision and the
+	//     write, so the link was retracted — see
+	//     [Service.SignInWith]'s "What is not atomic here, and why".
+	//
+	// It is a "not like this" refusal, not a dead end: the account exists and
+	// the user may well own it. The remedy in all three cases is for the
+	// application to authenticate the user locally (password, or a reset if
+	// they have no password) and then link the identity explicitly with
+	// [Service.LinkIdentity], which this policy does not gate.
+	//
+	// It discloses that SOMEBODY holds the address — see
+	// [SignInResult.Created] for what that is worth to a prober, and where
+	// rate limiting belongs.
 	ErrLinkRequiresVerification = errors.New("authlayer/auth: linking this identity requires a verified email on both sides")
 	// ErrLastCredential: removing this identity would leave the account
-	// with no way in at all — no other identity and no password credential.
-	// Returned by [IdentityStore.DeleteIdentityIfNotLast], which refuses
-	// the removal rather than performing it.
+	// with no way in at all — no other identity, and no password credential
+	// this [Service] would actually accept. Returned by
+	// [IdentityStore.DeleteIdentityIfNotLast], which refuses the removal
+	// rather than performing it.
+	//
+	// "Would actually accept" is the operative phrase, and it is stricter
+	// than "a password hash is stored". Under [WithRequireVerifiedEmail](true)
+	// [Service.Login] refuses an unverified account outright, so a hash on
+	// such an account is not a way in and [Service.UnlinkIdentity] does not
+	// count it as one — see [Service.passwordCanAuthenticate].
 	ErrLastCredential = errors.New("authlayer/auth: refusing to remove the account's last credential")
 	// ErrOAuthNotConfigured: an operation needing an [IdentityStore] was
 	// attempted on a [Service] built without [WithIdentityStore].
@@ -360,6 +433,39 @@ type IdentityStore interface {
 	// ErrIdentityNotFound when id matches no row. It is the only mutation
 	// this port performs on an existing row.
 	TouchIdentity(ctx context.Context, id string, now time.Time) error
+	// DeleteIdentity removes the single identity named by its surrogate id,
+	// or returns ErrIdentityNotFound when id matches no row. It removes that
+	// row and nothing else — not the user's other identities, not another
+	// user's row that happens to share a provider.
+	//
+	// # It makes NO reachability check, and that is not an oversight
+	//
+	// [IdentityStore.DeleteIdentityIfNotLast] exists because "unlink this
+	// provider" is a user-initiated removal that must never leave an account
+	// with no way in. This method is the opposite kind of operation: it is
+	// how the service RETRACTS a row it wrote itself, and how
+	// [Service.ResetPassword] sweeps identities on a credential rotation it
+	// has already committed. Neither caller is removing a way in that the
+	// account is relying on:
+	//
+	//   - [Service.SignInWith]'s compensating delete removes an identity the
+	//     same call created a moment earlier, leaving the account exactly as
+	//     the call found it. Refusing that delete would preserve precisely
+	//     the bad link it exists to retract.
+	//   - [Service.ResetPassword] sweeps AFTER [Store.UpdateUserPassword]
+	//     has committed a fresh password, so the account holds a credential
+	//     the sweep cannot touch. See that method's doc for the one
+	//     configuration in which that password is not yet a WORKING
+	//     credential, and why it is recoverable rather than a lockout.
+	//
+	// An application MUST NOT reach for this in place of
+	// DeleteIdentityIfNotLast on a connected-accounts screen: this method
+	// will happily remove an account's last credential, which is the
+	// permanent, silent lockout that method's "It MUST be atomic" section
+	// exists to prevent.
+	//
+	// The delete is one step; there is no check to be split from it.
+	DeleteIdentity(ctx context.Context, id string) error
 	// DeleteIdentityIfNotLast removes userID's identities for provider —
 	// but ONLY if doing so leaves the account reachable, which is the case
 	// when either another identity survives the delete or userHasPassword
@@ -405,28 +511,48 @@ type IdentityStore interface {
 	// This port cannot read a password hash, and giving it the ability to
 	// would mean handing the identity backend the credential table.
 	//
+	// The value the caller computes is "can this account authenticate with
+	// its password", not "is a hash stored" — see
+	// [Service.passwordCanAuthenticate] for why the two differ under
+	// [WithRequireVerifiedEmail].
+	//
 	// What makes passing the value in SAFE, rather than merely necessary,
 	// is the direction the value can go stale in. The caller reads the user
 	// first, so a change landing between that read and this call could in
 	// principle invalidate it — but only one of the two directions is
-	// dangerous, and it cannot happen:
+	// dangerous:
 	//
-	//   - false becoming true (the user acquires a password mid-call): this
-	//     method refuses a delete that would in fact have been safe.
-	//     Fail-closed, self-correcting on retry.
-	//   - true becoming false (the user LOSES their password mid-call):
-	//     this method would allow the delete that locks them out. No
-	//     [Service] method can produce this transition — the only two paths
-	//     that write a password (ChangePassword, ResetPassword) both write
-	//     a freshly hashed, non-empty value, and this package offers no
-	//     "remove my password" and no "delete my account" at all.
+	//   - false becoming true (the account acquires a working password
+	//     mid-call): this method refuses a delete that would in fact have
+	//     been safe. Fail-closed, self-correcting on retry.
+	//   - true becoming false (the account LOSES its working password
+	//     mid-call): this method would allow the delete that locks it out.
 	//
-	// The one way to reach the dangerous transition is for an application
-	// to call [Store.UpdateUserPassword] with an empty hash itself, going
-	// around Service. An application that does that has removed a
-	// credential this package has no idea about; it must not concurrently
-	// unlink identities, and if it grows a "remove my password" feature,
-	// that feature owes the same last-credential check this method makes.
+	// The dangerous direction is unreachable through [Service] for the hash
+	// itself: the only two paths that write a password (ChangePassword,
+	// ResetPassword) both write a freshly hashed, non-empty value, and this
+	// package offers no "remove my password" and no "delete my account" at
+	// all.
+	//
+	// Under [WithRequireVerifiedEmail](true) the verified half CAN move the
+	// other way, and this doc says so rather than pretending otherwise:
+	// [Store.UpdateUserEmail] clears EmailVerifiedAt, and
+	// [Service.VerifyEmail]'s email-change path calls it before re-stamping
+	// the new address. An unlink whose read lands in that instant passes a
+	// true that is false by the time the delete runs, and the account is left
+	// with a password its configuration will not accept and no identity. That
+	// is not the permanent lockout the password case would be: the account
+	// still holds an address it has just proved control of, so
+	// [Service.RequestPasswordReset] followed by [Service.ResetPassword]
+	// certifies it again and restores the login.
+	//
+	// The other way to reach the dangerous transition is for an application
+	// to call [Store.UpdateUserPassword] with an empty hash itself, or
+	// [Store.UpdateUserEmail] directly, going around Service. An application
+	// that does that has removed a credential this package has no idea about;
+	// it must not concurrently unlink identities, and if it grows a "remove
+	// my password" feature, that feature owes the same last-credential check
+	// this method makes.
 	DeleteIdentityIfNotLast(ctx context.Context, userID, provider string, userHasPassword bool) error
 }
 

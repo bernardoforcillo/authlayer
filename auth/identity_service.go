@@ -59,9 +59,30 @@ func requireProviderSubject(ext ExternalIdentity) error {
 //     - No local account at that address: PROVISION one, with an empty
 //     PasswordHash and EmailVerifiedAt set only if the provider asserted
 //     the address verified. Created is true.
-//     - A local account exists: LINK to it only if the configured [Linking]
-//     policy allows, otherwise [ErrLinkRequiresVerification]. Created is
-//     false.
+//     - A local account exists: LINK to it only if the address came from
+//     the PROVIDER and the configured [Linking] policy allows, otherwise
+//     [ErrLinkRequiresVerification]. Created is false.
+//
+// # A caller-supplied address never links
+//
+// The link branch is reached on nothing but a matching address, so WHOSE
+// address it is decides what may be done with it. A
+// [SignInRequest.FallbackEmail] may PROVISION a new account and may never
+// LINK to an existing one — under every [Linking] policy, [LinkAlways]
+// included, and the check sits above the policy switch for exactly that
+// reason.
+//
+// The provider asserted no address on that path. Linking on one the caller
+// supplied would attach an external account to a pre-existing local account
+// on the strength of a string the caller typed: anyone able to complete a
+// dance at any configured provider, with any throwaway account, names a
+// victim's address and is signed in as them. LinkAlways's own justification
+// is about a provider you operate and whose assertions you trust, and it
+// says nothing about a path with no assertion in it at all.
+//
+// Provisioning stays allowed because nobody holds the address: there is no
+// account to take over, and refusing would strand every user whose provider
+// keeps their address private — the case FallbackEmail exists for.
 //
 // # Why the subject rung comes first
 //
@@ -184,15 +205,50 @@ func requireProviderSubject(ext ExternalIdentity) error {
 // directly; where it was over the address alone, rung 2 applies the policy
 // to whichever account won.
 //
-// One window cannot be closed from here: the linking decision reads the
-// local account and then writes the identity, and [Store] and [IdentityStore]
-// may be different backends with no transaction spanning them (that is the
-// point of the split port — see [IdentityStore]'s doc). A concurrent
-// [Store.UpdateUserEmail] landing in between can therefore leave a link
-// decided on an EmailVerifiedAt the account no longer has. The decision was
-// correct as of the read, the address changed under it rather than the
-// authorization being forged, and closing it would require a transaction the
-// port deliberately does not offer.
+// The linking decision reads the local account from [Store] and then writes
+// the identity to [IdentityStore], and the two may be different backends with
+// no transaction spanning them (that is the point of the split port — see
+// [IdentityStore]'s doc). A concurrent [Store.UpdateUserEmail] landing in
+// between would otherwise leave the identity attached to an account that no
+// longer holds the asserted address AT ALL — and rung 1 would then resolve
+// that subject to that account forever, never consulting an address again.
+//
+// That one does not need a transaction, and is closed: after the write, the
+// account is re-read and the row is retracted when the address it was matched
+// on is no longer the account's. See [Service.confirmLinkedAddress] for the
+// exact guarantee this restores, for why re-reading the address also covers
+// the EmailVerifiedAt the decision stood on, and for the one residual — a
+// retraction whose own delete fails leaves the row, and says so with an
+// error.
+//
+// # The window that is DISCLOSED rather than closed
+//
+// On the provisioning branch [Store.CreateUser] commits before
+// [IdentityStore.CreateIdentity] runs. A transient identity-backend failure
+// therefore leaves a user row holding the address with no password and no
+// identity, and this method returns the store's error.
+//
+// The cost is real. When the provider did not assert the address verified,
+// every retry of the identical assertion now finds that account and is
+// refused with [ErrLinkRequiresVerification] — the account exists, is
+// unverified, and rung 2's policy will not link to it — so the sign-in the
+// user was attempting cannot succeed however many times they try it.
+//
+// It is not, however, an address lost for good, and it has exactly one
+// recovery: [Service.RequestPasswordReset] followed by
+// [Service.ResetPassword], the same route this method's own password-less
+// accounts take. Redeeming that token gives the account a password AND
+// certifies the address, after which [Service.Login] works and a later
+// verified assertion links under [LinkVerified].
+// TestSignInWithLeavesTheProvisionedUserWhenTheIdentityWriteFails pins both
+// halves, so this disclosure is checked rather than asserted.
+//
+// Compensating — deleting the just-created user — is what would close it, and
+// it is not available: [Store] has no method that deletes a user, and adding
+// one would be a nineteenth method on a port that shipped in v0.1.0, breaking
+// every third-party backend implementing it. That is the same constraint that
+// made [IdentityStore] a separate port in the first place, and it is not
+// worth breaking for a window a documented recovery already covers.
 //
 // SignInResult.User never carries a live PasswordHash — see
 // [UserBase.PasswordHash]. Note that an account provisioned here has no
@@ -274,7 +330,9 @@ func (s *Service) SignInWith(ctx context.Context, req SignInRequest) (SignInResu
 	case err != nil:
 		return zero, err
 	default:
-		if !s.mayLink(providerVerified, u) {
+		// providerAsserted is passed, not just providerVerified, because the
+		// fallback rule sits ABOVE the policy — see [Service.mayLink].
+		if !s.mayLink(providerAsserted, providerVerified, u) {
 			return zero, ErrLinkRequiresVerification
 		}
 		// Linking certifies nothing about the local address: EmailVerifiedAt
@@ -282,7 +340,7 @@ func (s *Service) SignInWith(ctx context.Context, req SignInRequest) (SignInResu
 	}
 
 	lastUsed := now
-	if _, err := identities.CreateIdentity(ctx, Identity{
+	written, err := identities.CreateIdentity(ctx, Identity{
 		ID:       s.cfg.idGen(),
 		UserID:   u.ID,
 		Provider: ext.Provider,
@@ -299,8 +357,20 @@ func (s *Service) SignInWith(ctx context.Context, req SignInRequest) (SignInResu
 		// signed the user in" true. A link made without a sign-in leaves it
 		// nil.
 		LastUsedAt: &lastUsed,
-	}); err != nil {
+	})
+	if err != nil {
 		return zero, err
+	}
+
+	// The link rung decided on an address read from another store, so
+	// confirm the account still holds it and retract the row if it does not
+	// — see [Service.confirmLinkedAddress]. The provisioning rung is not
+	// checked: the account was created by this very call, its id has not
+	// left this function, and its address was free a moment ago.
+	if !created {
+		if err := s.confirmLinkedAddress(ctx, identities, written, u.ID, email); err != nil {
+			return zero, err
+		}
 	}
 
 	minted, err := s.mintSession(ctx, u, req.IP, req.UserAgent)
@@ -355,16 +425,44 @@ func (s *Service) signInLinkedIdentity(ctx context.Context, identities IdentityS
 // existing-account case: may this external identity be attached to u
 // implicitly, on the strength of a matching address?
 //
-// providerVerified is NOT ext.EmailVerified — it is that flag AND the fact
-// that the address being matched is one the provider actually returned, so a
+// providerAsserted says whose address that is. providerVerified is NOT
+// ext.EmailVerified — it is that flag AND providerAsserted, so a
 // [SignInRequest.FallbackEmail] can never inherit a verification. See
 // [Service.SignInWith]'s doc.
+//
+// # A caller-supplied address may provision, and may never link
+//
+// The first check is ABOVE the policy switch, deliberately, so that it holds
+// under [LinkAlways] too.
+//
+// When the provider returned no address, the one being matched here came from
+// [SignInRequest.FallbackEmail]: it is the APPLICATION's value, and the
+// provider asserted nothing about it whatsoever. Linking on it would attach
+// an external account to a pre-existing local account on the strength of a
+// string the caller supplied — anyone who can complete a dance at any
+// configured provider, with any throwaway account, names a victim's address
+// and is signed in as them.
+//
+// [LinkAlways] would otherwise do exactly that, and its own doc does not
+// cover it: the mode is blessed for "a single first-party identity provider
+// that you operate, whose verification semantics you know, and which no third
+// party can make assert an arbitrary address" — a justification about a
+// PROVIDER's assertions, which says nothing about a path where the provider
+// asserts no address at all. So the rule is not a fourth policy branch; it is
+// a precondition every branch is subject to.
+//
+// Provisioning is untouched. Nobody holds the address, so there is no account
+// to take over, and refusing would strand every user whose provider keeps
+// their address private — the case FallbackEmail exists for.
 //
 // The default branch is unreachable: [WithLinking] panics at construction on
 // any mode outside the three constants. It denies anyway, because the one
 // thing a policy switch must never do is fall through to "allow" for a value
 // nobody anticipated.
-func (s *Service) mayLink(providerVerified bool, u UserBase) bool {
+func (s *Service) mayLink(providerAsserted, providerVerified bool, u UserBase) bool {
+	if !providerAsserted {
+		return false
+	}
 	switch s.cfg.linking {
 	case LinkVerified:
 		// BOTH halves, and each one closes an attack the other does not —
@@ -377,6 +475,167 @@ func (s *Service) mayLink(providerVerified bool, u UserBase) bool {
 	default:
 		return false
 	}
+}
+
+// confirmLinkedAddress is rung 2's compensating re-read: the link was decided
+// on an address read from [Store] and then written to [IdentityStore], and
+// the two may be different backends with no transaction spanning them. This
+// re-reads the account and retracts the row when the address it was matched
+// on is no longer the account's.
+//
+// # What it buys, precisely
+//
+// Without it, a [Store.UpdateUserEmail] landing in that window leaves an
+// identity attached to an account that does not hold the asserted address at
+// ALL — and rung 1 then resolves that subject to that account forever,
+// without ever consulting an address again. The row outlives the fact that
+// justified it, and nothing later re-examines it.
+//
+// With it, the guarantee an uncontended link has is restored: at an instant
+// at or after the row was written, the account held the address it was
+// matched on. An address change landing AFTER that instant is not this
+// method's business and never was — it is the ordinary event
+// [Identity.Email]'s doc describes, and unlinking somebody's Google because
+// they later changed their local address would be a bug of its own.
+//
+// # Why re-reading the ADDRESS also covers the verification
+//
+// [LinkVerified] decides on u.EmailVerifiedAt, so it might look as though
+// that field needs re-reading too. It does not, because no [Service] method
+// can clear it without also moving the address: [Store.UpdateUserEmail] is
+// the only writer that clears it and it changes the address by definition,
+// and [Service.VerifyEmail]'s email-change path re-stamps the new address
+// verified before it returns. An address that did not move therefore cannot
+// have silently lost the verification the decision stood on.
+//
+// The exception is the one this package always names: an application calling
+// [Store.UpdateUserEmail] itself with the address the row already holds
+// clears EmailVerifiedAt without moving anything, and this check will not see
+// it. That is the same escape hatch [IdentityStore.DeleteIdentityIfNotLast]'s
+// staleness argument discloses, reached the same way — by going around
+// Service.
+//
+// # What it costs when it fires
+//
+// The retraction deletes a row this call wrote moments ago, so it removes
+// nothing the account was relying on. A delete that itself FAILS is returned
+// as-is and the row survives — the one residual, and the reason the error is
+// propagated rather than swallowed: a caller must never read "your sign-in
+// failed" as "nothing was written".
+//
+// [ErrIdentityNotFound] from the delete is not a failure: the row this call
+// wrote is already gone, which is the state the retraction wanted.
+func (s *Service) confirmLinkedAddress(ctx context.Context, identities IdentityStore, written Identity, userID, matched string) error {
+	u, err := s.store.FindUserByID(ctx, userID)
+	if err == nil && u.Email == matched {
+		return nil
+	}
+
+	if derr := identities.DeleteIdentity(ctx, written.ID); derr != nil && !errors.Is(derr, ErrIdentityNotFound) {
+		return derr
+	}
+	if err != nil {
+		// The account could not be re-read at all — a deleted user, or a
+		// store outage. Either way the link is retracted and the store's own
+		// error is what the caller gets.
+		return err
+	}
+	// The address moved under the decision. This is the same refusal the
+	// policy itself produces, and it carries the same remedy: authenticate
+	// the user by some other means and call [Service.LinkIdentity]. A retry
+	// re-enters the ladder at the top, where the account at the CURRENT
+	// address is the one the policy is applied to.
+	return ErrLinkRequiresVerification
+}
+
+// sweepIdentities removes every external identity on userID's account. It is
+// [Service.ResetPassword]'s, and only ResetPassword's — see that method's doc
+// for why an unauthenticated recovery sweeps and an authenticated
+// [Service.ChangePassword] deliberately does not.
+//
+// The optional port being absent is not an error here, and that is the whole
+// reason this is a helper rather than a call to [Service.identities]. A
+// deployment that offers no external sign-in has no identities to sweep, and
+// turning every password reset in such a deployment into
+// [ErrOAuthNotConfigured] would break the one flow this package documents as
+// the way back into a locked-out account.
+//
+// A [Service] built WITHOUT [WithIdentityStore] over a users table that some
+// OTHER Service does wire one to is the stated limit: this sweep can only
+// remove rows through the port the Service performing the reset holds.
+//
+// The list and the deletes are separate calls, with the same SEQUENTIAL-ONLY
+// scope [Service.ResetPassword]'s verification sweeps disclose: an identity
+// linked by a call genuinely concurrent with this one can survive it. Closing
+// that would need a transaction the port does not offer, and the exposure is
+// bounded by the linking policy, which still applies to that concurrent call.
+//
+// [ErrIdentityNotFound] from a delete is success: another caller removed the
+// row first, which is the state this wanted.
+func (s *Service) sweepIdentities(ctx context.Context, userID string) error {
+	identities := s.cfg.identityStore
+	if identities == nil {
+		return nil
+	}
+	rows, err := identities.ListIdentitiesByUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	for _, i := range rows {
+		if err := identities.DeleteIdentity(ctx, i.ID); err != nil && !errors.Is(err, ErrIdentityNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
+// passwordCanAuthenticate reports whether u's password credential is one this
+// Service would actually accept — not merely whether a hash is stored.
+//
+// The distinction is the whole point. [Service.Login] refuses an empty
+// PasswordHash AND, under [WithRequireVerifiedEmail](true), an unverified
+// account. A stored hash on an unverified account under that option is
+// therefore not a way in, and treating it as one is how
+// [Service.UnlinkIdentity] would remove the only door that opens.
+//
+// It is deliberately the same pair of conditions [Service.Login] applies,
+// read off the same config, rather than a second rule that could drift.
+func (s *Service) passwordCanAuthenticate(u UserBase) bool {
+	if u.PasswordHash == "" {
+		return false
+	}
+	return !s.cfg.requireVerifiedEmail || u.EmailVerifiedAt != nil
+}
+
+// revokeEverySession revokes every session family userID holds — one
+// [Store.DeleteSessionsByFamily] per distinct family, so rotated-but-unexpired
+// predecessor rows go too rather than only each family's currently-live row.
+//
+// It is the "sweep everything, spare nothing" shape [Service.LogoutAll],
+// [Service.ResetPassword] and [Service.UnlinkIdentity] share.
+// [Service.ChangePassword] deliberately does NOT use it: that method spares
+// the caller's own family, and holds the currentSessionID to identify it
+// with.
+//
+// A failure partway through is returned immediately, leaving the families
+// already revoked revoked and the rest untouched. The caller sees a non-nil
+// error either way and must not assume the operation mostly worked.
+func (s *Service) revokeEverySession(ctx context.Context, userID string) error {
+	sessions, err := s.store.ListSessionsByUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	done := make(map[string]bool, len(sessions))
+	for _, sess := range sessions {
+		if done[sess.FamilyID] {
+			continue
+		}
+		done[sess.FamilyID] = true
+		if err := s.store.DeleteSessionsByFamily(ctx, sess.FamilyID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // LinkIdentity attaches an external account to a local one DELIBERATELY:
@@ -510,14 +769,50 @@ func (s *Service) LinkIdentity(ctx context.Context, userID string, ext ExternalI
 // [ErrOAuthNotConfigured].
 //
 // It refuses to remove the account's last way in: with no other identity
-// surviving the delete and no password credential, the call fails with
-// [ErrLastCredential] and removes NOTHING. That is not a formality. An
+// surviving the delete and no WORKING password credential, the call fails
+// with [ErrLastCredential] and removes NOTHING. That is not a formality. An
 // account with no identity and no password cannot be authenticated by
 // anything in this package — not by [Service.Login], which refuses an empty
 // PasswordHash, and not by [Service.SignInWith], which has no link left to
 // resolve. The lockout would be permanent. [ErrIdentityNotFound] means
 // there was nothing to unlink at that provider, which is a different answer
 // an application's connected-accounts screen acts on differently.
+//
+// # Why the sessions go too
+//
+// A successful unlink revokes EVERY session family the account holds — the
+// same "spare nothing" sweep [Service.LogoutAll] and [Service.ResetPassword]
+// perform, via [Service.revokeEverySession].
+//
+// This is a credential removal, and every other credential change in this
+// package sweeps. Without it, a session minted THROUGH the identity being
+// removed keeps rotating for its full [WithRefreshTTL] — "disconnect this
+// account" would leave the disconnected account's session live, which is the
+// opposite of what the screen calling this says it does.
+//
+// It sweeps all of the user's families rather than only those minted through
+// this identity, because a [Session] records no identity provenance: nothing
+// in the row says which credential minted it, and a rotated successor would
+// not carry it anyway. Adding that column is a [Store] schema change for a
+// distinction that stops being true after the first refresh. The blunt sweep
+// is also the safer default for the case that motivates an unlink at all —
+// "that Google account is not mine any more" — where the sessions worth
+// keeping are the ones the user can trivially re-create by signing in.
+//
+// There is no carve-out for the caller's own session, unlike
+// [Service.ChangePassword]. That method is handed a currentSessionID it can
+// identify the caller's family with; this one takes no session at all, and
+// inventing a parameter for it would ask an application to nominate a session
+// to spare with nothing here able to check the nomination is honest.
+// Disconnecting a provider therefore signs the user out everywhere, and the
+// connected-accounts screen should say so before it calls this.
+//
+// The ORDER is load-bearing in the small: the delete runs first, so a refusal
+// — either sentinel — reaches the caller having changed nothing at all. A
+// revocation that outlived its own refused operation would sign a user out of
+// every device to tell them "no". Once the delete has committed, a failure in
+// the revocation is returned as-is with the identity already gone; the caller
+// sees an error and must not assume the unlink did not happen.
 //
 // The decision and the delete happen inside
 // [IdentityStore.DeleteIdentityIfNotLast] as ONE atomic step, which is why
@@ -538,9 +833,21 @@ func (s *Service) LinkIdentity(ctx context.Context, userID string, ext ExternalI
 //
 // That argument depends on the read being FRESH and being the account's real
 // state. It is performed on every call rather than cached, and the flag is
-// derived from the stored [UserBase.PasswordHash] rather than assumed —
-// passing a constant true would be exactly the lockout above, wearing a
-// successful return.
+// derived from the stored account rather than assumed — passing a constant
+// true would be exactly the lockout above, wearing a successful return.
+//
+// # The question asked is "can it authenticate", not "is a hash stored"
+//
+// [Service.passwordCanAuthenticate] answers it, and the difference is not
+// academic. Under [WithRequireVerifiedEmail](true), [Service.Login] refuses
+// an unverified account outright: a stored hash on such an account opens
+// nothing, so counting it as a way in would let this method remove the only
+// door that does open. The predicate reads the same option Login reads, so
+// the two cannot disagree about what a working credential is.
+//
+// It errs strict, which is the safe direction: an account that would in fact
+// have been fine is refused an unlink until it verifies its address, and the
+// refusal removes nothing.
 func (s *Service) UnlinkIdentity(ctx context.Context, userID, provider string) error {
 	identities, err := s.identities()
 	if err != nil {
@@ -550,13 +857,23 @@ func (s *Service) UnlinkIdentity(ctx context.Context, userID, provider string) e
 	// Read the credential state fresh, immediately before the delete: see
 	// "Why the password state is read here and passed in", and
 	// [IdentityStore.DeleteIdentityIfNotLast]'s own staleness argument,
-	// which this ordering is what makes true.
+	// which this ordering is what makes true. The question asked of the
+	// account is whether it can AUTHENTICATE, not whether a hash is stored —
+	// see [Service.passwordCanAuthenticate].
 	u, err := s.store.FindUserByID(ctx, userID)
 	if err != nil {
 		return err
 	}
 
-	return identities.DeleteIdentityIfNotLast(ctx, userID, provider, u.PasswordHash != "")
+	// The delete comes first, so a refusal — ErrLastCredential or
+	// ErrIdentityNotFound — reaches the caller having changed nothing at all.
+	if err := identities.DeleteIdentityIfNotLast(ctx, userID, provider, s.passwordCanAuthenticate(u)); err != nil {
+		return err
+	}
+
+	// The credential is gone; now take back what it minted. See "Why the
+	// sessions go too".
+	return s.revokeEverySession(ctx, userID)
 }
 
 // ListIdentities returns the external accounts linked to userID, and only

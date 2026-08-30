@@ -262,6 +262,73 @@ func TestTouchIdentityReportsAMiss(t *testing.T) {
 	}
 }
 
+// --- DeleteIdentity ---
+
+// TestDeleteIdentityRemovesExactlyOneRow pins the scope of the by-id delete:
+// the row named, and nothing that merely resembles it — not the same user's
+// other identity, not another user's row at the same provider. It is the
+// method the service uses to RETRACT a row it wrote itself, so removing one
+// row too many would delete a link somebody is relying on.
+func TestDeleteIdentityRemovesExactlyOneRow(t *testing.T) {
+	s := memory.NewIdentityStore()
+	ctx := context.Background()
+
+	mustCreate(t, s, auth.Identity{ID: "i1", UserID: "u1", Provider: "google", Subject: "g1"})
+	mustCreate(t, s, auth.Identity{ID: "i2", UserID: "u1", Provider: "google", Subject: "g2"})
+	mustCreate(t, s, auth.Identity{ID: "i3", UserID: "u2", Provider: "google", Subject: "g3"})
+
+	if err := s.DeleteIdentity(ctx, "i1"); err != nil {
+		t.Fatalf("DeleteIdentity(i1): %v", err)
+	}
+	if _, err := s.FindIdentityByProviderSubject(ctx, "google", "g1"); !errors.Is(err, auth.ErrIdentityNotFound) {
+		t.Fatalf("the named row survived: err = %v, want ErrIdentityNotFound", err)
+	}
+
+	u1, err := s.ListIdentitiesByUser(ctx, "u1")
+	if err != nil || len(u1) != 1 || u1[0].ID != "i2" {
+		t.Fatalf("u1 rows = %+v (err %v), want only i2 — a by-id delete must not take the user's siblings", u1, err)
+	}
+	u2, err := s.ListIdentitiesByUser(ctx, "u2")
+	if err != nil || len(u2) != 1 {
+		t.Fatalf("u2 rows = %+v (err %v), want another user's row untouched", u2, err)
+	}
+}
+
+// TestDeleteIdentityReportsAMiss pins that an unknown id is
+// ErrIdentityNotFound rather than the silent success a delete-where-matching
+// gives. SignInWith's compensating delete reads that answer: "the row I just
+// wrote is already gone" is a different fact from "I removed it".
+func TestDeleteIdentityReportsAMiss(t *testing.T) {
+	s := memory.NewIdentityStore()
+
+	if err := s.DeleteIdentity(context.Background(), "nope"); !errors.Is(err, auth.ErrIdentityNotFound) {
+		t.Fatalf("DeleteIdentity(unknown id) err = %v, want ErrIdentityNotFound", err)
+	}
+}
+
+// TestDeleteIdentityMakesNoReachabilityCheck pins the difference from
+// DeleteIdentityIfNotLast, which is the whole reason both exist. This method
+// removes a password-less account's only identity without complaint; the port
+// doc says so, and an application that reached for it on a connected-accounts
+// screen would produce exactly the lockout the other method refuses.
+func TestDeleteIdentityMakesNoReachabilityCheck(t *testing.T) {
+	s := memory.NewIdentityStore()
+	ctx := context.Background()
+
+	mustCreate(t, s, auth.Identity{ID: "i1", UserID: "u1", Provider: "google", Subject: "g1"})
+
+	if err := s.DeleteIdentityIfNotLast(ctx, "u1", "google", false); !errors.Is(err, auth.ErrLastCredential) {
+		t.Fatalf("control: DeleteIdentityIfNotLast err = %v, want ErrLastCredential", err)
+	}
+	if err := s.DeleteIdentity(ctx, "i1"); err != nil {
+		t.Fatalf("DeleteIdentity must not apply the reachability check: %v", err)
+	}
+	rows, err := s.ListIdentitiesByUser(ctx, "u1")
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("rows = %+v (err %v), want the row gone", rows, err)
+	}
+}
+
 // --- DeleteIdentityIfNotLast ---
 
 // TestDeleteIdentityIfNotLastReportsAMiss pins that "this user has no

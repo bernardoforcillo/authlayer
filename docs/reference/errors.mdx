@@ -151,8 +151,8 @@ The remaining six, raised by `SignInWith`, `LinkIdentity`, `UnlinkIdentity` and
 |---|---|---|
 | `ErrIdentityNotFound` | No identity for that `(provider, subject)` pair, id, or `(user, provider)` pair. From `UnlinkIdentity` it means there was **nothing to unlink** | 404 |
 | `ErrIdentityLinked` | That `(provider, subject)` pair is already linked to a **different** user. An existing link is never re-pointed | 409 |
-| `ErrLinkRequiresVerification` | The address matches an existing local account and the [linking policy](/oauth/linking) refused the implicit link. Not a dead end — `LinkIdentity` is the remedy | 409 |
-| `ErrLastCredential` | Unlinking would leave the account with no identity **and** no password — a permanent lockout, so nothing is removed | 422 |
+| `ErrLinkRequiresVerification` | The address matches an existing local account and the identity was not attached to it: the [linking policy](/oauth/linking) refused, or the address came from `FallbackEmail` (refused under **every** policy), or the account's address moved under the decision and the link was retracted. Not a dead end — `LinkIdentity` is the remedy in all three | 409 |
+| `ErrLastCredential` | Unlinking would leave the account with no identity **and** no password this `Service` would accept — under `WithRequireVerifiedEmail(true)` a hash on an unverified account does not count. A permanent lockout, so nothing is removed | 422 |
 | `ErrProviderSubjectRequired` | An `ExternalIdentity` arrived with a blank or whitespace-only `Provider` or `Subject`. Refused by **both** entry points before any store is touched | 400 |
 | `ErrOAuthNotConfigured` | An external-identity method was called on a `Service` built without `WithIdentityStore` — a wiring bug, not caller input | 500 |
 

@@ -138,7 +138,8 @@ true
 
 <ResponseField name="UnlinkIdentity(ctx, userID, provider string) error" type="method">
   Remove every identity that user holds at that provider — unless doing so
-  would leave the account with no way in at all. See
+  would leave the account with no way it can actually authenticate. A
+  successful unlink also revokes **every** session the account holds. See
   [Connected accounts](/oauth/connected-accounts).
 </ResponseField>
 
@@ -157,9 +158,10 @@ go run ./examples/oauth
 
 It provisions an account from a fake provider, signs the same subject in again,
 changes the provider's reported address and shows the link surviving it,
-refuses an unverified assertion claiming an existing account, links that same
-assertion explicitly after a password login, and refuses to remove an account's
-last credential.
+refuses an unverified assertion claiming an existing account, refuses a
+caller-supplied `FallbackEmail` naming one, links that same assertion
+explicitly after a password login, refuses to remove an account's last
+credential, and ends on a password reset disconnecting every linked account.
 
 {/* verify:stdout "<nil> true dana@example.com true\n<nil> 1\ngoogle 109371829301827364501 dana@example.com true\ntrue" */}
 

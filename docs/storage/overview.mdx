@@ -12,10 +12,10 @@ four.
 | `scope.Store[C, M]` | containers, members, custom roles, a transaction | composed from `ContainerStore`, `MemberStore`, `RoleStore` |
 | `invite.Store` | email invitations and links | 13 |
 | `auth.Store` | users, sessions, verifications | 18 |
-| `auth.IdentityStore` | [external identities](/oauth/overview) — **optional** | 5 |
+| `auth.IdentityStore` | [external identities](/oauth/overview) — **optional** | 6 |
 
 <Note>
-`auth.IdentityStore` is a port of its own rather than five more methods on
+`auth.IdentityStore` is a port of its own rather than six more methods on
 `auth.Store`, because `auth.Store` is released: adding to it would break every
 third-party backend that already implements it. An application offering no
 external sign-in wires none, creates no table, and gets `ErrOAuthNotConfigured`
@@ -208,6 +208,14 @@ who can sign in as whom.
     both callers told they succeeded.
   </Card>
 </Columns>
+
+<Note>
+`DeleteIdentity` — the sixth method — is the by-id sibling and makes **no**
+reachability check at all: it is how the service retracts a row it wrote itself
+(a link whose account moved out from under it) and how `ResetPassword` sweeps
+identities after it has already committed a new password. Never reach for it
+from a connected-accounts screen; that is `DeleteIdentityIfNotLast`'s job.
+</Note>
 
 <Warning>
 A fourth obligation is not a MUST the port can state, because it is about what a

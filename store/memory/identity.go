@@ -143,6 +143,25 @@ func (s *IdentityStore) TouchIdentity(_ context.Context, id string, now time.Tim
 	return nil
 }
 
+// DeleteIdentity removes the one row named by id, or returns
+// auth.ErrIdentityNotFound when id matches no row. It touches nothing else.
+//
+// Unlike [IdentityStore.DeleteIdentityIfNotLast] it makes no reachability
+// check at all, and will remove an account's last credential if asked — see
+// auth.IdentityStore.DeleteIdentity for the two service callers that may ask
+// and why neither is removing a way in the account relies on. The lookup and
+// the delete share one acquisition of mu like every other method here, though
+// nothing here is a check-then-act: there is no decision to split.
+func (s *IdentityStore) DeleteIdentity(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.identities[id]; !ok {
+		return auth.ErrIdentityNotFound
+	}
+	delete(s.identities, id)
+	return nil
+}
+
 // DeleteIdentityIfNotLast removes every identity of userID at provider, but
 // only when the account is still reachable afterwards — either another
 // identity survives the delete or userHasPassword is true. Otherwise it

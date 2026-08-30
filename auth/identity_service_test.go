@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/password"
 	"github.com/bernardoforcillo/authlayer/store/memory"
 	"github.com/bernardoforcillo/authlayer/token"
 )
@@ -1829,7 +1830,11 @@ func TestUnlinkIdentityPassesTheAccountsRealPasswordState(t *testing.T) {
 	}
 
 	// The same account, once it has been through the reset flow, is a
-	// different answer — which is why the value is read per call.
+	// different answer — which is why the value is read per call. The reset
+	// also SWEEPS every identity (see TestResetPasswordSweepsEveryIdentityOnTheAccount),
+	// so the connected account has to be linked again before there is
+	// anything left to unlink; that re-link is the documented consequence of
+	// the sweep, not an artifact of this test.
 	tok, ok, err := svc.RequestPasswordReset(ctx, "jo@example.com", "198.51.100.7")
 	if err != nil || !ok {
 		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
@@ -1837,11 +1842,19 @@ func TestUnlinkIdentityPassesTheAccountsRealPasswordState(t *testing.T) {
 	if err := svc.ResetPassword(ctx, tok, "First-Password-Ever-4!"); err != nil {
 		t.Fatalf("ResetPassword: %v", err)
 	}
+	if err := svc.UnlinkIdentity(ctx, noPassword.ID, "google"); !errors.Is(err, auth.ErrIdentityNotFound) {
+		t.Fatalf("UnlinkIdentity straight after the reset err = %v, want ErrIdentityNotFound — the reset swept the link", err)
+	}
+	mustLink(t, svc, noPassword.ID, googleExt("jo@example.com", true))
 	if err := svc.UnlinkIdentity(ctx, noPassword.ID, "google"); err != nil {
-		t.Fatalf("UnlinkIdentity after the reset err = %v, want success — the account now has a password", err)
+		t.Fatalf("UnlinkIdentity after the re-link err = %v, want success — the account now has a password", err)
 	}
 
-	want := []bool{false, true, true}
+	// The fourth call is the sweep's own: ResetPassword removes identities by
+	// id and never reaches DeleteIdentityIfNotLast, so the recorded values
+	// are the four UnlinkIdentity calls above, in order — and every one of
+	// them was computed from the account's real state at the time.
+	want := []bool{false, true, true, true}
 	if len(spy.seen) != len(want) {
 		t.Fatalf("userHasPassword calls = %v, want %v", spy.seen, want)
 	}
@@ -1924,5 +1937,621 @@ func TestListIdentitiesFailsClosedWhenTheStoreFails(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("ListIdentities returned %d rows alongside its error, want none", len(got))
+	}
+}
+
+// ============================================================
+// A caller-supplied address may PROVISION, and may never LINK
+// ============================================================
+
+// fallbackReq builds the shape this section is about: a provider that
+// returned NO address, and an application-supplied one alongside it. The
+// assertion carries EmailVerified: true throughout, because the point is
+// that the flag cannot launder an address the provider never mentioned.
+func fallbackReq(subject, fallback string) auth.SignInRequest {
+	return auth.SignInRequest{
+		Identity:      auth.ExternalIdentity{Provider: "github", Subject: subject, EmailVerified: true},
+		FallbackEmail: fallback,
+		IP:            "198.51.100.66",
+		UserAgent:     "oauth-agent",
+	}
+}
+
+// TestSignInWithNeverLinksAFallbackEmailUnderAnyPolicy is the rule, and it
+// holds ABOVE the [auth.Linking] policy rather than inside it.
+//
+// Rung 2 reaches the link branch on nothing but a matching address. When that
+// address came from [auth.SignInRequest.FallbackEmail] it is the CALLER's
+// value and the provider asserted no address at all, so linking on it attaches
+// an external account to a local account on the strength of a string the
+// caller typed. Under LinkAlways that is a plain takeover: the mode's own doc
+// blesses "a single first-party IdP you operate, which no third party can make
+// assert an arbitrary address" — a justification that says nothing about this
+// path, where the provider asserts nothing and the address is the caller's.
+//
+// So all three modes are tested, and LinkAlways is the one that matters: a
+// rule expressed as a fourth branch of the policy switch would leave it open.
+func TestSignInWithNeverLinksAFallbackEmailUnderAnyPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode auth.Linking
+	}{
+		{"LinkVerified", auth.LinkVerified},
+		{"LinkNever", auth.LinkNever},
+		{"LinkAlways", auth.LinkAlways},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, store, ids := newOAuthService(t, auth.WithLinking(tc.mode))
+			ctx := context.Background()
+
+			victim := signUpVerified(t, svc, "vera@example.com", validPassword)
+
+			res, err := svc.SignInWith(ctx, fallbackReq("github-attacker", "  VERA@example.com "))
+			if !errors.Is(err, auth.ErrLinkRequiresVerification) {
+				t.Fatalf("SignInWith(fallback naming a registered address) err = %v, want ErrLinkRequiresVerification — a caller-supplied address must never attach an identity to somebody else's account", err)
+			}
+			assertNoTokens(t, res)
+			assertNoIdentityRow(t, ids, "github", "github-attacker")
+			if n := len(identitiesOf(t, ids, victim.ID)); n != 0 {
+				t.Fatalf("the victim's account gained %d identities, want 0 — the refusal must write nothing", n)
+			}
+			if n := sessionCount(t, store, victim.ID); n != 0 {
+				t.Fatalf("sessions for the victim = %d, want 0 — a refused sign-in must mint nothing", n)
+			}
+		})
+	}
+}
+
+// TestSignInWithFallbackStillProvisionsUnderEveryPolicy is the other half of
+// the rule, and the reason it is stated as "may provision but never link"
+// rather than "a fallback is refused". Nobody holds the address, so there is
+// no account to take over, and refusing would strand every GitHub user with
+// a private address.
+func TestSignInWithFallbackStillProvisionsUnderEveryPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode auth.Linking
+	}{
+		{"LinkVerified", auth.LinkVerified},
+		{"LinkNever", auth.LinkNever},
+		{"LinkAlways", auth.LinkAlways},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, _ := newOAuthService(t, auth.WithLinking(tc.mode))
+
+			res, err := svc.SignInWith(context.Background(), fallbackReq("github-newcomer", "wynn@example.com"))
+			if err != nil || !res.Created {
+				t.Fatalf("SignInWith(fallback naming an unregistered address) = created %v, err %v; want a provisioned account", res.Created, err)
+			}
+			if res.User.EmailVerifiedAt != nil {
+				t.Fatal("provisioned account is verified, want unverified — a fallback address carries no verification")
+			}
+		})
+	}
+}
+
+// TestSignInWithStillLinksAProviderAssertedAddressUnderLinkAlways guards the
+// blast radius of the rule above: it is about the FALLBACK path only, and
+// must not quietly turn LinkAlways into LinkNever for the path that mode
+// actually exists for.
+func TestSignInWithStillLinksAProviderAssertedAddressUnderLinkAlways(t *testing.T) {
+	svc, _, _ := newOAuthService(t, auth.WithLinking(auth.LinkAlways))
+	ctx := context.Background()
+
+	u := mustSignUp(t, svc, "xan@example.com", validPassword) // unverified, on purpose
+
+	res, err := svc.SignInWith(ctx, signInReq(extOf("github", "github-xan", "xan@example.com", false)))
+	if err != nil {
+		t.Fatalf("SignInWith under LinkAlways with a provider-asserted address: %v", err)
+	}
+	if res.Created || res.User.ID != u.ID {
+		t.Fatalf("SignInWith = %+v, want an implicit link to %q", res, u.ID)
+	}
+}
+
+// ============================================================
+// ResetPassword sweeps identities; ChangePassword does not
+// ============================================================
+
+// TestResetPasswordSweepsEveryIdentityOnTheAccount pins the sweep and its
+// scope: every one of the account's identities, at every provider, and
+// nobody else's.
+//
+// ResetPassword is UNAUTHENTICATED recovery — the actor proved control of an
+// address and nothing else — so it is the one path that must assume every
+// other credential on the account is hostile. An external identity is such a
+// credential, and one nothing else in this package can sweep.
+func TestResetPasswordSweepsEveryIdentityOnTheAccount(t *testing.T) {
+	svc, _, ids := newOAuthService(t)
+	ctx := context.Background()
+
+	u := oauthAccount(t, svc, googleExt("nils@example.com", true))
+	mustLink(t, svc, u.ID, extOf("github", "github-nils", "nils@example.com", true))
+	other := oauthAccount(t, svc, extOf("google", "google-subject-other", "opal@example.com", true))
+
+	if n := len(identitiesOf(t, ids, u.ID)); n != 2 {
+		t.Fatalf("fixture holds %d identities, want 2", n)
+	}
+
+	tok, ok, err := svc.RequestPasswordReset(ctx, "nils@example.com", "198.51.100.7")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	if err := svc.ResetPassword(ctx, tok, "First-Password-Ever-4!"); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	if rows := identitiesOf(t, ids, u.ID); len(rows) != 0 {
+		t.Fatalf("identities after the reset = %+v, want none — an unauthenticated recovery must not leave a credential it did not rotate", rows)
+	}
+	assertNoIdentityRow(t, ids, "google", "google-subject-1")
+	assertNoIdentityRow(t, ids, "github", "github-nils")
+	if n := len(identitiesOf(t, ids, other.ID)); n != 1 {
+		t.Fatalf("another account's identities = %d, want 1 — the sweep is scoped to the resetting account", n)
+	}
+}
+
+// TestPasswordResetRecoversAnAccountProvisionedByAFallbackAddress is the
+// whole point of the sweep, run end to end through the flow the docs
+// prescribe and nothing else.
+//
+// The attacker completes a real dance at a provider that returns no address
+// and supplies the victim's address themselves. Nobody holds it yet, so this
+// provisions — the one thing a fallback may still do. The victim then
+// performs the documented recovery, and afterwards the attacker's assertion
+// must reach the account by no route at all.
+func TestPasswordResetRecoversAnAccountProvisionedByAFallbackAddress(t *testing.T) {
+	svc, store, ids := newOAuthService(t)
+	ctx := context.Background()
+
+	planted, err := svc.SignInWith(ctx, fallbackReq("github-attacker", "wren@example.com"))
+	if err != nil || !planted.Created {
+		t.Fatalf("the attacker's provisioning: created=%v err=%v", planted.Created, err)
+	}
+
+	// RequestPasswordReset -> ResetPassword -> Login -> LogoutAll, exactly as
+	// documented, and nothing else.
+	tok, ok, err := svc.RequestPasswordReset(ctx, "wren@example.com", "203.0.113.9")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	if err := svc.ResetPassword(ctx, tok, "First-Password-Ever-4!"); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+	login, err := svc.Login(ctx, "wren@example.com", "First-Password-Ever-4!", "203.0.113.9", "victim")
+	if err != nil {
+		t.Fatalf("Login after the reset: %v", err)
+	}
+	if err := svc.LogoutAll(ctx, login.User.ID); err != nil {
+		t.Fatalf("LogoutAll: %v", err)
+	}
+
+	if rows := identitiesOf(t, ids, planted.User.ID); len(rows) != 0 {
+		t.Fatalf("the attacker's identity survived the recovery: %+v", rows)
+	}
+	res, err := svc.SignInWith(ctx, fallbackReq("github-attacker", "wren@example.com"))
+	if !errors.Is(err, auth.ErrLinkRequiresVerification) {
+		t.Fatalf("the attacker's assertion after the recovery: err = %v, want ErrLinkRequiresVerification", err)
+	}
+	assertNoTokens(t, res)
+	if n := sessionCount(t, store, planted.User.ID); n != 0 {
+		t.Fatalf("sessions after the recovery = %d, want 0", n)
+	}
+}
+
+// callLog records the order in which the two stores below were called. It is
+// shared by a wrapper over each port, which is the only way to observe an
+// ordering that spans them.
+type callLog struct {
+	mu   sync.Mutex
+	seen []string
+}
+
+func (l *callLog) note(what string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.seen = append(l.seen, what)
+}
+
+func (l *callLog) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.seen...)
+}
+
+// orderedIdentityStore and orderedAuthStore delegate everything and note the
+// two calls whose relative order is the property under test.
+type orderedIdentityStore struct {
+	auth.IdentityStore
+	log *callLog
+}
+
+func (s orderedIdentityStore) DeleteIdentity(ctx context.Context, id string) error {
+	s.log.note("DeleteIdentity")
+	return s.IdentityStore.DeleteIdentity(ctx, id)
+}
+
+type orderedAuthStore struct {
+	*memory.AuthStore
+	log *callLog
+}
+
+func (s orderedAuthStore) DeleteSessionsByFamily(ctx context.Context, familyID string) error {
+	s.log.note("DeleteSessionsByFamily")
+	return s.AuthStore.DeleteSessionsByFamily(ctx, familyID)
+}
+
+// TestResetPasswordSweepsIdentitiesBeforeSessions pins the ORDER of the two
+// sweeps, deterministically and without a single goroutine, because the order
+// is the whole reason the sweep helps.
+//
+// Revoking sessions first would leave the identity live for the length of the
+// remaining work: whoever holds it can complete a dance and mint a FRESH
+// session, which the revocation that already ran cannot reach. Removing the
+// identity first means no new session can be minted through it, and the
+// revocation that follows catches anything minted just before.
+//
+// Recording the call order across the two ports is the only way to observe
+// this: both orderings leave exactly the same rows behind, so a
+// state-only assertion cannot tell them apart.
+func TestResetPasswordSweepsIdentitiesBeforeSessions(t *testing.T) {
+	log := &callLog{}
+	inner := memory.NewAuthStore()
+	svc := auth.New(orderedAuthStore{AuthStore: inner, log: log},
+		auth.WithIdentityStore(orderedIdentityStore{IdentityStore: memory.NewIdentityStore(), log: log}),
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute))
+	ctx := context.Background()
+
+	oauthAccount(t, svc, googleExt("ines@example.com", true))
+	if _, err := svc.SignInWith(ctx, signInReq(googleExt("ines@example.com", true))); err != nil {
+		t.Fatalf("second SignInWith: %v", err)
+	}
+
+	tok, ok, err := svc.RequestPasswordReset(ctx, "ines@example.com", "198.51.100.7")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	if err := svc.ResetPassword(ctx, tok, "First-Password-Ever-4!"); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	seen := log.snapshot()
+	identities, sessions := 0, 0
+	for _, call := range seen {
+		switch call {
+		case "DeleteIdentity":
+			if sessions > 0 {
+				t.Fatalf("call order = %v; an identity was removed AFTER a session family was revoked — the identity was live while the revocation ran", seen)
+			}
+			identities++
+		case "DeleteSessionsByFamily":
+			sessions++
+		}
+	}
+	if identities != 1 || sessions != 2 {
+		t.Fatalf("call order = %v; want 1 identity delete then 2 family revocations", seen)
+	}
+}
+
+// TestChangePasswordLeavesConnectedAccountsAlone is the other side of the
+// split, and it is deliberate rather than an omission. ChangePassword's
+// caller was ALREADY authenticated and is performing a routine action;
+// unlinking someone's Google on a routine password change is UX-hostile and
+// buys nothing. It mirrors the Logout/LogoutAll split already in the package.
+func TestChangePasswordLeavesConnectedAccountsAlone(t *testing.T) {
+	svc, _, ids := newOAuthService(t)
+	ctx := context.Background()
+
+	u := mustSignUp(t, svc, "yuri@example.com", validPassword)
+	mustLink(t, svc, u.ID, extOf("google", "google-yuri", "yuri@example.com", true))
+
+	login, err := svc.Login(ctx, "yuri@example.com", validPassword, "198.51.100.7", "laptop")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	claims, err := svc.VerifyAccessToken(login.AccessToken)
+	if err != nil {
+		t.Fatalf("VerifyAccessToken: %v", err)
+	}
+	if err := svc.ChangePassword(ctx, u.ID, claims.SessionID, validPassword, "Another-Valid-Pass-9!"); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+
+	if n := len(identitiesOf(t, ids, u.ID)); n != 1 {
+		t.Fatalf("identities after ChangePassword = %d, want 1 — a routine, authenticated change must not disconnect anything", n)
+	}
+}
+
+// TestResetPasswordWithNoIdentityStoreConfigured pins that the sweep is
+// conditional on the OPTIONAL port being wired, and does not turn every
+// password reset in a deployment with no external sign-in into
+// ErrOAuthNotConfigured.
+func TestResetPasswordWithNoIdentityStoreConfigured(t *testing.T) {
+	svc, _ := newTestService(t) // no WithIdentityStore
+	ctx := context.Background()
+
+	mustSignUp(t, svc, "zev@example.com", validPassword)
+	tok, ok, err := svc.RequestPasswordReset(ctx, "zev@example.com", "198.51.100.7")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	if err := svc.ResetPassword(ctx, tok, "Another-Valid-Pass-9!"); err != nil {
+		t.Fatalf("ResetPassword with no identity store: %v, want success", err)
+	}
+}
+
+// ============================================================
+// The cross-store windows, and what each one costs
+// ============================================================
+
+// emailMovingIdentityStore delegates CreateIdentity to a real store and then,
+// inside the same call, moves the user's address through the auth store —
+// which is exactly the concurrent Store.UpdateUserEmail landing in
+// SignInWith's cross-store window, driven deterministically instead of raced
+// for. moveTo == "" moves nothing, which is the control.
+type emailMovingIdentityStore struct {
+	auth.IdentityStore
+
+	store  *memory.AuthStore
+	moveTo string
+}
+
+func (s *emailMovingIdentityStore) CreateIdentity(ctx context.Context, i auth.Identity) (auth.Identity, error) {
+	got, err := s.IdentityStore.CreateIdentity(ctx, i)
+	if err != nil || s.moveTo == "" {
+		return got, err
+	}
+	if err := s.store.UpdateUserEmail(ctx, i.UserID, s.moveTo, time.Now()); err != nil {
+		return auth.Identity{}, err
+	}
+	return got, nil
+}
+
+// TestSignInWithRetractsALinkWhoseAddressMovedUnderIt pins the compensating
+// re-read.
+//
+// The link is decided on an address read from the users table and then
+// written to a different table, and the two may be different backends with no
+// transaction spanning them. If the account's address moves in between, the
+// identity ends up attached to an account that does not hold the asserted
+// address at all — and rung 1 then resolves that subject forever, never
+// consulting an address again. Re-reading the address after the write and
+// deleting the row when it moved needs no cross-store transaction, and it is
+// what keeps "the account held this address when the link was made" true.
+func TestSignInWithRetractsALinkWhoseAddressMovedUnderIt(t *testing.T) {
+	t.Run("moved", func(t *testing.T) {
+		mover := &emailMovingIdentityStore{IdentityStore: memory.NewIdentityStore(), moveTo: "moved@example.com"}
+		svc, store, _ := newOAuthService(t, auth.WithIdentityStore(mover))
+		mover.store = store
+		ctx := context.Background()
+
+		victim := signUpVerified(t, svc, "zoe@example.com", validPassword)
+
+		res, err := svc.SignInWith(ctx, signInReq(extOf("google", "google-zoe", "zoe@example.com", true)))
+		if !errors.Is(err, auth.ErrLinkRequiresVerification) {
+			t.Fatalf("SignInWith err = %v, want ErrLinkRequiresVerification — the account no longer holds the asserted address", err)
+		}
+		assertNoTokens(t, res)
+		assertNoIdentityRow(t, mover, "google", "google-zoe")
+		if n := len(identitiesOf(t, mover, victim.ID)); n != 0 {
+			t.Fatalf("the account kept %d identities, want 0 — the link must be retracted, not left resolving forever", n)
+		}
+		if n := sessionCount(t, store, victim.ID); n != 0 {
+			t.Fatalf("sessions = %d, want 0 — a retracted link must mint nothing", n)
+		}
+	})
+
+	t.Run("unmoved", func(t *testing.T) {
+		mover := &emailMovingIdentityStore{IdentityStore: memory.NewIdentityStore()} // moves nothing
+		svc, store, _ := newOAuthService(t, auth.WithIdentityStore(mover))
+		mover.store = store
+		ctx := context.Background()
+
+		victim := signUpVerified(t, svc, "zoe@example.com", validPassword)
+
+		res, err := svc.SignInWith(ctx, signInReq(extOf("google", "google-zoe", "zoe@example.com", true)))
+		if err != nil {
+			t.Fatalf("SignInWith: %v — the compensation must fire only when the address actually moved", err)
+		}
+		if res.Created || res.User.ID != victim.ID {
+			t.Fatalf("SignInWith = %+v, want an implicit link to %q", res, victim.ID)
+		}
+		if n := len(identitiesOf(t, mover, victim.ID)); n != 1 {
+			t.Fatalf("identities = %d, want 1 — an uncontended link must survive", n)
+		}
+	})
+}
+
+// createFailIdentityStore fails every CreateIdentity with a transient error:
+// the identity backend being briefly unavailable, which is the failure the
+// window below is about.
+type createFailIdentityStore struct {
+	auth.IdentityStore
+}
+
+func (s createFailIdentityStore) CreateIdentity(context.Context, auth.Identity) (auth.Identity, error) {
+	return auth.Identity{}, errIdentityBoom
+}
+
+// TestSignInWithLeavesTheProvisionedUserWhenTheIdentityWriteFails pins the
+// window Store.CreateUser committing before IdentityStore.CreateIdentity
+// leaves open — the one this package DISCLOSES rather than closes, because
+// closing it would need a "delete this user" method on the released,
+// 18-method auth.Store port.
+//
+// The test exists so the disclosure is checked rather than asserted. It pins
+// both halves: the orphaned user row survives and refuses the identical
+// assertion for as long as the provider keeps reporting the address
+// unverified, AND the documented recovery — a password reset, which certifies
+// the address on the way through — actually gets the address back.
+func TestSignInWithLeavesTheProvisionedUserWhenTheIdentityWriteFails(t *testing.T) {
+	svc, store, _ := newOAuthService(t, auth.WithIdentityStore(createFailIdentityStore{memory.NewIdentityStore()}))
+	ctx := context.Background()
+
+	// The provider did NOT assert the address verified, which is what makes
+	// the retry unable to link.
+	ext := extOf("github", "github-ada", "ada@example.com", false)
+	res, err := svc.SignInWith(ctx, signInReq(ext))
+	if !errors.Is(err, errIdentityBoom) {
+		t.Fatalf("SignInWith err = %v, want the identity store's own error", err)
+	}
+	assertNoTokens(t, res)
+
+	orphan, err := store.FindUserByEmail(ctx, "ada@example.com")
+	if err != nil {
+		t.Fatalf("FindUserByEmail = %v; the disclosure says the user row survives the failed identity write", err)
+	}
+	if orphan.PasswordHash != "" || orphan.EmailVerifiedAt != nil {
+		t.Fatalf("orphan = %+v, want no password and no verification — that is what makes the retry refuse", orphan)
+	}
+
+	// A healthy identity backend over the SAME users table: the retry.
+	healthy := auth.New(store,
+		auth.WithIdentityStore(memory.NewIdentityStore()),
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute))
+
+	if _, err := healthy.SignInWith(ctx, signInReq(ext)); !errors.Is(err, auth.ErrLinkRequiresVerification) {
+		t.Fatalf("retrying the identical assertion: err = %v, want ErrLinkRequiresVerification — this is the disclosed cost", err)
+	}
+
+	// The documented recovery, which is why this is a trap and not a lockout.
+	tok, ok, err := healthy.RequestPasswordReset(ctx, "ada@example.com", "203.0.113.9")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset on the orphan: ok=%v err=%v", ok, err)
+	}
+	if err := healthy.ResetPassword(ctx, tok, "First-Password-Ever-4!"); err != nil {
+		t.Fatalf("ResetPassword on the orphan: %v", err)
+	}
+	if _, err := healthy.Login(ctx, "ada@example.com", "First-Password-Ever-4!", "203.0.113.9", "web"); err != nil {
+		t.Fatalf("Login after the recovery: %v — the address must not be unreachable for good", err)
+	}
+}
+
+// ============================================================
+// Unlinking is a credential removal
+// ============================================================
+
+// TestUnlinkIdentityRevokesEverySessionOfTheAccount pins the sweep. Every
+// other credential change in this package revokes session families; removing
+// an external credential and revoking nothing would leave a session minted
+// THROUGH the identity being removed rotating indefinitely, which is the
+// opposite of what "disconnect this account" means on the screen that calls
+// it.
+func TestUnlinkIdentityRevokesEverySessionOfTheAccount(t *testing.T) {
+	svc, store, _ := newOAuthService(t)
+	ctx := context.Background()
+
+	u := mustSignUp(t, svc, "bea@example.com", validPassword)
+	ext := extOf("google", "google-bea", "bea@example.com", true)
+	mustLink(t, svc, u.ID, ext)
+
+	if _, err := svc.SignInWith(ctx, signInReq(ext)); err != nil {
+		t.Fatalf("SignInWith: %v", err)
+	}
+	if _, err := svc.Login(ctx, "bea@example.com", validPassword, "198.51.100.7", "laptop"); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	bystander := oauthAccount(t, svc, extOf("google", "google-bystander", "cy@example.com", true))
+	if n := sessionCount(t, store, u.ID); n != 2 {
+		t.Fatalf("fixture holds %d sessions, want 2", n)
+	}
+
+	if err := svc.UnlinkIdentity(ctx, u.ID, "google"); err != nil {
+		t.Fatalf("UnlinkIdentity: %v", err)
+	}
+	if n := sessionCount(t, store, u.ID); n != 0 {
+		t.Fatalf("sessions after the unlink = %d, want 0 — a session minted through the removed identity must not keep rotating", n)
+	}
+	if n := sessionCount(t, store, bystander.ID); n != 1 {
+		t.Fatalf("another account's sessions = %d, want 1 — the revocation is scoped to the unlinking account", n)
+	}
+}
+
+// TestUnlinkIdentityRefusalRevokesNothing pins that both refusals are total.
+// A revocation that survived its own refused operation would sign a user out
+// of every device to tell them "no".
+func TestUnlinkIdentityRefusalRevokesNothing(t *testing.T) {
+	svc, store, _ := newOAuthService(t)
+	ctx := context.Background()
+
+	u := oauthAccount(t, svc, googleExt("cleo@example.com", true))
+	if n := sessionCount(t, store, u.ID); n != 1 {
+		t.Fatalf("fixture holds %d sessions, want 1", n)
+	}
+
+	if err := svc.UnlinkIdentity(ctx, u.ID, "google"); !errors.Is(err, auth.ErrLastCredential) {
+		t.Fatalf("UnlinkIdentity err = %v, want ErrLastCredential", err)
+	}
+	if n := sessionCount(t, store, u.ID); n != 1 {
+		t.Fatalf("sessions after the REFUSED unlink = %d, want 1 — a refusal must have no effect at all", n)
+	}
+
+	if err := svc.UnlinkIdentity(ctx, u.ID, "github"); !errors.Is(err, auth.ErrIdentityNotFound) {
+		t.Fatalf("UnlinkIdentity(unlinked provider) err = %v, want ErrIdentityNotFound", err)
+	}
+	if n := sessionCount(t, store, u.ID); n != 1 {
+		t.Fatalf("sessions after unlinking a provider that was never linked = %d, want 1", n)
+	}
+}
+
+// TestUnlinkIdentityAsksWhetherTheAccountCanAuthenticate pins the
+// reachability predicate.
+//
+// "Does the account hold a password hash?" is the wrong question. Under
+// WithRequireVerifiedEmail(true) a password on an unverified account is not a
+// working credential — Login refuses it outright — so unlinking the last
+// identity of such an account removes the only door that opens, which is
+// precisely the lockout ErrLastCredential exists to prevent.
+func TestUnlinkIdentityAsksWhetherTheAccountCanAuthenticate(t *testing.T) {
+	svc, _, ids := newOAuthService(t, auth.WithRequireVerifiedEmail(true))
+	ctx := context.Background()
+
+	signup, err := svc.SignUp(ctx, "dara@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+	mustLink(t, svc, signup.User.ID, extOf("google", "google-dara", "dara@example.com", true))
+
+	// The account holds a password hash, and it does not work.
+	if _, err := svc.Login(ctx, "dara@example.com", validPassword, "198.51.100.7", "web"); !errors.Is(err, auth.ErrEmailNotVerified) {
+		t.Fatalf("Login err = %v, want ErrEmailNotVerified — the fixture depends on the password not being a working credential", err)
+	}
+
+	if err := svc.UnlinkIdentity(ctx, signup.User.ID, "google"); !errors.Is(err, auth.ErrLastCredential) {
+		t.Fatalf("UnlinkIdentity err = %v, want ErrLastCredential — a password the configured policy refuses is not a way in", err)
+	}
+	if n := len(identitiesOf(t, ids, signup.User.ID)); n != 1 {
+		t.Fatalf("identity rows = %d, want 1 — the refusal must remove nothing", n)
+	}
+
+	// Verify the address and the same unlink is allowed: the predicate asks
+	// what the account can do, so its answer moves with the account.
+	if _, err := svc.VerifyEmail(ctx, signup.VerifyToken); err != nil {
+		t.Fatalf("VerifyEmail: %v", err)
+	}
+	if err := svc.UnlinkIdentity(ctx, signup.User.ID, "google"); err != nil {
+		t.Fatalf("UnlinkIdentity after verification: %v, want success", err)
+	}
+}
+
+// TestUnlinkIdentityAllowsAnUnverifiedPasswordWhenThePolicyDoesNot is the
+// control for the test above: with WithRequireVerifiedEmail left at its
+// default the very same account CAN authenticate with that password, so the
+// unlink must go through. The predicate follows the configuration rather than
+// being a second, stricter rule of its own.
+func TestUnlinkIdentityAllowsAnUnverifiedPasswordWhenThePolicyDoesNot(t *testing.T) {
+	svc, _, _ := newOAuthService(t) // requireVerifiedEmail defaults to false
+	ctx := context.Background()
+
+	u := mustSignUp(t, svc, "dara@example.com", validPassword) // unverified
+	mustLink(t, svc, u.ID, extOf("google", "google-dara", "dara@example.com", true))
+
+	if _, err := svc.Login(ctx, "dara@example.com", validPassword, "198.51.100.7", "web"); err != nil {
+		t.Fatalf("Login: %v — the fixture depends on the password working here", err)
+	}
+	if err := svc.UnlinkIdentity(ctx, u.ID, "google"); err != nil {
+		t.Fatalf("UnlinkIdentity: %v, want success — the account can authenticate with its password", err)
 	}
 }

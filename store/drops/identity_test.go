@@ -302,6 +302,34 @@ func TestTouchIdentityUpdatesLastUsedAt(t *testing.T) {
 	}
 }
 
+// DeleteIdentity is the by-id retraction, and the point of pinning its shape
+// is that it must NOT be the transaction its sibling is: it decides nothing,
+// so there is no read to be serialized against a write. One DELETE keyed on
+// the primary key, and a zero rows-affected reported as ErrIdentityNotFound.
+func TestDeleteIdentityIssuesOneKeyedDelete(t *testing.T) {
+	fd := &fakeDriver{affected: 1}
+	if err := newIdentityStore(fd).DeleteIdentity(context.Background(), "i1"); err != nil {
+		t.Fatalf("DeleteIdentity: %v", err)
+	}
+	if fd.begins != 0 {
+		t.Fatalf("begins = %d, want 0 — a delete that decides nothing needs no transaction", fd.begins)
+	}
+	stmt := lastExec(fd)
+	if !strings.Contains(stmt, "DELETE") || !strings.Contains(stmt, "id") {
+		t.Fatalf("DeleteIdentity issued %q, want a DELETE keyed on id", stmt)
+	}
+	if strings.Contains(stmt, "user_id") || strings.Contains(stmt, "provider") {
+		t.Fatalf("DeleteIdentity issued %q, want the primary key alone in the WHERE clause", stmt)
+	}
+}
+
+func TestDeleteIdentityReportsAMissAsNotFound(t *testing.T) {
+	st := newIdentityStore(&fakeDriver{affected: 0})
+	if err := st.DeleteIdentity(context.Background(), "nope"); !errors.Is(err, auth.ErrIdentityNotFound) {
+		t.Fatalf("err = %v, want ErrIdentityNotFound", err)
+	}
+}
+
 // DeleteIdentityIfNotLast must be a TRANSACTION, not a bare statement — see
 // its doc for why a single conditional DELETE cannot express the check. The
 // fake driver counts Begin, so this pins the shape rather than trusting the

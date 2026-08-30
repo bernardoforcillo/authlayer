@@ -128,6 +128,10 @@ func (stubIdentityStore) TouchIdentity(_ context.Context, _ string, _ time.Time)
 	return ErrIdentityNotFound
 }
 
+func (stubIdentityStore) DeleteIdentity(_ context.Context, _ string) error {
+	return ErrIdentityNotFound
+}
+
 func (stubIdentityStore) DeleteIdentityIfNotLast(_ context.Context, _, _ string, _ bool) error {
 	return ErrIdentityNotFound
 }

@@ -320,6 +320,40 @@ type Verification struct {
 // comparing an address invite stored against an address auth stored; they
 // are two functions rather than one only because invite takes no dependency
 // on this package (see its own package doc for why).
+//
+// # The limitation this rule accepts, stated rather than discovered
+//
+// RFC 5321 §2.4 makes the LOCAL part of an address case-SENSITIVE, and its
+// interpretation the destination host's business; only the domain is
+// case-insensitive. This function lowercases both, so a mail system that
+// genuinely distinguishes Mike@ from mike@ has two addresses this package
+// treats as one account. That is deliberate — treating Bob@ and bob@ as two
+// accounts is the failure that actually happens, and every mail provider in
+// wide use folds the local part — but it has two consequences worth naming
+// where an external provider is involved:
+//
+//   - A provider's verification of MIKE@EXAMPLE.COM is credited to
+//     mike@example.com. With a case-insensitive provider (which is every
+//     large one) those are the same mailbox and nothing is bridged. With a
+//     case-SENSITIVE OIDC provider they need not be, and the [Linking] policy
+//     would then treat a verification of one mailbox as a verification of
+//     another.
+//   - [strings.ToLower] applies Unicode simple lowercasing, which maps a few
+//     non-ASCII runes onto ASCII ones: U+212A KELVIN SIGN becomes "k", and
+//     U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE becomes "i". An SMTPUTF8
+//     deployment that issues both mike@ and mi<U+212A>e@ as distinct
+//     mailboxes therefore has two addresses this package cannot tell apart.
+//     (It is simple lowercasing, not full case folding: U+017F LATIN SMALL
+//     LETTER LONG S is left alone rather than folded to "s".)
+//
+// Both are accepted rather than fixed. The rule is shared with invite and
+// applied by every store on both the read and the write side, so a change to
+// it re-keys stored rows in two packages; and the alternative — preserving
+// local-part case — reinstates the duplicate-account failure this rule exists
+// to prevent, for a mail configuration essentially nobody runs. An
+// application that does run one must not offer external sign-in against a
+// case-sensitive provider, or must fold its own addresses before they reach
+// this package.
 func NormalizeEmail(s string) string {
 	return emailnorm.Normalize(s)
 }

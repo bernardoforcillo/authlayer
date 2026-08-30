@@ -562,6 +562,52 @@ func (d *identityQueryRecorder) last() string {
 // re-exercises its self-healing property against a real server.
 //
 // Mirrors auth's TestDeleteVerificationsByUserAndPurposeUsesTheIndexLive.
+// TestDeleteIdentityRemovesOneRowLive proves the by-id retraction against a
+// real server: exactly the named row goes, the user's sibling at the SAME
+// provider stays, another user's row stays, and a second delete of the same
+// id reports ErrIdentityNotFound rather than succeeding twice.
+//
+// The unit suite can only see the statement this method renders. Whether that
+// statement's WHERE clause actually selects one row on a server holding three
+// near-identical ones is a property of the server, and it is the property
+// [github.com/bernardoforcillo/authlayer/auth.Service.SignInWith]'s
+// compensating delete depends on: retracting one row too many there would
+// remove a link the account was already relying on.
+func TestDeleteIdentityRemovesOneRowLive(t *testing.T) {
+	_, st := newLiveIdentityStore(t)
+	ctx := context.Background()
+	user, other := uid.NewV7(), uid.NewV7()
+
+	target := liveIdentity(user, "google", "del-target")
+	sibling := liveIdentity(user, "google", "del-sibling") // same user, same provider
+	stranger := liveIdentity(other, "google", "del-stranger")
+	for _, i := range []auth.Identity{target, sibling, stranger} {
+		if _, err := st.CreateIdentity(ctx, i); err != nil {
+			t.Fatalf("CreateIdentity(%s): %v", i.Subject, err)
+		}
+	}
+
+	if err := st.DeleteIdentity(ctx, target.ID); err != nil {
+		t.Fatalf("DeleteIdentity: %v", err)
+	}
+	if _, err := st.FindIdentityByProviderSubject(ctx, "google", "del-target"); !errors.Is(err, auth.ErrIdentityNotFound) {
+		t.Fatalf("the named row survived: err = %v, want ErrIdentityNotFound", err)
+	}
+
+	mine, err := st.ListIdentitiesByUser(ctx, user)
+	if err != nil || len(mine) != 1 || mine[0].ID != sibling.ID {
+		t.Fatalf("rows for the user = %+v (err %v), want only the sibling — a by-id DELETE must not widen to (user, provider)", mine, err)
+	}
+	theirs, err := st.ListIdentitiesByUser(ctx, other)
+	if err != nil || len(theirs) != 1 {
+		t.Fatalf("rows for the other user = %+v (err %v), want their row untouched", theirs, err)
+	}
+
+	if err := st.DeleteIdentity(ctx, target.ID); !errors.Is(err, auth.ErrIdentityNotFound) {
+		t.Fatalf("second DeleteIdentity of the same id: err = %v, want ErrIdentityNotFound — zero rows affected is a miss, not a success", err)
+	}
+}
+
 func TestIdentityStoreListIdentitiesByUserUsesTheIndexLive(t *testing.T) {
 	sqlDB, rawDB := openLiveDB(t)
 	rec := &identityQueryRecorder{Driver: stdlib.New(sqlDB)}

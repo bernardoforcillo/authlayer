@@ -1,8 +1,9 @@
 // Command oauth is a runnable, database-free tour of authlayer's external
 // ("sign in with Google/GitHub/…") identities: the resolution ladder, the
 // linking policy, the explicit link that is the remedy when that policy
-// refuses, and the two edges — the account's last credential, and an account
-// that has no password at all.
+// refuses, and the edges — the account's last credential, an account that has
+// no password at all, and what a password reset does to every connected
+// account on the way through.
 //
 //	go run ./examples/oauth
 //
@@ -228,6 +229,22 @@ func main() {
 	fmt.Printf("  identity rows for bob: %d (was %d)   sessions for bob: %d\n",
 		len(list(ctx, svc, bob)), before, sessions(ctx, svc, bob))
 
+	// The same refusal covers an address the APPLICATION supplies. A
+	// provider that returns no address at all — github with a private one is
+	// the usual case — leaves the app nothing to key on, so SignInWith takes
+	// a FallbackEmail. That value may PROVISION a new account and may never
+	// LINK to an existing one, under any policy including LinkAlways: the
+	// provider vouched for no address whatsoever, so linking on one would
+	// attach an external account to somebody else's local account on the
+	// strength of a string the caller typed.
+	_, err = svc.SignInWith(ctx, auth.SignInRequest{
+		Identity:      auth.ExternalIdentity{Provider: "github", Subject: "github|4004", EmailVerified: true},
+		FallbackEmail: "bob@example.com",
+		IP:            "198.51.100.66",
+	})
+	expect(errors.Is(err, auth.ErrLinkRequiresVerification), "a caller-supplied address must never link to an existing account")
+	fmt.Printf("  a FallbackEmail naming bob's address (no provider assertion at all) -> %v\n", err)
+
 	// LinkNever refuses the same implicit link whatever the provider says,
 	// which is what makes step 6's point sharp rather than incidental.
 	_, err = strict.SignInWith(ctx, auth.SignInRequest{
@@ -322,9 +339,15 @@ func main() {
 	fmt.Printf("  identity rows for alice: %d (the row survives)\n", len(list(ctx, svc, alice)))
 
 	// Bob holds a password, so his account stays reachable without the
-	// identity and the unlink goes through.
+	// identity and the unlink goes through. It also signs him out
+	// EVERYWHERE: removing a credential revokes every session family the
+	// account holds, the same sweep LogoutAll performs, because a session
+	// minted through the identity being removed must not keep rotating.
+	fmt.Printf("  sessions for bob before the unlink: %d\n", sessions(ctx, svc, bob))
 	must(svc.UnlinkIdentity(ctx, bob, "github"))
-	fmt.Printf("  bob holds a password -> unlinked; identity rows for bob: %d\n", len(list(ctx, svc, bob)))
+	fmt.Printf("  bob holds a password -> unlinked; identity rows for bob: %d; sessions: %d\n",
+		len(list(ctx, svc, bob)), sessions(ctx, svc, bob))
+	expect(sessions(ctx, svc, bob) == 0, "removing a credential must revoke every session")
 
 	// A provider the user never linked is a different answer, and a
 	// connected-accounts screen acts on it differently.
@@ -365,18 +388,41 @@ func main() {
 	must(err)
 	fmt.Println("  RequestPasswordReset -> ResetPassword -> Login: the only route to a first password")
 
-	// Her google identity still works — acquiring a password unlinks
-	// nothing — and now that she holds one, the unlink step 7 refused is
-	// allowed.
-	stillWorks, err := svc.SignInWith(ctx, auth.SignInRequest{
+	// -- 9. A reset disconnects every linked account ---------------------
+	//
+	// ResetPassword is UNAUTHENTICATED recovery: whoever redeemed the token
+	// proved control of an address and nothing else. So it assumes every
+	// OTHER credential on the account is hostile — which is why it revokes
+	// every session, and why it also removes every external identity. An
+	// attacker who had linked one would otherwise keep signing in through it
+	// after the victim performed every recovery step the docs prescribe.
+	//
+	// ChangePassword deliberately does not sweep: its caller was already
+	// authenticated and is doing something routine.
+	step("a reset disconnects every linked account")
+	expect(len(list(ctx, svc, alice)) == 0, "an unauthenticated recovery must sweep every identity")
+	fmt.Printf("  identity rows for alice after her reset: %d (her google link is gone)\n",
+		len(list(ctx, svc, alice)))
+
+	// The consequence, stated plainly: connected accounts must be linked
+	// again. She is authenticated now — she just logged in with the password
+	// the reset gave her — so the application links deliberately.
+	relinked, err := svc.LinkIdentity(ctx, alice, google.authorize("google|1001"))
+	must(err)
+	fmt.Printf("  re-linked after the reset: %s\n", describe(relinked))
+
+	backIn, err := svc.SignInWith(ctx, auth.SignInRequest{
 		Identity: google.authorize("google|1001"),
 		IP:       "203.0.113.9",
 	})
 	must(err)
-	expect(stillWorks.User.ID == alice, "acquiring a password must not unlink anything")
+	expect(backIn.User.ID == alice && !backIn.Created, "the re-link must make rung 1 resolve to her account again")
+	fmt.Printf("  google signs her in again: id=%s created=%v\n", short(backIn.User.ID), backIn.Created)
+
+	// And with a password held, the unlink step 7 refused is allowed.
 	must(svc.UnlinkIdentity(ctx, alice, "google"))
-	fmt.Printf("  google still signs her in; and with a password held, the unlink now succeeds (rows: %d)\n",
-		len(list(ctx, svc, alice)))
+	fmt.Printf("  with a password held, the unlink now succeeds (rows: %d, sessions: %d)\n",
+		len(list(ctx, svc, alice)), sessions(ctx, svc, alice))
 
 	fmt.Println("\ndone")
 }

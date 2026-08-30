@@ -1968,10 +1968,19 @@ fmt.Println(err, res.Created, res.User.Email) // <nil> true dana@example.com
 
 `SignInWith` takes a `SignInRequest` struct, not positional arguments, and
 returns a `SignInResult`: `Created`, the `User`, and the same `AccessToken`
-and `RefreshToken` a password `Login` mints. Unlike `SignUpResult.Created`,
-this `Created` is safe to branch on in a public handler — reaching it takes a
-provider's assertion about a specific external account, which an anonymous
-prober does not have, so it is not the enumeration oracle sign-up's would be.
+and `RefreshToken` a password `Login` mints. `Created` is what you branch on to
+run first-run onboarding.
+
+**It is not free of disclosure, and an earlier version of this readme said it
+was.** Reaching it takes a *completed* dance at a configured provider, so it is
+not the freely pollable oracle sign-up's would be — but on the `FallbackEmail`
+path the address is the caller's, so the outcome answers a question about it:
+unregistered provisions, registered is refused with
+`ErrLinkRequiresVerification`. The signal is the error rather than the field,
+and the cost to a prober is one throwaway provider account per probe (a reused
+subject resolves on rung 1 and never consults an address) plus a junk local
+account left behind on every miss. That is a real cost, not a wall. Rate-limit
+your callback.
 
 Two deliberate differences from `Login`, both pinned by test: `SignInWith`
 consults **no rate limiter** (the IP-keyed `WithRateLimiter` gates `Login` and
@@ -1996,14 +2005,30 @@ Two rungs, tried strictly in this order.
    - **No local account at that address** → provision one, with an **empty
      `PasswordHash`** and `EmailVerifiedAt` stamped only if the provider
      asserted the address verified. `Created` is true.
-   - **A local account exists** → link to it only if the `Linking` policy
-     allows, otherwise `ErrLinkRequiresVerification`. `Created` is false.
+   - **A local account exists** → link to it only if the address came from the
+     **provider** and the `Linking` policy allows, otherwise
+     `ErrLinkRequiresVerification`. `Created` is false.
 
 A `FallbackEmail` is **never** credited with `EmailVerified`, whatever the
 provider said. That flag is the provider's claim about the address *the
 provider returned*; when it returned none the claim is about nothing, and
 letting it certify an address your application supplied would let a
 verification of some entirely different address stand in for this one.
+
+**A `FallbackEmail` may provision a new account and may never link to an
+existing one** — under `LinkVerified`, under `LinkNever`, and under
+`LinkAlways` too. The provider vouched for no address on that path, so the one
+being matched is a string your caller supplied: linking on it would attach an
+external account to somebody else's local account on the strength of that
+string, and anyone able to finish a dance at any configured provider with a
+throwaway account could name a victim's address and be signed in as them. The
+rule therefore sits **above** the policy switch rather than inside it.
+Provisioning stays allowed because nobody holds the address — there is nobody
+to take over from, and refusing would strand every user whose provider keeps
+their address private, which is the case `FallbackEmail` exists for. The
+consequence to design your callback around: such a user cannot reach an account
+they already hold by typing its address; they sign in with their password (or a
+reset) and connect the provider afterwards.
 
 A blank — or whitespace-only — `Provider` or `Subject` is refused with
 `ErrProviderSubjectRequired` before any store is touched, in **both**
@@ -2041,7 +2066,7 @@ owns that account without ever learning the password.
 |---|---|---|
 | `LinkVerified` *(default; `Linking`'s zero value)* | the provider asserted the address verified **and** the local account's own email is already verified | Both halves; each closes an attack the other does not. |
 | `LinkNever` | never | Every link must then be made explicitly, by an application that authenticated the user some other way first. |
-| `LinkAlways` | always, on an address match alone | **Unsafe for any provider you do not fully control** — see below. |
+| `LinkAlways` | always, on a **provider-asserted** address match alone | **Unsafe for any provider you do not fully control** — see below. |
 
 `LinkVerified` needs *both* halves because either one alone is forgeable by
 exactly the route the other closes. Without the provider half, anyone who can
@@ -2056,7 +2081,9 @@ Its only legitimate use is a single first-party identity provider that **you**
 operate, whose verification semantics you know, and which no third party can
 make assert an arbitrary address. A provider that does not report verification
 status at all must be mapped to `EmailVerified: false`, never defaulted to
-true.
+true. That justification is about a provider's *assertions*, and it is the
+exact boundary of what the mode permits: it does not extend to a
+`FallbackEmail`, which links under no policy at all.
 
 `WithLinking` **panics** on a mode outside those three, at construction rather
 than at the first sign-in: a linking mode is a security decision made once, by
@@ -2151,6 +2178,25 @@ would be permanent and silent. `ErrIdentityNotFound` is the different answer
 for "there was nothing to unlink here", which a connected-accounts screen acts
 on differently.
 
+The question asked of the account is **"can it authenticate"**, not "is a hash
+stored". Under `WithRequireVerifiedEmail(true)` `Login` refuses an unverified
+account outright, so a password hash on one opens nothing and unlinking its
+last identity would remove the only door that does — the predicate reads the
+same option `Login` reads, so the two cannot disagree. It errs strict, and a
+refusal removes nothing.
+
+A successful unlink also **revokes every session the account holds**, the same
+sweep `LogoutAll` and `ResetPassword` perform. Removing a credential and
+revoking nothing would leave a session minted *through the identity being
+removed* rotating for its full refresh TTL — the opposite of what "disconnect
+this account" means. It sweeps all of the user's families rather than only
+those minted through this identity, because a `Session` records no identity
+provenance and a rotated successor would not carry it anyway; and there is no
+carve-out for the caller's own session, unlike `ChangePassword`, which is handed
+a `currentSessionID` this method has no equivalent of. Say so on the screen
+before you call it. The delete runs first, so either refusal reaches you having
+changed nothing at all.
+
 The check and the delete are **one atomic step inside the store**
 (`DeleteIdentityIfNotLast`), not a read-then-write in the service. Two
 concurrent unlinks of a password-less user's last two identities would
@@ -2200,6 +2246,36 @@ because a regression there would strand every such account on its provider
 forever. A dedicated "set your first password" method would be better API; it
 is additive, and not shipped.
 
+### A password reset disconnects every linked account
+
+`ResetPassword` removes **every** external identity on the account, and
+`ChangePassword` removes none. A reset is *unauthenticated* recovery: whoever
+redeemed the token proved control of an address and nothing else — no password,
+no session, no device — so it is the one path that must assume every other
+credential on the account is hostile, exactly as it already assumes every
+session is. An external identity is such a credential, and the only one nothing
+else here can reach: without the sweep, an attacker who had provisioned an
+account holding the victim's address kept signing in through their identity
+after the victim reset the password, logged in and called `LogoutAll` — every
+step these docs prescribe, with the account still not theirs at the end.
+`ChangePassword` deliberately does not sweep, because its caller was already
+authenticated and is doing something routine; that is the same split this
+package draws between `Logout` and `LogoutAll`.
+
+**The consequence, plainly: after a password reset, connected accounts must be
+linked again.** Either the user presses "Sign in with Google" once more — rung
+2 re-applies the policy, and a reset has just certified the address, so a
+verified assertion links straight back — or your application calls
+`LinkIdentity` once they are authenticated. The sweep removes links that
+*exist*; it cannot stop a provider that will keep asserting the address as
+verified from being linked again under `LinkVerified`, which is the trust your
+configuration places in that provider.
+
+The sweep runs **before** the session revocation, not after: an identity left
+live while the revocation runs can mint a fresh session the revocation has
+already passed. A `Service` built without `WithIdentityStore` sweeps nothing and
+reports no error, so a deployment with no external sign-in is unaffected.
+
 ### The `identities` table
 
 `dropsstore.NewIdentityStore(db)` is the PostgreSQL backend, with its own
@@ -2239,14 +2315,36 @@ a link — "it exists now, so link to it" would skip the policy for precisely th
 caller who lost the race. A retry from your application re-enters the ladder at
 the top, which is the right outcome either way.
 
-**One window is not closed.** The linking decision reads the local account and
-then writes the identity, and `auth.Store` and `auth.IdentityStore` may be
-different backends with no transaction spanning them — that is the point of the
-split port. A concurrent `UpdateUserEmail` landing in between can therefore
-leave a link decided on an `EmailVerifiedAt` the account no longer has. The
-decision was correct as of the read, the address changed under it rather than
-the authorization being forged, and closing it would require a transaction the
-port deliberately does not offer.
+**The link window, closed without a transaction.** The linking decision reads
+the local account from `auth.Store` and then writes the identity to
+`auth.IdentityStore`, and the two may be different backends with no transaction
+spanning them — that is the point of the split port. A concurrent
+`UpdateUserEmail` landing in between would otherwise leave the identity
+attached to an account that no longer holds the asserted address **at all**,
+and rung 1 would then resolve that subject to it forever, never consulting an
+address again. Closing that needs no transaction and it is closed: after the
+write the account is re-read, and the row is deleted when the address it was
+matched on is no longer the account's, with `ErrLinkRequiresVerification`
+returned. Re-reading the address covers the `EmailVerifiedAt` the decision
+stood on too, because nothing in `Service` can clear that field without also
+moving the address. What remains is a retraction whose own delete fails: the
+row survives, and the error says so.
+
+**One window is disclosed rather than closed.** On the *provisioning* branch
+`Store.CreateUser` commits before `CreateIdentity` runs, so a transient
+identity-backend failure leaves a user row holding the address with no password
+and no identity. When the provider did not assert the address verified, every
+retry of the identical assertion then finds that account and is refused with
+`ErrLinkRequiresVerification`. It is not an address lost for good:
+`RequestPasswordReset` → `ResetPassword` gives that account a password **and**
+certifies the address, after which `Login` works and a later verified assertion
+links normally — pinned by
+`TestSignInWithLeavesTheProvisionedUserWhenTheIdentityWriteFails`, so the
+disclosure is checked rather than asserted. Compensating would mean deleting
+the just-created user, and `auth.Store` has no method that deletes one; adding
+a nineteenth to a port that shipped in `v0.1.0` would break every third-party
+backend, which is the same constraint that made `IdentityStore` separate in the
+first place.
 
 ## Errors
 
@@ -2343,8 +2441,8 @@ The remaining six are the [external-identity](#oauth) surface's own, raised by
 |---|---|---|
 | `ErrIdentityNotFound` | No identity for that `(provider, subject)` pair, id, or `(user, provider)` pair. From `UnlinkIdentity`, it means there was nothing to unlink | 404 |
 | `ErrIdentityLinked` | That `(provider, subject)` pair is already linked to a *different* user. An existing link is never re-pointed | 409 |
-| `ErrLinkRequiresVerification` | The address matches an existing local account, and the [`Linking`](#the-three-linking-modes) policy refused the implicit link. The remedy is `LinkIdentity` after authenticating the user another way | 409 |
-| `ErrLastCredential` | Unlinking would leave the account with no identity and no password — a permanent lockout, so nothing is removed | 422 |
+| `ErrLinkRequiresVerification` | The address matches an existing local account and the identity was not attached to it: the [`Linking`](#the-three-linking-modes) policy refused, or the address came from `FallbackEmail` (refused under every policy), or the account's address moved under the decision and the link was retracted. The remedy in all three is `LinkIdentity` after authenticating the user another way | 409 |
+| `ErrLastCredential` | Unlinking would leave the account with no identity and no password this `Service` would accept — under `WithRequireVerifiedEmail(true)` a hash on an unverified account does not count. A permanent lockout, so nothing is removed | 422 |
 | `ErrProviderSubjectRequired` | An `ExternalIdentity` arrived with a blank or whitespace-only `Provider` or `Subject`. Refused before any store is touched, by both entry points | 400 |
 | `ErrOAuthNotConfigured` | An external-identity method was called on a `Service` built without `WithIdentityStore` — a wiring bug, not caller input | 500 |
 

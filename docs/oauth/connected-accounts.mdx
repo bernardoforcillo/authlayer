@@ -1,6 +1,6 @@
 ---
 title: "Connected accounts"
-description: "Listing a user's identities, removing one, and the two edges that follow: the refusal to delete an account's last way in, and an account provisioned with no password at all."
+description: "Listing a user's identities, removing one, and the edges that follow: the refusal to delete an account's last way in, the sessions an unlink revokes, and an account provisioned with no password at all."
 ---
 
 `ListIdentities` and `UnlinkIdentity` are what a "connected accounts" screen is
@@ -65,6 +65,15 @@ have no link to resolve. The lockout would be permanent and silent, so the
 removal is refused and **nothing** is deleted.
 </Warning>
 
+The question asked of the account is "can it **authenticate**", not "is a hash
+stored". Under `WithRequireVerifiedEmail(true)` an unverified account is
+refused by `Login` outright, so a password hash on one opens nothing — and
+unlinking its last identity would remove the only door that does open. The
+predicate reads the same option `Login` reads, so the two cannot disagree about
+what a working credential is. It errs strict: an account that would in fact
+have been fine is refused the unlink until it verifies its address, and the
+refusal removes nothing.
+
 `UnlinkIdentity` removes **every** row for `(userID, provider)` — nothing in the
 data model forbids two identities at one provider, and "unlink this provider"
 means all of them. The reachability test is on what would **remain**, not on the
@@ -98,6 +107,37 @@ unspecified — `store/memory` returns an empty non-nil slice and `store/drops`
 returns nil — so use `len`, never a nil comparison. Order is unspecified too;
 sort if you depend on one.
 </Note>
+
+## A successful unlink signs the user out everywhere
+
+Removing an identity is a credential removal, and every credential change in
+this package sweeps session families. A successful `UnlinkIdentity` revokes
+**every** family the account holds — the same "spare nothing" sweep `LogoutAll`
+and `ResetPassword` perform.
+
+<Warning>
+Without it, a session minted **through the identity being removed** keeps
+rotating for its full refresh TTL. "Disconnect this account" would leave the
+disconnected account's session live, which is the opposite of what the button
+says.
+</Warning>
+
+It sweeps all of the user's families rather than only those minted through this
+identity, because a `Session` records no identity provenance — nothing in the
+row says which credential minted it, and a rotated successor would not carry it
+anyway. The blunt sweep is also the safer default for the case that motivates
+an unlink at all: *"that Google account is not mine any more."*
+
+There is **no carve-out for the caller's own session**, unlike
+`ChangePassword`. That method is handed a `currentSessionID` it can identify
+the caller's family with; this one takes no session, and a parameter for it
+would ask you to nominate a session to spare with nothing here able to check
+the nomination. **Say so on the screen before you call it.**
+
+Both refusals stay total: the delete runs first, so `ErrLastCredential` and
+`ErrIdentityNotFound` each reach you having changed nothing at all. A
+revocation that outlived its own refused operation would sign a user out of
+every device to tell them "no".
 
 ## Why the decision lives in the store
 
@@ -156,12 +196,28 @@ value can go stale in:
 
 | Transition | Consequence |
 |---|---|
-| `false` → `true` (the user acquires a password mid-call) | Refuses a delete that would in fact have been safe. Fail-closed, self-correcting on retry. |
-| `true` → `false` (the user **loses** their password mid-call) | Would allow the delete that locks them out — and **no `Service` method can produce it**. |
+| `false` → `true` (the account gains a working password mid-call) | Refuses a delete that would in fact have been safe. Fail-closed, self-correcting on retry. |
+| `true` → `false` (the account **loses** its working password mid-call) | Would allow the delete that locks it out. |
 
-Both password writers (`ChangePassword`, `ResetPassword`) store a freshly
+For the hash itself the dangerous direction is unreachable through `Service`:
+both password writers (`ChangePassword`, `ResetPassword`) store a freshly
 hashed, non-empty value, and this package offers no "remove my password" and no
 account deletion at all.
+
+<Note>
+Under `WithRequireVerifiedEmail(true)` the **verified** half can move the other
+way, and this page says so rather than pretending otherwise.
+`Store.UpdateUserEmail` clears `EmailVerifiedAt`, and `VerifyEmail`'s
+email-change path calls it before re-stamping the new address. An unlink whose
+read lands in that instant passes a `true` that is false by the time the delete
+runs, leaving an account with a password its configuration will not accept and
+no identity.
+
+That is **not** the permanent lockout the password case would be: the account
+still holds an address it has just proved control of, so
+`RequestPasswordReset` → `ResetPassword` certifies it again and restores the
+login.
+</Note>
 
 <Warning>
 **The one way to reach the dangerous transition** is for an application to call
@@ -202,19 +258,82 @@ if err == nil && ok {
 }
 login, loginErr := svc.Login(ctx, "ida@example.com", "First-Password-Ever-4!", "203.0.113.9", "web")
 fmt.Println(err, loginErr, login.User.ID == res.User.ID)
-
-// And now the unlink refused above goes through: the account stays reachable.
-fmt.Println(svc.UnlinkIdentity(ctx, res.User.ID, "google"))
 ```
 
 ```
 <nil> <nil> true
-<nil>
 ```
 
 `TestOAuthProvisionedUserGetsAPasswordThroughTheResetFlow` pins that arc end to
 end, because a regression there would strand every externally-provisioned
 account on its provider forever, with no way in if that provider is lost.
+
+## A password reset disconnects every linked account
+
+That same reset also removed Ida's Google link:
+
+{/* verify:main */}
+```go
+rows, _ = svc.ListIdentities(ctx, res.User.ID)
+fmt.Println(len(rows))
+```
+
+```
+0
+```
+
+<Warning>
+`ResetPassword` is **unauthenticated recovery**: whoever redeemed the token
+proved control of an address and *nothing else* — no password, no session, no
+device. It is therefore the one path that must assume every other credential on
+the account is hostile, exactly as it already assumes every session is.
+
+An external identity is such a credential, and the only one nothing else here
+can reach. Without the sweep the documented recovery did not recover: an
+attacker who had provisioned an account holding the victim's address kept
+signing in through their identity after the victim reset the password, logged
+in and called `LogoutAll` — every step the docs prescribe, with the account
+still not theirs at the end.
+</Warning>
+
+`ChangePassword` deliberately does **not** sweep: its caller was already
+authenticated and is doing something routine. Disconnecting somebody's Google
+because they rotated their password is UX-hostile and buys nothing. It is the
+same split this package draws between `Logout` and `LogoutAll`.
+
+**Tell your users.** After a password reset, connected accounts must be linked
+again — either by pressing "Sign in with Google" once more (rung 2 re-applies
+the [linking policy](/oauth/linking), and a reset has just certified the
+address, so a verified assertion links straight back) or by calling
+`LinkIdentity` explicitly once they are authenticated:
+
+{/* verify:main */}
+```go
+google := auth.ExternalIdentity{
+	Provider: "google", Subject: "5005",
+	Email: "ida@example.com", EmailVerified: true,
+}
+_, relinkErr := svc.LinkIdentity(ctx, res.User.ID, google)
+
+// And now the unlink refused at the top goes through — taking her sessions
+// with it, because removing a credential revokes them all.
+before, _ := svc.ListSessions(ctx, res.User.ID)
+unlinkErr := svc.UnlinkIdentity(ctx, res.User.ID, "google")
+after, _ := svc.ListSessions(ctx, res.User.ID)
+fmt.Println(relinkErr, unlinkErr, len(before), len(after))
+```
+
+```
+<nil> <nil> 1 0
+```
+
+<Note>
+The sweep removes links that **exist**. It cannot stop a provider that will
+keep asserting the address as verified from being linked again under
+`LinkVerified` — that is the trust your configuration places in that provider.
+Against such a provider no local action recovers anything; the remedy is
+`LinkNever`, or not configuring it.
+</Note>
 
 <Note>
 A dedicated "set your first password" method would be better API than routing
@@ -223,7 +342,7 @@ it is deliberately not in this release. See
 [the password lifecycle](/authentication/passwords) for the flow as it stands.
 </Note>
 
-{/* verify:stdout "<nil> true\ntrue\n1\ntrue\n<nil> 0\ntrue\n<nil> <nil> true\n<nil>" */}
+{/* verify:stdout "<nil> true\ntrue\n1\ntrue\n<nil> 0\ntrue\n<nil> <nil> true\n0\n<nil> <nil> 1 0" */}
 
 ## Next
 

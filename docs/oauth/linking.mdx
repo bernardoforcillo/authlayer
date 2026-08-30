@@ -21,7 +21,7 @@ a provider that lets an address be re-assigned.
 |---|---|---|
 | `LinkVerified` | the provider asserted the address verified **and** the local account's own email is already verified | **default**, and `Linking`'s zero value |
 | `LinkNever` | never | every link must be made explicitly |
-| `LinkAlways` | always, on an address match alone | **unsafe** for a provider you do not control |
+| `LinkAlways` | always, on a **provider-asserted** address match alone | **unsafe** for a provider you do not control |
 
 `LinkVerified` being the **zero value** is load-bearing: a caller who never
 calls `WithLinking` gets the safe policy rather than a permissive one. An int
@@ -56,6 +56,19 @@ A provider that does not report verification status at all must be mapped to
 `EmailVerified: false`. Defaulting an unknown to `true` hands account takeover
 to anyone who can make that provider assert a victim's address.
 </Note>
+
+### One rule sits above all three modes
+
+**A `SignInRequest.FallbackEmail` may provision a new account and may never
+link to an existing one** — under `LinkVerified`, under `LinkNever`, and under
+`LinkAlways` too.
+
+That justification for `LinkAlways` above is about a **provider's assertions**.
+On the fallback path the provider asserted no address at all, and the one being
+matched is a string your caller supplied: linking on it would attach an
+external account to somebody else's local account on nothing but that string.
+So the rule is a precondition every mode is subject to, not a fourth mode. See
+[Signing in](/oauth/sign-in#it-can-provision-and-it-can-never-link).
 
 `WithLinking` **panics** on a mode outside those three, at construction rather
 than at the first sign-in. A linking mode is a security decision made once, by a
@@ -128,6 +141,13 @@ The refusal is total: no identity row is written, and no session is issued.
 exists and the user may well own it — so your application authenticates them by
 some **other** means (a password login, or a [reset](/authentication/passwords)
 if they have no password) and links deliberately.
+
+Three conditions produce that one sentinel, and they share it because they
+share this remedy: the policy refused; the address came from `FallbackEmail`;
+or the account's address **moved** between the linking decision and the write,
+so the link was [retracted](/oauth/sign-in#the-link-window-and-how-it-is-closed-without-a-transaction).
+Giving each its own error would name the cause where what a caller acts on is
+the remedy.
 
 {/* verify:main */}
 ```go
