@@ -1,17 +1,26 @@
 ---
 title: "Storage"
-description: "Three independent Store ports, two shipped backends, and one discipline: a store is pure persistence that never authorizes anything."
+description: "Four independent Store ports, two shipped backends, and one discipline: a store is pure persistence that never authorizes anything."
 ---
 
-authlayer has **three** persistence ports, and they are independent. You can
+authlayer has **four** persistence ports, and they are independent. You can
 implement one and not the others, and the two shipped backends implement all
-three.
+four.
 
 | Port | Holds | Methods |
 |---|---|---|
 | `scope.Store[C, M]` | containers, members, custom roles, a transaction | composed from `ContainerStore`, `MemberStore`, `RoleStore` |
 | `invite.Store` | email invitations and links | 13 |
 | `auth.Store` | users, sessions, verifications | 18 |
+| `auth.IdentityStore` | [external identities](/oauth/overview) — **optional** | 6 |
+
+<Note>
+`auth.IdentityStore` is a port of its own rather than six more methods on
+`auth.Store`, because `auth.Store` is released: adding to it would break every
+third-party backend that already implements it. An application offering no
+external sign-in wires none, creates no table, and gets `ErrOAuthNotConfigured`
+from the four methods that would need it.
+</Note>
 
 <Columns cols={2}>
   <Card title="store/memory" icon="microchip" href="/storage/memory">
@@ -65,9 +74,11 @@ There is **no cross-store transaction anywhere**. Invitation acceptance spans
 `invite.Store` and `scope.Store`, which may not even share a database, and
 `auth`, `scope` and `invite` declare no foreign keys between their tables. That
 constraint is what shapes
-[claim-first-admit-second](/invitations/security#claim-first-admit-second) and
-what leaves the
-[verification sweeps sequential-only](/authentication/passwords#both-sweeps-are-sequential-only).
+[claim-first-admit-second](/invitations/security#claim-first-admit-second), what
+leaves the
+[verification sweeps sequential-only](/authentication/passwords#both-sweeps-are-sequential-only),
+and what leaves one window in external sign-in
+[open and documented](/oauth/sign-in) rather than closed.
 </Warning>
 
 ## The strictest port
@@ -173,10 +184,53 @@ rather than the behaviour of one call:
   </Card>
 </Columns>
 
+## The three identity MUSTs
+
+`auth.IdentityStore` is small, and all three of its **MUSTs** bound one thing:
+who can sign in as whom.
+
+<Columns cols={2}>
+  <Card title="(Provider, Subject) is unique" icon="fingerprint">
+    A composite `UNIQUE` in a SQL backend. Without it two rows can name one
+    external account against two **different** local users, and a sign-in
+    resolving that subject lands on whichever row the backend returns first —
+    decided by row order.
+  </Card>
+  <Card title="CreateIdentity decides and writes in one step" icon="lock">
+    `ErrIdentityLinked` must come from the write attempt itself, never from a
+    separate read that a concurrent link could race. An existing row is never
+    silently replaced or re-pointed at another user.
+  </Card>
+  <Card title="DeleteIdentityIfNotLast is atomic" icon="shield-halved">
+    The reachability check and the delete are **one** step: one statement, one
+    transaction, or one acquisition of the mutex. A read-then-write there
+    [locks a user out permanently](/oauth/connected-accounts), silently, with
+    both callers told they succeeded.
+  </Card>
+</Columns>
+
+<Note>
+`DeleteIdentity` — the sixth method — is the by-id sibling and makes **no**
+reachability check at all: it is how the service retracts a row it wrote itself
+(a link whose account moved out from under it) and how `ResetPassword` sweeps
+identities after it has already committed a new password. Never reach for it
+from a connected-accounts screen; that is `DeleteIdentityIfNotLast`'s job.
+</Note>
+
+<Warning>
+A fourth obligation is not a MUST the port can state, because it is about what a
+backend must **not** add: an identity row holds `(provider, subject, email)` and
+two timestamps, and [no provider token of any kind](/oauth/overview). A backend
+that "helpfully" stores the access token it was never given has moved the
+library's boundary on its users' behalf.
+</Warning>
+
 ## They are executable, not just prose
 
-Both strict ports ship their contract as a runnable suite, so a third-party
-backend author can check their work:
+The two **strict** ports ship their contract as a runnable suite, so a
+third-party backend author can check their work. `auth.IdentityStore` does not
+have one — its obligations are covered by `store/memory`'s and `store/drops`'
+own tests, including a live concurrency test for the atomicity MUST above:
 
 {/* verify:skip test-function bodies needing a *testing.T; both are compiled and run by the project's own suite — store/memory runs each in store/memory/auth_test.go and invite_test.go, and store/drops runs each in its integration lane */}
 ```go
@@ -196,7 +250,7 @@ See [Writing your own backend](/storage/custom-backends).
     The production wiring, in full, imports included.
   </Card>
   <Card title="The schema" icon="table" href="/storage/schema">
-    Eight tables, and which constraint is load-bearing.
+    Nine tables, and which constraint is load-bearing.
   </Card>
   <Card title="Custom backends" icon="plug" href="/storage/custom-backends">
     Running the two contract suites.

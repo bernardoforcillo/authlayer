@@ -24,21 +24,24 @@ import (
 scopeStore := memory.New[org.Organization, org.Member]() // scope.Store
 inviteStore := memory.NewInviteStore()                   // invite.Store
 authStore := memory.NewAuthStore()                       // auth.Store
+identityStore := memory.NewIdentityStore()               // auth.IdentityStore
 
 svc := org.New(org.NewAccess(nil), scopeStore)
 isvc := invite.New(svc.Service, inviteStore)
 
 ctx := org.WithSubject(context.Background(), "alice")
 acme, err := svc.CreateOrganization(ctx, "Acme", "acme")
-fmt.Println(err, acme.Name, isvc != nil, authStore != nil)
+fmt.Println(err, acme.Name, isvc != nil, authStore != nil, identityStore != nil)
 ```
 
 ```
-<nil> Acme true true
+<nil> Acme true true true
 ```
 
-All three are generic-free to construct except `memory.New`, which takes the
-same container and member type parameters your `scope.Service` uses.
+All four are generic-free to construct except `memory.New`, which takes the same
+container and member type parameters your `scope.Service` uses. The identity
+store is [optional](/oauth/overview) — wire it with
+`auth.WithIdentityStore(identityStore)` only if you offer external sign-in.
 
 ## What it enforces
 
@@ -56,6 +59,12 @@ Every uniqueness constraint its ports describe.
     `memory.ErrInviteEmailTaken`, and `Link.Code` as `memory.ErrLinkCodeTaken`.
     Addresses are normalized on both sides, so that pair constraint bites on a
     person rather than on a spelling.
+  </Card>
+  <Card title="auth.IdentityStore" icon="id-badge">
+    Both rules its port declares: `Identity.ID` (`auth.ErrIDTaken`) and the
+    `(Provider, Subject)` pair (`auth.ErrIdentityLinked`) — the one that keeps
+    [one external account from mapping to two users](/oauth/overview). Both are
+    port sentinels here, not backend-level errors.
   </Card>
 </Columns>
 
@@ -88,9 +97,16 @@ duplicate code refused: true
 
 ## Atomicity
 
-Both stores satisfy every atomicity MUST their ports state by holding **one
+Every store here satisfies every atomicity MUST its port states by holding **one
 mutex for each method's entire body**, so no check-then-write can be split by a
 concurrent call.
+
+For `IdentityStore.DeleteIdentityIfNotLast` that is not a general habit but the
+whole point of the type: the scan, the reachability decision and the delete
+happen under one acquisition, and a split there
+[locks a user out permanently and silently](/oauth/connected-accounts). The
+package's own suite pins it with a 200-round concurrency test and a deliberately
+split-lock control store that must fail it.
 
 That is also why `store/memory` owes neither of
 [`DeleteSessionsByFamily`'s two extra MUSTs](/storage/overview#the-strictest-port):
@@ -134,7 +150,7 @@ not arise in practice — but a hand-written test that reuses an id will behave
 differently on the two backends.
 </Warning>
 
-{/* verify:stdout "<nil> Acme true true\nduplicate code refused: true\nmemory accepts a duplicate slug: <nil> acme" */}
+{/* verify:stdout "<nil> Acme true true true\nduplicate code refused: true\nmemory accepts a duplicate slug: <nil> acme" */}
 
 ## Use it for tests, not for production
 

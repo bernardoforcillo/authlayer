@@ -276,6 +276,18 @@ type config struct {
 	resetLimiter         RateLimiter
 	claimsExtender       func(UserBase) map[string]any
 	requireVerifiedEmail bool
+	// identityStore is the OPTIONAL external-identity port — see
+	// [WithIdentityStore]. nil means no external sign-in is configured, and
+	// every entry point needing it fails with [ErrOAuthNotConfigured]
+	// rather than dereferencing this.
+	identityStore IdentityStore
+	// linking is the implicit-link policy for external sign-in — see
+	// [Linking] and [WithLinking]. It is deliberately left at its ZERO
+	// VALUE by defaultConfig rather than assigned there: [LinkVerified] is
+	// that zero value, so a config built by any route at all — including
+	// one a future refactor forgets to run through defaultConfig — carries
+	// the safe policy. See [LinkVerified]'s own doc.
+	linking Linking
 }
 
 func defaultConfig() config {
@@ -559,6 +571,16 @@ func WithPasswordResetRateLimiter(l RateLimiter) Option {
 // verified, with [ErrEmailNotVerified]. The default is false: an unverified
 // account may still log in. See Login's doc for exactly when this check
 // runs relative to the password check.
+//
+// One other method reads it, and only as a consequence of what it means to
+// Login: [Service.UnlinkIdentity] asks whether the account could authenticate
+// with its password before it removes an external identity, and under this
+// option an unverified account cannot — so the unlink is refused with
+// [ErrLastCredential] rather than removing the only credential that works.
+// See [Service.passwordCanAuthenticate].
+//
+// [Service.SignInWith] deliberately does NOT honour it — see that method's
+// "Why WithRequireVerifiedEmail does not apply here".
 func WithRequireVerifiedEmail(require bool) Option {
 	return func(c *config) { c.requireVerifiedEmail = require }
 }
@@ -597,6 +619,53 @@ func WithClaimsExtender(f func(UserBase) map[string]any) Option {
 	return func(c *config) {
 		if f != nil {
 			c.claimsExtender = f
+		}
+	}
+}
+
+// WithIdentityStore wires the OPTIONAL [IdentityStore] port, enabling
+// external ("sign in with Google/GitHub/…") identities. The default is nil:
+// a Service built without this option persists no identities at all, and
+// every entry point that needs the port refuses with
+// [ErrOAuthNotConfigured] rather than dereferencing nil. A nil s is ignored,
+// leaving the default (or a prior option) in place.
+//
+// It is a separate port, not part of [Store], because [Store] is released:
+// adding a method to it would break every third-party backend. See
+// [IdentityStore]'s own doc, and auth/identity.go's package doc, for the
+// boundary this port keeps — in particular that authlayer stores no provider
+// access or refresh tokens.
+func WithIdentityStore(s IdentityStore) Option {
+	return func(c *config) {
+		if s != nil {
+			c.identityStore = s
+		}
+	}
+}
+
+// WithLinking sets the [Linking] policy governing when an external sign-in
+// may implicitly attach a provider's identity to a PRE-EXISTING local
+// account matched by email address. The default is [LinkVerified], which is
+// Linking's zero value — see that constant's doc for why the safe policy is
+// the one a caller gets by saying nothing.
+//
+// It PANICS when m is not one of the three declared constants, rather than
+// silently falling back to some policy the caller did not choose. A linking
+// mode is a security decision made once, at wiring time, by a human reading
+// this option's doc; a typo'd or out-of-range value is a construction bug,
+// and the alternative — a Service that exists holding a mode no branch of
+// the ladder handles — is either a runtime denial nobody can explain or, far
+// worse, a fallback that links more freely than intended. This matches
+// [github.com/bernardoforcillo/authlayer/scope.New]'s stance on WithParent
+// and [github.com/bernardoforcillo/authlayer/access.Access.NewRole]'s on a
+// mis-declared role.
+func WithLinking(m Linking) Option {
+	return func(c *config) {
+		switch m {
+		case LinkVerified, LinkNever, LinkAlways:
+			c.linking = m
+		default:
+			panic(fmt.Sprintf("authlayer/auth: WithLinking(%d): unknown linking mode", int(m)))
 		}
 	}
 }
@@ -697,10 +766,14 @@ type Service struct {
 
 // New wires a [Store] and options into a Service.
 //
-// It cannot fail: every [Option] either applies a valid value or leaves the
-// default in place (each option's own doc says which inputs it ignores), and
-// there is no type argument to get wrong. That is why it returns no error,
-// matching every other constructor in this codebase (scope.New, invite.New).
+// It returns no error, matching every other constructor in this codebase
+// (scope.New, invite.New): every [Option] but one either applies a valid
+// value or leaves the default in place (each option's own doc says which
+// inputs it ignores), and there is no type argument to get wrong. The
+// exception is [WithLinking], which PANICS on a mode outside its three
+// declared constants rather than leaving the Service holding a policy no
+// branch handles — see that option's doc, and scope.New, which takes the
+// same construction-time stance on WithParent.
 // The one configuration this constructor cannot check for you is [WithJWT]:
 // there is no default signing key, so a Service built without one — or with
 // one under the 32-byte HS256 floor — fails closed the first time
@@ -997,7 +1070,8 @@ func (s *Service) mintSignupVerification(ctx context.Context, userID, email stri
 //     as its own enumeration channel.
 //  6. Only once every check above has passed does this touch the Store
 //     with a write ([Store.CreateSession]) — and even that is ordered
-//     LAST, after [token.Issue] has already succeeded (see the body): a
+//     LAST, after [token.Issue] has already succeeded (see mintSession,
+//     the minting tail this method and [Service.SignInWith] share): a
 //     misconfigured signing key ([WithJWT] never called, or too short)
 //     fails before any Session row is persisted, rather than leaving an
 //     orphaned, unreachable-by-refresh-token row behind that
@@ -1047,6 +1121,43 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 		return zero, ErrEmailNotVerified
 	}
 
+	return s.mintSession(ctx, u, ip, userAgent)
+}
+
+// mintSession is the session-issuing tail shared by [Service.Login] and
+// [Service.SignInWith]: given a user whose identity the caller has ALREADY
+// established, it mints a root session — a fresh refresh token, its
+// [Session] row, and a matching access token — and returns the three things
+// a successful authentication hands back.
+//
+// # It authenticates nothing
+//
+// This helper performs no credential check, no rate-limit check, no
+// email-verification check and no linking-policy check. Every one of those
+// belongs to whoever calls it, and the two callers run different sets:
+// [Service.Login] proves possession of a password and honours
+// [WithRequireVerifiedEmail]; [Service.SignInWith] proves nothing itself and
+// stands instead on a provider's assertion plus the [Linking] policy. A
+// third caller would mint a live session for whoever u names with no check
+// at all, so any future one must be read as the assertion "I have already
+// decided this user is authenticated".
+//
+// It exists because there must be exactly ONE minting path. Two would drift,
+// and the drift would not be a compile error: a scrub, a claim, or the
+// family-id rule fixed in one and forgotten in the other surfaces as a live
+// credential digest inside a JWT claim, or as a session no revocation can
+// reach. [Service.Refresh] deliberately does NOT use it — a rotation
+// inherits its predecessor's FamilyID rather than starting a new chain,
+// which is the one thing this function hard-codes the other way.
+//
+// The order inside is load-bearing, and is the order [Service.Login]'s own
+// doc describes at point 6: PasswordHash is scrubbed BEFORE the claims
+// extender runs, and [github.com/bernardoforcillo/authlayer/token.Issue]
+// runs BEFORE [Store.CreateSession], so a misconfigured signing key fails
+// without leaving an orphaned session row behind.
+func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent string) (LoginResult, error) {
+	var zero LoginResult
+
 	now := s.cfg.clock()
 	sessionID := s.cfg.idGen()
 	refreshPlain, refreshHash, err := token.GenerateOpaque()
@@ -1070,9 +1181,9 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 	if s.cfg.claimsExtender != nil {
 		extra = s.cfg.claimsExtender(u)
 	}
-	// Issued BEFORE CreateSession, deliberately — see "Order of checks"
-	// point 6 above: a bad signing key must fail before any Session row
-	// exists to be orphaned.
+	// Issued BEFORE CreateSession, deliberately — see [Service.Login]'s
+	// "Order of checks" point 6: a bad signing key must fail before any
+	// Session row exists to be orphaned.
 	accessToken, err := token.Issue(token.Claims{
 		Subject:   u.ID,
 		SessionID: sessionID,
@@ -2079,6 +2190,15 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // next is validated against the configured [password.Rules]
 // ([ErrWeakPassword] on failure) before it is hashed and persisted.
 //
+// It does NOT disconnect the account's external identities, and
+// [Service.ResetPassword] does. The asymmetry is deliberate and is the same
+// one this package draws between [Service.Logout] and [Service.LogoutAll]:
+// the caller here proved they hold the current password and is performing a
+// routine action, so unlinking their Google would be UX-hostile and would buy
+// nothing. A reset is unauthenticated recovery, where every other credential
+// on the account has to be assumed hostile — see that method's "Why an
+// unauthenticated recovery sweeps identities".
+//
 // # Identifying the caller's own session
 //
 // On success, ChangePassword revokes every OTHER session belonging to
@@ -2537,7 +2657,10 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 // minted by [Service.RequestPasswordReset] — setting the account's password
 // to next, certifying the address the token was delivered to if it is not
 // already certified (see "Why a completed reset verifies the address"
-// below), and revoking EVERY session the account has, on every device (see
+// below), removing EVERY external identity linked to the account (see "Why an
+// unauthenticated recovery sweeps identities" below — after a reset,
+// connected accounts must be linked again), and revoking EVERY session the
+// account has, on every device (see
 // [Service.ChangePassword]'s doc, "What revocation does not revoke", for
 // what that guarantee does NOT include — the same limitation applies here):
 // unlike [Service.ChangePassword], there is no "caller's own session" to spare
@@ -2609,6 +2732,63 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 // precisely because the account may be compromised, so it must not leave
 // that armed.
 //
+// # Why an unauthenticated recovery sweeps identities
+//
+// Every external identity on the account is removed too, via
+// [IdentityStore.DeleteIdentity] — the connected Google, the connected
+// GitHub, all of them — when the [Service] was built with
+// [WithIdentityStore]. One with no identity store configured sweeps nothing
+// and reports no error; see [Service.sweepIdentities] for that, and for the
+// two-Services-one-users-table configuration it cannot cover.
+//
+// This method is UNAUTHENTICATED recovery. Whoever redeemed the token proved
+// control of an address and NOTHING else — no password, no session, no
+// device. It is therefore the one path in this package that must assume every
+// other credential on the account is hostile, exactly as it already assumes
+// every session is and revokes them all below.
+//
+// An external identity is such a credential, and it is the only one nothing
+// else here can reach. Without the sweep the documented recovery did not
+// recover: an attacker who provisioned an account holding the victim's
+// address kept signing in through their identity after the victim had reset
+// the password, logged in, and called [Service.LogoutAll] — every step the
+// docs prescribe, with the account still not theirs at the end of it. The
+// victim's own reset even certified the address on the way through, which
+// unblocked [LinkVerified] for the attacker's later assertions.
+//
+// [Service.ChangePassword] deliberately does NOT sweep, and that asymmetry is
+// the point rather than an oversight: its caller was ALREADY authenticated
+// and is performing a routine action. Disconnecting somebody's Google because
+// they rotated their password is UX-hostile and buys nothing. It mirrors the
+// [Service.Logout] / [Service.LogoutAll] split this package already draws.
+//
+// # The consequence, stated plainly
+//
+// After a password reset, connected accounts must be linked again. A user who
+// resets and then presses "Sign in with Google" is treated as an unknown
+// (provider, subject): the ladder starts at the top, and rung 2 applies the
+// [Linking] policy to whatever it finds at the asserted address — which, for
+// an account this reset has just certified, means [LinkVerified] will link a
+// verified assertion straight back. Tell the user that, or offer the link
+// explicitly with [Service.LinkIdentity] after the reset.
+//
+// What the sweep does not do, said rather than implied: it removes links that
+// EXIST. It cannot stop a provider that will keep asserting the address as
+// verified from being linked again under [LinkVerified], because that is the
+// trust this package's policy places in providers by configuration. Against
+// such a provider no local action recovers anything; the remedy is
+// [LinkNever], or not configuring it.
+//
+// The sweep runs BEFORE the session revocation below, not after. The order is
+// what makes it worth anything: an identity left live while the revocation
+// runs can mint a fresh session that the revocation has already passed,
+// whereas removing it first means the revocation catches anything minted just
+// before. TestResetPasswordSweepsIdentitiesBeforeSessions pins the order
+// itself, since both orderings leave identical rows behind.
+//
+// The list and the deletes are separate calls, with the same SEQUENTIAL-ONLY
+// scope the verification sweeps have.
+//
 // These are the same two side doors [Service.ChangePassword] closes for its
 // own, differently-triggered path, with the identical SEQUENTIAL-ONLY scope
 // that method's doc discloses: nothing orders either sweep against a
@@ -2679,12 +2859,21 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 // failure in the stamp leaves the reset's security guarantees fully in
 // place and only the audit field unset.
 //
-// A Store or Hasher error at any step is returned as-is — see the
-// package's "Fail closed" constraint. In particular, a
-// [Store.DeleteSessionsByFamily] failure partway through the revocation
-// loop is returned immediately, leaving whichever families were already
-// revoked revoked and the rest untouched — the caller sees a non-nil error
-// either way and must not assume the reset "mostly worked".
+// A Store, IdentityStore or Hasher error at any step is returned as-is — see
+// the package's "Fail closed" constraint. In particular, a
+// [Store.DeleteSessionsByFamily] or [IdentityStore.DeleteIdentity] failure
+// partway through its loop is returned immediately, leaving whichever rows
+// were already removed removed and the rest untouched — the caller sees a
+// non-nil error either way and must not assume the reset "mostly worked".
+//
+// One configuration deserves naming, because it is the one case where a
+// completed reset can leave an account it cannot immediately log in to. Under
+// [WithRequireVerifiedEmail](true), an account whose address moved between
+// the request and the redemption gets no stamp (see the two guards above),
+// so it ends with a fresh password its own configuration will not accept and
+// with its identities swept. It is recoverable, not lost: a reset requested
+// for the account's CURRENT address certifies that one and restores the
+// login.
 func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) error {
 	v, err := s.store.FindVerificationByHash(ctx, token.HashOpaque(plainToken))
 	if err != nil {
@@ -2729,23 +2918,23 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 		return err
 	}
 
+	// Remove every external identity BEFORE the sessions — see the method
+	// doc's "Why an unauthenticated recovery sweeps identities". An identity
+	// left standing is a live credential this rotation did not touch, and one
+	// that can mint a fresh session; taking it away first means the session
+	// revocation below also catches anything minted through it in the
+	// meantime. A Service with no [WithIdentityStore] sweeps nothing and
+	// reports no error.
+	if err := s.sweepIdentities(ctx, v.UserID); err != nil {
+		return err
+	}
+
 	// Revoke every session BEFORE the address stamp below — see the method
 	// doc's "Why the revocation comes before the stamp". The credential is
 	// already rotated and committed; nothing optional may run ahead of the
 	// step that takes the account back.
-	sessions, err := s.store.ListSessionsByUser(ctx, v.UserID)
-	if err != nil {
+	if err := s.revokeEverySession(ctx, v.UserID); err != nil {
 		return err
-	}
-	done := make(map[string]bool, len(sessions))
-	for _, sess := range sessions {
-		if done[sess.FamilyID] {
-			continue
-		}
-		done[sess.FamilyID] = true
-		if err := s.store.DeleteSessionsByFamily(ctx, sess.FamilyID); err != nil {
-			return err
-		}
 	}
 
 	// Redeeming this token proved control of the address it was delivered

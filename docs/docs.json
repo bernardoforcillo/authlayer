@@ -70,6 +70,16 @@
         ]
       },
       {
+        "group": "External identities",
+        "icon": "id-badge",
+        "pages": [
+          "oauth/overview",
+          "oauth/sign-in",
+          "oauth/linking",
+          "oauth/connected-accounts"
+        ]
+      },
+      {
         "group": "Invitations",
         "icon": "envelope-open-text",
         "pages": [

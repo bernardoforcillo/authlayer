@@ -6,7 +6,10 @@ description: "Every option on every service and store, with its default — and 
 <Note>
 Options apply at construction and **never afterwards**, so every `Service` is
 immutable once built. That is true of `scope.Option`, `auth.Option` and
-`invite.Option` alike.
+`invite.Option` alike. Two of them refuse an argument outright rather than
+falling back to a default — construction **panics**: `scope.New` when
+`WithParent` is given for a container type carrying no parent link, and
+`auth.New` when `WithLinking` is given a mode outside its three constants.
 </Note>
 
 ## `scope` / `org` / `team`
@@ -114,8 +117,26 @@ immutable once built. That is true of `scope.Option`, `auth.Option` and
 </ResponseField>
 
 <ResponseField name="WithIDGenerator(gen func() string)" type="Option" default="UUIDv7">
-  Id source for users, sessions and verifications. A non-UUID generator needs
-  `dropsstore.WithAuthTextLibraryIDs()`.
+  Id source for users, sessions, verifications and identities. A non-UUID
+  generator needs `dropsstore.WithAuthTextLibraryIDs()` — and
+  `dropsstore.WithIdentityTextLibraryIDs()` as well, if you wire an identity
+  store.
+</ResponseField>
+
+<ResponseField name="WithIdentityStore(s IdentityStore)" type="Option" default="nil — no external sign-in">
+  Wire the **optional** [external-identity](/oauth/overview) port. Without it,
+  all four identity methods fail with `ErrOAuthNotConfigured` and nothing is
+  persisted. A `nil` store is ignored. It is a port of its own rather than five
+  more methods on `auth.Store`, because that interface is released and adding to
+  it would break every third-party backend.
+</ResponseField>
+
+<ResponseField name="WithLinking(m Linking)" type="Option" default="LinkVerified — Linking's zero value">
+  When an external sign-in may **implicitly** attach an identity to a
+  pre-existing local account matched by address. **Panics** at construction on a
+  mode outside `LinkVerified`, `LinkNever` and `LinkAlways`, rather than falling
+  back to a policy nobody chose. It does **not** gate `LinkIdentity` — see
+  [The linking policy](/oauth/linking).
 </ResponseField>
 
 <Tip>
@@ -153,7 +174,7 @@ independently; `invite` does **not** read `Policy`.
 
 ## `store/drops`
 
-Three separate option types, one per store, because the three stores are
+Four separate option types, one per store, because the four stores are
 independent.
 
 | Option | Type | Effect |
@@ -166,6 +187,8 @@ independent.
 | `WithInviteTextUserIDs()` | `InviteOption` | Retype `invited_by`, `created_by` |
 | `WithAuthNames(AuthNames{...})` | `AuthOption` | Rename `users`, `sessions`, `verifications` |
 | `WithAuthTextLibraryIDs()` | `AuthOption` | Retype **all five** auth id columns together |
+| `WithIdentityNames(IdentityNames{...})` | `IdentityOption` | Rename `identities` |
+| `WithIdentityTextLibraryIDs()` | `IdentityOption` | Retype **both** identity id columns together |
 
 <Warning>
 The library-ids and user-ids options answer **independent** questions and do not
@@ -173,9 +196,12 @@ substitute for each other. `New[...](db, WithTextUserIDs())` with a ULID
 generator still fails on the first write, because the container's own `id`
 column is still `uuid`. See [Ids](/concepts/ids).
 
-The auth store has **no** text-*user*-id option at all: it owns the `users`
-table its `user_id` columns point at, so a `user_id` typed differently from
-`users.id` could never be self-consistent.
+Neither the auth store nor the identity store has a text-*user*-id option at
+all. The auth store owns the `users` table its `user_id` columns point at, so a
+`user_id` typed differently from `users.id` could never be self-consistent — and
+`identities.user_id` references that same column, which is why
+`WithIdentityTextLibraryIDs()` moves it along with `identities.id` and must be
+passed **alongside** `WithAuthTextLibraryIDs()`.
 </Warning>
 
 ## Next

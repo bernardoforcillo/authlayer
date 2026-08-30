@@ -4,8 +4,9 @@ description: "Every id authlayer mints is a UUIDv7, and its column is a PostgreS
 ---
 
 Every id authlayer mints for itself — a container's `id`, a custom role's `id`,
-a user, a session, a verification, an invite, a link — is a **UUIDv7** drawn
-from `crypto/rand`. The generator is `internal/uid`, written out per RFC 9562
+a user, a session, a verification, an invite, a link, an
+[external identity](/oauth/overview) — is a **UUIDv7** drawn from
+`crypto/rand`. The generator is `internal/uid`, written out per RFC 9562
 rather than depended on, which is what keeps the module at three requirements.
 
 User ids are in that list: authlayer's [authentication half](/authentication/overview)
@@ -78,9 +79,10 @@ scopeSt := dropsstore.New[org.Organization, org.Member](db,
 inviteSt := dropsstore.NewInviteStore(db,
 	dropsstore.WithInviteTextLibraryIDs(), dropsstore.WithInviteTextUserIDs())
 authSt := dropsstore.NewAuthStore(db, dropsstore.WithAuthTextLibraryIDs())
+identitySt := dropsstore.NewIdentityStore(db, dropsstore.WithIdentityTextLibraryIDs())
 
 orgSvc := org.New(ac, scopeSt, org.WithIDGenerator(newID))
-authSvc := auth.New(authSt, auth.WithIDGenerator(newID))
+authSvc := auth.New(authSt, auth.WithIdentityStore(identitySt), auth.WithIDGenerator(newID))
 ```
 
 <Note>
@@ -101,6 +103,15 @@ What it has instead is `WithAuthTextLibraryIDs()`, one option that moves **all
 five** id columns together — `users.id`, `sessions.id`, `verifications.id`, and
 the two `user_id` columns referencing the first. A hatch that moved only the
 first three would fix `SignUp` and then break `Login`.
+
+`dropsstore.NewIdentityStore` is the same shape for the same reason:
+`WithIdentityTextLibraryIDs()` moves `identities.id` and `identities.user_id`
+together, and must be passed **alongside** `WithAuthTextLibraryIDs()` — the
+second of those columns references `users.id`, so leaving one `uuid` while the
+other went `text` fixes nothing and fails the first
+[external sign-in](/oauth/sign-in) with the very `22P02` the option exists to
+remove. There is no text-*user*-id option here either, for the same reason: no
+coherent configuration exists in which those two columns disagree.
 
 ## Choose before the tables exist
 
