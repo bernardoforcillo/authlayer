@@ -298,7 +298,7 @@ All of these read the actor and scope from the context.
 | `CreateOrganization(ctx, name, slug)` | subject only | caller becomes owner; no permission check — gate it upstream |
 | `AddMember(ctx, userID, roleKey)` | `member:create` + escalation guard | `ErrAlreadyMember` on a duplicate |
 | `ChangeMemberRole(ctx, userID, roleKey)` | `member:update` + escalation guard | owner cannot be demoted under `LastOwnerLocked` |
-| `RemoveMember(ctx, userID)` | `member:delete` + escalation guard *on the target's role* | so two admins cannot evict each other |
+| `RemoveMember(ctx, userID)` | `member:delete` + escalation guard *on the target's role* | refuses a target who outranks you; **equal ranks may remove each other** |
 | `LeaveContainer(ctx)` | membership only | owner cannot leave under `LastOwnerLocked` |
 | `ListMembers(ctx)` | membership only | non-members get `ErrNotMember`, not an empty list |
 | `TransferOwnership(ctx, userID)` | **owner only** | target must already be a member |
