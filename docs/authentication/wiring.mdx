@@ -1,0 +1,188 @@
+---
+title: "Wiring auth, org and invite together"
+description: "The three services share no store and no types. The one seam every integration hits, and the user id that is the only thing crossing between them."
+---
+
+`auth`, `org`/`scope` and `invite` share **no store and no types**. The only
+thing that connects them is the user id `auth` mints, which the other two treat
+as an opaque subject.
+
+## The seam
+
+<Warning>
+`invite.New` takes the **generic `*scope.Service`**, not the `org.Service`
+wrapper. `org.Service` embeds
+`*scope.Service[Organization, Member, *Organization, *Member]`, so the field is
+reached by the embedded type's own name: **`orgSvc.Service`**.
+
+Every `auth` + `invite` integration hits this line.
+</Warning>
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/invite"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault")
+
+authSvc := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithRequireVerifiedEmail(true))
+
+orgSvc := org.New(
+	org.NewAccess(map[string][]access.Action{"project": {"create", "read"}}),
+	memory.New[org.Organization, org.Member]())
+
+// THE SEAM: the embedded *scope.Service, not the org.Service wrapper.
+inviteSvc := invite.New(orgSvc.Service, memory.NewInviteStore())
+```
+
+Three separate stores. In production those are
+`dropsstore.NewAuthStore(db)`, `dropsstore.New[...](db)` and
+`dropsstore.NewInviteStore(db)` — three sets of tables, each with its own
+`CreateSchema`, and **no foreign keys between them**.
+
+## The user id is the whole bridge
+
+{/* verify:main */}
+```go
+ctx := context.Background()
+
+signup, _ := authSvc.SignUp(ctx, "alice@example.com", "Correct-Horse-Battery-7")
+_, _ = authSvc.VerifyEmail(ctx, signup.VerifyToken)
+login, _ := authSvc.Login(ctx,
+	"alice@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+
+// login.User.ID is what org and invite see as the subject.
+// Nothing else crosses between the halves.
+alice := org.WithSubject(ctx, login.User.ID)
+acme, err := orgSvc.CreateOrganization(alice, "Acme", "acme")
+fmt.Println("owner is the auth user:", acme.OwnerID == login.User.ID, err)
+```
+
+```
+owner is the auth user: true <nil>
+```
+
+In a request handler that id comes from a verified access token:
+
+{/* verify:main */}
+```go
+claims, err := authSvc.VerifyAccessToken(login.AccessToken)
+if err != nil {
+	panic(err)
+}
+inOrg := org.WithOrg(org.WithSubject(ctx, claims.Subject), acme.ID)
+
+may, _ := orgSvc.Can(inOrg, "project", org.ActionCreate)
+fmt.Println("may create projects:", may)
+```
+
+```
+may create projects: true
+```
+
+## Inviting someone who has no account yet
+
+The ordering that matters: the invitation is minted for an **address**, before
+the invitee has an account at all.
+
+{/* verify:main */}
+```go
+inv, inviteToken, err := inviteSvc.InviteByEmail(inOrg, "carol@example.com", org.RoleAdmin)
+fmt.Println("invite:", err, inv.RoleKey, inviteToken != "")
+// Deliver inviteToken yourself: authlayer knows no base URL.
+
+// Carol signs up through auth like anyone else.
+carolSignup, _ := authSvc.SignUp(ctx, "carol@example.com", "Correct-Horse-Battery-7")
+_, _ = authSvc.VerifyEmail(ctx, carolSignup.VerifyToken)
+carolLogin, _ := authSvc.Login(ctx,
+	"carol@example.com", "Correct-Horse-Battery-7", "198.51.100.7", "curl/8")
+
+// She accepts with the id auth minted for her.
+carol := org.WithSubject(ctx, carolLogin.User.ID)
+joined, err := inviteSvc.AcceptInvite(carol, inviteToken)
+fmt.Println("joined:", err, joined.Name)
+
+standing, elevated, _ := orgSvc.Standing(ctx, acme.ID, carolLogin.User.ID)
+fmt.Println("carol is an admin:",
+	standing.Allows(org.ResourceMember, org.ActionCreate), "elevated:", elevated)
+```
+
+```
+invite: <nil> admin true
+joined: <nil> Acme
+carol is an admin: true elevated: false
+```
+
+<Note>
+`elevated: false` is correct and load-bearing. The built-in `admin` role is
+deliberately short of full permission — it excludes `organization:delete` — so
+an admin remains subject to the
+[privilege-escalation guard](/authorization/privilege-escalation).
+</Note>
+
+<Warning>
+Nothing binds the invitation to the account that accepts it. `AcceptInvite`
+admits **whoever presents the token**, at the invited role, and never compares
+the accepting subject to `EmailInvite.Email`. If your application needs that
+binding, enforce it yourself — `PreviewInvite` reads the invited address out of
+a token without consuming it, so you can compare it against the authenticated
+user's own verified address. See
+[Invitation security](/invitations/security#an-email-invite-is-a-bearer-credential).
+</Warning>
+
+{/* verify:stdout "owner is the auth user: true <nil>\nmay create projects: true\ninvite: <nil> admin true\njoined: <nil> Acme\ncarol is an admin: true elevated: false" */}
+
+## What you still own
+
+<Columns cols={2}>
+  <Card title="Transport" icon="server">
+    Routes, cookies, headers, status codes. Where the access token lives on the
+    client and how the refresh token gets sent back.
+  </Card>
+  <Card title="Email delivery" icon="envelope">
+    Two token strings on this page — `signup.VerifyToken` and `inviteToken` —
+    are secrets you must deliver and must not log.
+  </Card>
+  <Card title="Profile data" icon="user">
+    `auth` stores `UserBase` only. A display name lives in your table, keyed by
+    `UserBase.ID`. `WithClaimsExtender` is where you put it in a token.
+  </Card>
+  <Card title="Two cron jobs" icon="clock">
+    `auth.Service.PurgeExpired` and `invite.Service.PurgeExpired`. Both span
+    every user or container the store holds and authorize nothing — never wire
+    either to a per-request handler.
+  </Card>
+</Columns>
+
+## The runnable version
+
+`examples/auth` runs exactly this, end to end, and prints a trace of each step:
+
+```sh
+go run ./examples/auth
+```
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Invitations" icon="envelope-open-text" href="/invitations/overview">
+    Both flows, and the security properties that make them safe.
+  </Card>
+  <Card title="The PostgreSQL store" icon="database" href="/storage/postgres">
+    Swapping all three memory stores for real ones.
+  </Card>
+</Columns>

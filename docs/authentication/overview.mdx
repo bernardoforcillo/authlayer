@@ -1,0 +1,157 @@
+---
+title: "The authentication core"
+description: "What auth owns — the user record, its password credential, revocable sessions, and one-time tokens — and the four boundaries it deliberately does not cross."
+---
+
+`auth` owns identity: the user record, its password credential, revocable
+server-side sessions, and the one-time tokens that confirm an address or reset a
+password. It sits on two smaller packages — `token`, which mints the opaque
+refresh tokens and the HS256 access tokens, and `password`, the hashing port
+with a bcrypt default.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault") // the HS256 floor, RFC 7518 §3.2
+
+svc := auth.New(memory.NewAuthStore(), // swap for dropsstore.NewAuthStore(db)
+	auth.WithJWT([][]byte{key}, 15*time.Minute), // access-token TTL
+	auth.WithRefreshTTL(30*24*time.Hour),        // session lifetime
+	auth.WithRequireVerifiedEmail(true))
+
+ctx := context.Background()
+res, err := svc.SignUp(ctx, "  Bob@Example.com ", "Correct-Horse-Battery-7")
+fmt.Println(err, res.Created, res.User.Email)
+```
+
+```
+<nil> true bob@example.com
+```
+
+Every address is passed through `auth.NormalizeEmail` (trim, lowercase) on
+every read and write, which is why the trailing space and the capitals vanish —
+and why `BOB@example.com` cannot become a second account.
+
+## What authlayer does not own
+
+<AccordionGroup>
+  <Accordion title="No transport" icon="server">
+    No HTTP handlers, no cookies, no middleware, no base URL. Where you put the
+    tokens, which status codes you return, how a browser stores anything — all
+    yours.
+  </Accordion>
+  <Accordion title="No email delivery" icon="envelope">
+    `SignUp`, `RequestPasswordReset` and `RequestEmailChange` each return a
+    plaintext token **exactly once**. Putting it in a message is entirely
+    yours, the same division [`invite`](/invitations/overview) draws.
+  </Accordion>
+  <Accordion title="No user profile" icon="user">
+    The `Store` persists `auth.UserBase` and nothing else — id, normalized
+    email, verification stamp, password hash, timestamps. A `Plan` or
+    `DisplayName` field of yours lives in your own table, keyed by
+    `UserBase.ID`.
+  </Accordion>
+  <Accordion title="No OAuth in this release" icon="right-to-bracket">
+    Social and enterprise identity providers are not shipped. Password
+    credentials, email verification and revocable sessions are.
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+Unlike `scope`, **`auth` is not generic over your user type**. A container is
+genuinely application-shaped, so `scope` takes yours. A credential record is
+not: `auth` needs exactly one fixed set of columns, every one of them
+load-bearing for a flow it implements. That is also what keeps this library's
+migrations from ever owning a column your product's shape decides.
+</Note>
+
+## Four lifetimes, one option each
+
+| Token | Minted by | Default TTL | Option |
+|---|---|---|---|
+| access | `Login`, `Refresh` | 15 min | `WithJWT(keys, ttl)` |
+| refresh (session) | `Login`, `Refresh` | 30 days | `WithRefreshTTL` |
+| `signup`, `email_change` | `SignUp`, `RequestEmailChange` | 24 hours | `WithVerificationTTL` |
+| `password_reset` | `RequestPasswordReset` | 1 hour | `WithPasswordResetTTL` |
+
+The defaults differ on purpose. The signup window is generous because mail that
+arrives late must not force a whole new sign-up; the reset window is short
+because a reset link grants a full **credential change** rather than an "I own
+this address" attestation.
+
+<Tip>
+Every one of these **ignores a non-positive duration** and keeps its default,
+rather than minting a token that has already expired.
+</Tip>
+
+<Warning>
+Shortening the verification TTL also shortens how long an `email_change` token
+stays armed — and that is the strongest of the three, because `VerifyEmail`
+redeems it with no authentication at all. See
+[Email verification and change](/authentication/email-verification).
+</Warning>
+
+## The three records
+
+<ResponseField name="UserBase" type="struct">
+  `ID`, `Email` (always normalized, unique), `EmailVerifiedAt *time.Time`,
+  `PasswordHash`, `CreatedAt`, `UpdatedAt`. An **empty** `PasswordHash` is a
+  real, supported state — an account with no password credential — not a
+  zero-value accident. `PasswordHash` carries `json:"-"`, and every `Service`
+  method additionally clears it on the value it hands back.
+</ResponseField>
+
+<ResponseField name="Session" type="struct">
+  One refresh token's row: `ID`, `UserID`, `TokenHash` (sha256 of the
+  plaintext, never the plaintext), `FamilyID`, `ExpiresAt`, `CreatedAt`,
+  `RotatedAt *time.Time`, plus `UserAgent` and `IP` as **audit/display fields
+  only — never a security check**. `RotatedAt == nil` means current.
+</ResponseField>
+
+<ResponseField name="Verification" type="struct">
+  A one-time hashed token: `ID`, `UserID`, `TokenHash`, `Purpose` (`signup`,
+  `email_change`, `password_reset`), `Email`, `ExpiresAt`, `CreatedAt`. `Email`
+  is **always** populated and always normalized, whatever the purpose — a
+  completed reset compares it against the account's current address before
+  certifying anything.
+</ResponseField>
+
+## The runnable tours
+
+Two programs in the module cover this whole section end to end, against
+`store/memory`, with no database:
+
+```sh
+go run ./examples/auth    # sign up, verify, log in, org, invite, refresh, log out
+go run ./examples/reset   # the password lifecycle and the email change
+```
+
+{/* verify:stdout "<nil> true bob@example.com" */}
+
+## Where to go next
+
+<Columns cols={2}>
+  <Card title="Sign-up" icon="user-plus" href="/authentication/sign-up">
+    The enumeration property, and the obligation it places on your handler.
+  </Card>
+  <Card title="Login" icon="right-to-bracket" href="/authentication/login">
+    What `Login` checks, in what order, and why `ip` is mandatory.
+  </Card>
+  <Card title="Sessions" icon="clock-rotate-left" href="/authentication/sessions">
+    Exactly what revocation revokes — and what it does not.
+  </Card>
+  <Card title="Refresh rotation" icon="rotate" href="/authentication/refresh-rotation">
+    Reuse detection and family revocation.
+  </Card>
+</Columns>

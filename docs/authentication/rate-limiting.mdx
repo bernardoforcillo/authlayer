@@ -1,0 +1,259 @@
+---
+title: "Rate limiting, and the bounds on enumeration safety"
+description: "Two limiters, no default, and fail-closed. Plus the measured timing channel that enumeration safety does not close, with the harness that re-derives it."
+---
+
+`RateLimiter` is a one-method port:
+
+{/* verify:skip an interface declaration reproduced from the auth package; the implementation below satisfies it and is compiled and run */}
+```go
+type RateLimiter interface {
+	Allow(ctx context.Context, key string) (bool, error)
+}
+```
+
+Two options wire two different limiters:
+
+| Option | Keyed on | Consulted by |
+|---|---|---|
+| `WithRateLimiter(l)` | **IP** | `Login` and `RequestPasswordReset` |
+| `WithPasswordResetRateLimiter(l)` | **email address** | `RequestPasswordReset` only |
+
+<Note>
+Keying login on IP and **never** on email is deliberate: an email-keyed bucket
+lets an attacker lock a victim out of their own account by exhausting the
+victim's bucket, never their own. Only the attacker's own IP bucket is ever
+spent.
+</Note>
+
+## There is no default limiter
+
+<Warning>
+The zero configuration rate-limits **nothing**. authlayer has no idea what your
+traffic looks like, and a wrong default here is an outage. Wiring one is your
+job.
+</Warning>
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:decl */}
+```go
+// counter is a deliberately minimal limiter: N attempts per key, ever.
+// A real one is a token bucket or a sliding window in Redis.
+type counter struct {
+	mu   sync.Mutex
+	max  int
+	seen map[string]int
+	fail error // when non-nil, the limiter cannot answer at all
+}
+
+func (c *counter) Allow(_ context.Context, key string) (bool, error) {
+	if c.fail != nil {
+		return false, c.fail
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.seen[key]++
+	return c.seen[key] <= c.max, nil
+}
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault")
+limiter := &counter{max: 2, seen: map[string]int{}}
+
+svc := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithRateLimiter(limiter))
+
+ctx := context.Background()
+res, _ := svc.SignUp(ctx, "bob@example.com", "Correct-Horse-Battery-7")
+_, _ = svc.VerifyEmail(ctx, res.VerifyToken)
+
+for i := 1; i <= 3; i++ {
+	_, err := svc.Login(ctx, "bob@example.com", "wrong", "203.0.113.9", "curl/8")
+	fmt.Printf("attempt %d: invalid=%v limited=%v\n", i,
+		errors.Is(err, auth.ErrInvalidCredentials),
+		errors.Is(err, auth.ErrRateLimited))
+}
+
+// A different IP has its own bucket. The victim is never locked out by
+// somebody else's attempts.
+_, err := svc.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "198.51.100.7", "curl/8")
+fmt.Println("the real user, from another IP:", err)
+```
+
+```
+attempt 1: invalid=true limited=false
+attempt 2: invalid=true limited=false
+attempt 3: invalid=false limited=true
+```
+```
+the real user, from another IP: <nil>
+```
+
+<Note>
+A denial is decided **before** the `Store` or the `Hasher` is touched at all, so
+a limited caller costs you neither a query nor a bcrypt comparison.
+</Note>
+
+## It fails closed
+
+A limiter that returns an **error** has failed to make a decision, and an
+authentication decision that cannot be made must deny. The error propagates and
+the call is refused rather than admitted.
+
+{/* verify:main */}
+```go
+broken := errors.New("redis is unreachable")
+closed := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithRateLimiter(&counter{fail: broken}))
+
+_, err = closed.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+fmt.Println("limiter outage:", errors.Is(err, broken), errors.Is(err, auth.ErrRateLimited))
+```
+
+```
+limiter outage: true false
+```
+
+Note that the limiter's own error propagates — it is **not** flattened into
+`ErrRateLimited`, so you can tell "too many attempts" from "my limiter is down".
+
+## The reset limiter's denial has a different shape
+
+<Warning>
+A denial from the **address-keyed** reset limiter returns the same
+`("", false, nil)` an unknown address gets, **not** `ErrRateLimited`.
+
+That is a difference of shape, not of stance. A distinguishable error reachable
+only once enough requests for *that address* had run would itself be the
+existence oracle the method exists to close.
+</Warning>
+
+{/* verify:main */}
+```go
+byAddress := &counter{max: 1, seen: map[string]int{}}
+resetSvc := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithPasswordResetRateLimiter(byAddress))
+
+r, _ := resetSvc.SignUp(ctx, "bob@example.com", "Correct-Horse-Battery-7")
+_, _ = resetSvc.VerifyEmail(ctx, r.VerifyToken)
+
+for i := 1; i <= 2; i++ {
+	tok, ok, err := resetSvc.RequestPasswordReset(ctx, "bob@example.com", "203.0.113.9")
+	fmt.Printf("request %d: token=%v ok=%v err=%v\n", i, tok != "", ok, err)
+}
+```
+
+```
+request 1: token=true ok=true err=<nil>
+request 2: token=false ok=false err=<nil>
+```
+
+The second row is indistinguishable from an unknown address, which is the point.
+
+## Enumeration safety is bounded, not absolute
+
+`SignUp` and `RequestPasswordReset` equalise the **sequence of calls** and the
+**set of errors** each branch can produce. **Neither equalises the wall clock.**
+
+On `RequestPasswordReset` the residual is *measured* rather than assumed, by a
+harness in the tree — so it can be re-derived and re-checked after any change:
+
+```sh
+AUTHLAYER_TEST_DSN=... go test -tags integration ./store/drops/ -run TimingChannel -v
+```
+
+<Warning>
+Against a live PostgreSQL store a **known address answers several times slower**
+than an unknown one, because the known branch performs two extra writes —
+invalidate the previous token, mint the new one — that the unknown branch has no
+user row to perform.
+
+The durable finding is that the two distributions are **disjoint at the known
+branch's 5th percentile against the unknown branch's 95th**: on a quiet
+same-host network one sample already separates them more often than not.
+
+Six runs on one machine (Windows host, PostgreSQL in a container, loopback) put
+the known median at **3.3–8.7 ms** against an unknown median of **0.5–1.0 ms** —
+Δ≈2.8–8.0 ms, roughly **5.5–12×**. The disjointness held on every run; the
+absolute numbers did not — the same machine reported 9.5–16.7 ms on a different
+day — and yours will differ, which is why the harness *reports* rather than
+asserting a threshold.
+</Warning>
+
+### What widens it, and what no longer does
+
+<Columns cols={2}>
+  <Card title="Unreclaimed dead tuples widen it" icon="triangle-exclamation">
+    The harness measures a freshly vacuumed table. An unvacuumed version of it
+    watched its own churn take the known median from **6.3 ms to 31.8 ms**.
+  </Card>
+  <Card title="Table size no longer does" icon="check">
+    `store/drops` indexes `verifications (user_id, purpose)`, so the
+    invalidating `DELETE` reads your own rows rather than scanning every
+    pending token held for all users.
+  </Card>
+</Columns>
+
+That second one was measured, not assumed: seeding **40,000** other users'
+pending tokens moved the known branch's floor from 2.3–2.5 ms to 4.7–5.0 ms
+*without* the index, and left it at 2.4–2.8 ms *with* it.
+
+<Warning>
+A backend that omits that index — a third-party `Store`, or your own migrations
+owning these tables — puts the growth term back. It is a **security-relevant**
+part of the schema, not only a performance one.
+</Warning>
+
+Over WAN jitter this needs on the order of **10²–10³ samples against one
+address** to resolve: practical against a single suspected address, impractical
+for bulk enumeration, and real either way.
+
+### What bounds it
+
+`WithPasswordResetRateLimiter` caps how many samples an attacker can collect
+against any one address — which is the resource this channel actually needs. It
+earns its keep twice over, because the re-issue behaviour it gates has a second
+cost: since each request invalidates the account's previous reset token, anyone
+who merely knows an address can kill a victim's genuine pending link by looping
+calls.
+
+<Warning>
+A caller can reopen the channel from outside. If your handler awaits
+`RequestPasswordReset` and then does **address-dependent work** before
+responding — a real mail send, say — the transport leaks what the function
+bounded.
+
+Normalise your own response timing (a fixed delay, a queued or async send), or
+accept the documented channel.
+</Warning>
+
+{/* verify:stdout "attempt 1: invalid=true limited=false\nattempt 2: invalid=true limited=false\nattempt 3: invalid=false limited=true\nthe real user, from another IP: <nil>\nlimiter outage: true false\nrequest 1: token=true ok=true err=<nil>\nrequest 2: token=false ok=false err=<nil>" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Sign-up" icon="user-plus" href="/authentication/sign-up">
+    The other half of the enumeration property.
+  </Card>
+  <Card title="The schema" icon="table" href="/storage/schema">
+    Why `verifications (user_id, purpose)` is a security index.
+  </Card>
+</Columns>

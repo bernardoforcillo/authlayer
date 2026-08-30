@@ -1,0 +1,197 @@
+---
+title: "Refresh rotation and reuse detection"
+description: "Every refresh rotates. Presenting a rotated-away token is treated as compromise and revokes the whole family — a security-first trade, deliberately made."
+---
+
+Refreshing **rotates**: the presented token is marked superseded and a successor
+is minted in the same **family**. Every session descending from one login shares
+a `FamilyID`.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault")
+svc := auth.New(memory.NewAuthStore(), auth.WithJWT([][]byte{key}, 15*time.Minute))
+
+ctx := context.Background()
+res, _ := svc.SignUp(ctx, "bob@example.com", "Correct-Horse-Battery-7")
+_, _ = svc.VerifyEmail(ctx, res.VerifyToken)
+login, _ := svc.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+
+next, err := svc.Refresh(ctx, login.RefreshToken)
+fmt.Println("rotated:", err, next.RefreshToken != login.RefreshToken)
+
+rows, _ := svc.ListSessions(ctx, login.User.ID)
+live := 0
+for _, s := range rows {
+	if s.RotatedAt == nil {
+		live++
+	}
+}
+fmt.Println("rows:", len(rows), "live:", live, "same family:",
+	rows[0].FamilyID == rows[1].FamilyID)
+```
+
+```
+rotated: <nil> true
+rows: 2 live: 1 same family: true
+```
+
+The superseded row is kept **on purpose**. It is the tripwire.
+
+## A replay revokes the whole family
+
+authlayer cannot tell an attacker replaying a stolen token from a client
+retrying a raced request — so it treats **every** replay as compromise.
+
+{/* verify:main */}
+```go
+_, err = svc.Refresh(ctx, login.RefreshToken) // the token we already rotated away
+fmt.Println("replay:", errors.Is(err, auth.ErrTokenReuse))
+
+_, err = svc.Refresh(ctx, next.RefreshToken) // the successor died with its family
+fmt.Println("successor:", errors.Is(err, auth.ErrTokenInvalid))
+
+rows, _ = svc.ListSessions(ctx, login.User.ID)
+fmt.Println("sessions left:", len(rows))
+```
+
+```
+replay: true
+successor: true
+sessions left: 0
+```
+
+<Note>
+The successor is gone too. Revocation takes the **family**, not merely the token
+that was replayed, because a successor an attacker had already rotated into
+would otherwise survive the alarm that detected them.
+
+That is a security-first trade: a genuine race between a client and its own
+retry signs that user out everywhere. It is deliberate.
+</Note>
+
+An **expired** refresh token is ordinary end-of-life, not evidence of theft: it
+is `ErrTokenInvalid` and leaves the family intact.
+
+## Two atomicity obligations hold this together
+
+Both live on the [`Store` port](/storage/ports) as requirements, not as advice.
+
+<Steps>
+  <Step title="MarkRotated is a compare-and-set" icon="lock">
+    Of however many callers present the same refresh token at once, exactly one
+    sees `ok=true` — and only that result authorizes minting. Never a
+    `RotatedAt` value read a moment earlier, which is stale the instant the
+    goroutine yields.
+  </Step>
+  <Step title="CreateSuccessorSession is gated on the predecessor" icon="link">
+    It inserts the successor only if the predecessor row still exists, so a
+    family revoked in the window between the two is **not resurrected** by a
+    winner still in flight. `Refresh` returns `ErrSessionRevoked` instead of
+    minting.
+  </Step>
+</Steps>
+
+<Warning>
+Both windows are closed only insofar as the backend honours the atomicity the
+port demands of it. Both shipped stores do. A third-party backend that splits
+either into a read and a later write reopens a security hole rather than merely
+narrowing a race — see
+[Writing your own backend](/storage/custom-backends).
+
+Separately, `Session.TokenHash` must be **unique** across every row. That
+obligation sits on the record type rather than on a method, and a backend that
+satisfies every method contract and skips it is still wrong: two rows sharing a
+hash lets two concurrent callers each atomically win a *different* row, which is
+two successful rotations with no atomicity defect at all.
+</Warning>
+
+## The three `Refresh` failures
+
+| Sentinel | Meaning | Family |
+|---|---|---|
+| `ErrTokenInvalid` | Unknown token, or its session has expired | **not** revoked |
+| `ErrTokenReuse` | A rotated-away token was presented again | revoked |
+| `ErrSessionRevoked` | Won the rotation, but the family was revoked before the successor could be persisted | already revoked |
+
+<Warning>
+`ErrTokenReuse` must be checked **before** you test whether the error wraps
+anything else.
+
+Returned **alone**, the family is already revoked. It comes wrapped around a
+second error in exactly two cases — the family revocation itself failing, and
+`ErrStoreContract` — and in both a replay was detected while the family **may
+still be live**. Either way the alarm is never lost to the failure of the
+response to it.
+</Warning>
+
+{/* verify:main */}
+```go
+// The shape a refresh handler should use.
+handle := func(presented string) string {
+	_, err := svc.Refresh(ctx, presented)
+	switch {
+	case err == nil:
+		return "200, set the new tokens"
+	case errors.Is(err, auth.ErrTokenReuse):
+		return "401, and alert: a replay was detected"
+	case errors.Is(err, auth.ErrSessionRevoked), errors.Is(err, auth.ErrTokenInvalid):
+		return "401, sign in again"
+	default:
+		return "500"
+	}
+}
+fresh, _ := svc.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+_, _ = svc.Refresh(ctx, fresh.RefreshToken) // rotate it away
+
+fmt.Println(handle("never-issued"))
+fmt.Println(handle(fresh.RefreshToken))     // the replay
+fmt.Println(handle(fresh.RefreshToken))     // the same token, once more
+```
+
+```
+401, sign in again
+401, and alert: a replay was detected
+401, sign in again
+```
+
+<Warning>
+Note the third line. Reuse is reported **once**: family revocation *deletes* the
+rows, tripwire included, so a second presentation of the same token finds
+nothing and is `ErrTokenInvalid`. Do not build alerting that expects a replayed
+token to keep reporting `ErrTokenReuse` — the alarm fires on the transition, not
+on every subsequent attempt.
+</Warning>
+
+## Rotated rows are swept by a cron, not by a check
+
+`auth.Service.PurgeExpired(ctx, before)` is what removes retained predecessors
+once they expire. It is housekeeping rather than a security boundary — an
+expired row is already refused — but nothing else removes them, so it is
+required. See [Sessions](/authentication/sessions#housekeeping).
+
+{/* verify:stdout "rotated: <nil> true\nrows: 2 live: 1 same family: true\nreplay: true\nsuccessor: true\nsessions left: 0\n401, sign in again\n401, and alert: a replay was detected\n401, sign in again" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Sessions" icon="clock-rotate-left" href="/authentication/sessions">
+    What revocation revokes, and the access-token bound.
+  </Card>
+  <Card title="The Store ports" icon="plug" href="/storage/ports">
+    The atomicity obligations behind this page.
+  </Card>
+</Columns>

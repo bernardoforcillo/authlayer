@@ -1,0 +1,268 @@
+---
+title: "Access tokens"
+description: "Verifying the short-lived HS256 JWT with no store round trip, the sid claim, key rotation, and why hand-rolling this JWT is the safe choice here."
+---
+
+An access token is a short-lived HS256 JWT the server **never stores**.
+Verifying one is signature and expiry and nothing else — no lookup, no round
+trip — which is what makes it cheap enough to do on every request.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+	"github.com/bernardoforcillo/authlayer/token"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault")
+svc := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute))
+
+ctx := context.Background()
+res, _ := svc.SignUp(ctx, "bob@example.com", "Correct-Horse-Battery-7")
+_, _ = svc.VerifyEmail(ctx, res.VerifyToken)
+login, _ := svc.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+
+claims, err := svc.VerifyAccessToken(login.AccessToken)
+fmt.Println(err, claims.Subject == login.User.ID, claims.Email, claims.SessionID != "")
+```
+
+```
+<nil> true bob@example.com true
+```
+
+`WithJWT` already holds the keys, so verification is a **method** rather than
+something you re-wire with a second copy of the key material.
+
+## The claims
+
+<ResponseField name="Subject" type="string">
+  JSON `sub`. The user id — what you put on the context as the authorization
+  [subject](/concepts/context).
+</ResponseField>
+
+<ResponseField name="SessionID" type="string">
+  JSON `sid`. The id of the session that minted this token. It is what
+  `ChangePassword` wants for its `currentSessionID`, and the hook for
+  [true instant revocation](/authentication/sessions#the-hook-for-closing-the-gap).
+</ResponseField>
+
+<ResponseField name="Email" type="string">
+  Denormalized, for display without a lookup.
+</ResponseField>
+
+<ResponseField name="IssuedAt / ExpiresAt" type="int64">
+  Unix seconds, `iat` and `exp`. `Issue` sets both itself from the TTL; values
+  set on the `Claims` passed in are ignored for these two.
+</ResponseField>
+
+<ResponseField name="Extra" type="map[string]any">
+  JSON `ext`, populated by `WithClaimsExtender` and nil otherwise. See
+  [below](#application-claims-nest-under-ext).
+</ResponseField>
+
+## The pairing most handlers need
+
+{/* verify:main */}
+```go
+// Per request: verify locally, then read the user if you need the record.
+u, err := svc.User(ctx, claims.Subject)
+fmt.Println(err, u.Email, "hash scrubbed:", u.PasswordHash == "")
+
+// claims.SessionID is what ChangePassword wants, so the caller's own
+// family survives the sign-out-everywhere it performs.
+err = svc.ChangePassword(ctx, claims.Subject, claims.SessionID,
+	"Correct-Horse-Battery-7", "Another-Valid-Pass22!")
+fmt.Println("change password:", err)
+```
+
+```
+<nil> bob@example.com hash scrubbed: true
+change password: <nil>
+```
+
+`User(ctx, id)` is a thin wrapper over `Store.FindUserByID` that scrubs
+`PasswordHash` like every other `Service` method — which the `Store`'s own
+method, the only exported way to read a user before `User` existed, does not.
+
+## The failures are `token`'s own sentinels
+
+Unwrapped, so you can tell an expired token from a forged one.
+
+{/* verify:main */}
+```go
+_, err = svc.VerifyAccessToken(login.AccessToken + "x")
+fmt.Println("tampered:", errors.Is(err, token.ErrInvalidSignature) ||
+	errors.Is(err, token.ErrMalformedToken))
+
+_, err = svc.VerifyAccessToken("not.a.jwt")
+fmt.Println("garbage:", errors.Is(err, token.ErrMalformedToken))
+
+noKeys := auth.New(memory.NewAuthStore())
+_, err = noKeys.VerifyAccessToken(login.AccessToken)
+fmt.Println("Service built without WithJWT:", errors.Is(err, token.ErrKeyTooShort))
+```
+
+```
+tampered: true
+garbage: true
+Service built without WithJWT: true
+```
+
+| Sentinel | Meaning |
+|---|---|
+| `token.ErrMalformedToken` | Not a valid JWS compact serialization — wrong segment count, non-canonical base64, or a segment that is not JSON |
+| `token.ErrUnsupportedAlgorithm` | The header's `alg` is not exactly `"HS256"`. Returned **before** any signature is verified |
+| `token.ErrInvalidSignature` | No key in the list produced a matching signature |
+| `token.ErrExpiredToken` | The signature verified but `exp` is not in the future — checked **after** verification, so it cannot probe for a valid signature on forged claims |
+| `token.ErrKeyTooShort` | An HMAC key under 32 bytes appears anywhere in the key list |
+
+<Note>
+A `Service` built without `WithJWT` fails closed with `ErrKeyTooShort` here,
+exactly as `Login` does on the same misconfiguration. `Parse` checks every key's
+length **before** it looks at the token at all, so a misconfigured service
+surfaces on the request path and not only at startup.
+</Note>
+
+## Key rotation
+
+`WithJWT` takes a **list**. `Parse` tries every key; `Issue` always signs with
+the first. So rotating a signing key is: prepend the new one, deploy, and drop
+the old one once every token signed with it has expired.
+
+{/* verify:main */}
+```go
+oldKey := key
+newKey := []byte("a-different-32-byte-or-longer-key")
+
+rotated := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{newKey, oldKey}, 15*time.Minute))
+
+// A token signed with the OLD key still verifies during the overlap.
+c, err := rotated.VerifyAccessToken(login.AccessToken)
+fmt.Println("in-flight token survives rotation:", err, c.Subject == login.User.ID)
+```
+
+```
+in-flight token survives rotation: <nil> true
+```
+
+<Warning>
+`Parse` refuses the **whole call** with `ErrKeyTooShort` if *any* key in the
+list is short, rather than quietly skipping it. A rotation that appends an
+undersized key takes the service down loudly instead of silently narrowing
+verification.
+</Warning>
+
+## Application claims nest under `ext`
+
+`WithClaimsExtender` adds your own claims. They nest under one `"ext"` object
+**structurally**, not by denylist — so an extender cannot shadow a reserved
+claim.
+
+{/* verify:main */}
+```go
+ext := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithClaimsExtender(func(u auth.UserBase) map[string]any {
+		return map[string]any{"plan": "pro", "sub": "victim"}
+	}))
+
+_, _ = ext.SignUp(ctx, "dana@example.com", "Correct-Horse-Battery-7")
+dana, _ := ext.Login(ctx, "dana@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+
+parsed, err := token.Parse(dana.AccessToken, key)
+fmt.Println(err, parsed.Subject == dana.User.ID)
+fmt.Println(parsed.Extra["plan"], parsed.Extra["sub"])
+```
+
+```
+<nil> true
+pro victim
+```
+
+The extender's `"sub"` lands at `ext.sub`; the real subject is untouched.
+
+<Tip>
+The extender is where you attach the profile fields authlayer does not store.
+Look them up by `UserBase.ID` from your own tables and return them here.
+</Tip>
+
+## Why hand-rolling this JWT is defensible
+
+The two classic JWT vulnerabilities — `alg: none`, and RS256/HS256 confusion
+where a public key is fed to an HMAC verifier — need the **same enabling
+mistake**: a parser that takes its algorithm from the token and dispatches on
+it.
+
+`token.Parse` does not. It supports exactly one algorithm and compares the
+header's `alg` to the literal string `"HS256"` **before** it verifies a
+signature or decodes a payload. Every other value — a missing field, a
+lower-case `hs256` — is rejected through that one line with
+`ErrUnsupportedAlgorithm`. There is no `none` branch to reach and no second
+algorithm to confuse it with.
+
+<Warning>
+That single check is the whole justification for not taking a dependency — and
+it is why **generalising this package to a second algorithm would bring both
+vulnerabilities back**.
+</Warning>
+
+The same reasoning covers the key. An empty or undersized HMAC key is `alg:
+none` reached through the key parameter instead of the header — the realistic
+failure being `[]byte(os.Getenv("JWT_SECRET"))` with the variable unset — so
+`Issue` and `Parse` both refuse anything under **32 bytes**, the floor RFC 7518
+§3.2 sets for HS256.
+
+{/* verify:main */}
+```go
+_, err = token.Issue(token.Claims{Subject: "u1"}, []byte("too-short"), time.Minute)
+fmt.Println("short key at Issue:", errors.Is(err, token.ErrKeyTooShort))
+
+_, err = token.Issue(token.Claims{Subject: "u1"}, key, 0)
+fmt.Println("zero ttl at Issue: ", errors.Is(err, token.ErrInvalidTTL))
+```
+
+```
+short key at Issue: true
+zero ttl at Issue:  true
+```
+
+Signature comparison is `hmac.Equal`, and every segment is decoded with
+**strict** base64 — so one token has exactly one valid encoding, and the raw
+string is usable as a denylist key.
+
+{/* verify:stdout "<nil> true bob@example.com true\n<nil> bob@example.com hash scrubbed: true\nchange password: <nil>\ntampered: true\ngarbage: true\nService built without WithJWT: true\nin-flight token survives rotation: <nil> true\n<nil> true\npro victim\nshort key at Issue: true\nzero ttl at Issue:  true" */}
+
+## The bound you must carry
+
+<Warning>
+**Verifying an access token proves nothing about whether its session still
+exists.** Neither `VerifyAccessToken` nor the `token.Parse` beneath it looks
+anything up, so a token keeps working for up to its full TTL after `Logout`,
+`LogoutAll`, `RevokeSession`, `ChangePassword` or reuse detection killed the
+session behind it.
+
+[Sessions](/authentication/sessions) is the page that states that bound in full,
+and the `sid` claim above is the hook for closing it.
+</Warning>
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Sessions" icon="clock-rotate-left" href="/authentication/sessions">
+    What revocation revokes, and what it does not.
+  </Card>
+  <Card title="Wiring it to authorization" icon="link" href="/authentication/wiring">
+    Turning `claims.Subject` into an `org` subject.
+  </Card>
+</Columns>

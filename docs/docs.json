@@ -52,6 +52,22 @@
           "authorization/custom-scopes",
           "authorization/nested-scopes"
         ]
+      },
+      {
+        "group": "Authentication",
+        "icon": "key",
+        "pages": [
+          "authentication/overview",
+          "authentication/sign-up",
+          "authentication/login",
+          "authentication/access-tokens",
+          "authentication/sessions",
+          "authentication/refresh-rotation",
+          "authentication/passwords",
+          "authentication/email-verification",
+          "authentication/rate-limiting",
+          "authentication/wiring"
+        ]
       }
     ],
     "global": {
