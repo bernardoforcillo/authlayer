@@ -35,8 +35,9 @@ import (
 // longer meets the constraint for the first time in production. See
 // [ErrTokenHashTaken] for what a collision reports.
 //
-// [InviteStore]'s equivalent split is untouched and remains as its own doc
-// describes; invite.Store is a separate port with its own obligations.
+// [InviteStore] has since closed its own equivalent split — EmailInvite's
+// TokenHash and (ContainerID, Email), and Link's Code — for the same reason;
+// see that type's doc.
 //
 // It also enforces the id-collision contract [auth.Store] documents on every
 // Create* method: CreateUser, CreateSession and CreateVerification all check
@@ -51,17 +52,26 @@ type AuthStore struct {
 	verifications map[string]auth.Verification
 }
 
-// ErrTokenHashTaken reports that a Create* call would have stored a second
-// Session or Verification under a token hash another row of the same kind
-// already holds — the uniqueness [auth.Session.TokenHash] and
-// [auth.Verification.TokenHash] require of a backend.
+// ErrTokenHashTaken reports that a Create call would have stored a second row
+// under a token hash another row of the same kind already holds — the
+// uniqueness [auth.Session.TokenHash], [auth.Verification.TokenHash] and
+// [github.com/bernardoforcillo/authlayer/invite.EmailInvite] TokenHash each
+// require of a backend.
 //
-// It is deliberately NOT one of authlayer/auth's sentinels, and deliberately
-// not auth.ErrIDTaken. [auth.Store]'s error contract classifies exactly one
-// conflict on the Create* methods — ErrIDTaken, defined as "an id that
-// already identifies a row of that same kind" — and says of token-hash
-// uniqueness that CreateSession "does not itself check" it, leaving it to the
-// backend's own constraint. Reporting a hash collision as ErrIDTaken would
+// One error covers all three because all three columns hold the same thing —
+// a sha256 of a credential the store never sees in plaintext — and fail the
+// same way when two rows share one: the lookup that the whole redemption path
+// runs stops identifying a single row. [InviteStore.CreateEmailInvite]
+// returns it too, and a caller always knows which store it called.
+//
+// It is deliberately NOT one of authlayer/auth's or authlayer/invite's
+// sentinels, and deliberately not auth.ErrIDTaken. [auth.Store]'s error
+// contract classifies exactly one conflict on the Create* methods —
+// ErrIDTaken, defined as "an id that already identifies a row of that same
+// kind" — and says of token-hash uniqueness that CreateSession "does not
+// itself check" it, leaving it to the backend's own constraint;
+// [github.com/bernardoforcillo/authlayer/invite.Store] classifies no
+// conflict-on-create at all. Reporting a hash collision as ErrIDTaken would
 // therefore tell a caller something false about which column collided. This
 // store answers with its own backend-level error instead, exactly as
 // store/drops answers with the driver's own unique violation

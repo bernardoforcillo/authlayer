@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -15,25 +16,73 @@ import (
 // concurrent call.
 //
 // Unlike [Store], it is not generic — [invite.EmailInvite] and [invite.Link]
-// are fixed shapes — and it does not enforce uniqueness of TokenHash, Code,
-// or (ContainerID, Email) on EmailInvite; that is a database concern,
-// matching this package's stance on custom container fields (see the
-// package doc). store/drops enforces all three as UNIQUE constraints
-// (token_hash and code each on their own, container_id+email as a pair —
-// see store/drops/invite.go's InviteSchema); this store keys email invites
-// by ID alone and links by ID alone, so nothing here stops two rows sharing
-// a TokenHash, a Code, or a (ContainerID, Email) pair — CreateEmailInvite
-// and CreateLink will happily store the duplicate where store/drops would
-// reject it with a unique-violation error. That divergence is deliberately
-// deferred rather than fixed here (no sentinel in this package covers a
-// duplicate on create), but it means a test written only against this store
-// can never exercise the collision path production takes — that requires a
-// live store/drops test.
+// are fixed shapes.
+//
+// It enforces all three uniqueness constraints [invite.Store] states on the
+// record types: EmailInvite.TokenHash, EmailInvite's (ContainerID, Email)
+// pair, and Link.Code. Each check happens under the same acquisition of mu as
+// the write it guards, so two concurrent creates can never both pass it.
+//
+// It did NOT always. All three were deferred to store/drops — which has
+// enforced them as UNIQUE constraints from the start (token_hash and code
+// each on their own, container_id+email as a pair; see store/drops's
+// InviteSchema) — on the reading that a collision is an application-level
+// constraint the way a slug is, and this type's own doc used to say so. That
+// reading does not survive the port's text. A shared TokenHash or Code
+// defeats the single-winner property of [InviteStore.DeleteEmailInvite] and
+// [InviteStore.ConsumeLink] with no atomicity defect at all: two concurrent
+// redeemers resolve DIFFERENT colliding rows through
+// FindEmailInviteByTokenHash or FindLinkByCode and each correctly, atomically
+// wins the row it happened to pick, so a one-time token pays out twice and a
+// MaxUses:1 link admits two people. A duplicated (ContainerID, Email) pair is
+// what turns re-inviting an address into duplicating rather than replacing,
+// leaving a second live token behind a revocation performed from a screen
+// that shows one row. Deferring them meant a caller could develop here and
+// meet the constraint for the first time in production against store/drops;
+// closing them is what
+// [github.com/bernardoforcillo/authlayer/invite/invitetest] tests both
+// backends for. See [ErrTokenHashTaken], [ErrInviteEmailTaken] and
+// [ErrLinkCodeTaken] for what each collision reports.
+//
+// One divergence from store/drops remains and is NOT a uniqueness constraint
+// the port states: store/drops types an invite's and a link's id as a PRIMARY
+// KEY, so re-using one is a unique violation there, while this store keys
+// both maps by ID and a create under an id already present overwrites the row.
+// [invite.Store] documents no id-collision contract and authlayer/invite has
+// no sentinel for one (unlike auth.ErrIDTaken), so nothing here is entitled
+// to invent one; the service mints a fresh UUIDv7 for every record, so the
+// case does not arise in practice. It is recorded rather than closed
+// silently.
 type InviteStore struct {
 	mu           sync.Mutex
 	emailInvites map[string]invite.EmailInvite
 	links        map[string]invite.Link
 }
+
+// ErrInviteEmailTaken reports that [InviteStore.CreateEmailInvite] would have
+// stored a second pending invite for a (ContainerID, Email) pair that already
+// has one — the uniqueness [invite.EmailInvite] requires of a backend, and
+// what store/drops enforces as UNIQUE (container_id, email).
+//
+// The obligation is on the PAIR, not on the address: the same person invited
+// to two different containers is two legitimate rows, and this error is never
+// returned for that.
+//
+// Like [ErrTokenHashTaken] it is deliberately not one of authlayer/invite's
+// sentinels. That package's errors cover not-found and the three reasons a
+// redemption did not happen; it classifies no conflict-on-create at all, so
+// there is nothing there to reuse and inventing a meaning for an existing
+// sentinel would tell a caller something false. store/drops answers the same
+// case with the driver's own pg.ErrUniqueViolation unwrapped.
+var ErrInviteEmailTaken = errors.New("authlayer/store/memory: this container already has a pending invite for that address")
+
+// ErrLinkCodeTaken reports that [InviteStore.CreateLink] would have stored a
+// second link under a code another link already holds — the uniqueness
+// [invite.Link] requires of a backend, and what store/drops enforces as
+// UNIQUE (code).
+//
+// It is a backend-level error for the same reason [ErrInviteEmailTaken] is.
+var ErrLinkCodeTaken = errors.New("authlayer/store/memory: link code already exists")
 
 // NewInviteStore returns an empty in-memory invite.Store.
 func NewInviteStore() *InviteStore {
@@ -43,20 +92,58 @@ func NewInviteStore() *InviteStore {
 	}
 }
 
-// CreateEmailInvite stores the invite under its ID and returns it unchanged.
+// CreateEmailInvite stores the invite under its ID and returns it unchanged,
+// or returns [ErrTokenHashTaken] if another invite already holds
+// inv.TokenHash, or [ErrInviteEmailTaken] if the (ContainerID, Email) pair
+// already has a pending invite. Both checks and the write happen under one
+// acquisition of mu, so two concurrent calls contending for a hash or a pair
+// cannot both pass: the second to reach the lock sees the first's row already
+// present.
+//
+// The hash is checked first, so an invite that collides on both reports the
+// collision that matters to the redemption path.
 func (s *InviteStore) CreateEmailInvite(_ context.Context, inv invite.EmailInvite) (invite.EmailInvite, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.inviteHashTaken(inv.TokenHash) {
+		return invite.EmailInvite{}, ErrTokenHashTaken
+	}
+	if s.pendingInviteFor(inv.ContainerID, inv.Email) {
+		return invite.EmailInvite{}, ErrInviteEmailTaken
+	}
 	s.emailInvites[inv.ID] = inv
 	return inv, nil
 }
 
+// inviteHashTaken reports whether any stored invite already holds tokenHash.
+// Callers hold mu. A linear scan is fine for a reference store; store/drops
+// has a UNIQUE index do the same job.
+func (s *InviteStore) inviteHashTaken(tokenHash string) bool {
+	for _, inv := range s.emailInvites {
+		if inv.TokenHash == tokenHash {
+			return true
+		}
+	}
+	return false
+}
+
+// pendingInviteFor reports whether (containerID, email) already has a pending
+// invite. Callers hold mu.
+func (s *InviteStore) pendingInviteFor(containerID, email string) bool {
+	for _, inv := range s.emailInvites {
+		if inv.ContainerID == containerID && inv.Email == email {
+			return true
+		}
+	}
+	return false
+}
+
 // FindEmailInviteByTokenHash scans for the invite whose TokenHash matches, or
-// returns invite.ErrInviteNotFound. A linear scan is fine for a reference
-// store; store/drops instead enforces a UNIQUE constraint on token_hash,
-// which both indexes this lookup — the acceptance path every redeemed
-// invitation runs — and rejects a collision on write rather than letting two
-// rows silently share a hash.
+// returns invite.ErrInviteNotFound. At most one row can match, because
+// [InviteStore.CreateEmailInvite] refuses a colliding hash. A linear scan is
+// fine for a reference store; store/drops gets the same guarantee and an
+// index for this lookup — the acceptance path every redeemed invitation runs
+// — out of one UNIQUE constraint on token_hash.
 func (s *InviteStore) FindEmailInviteByTokenHash(_ context.Context, tokenHash string) (invite.EmailInvite, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -118,17 +205,37 @@ func (s *InviteStore) DeleteEmailInvitesFor(_ context.Context, containerID, emai
 	return nil
 }
 
-// CreateLink stores the link under its ID and returns it unchanged.
+// CreateLink stores the link under its ID and returns it unchanged, or
+// returns [ErrLinkCodeTaken] if another link already holds l.Code. The check
+// and the write happen under one acquisition of mu, so two concurrent calls
+// for one code cannot both pass.
 func (s *InviteStore) CreateLink(_ context.Context, l invite.Link) (invite.Link, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.linkCodeTaken(l.Code) {
+		return invite.Link{}, ErrLinkCodeTaken
+	}
 	s.links[l.ID] = l
 	return l, nil
 }
 
+// linkCodeTaken reports whether any stored link already holds code. Callers
+// hold mu. A linear scan is fine for a reference store; store/drops has a
+// UNIQUE index do the same job.
+func (s *InviteStore) linkCodeTaken(code string) bool {
+	for _, l := range s.links {
+		if l.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
 // FindLinkByCode scans for the link whose Code matches, or returns
-// invite.ErrLinkNotFound. A linear scan is fine for a reference store;
-// store/drops indexes the column.
+// invite.ErrLinkNotFound. At most one row can match, because
+// [InviteStore.CreateLink] refuses a colliding code. A linear scan is fine
+// for a reference store; store/drops gets the same guarantee, and an index,
+// out of one UNIQUE constraint on code.
 func (s *InviteStore) FindLinkByCode(_ context.Context, code string) (invite.Link, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

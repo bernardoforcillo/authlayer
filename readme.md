@@ -22,7 +22,7 @@ RBAC engine pulls in `drops`, and `pgx/v5` comes with the PostgreSQL store.
 
 ## Contents
 
-- [The model](#the-model) · [Quick start](#quick-start)
+- [The model](#the-model) · [Imports](#imports) · [Quick start](#quick-start)
 - [Statements & permissions](#statements--permissions) · [Roles](#roles) ·
   [How a decision is made](#how-a-decision-is-made)
 - [Context](#context) · [Checking permissions](#checking-permissions) ·
@@ -75,6 +75,46 @@ RBAC engine pulls in `drops`, and `pgx/v5` comes with the PostgreSQL store.
   referenced, but it does have `dropsstore.WithAuthTextLibraryIDs()`, which
   moves all five of its id columns together.
 
+## Imports
+
+Snippets below name packages rather than repeating an import block each time,
+so here is the whole set once. Three of these are not guessable from the
+identifier they introduce, which is why this section exists at all: `memory`
+lives at `store/memory`, `store/drops` declares `package dropsstore`, and the
+PostgreSQL wiring needs **two different packages both called `stdlib`**.
+
+```go
+import (
+    "github.com/bernardoforcillo/authlayer/access"
+    "github.com/bernardoforcillo/authlayer/auth"
+    "github.com/bernardoforcillo/authlayer/auth/authtest"
+    "github.com/bernardoforcillo/authlayer/invite"
+    "github.com/bernardoforcillo/authlayer/org"
+    "github.com/bernardoforcillo/authlayer/scope"
+    "github.com/bernardoforcillo/authlayer/team"
+    "github.com/bernardoforcillo/authlayer/token"
+
+    "github.com/bernardoforcillo/authlayer/store/memory"           // memory.New, NewInviteStore, NewAuthStore
+    dropsstore "github.com/bernardoforcillo/authlayer/store/drops" // package name is dropsstore, not drops
+
+    // Only the PostgreSQL store needs these three — see Storage.
+    "github.com/bernardoforcillo/drops/pg"     // pg.New, pg.Guard, pg.AnyOf, pg.OwnerGuard
+    "github.com/bernardoforcillo/drops/stdlib" // stdlib.New: wraps a *sql.DB as a drops driver
+    _ "github.com/jackc/pgx/v5/stdlib"         // registers the "pgx" database/sql driver
+)
+```
+
+The last two are the trap. `drops/stdlib` is used **by name** —
+`stdlib.New(sqlDB)` — and `pgx/v5/stdlib` is **blank-imported** purely for its
+`init`, which is what makes `sql.Open("pgx", dsn)` resolve; only one of them
+can hold the identifier `stdlib`, and it is the drops one. The
+[`store/drops` wiring snippet](#storedrops) writes both out in full rather
+than leaving you to work that out.
+
+Snippets also use `context`, `database/sql`, `errors`, `fmt` and `time` from
+the standard library. Where a snippet needs an import beyond this list, it
+carries its own block.
+
 ## Quick start
 
 ```go
@@ -90,18 +130,21 @@ alice := org.WithOrg(ctx, acme.ID)
 svc.AddMember(alice, "bob", org.RoleAdmin)
 
 bob := org.WithOrg(org.WithSubject(context.Background(), "bob"), acme.ID)
-ok, _ := svc.Can(bob, org.ResourceMember, org.ActionCreate)       // true
-ok, _  = svc.Can(bob, org.ResourceOrganization, org.ActionDelete) // false
+canAddMember, _ := svc.Can(bob, org.ResourceMember, org.ActionCreate)
+canDeleteOrg, _ := svc.Can(bob, org.ResourceOrganization, org.ActionDelete)
+fmt.Println(canAddMember, canDeleteOrg) // true false
 ```
 
 A full, database-free tour is in [`examples/basic`](examples/basic/main.go);
 [`examples/auth`](examples/auth/main.go) does the same for the whole library
 wired together — sign-up through log-out, with an org and an invitation in the
-middle:
+middle — and [`examples/reset`](examples/reset/main.go) covers the recovery
+flows the other two do not: password reset and email change.
 
 ```sh
 go run ./examples/basic
 go run ./examples/auth
+go run ./examples/reset
 ```
 
 ## Statements & permissions
@@ -214,8 +257,8 @@ guards. authlayer reuses drops' own keys (`pg.WithSubject` / `pg.WithTenant`).
 ctx = org.WithSubject(ctx, userID) // who is acting
 ctx = org.WithOrg(ctx, orgID)      // which organization
 
-userID, ok := org.SubjectFrom(ctx)
-orgID,  ok := org.OrgFrom(ctx)
+userID, haveSubject := org.SubjectFrom(ctx)
+orgID, haveOrg := org.OrgFrom(ctx)
 ```
 
 A missing subject is `ErrSubjectMissing`; a missing scope is `ErrOrgMissing`.
@@ -229,10 +272,10 @@ needs no scope — there is no organization yet.
 ok, err := svc.Can(ctx, "project", org.ActionDelete)
 
 // Error form: distinguishes 403-denied from 403-not-a-member from 404.
-err := svc.Authorize(ctx, "project", org.ActionCreate, org.ActionUpdate)
+err = svc.Authorize(ctx, "project", org.ActionCreate, org.ActionUpdate)
 
 // Out-of-band: ask about a user who is not the ctx subject.
-ok, err := svc.HasPermission(ctx, orgID, "carol", map[string][]access.Action{
+ok, err = svc.HasPermission(ctx, orgID, "carol", map[string][]access.Action{
     "project": {"create"},
     "billing": {"read"},
 })
@@ -541,6 +584,31 @@ All of them are written on the port as requirements with their consequences
 spelled out, because they constrain any third-party backend as much as the
 two shipped ones — see [Authentication](#enumeration-safe-sign-up).
 
+`invite.Store` carries seven **MUST**s of its own, and they are all about the
+same thing: bounding *who gets in*. **Four are on methods.** `ConsumeLink`
+must make its check and its increment one atomic step, or a `MaxUses: 1` link
+admits everyone who clicks it at once. `DeleteEmailInvite` must be
+rows-affected gated, because that gate — not any check above it — is what
+makes one emailed token pay out once; `AcceptInvite` claims first and grants
+second precisely so it is the only thing that has to hold. And
+`CreateEmailInvite` and `CreateLink` must refuse a write that would break a
+uniqueness constraint, atomically with performing it.
+
+**Three more are on the record types**, because they constrain the shape of
+the table rather than the behaviour of one call: `EmailInvite.TokenHash`,
+`Link.Code`, and `EmailInvite`'s `(ContainerID, Email)` pair — `UNIQUE`
+constraints in a SQL backend. The first two defeat the single-winner
+properties above *with no atomicity defect at all*: two rows sharing a `Code`
+means two concurrent redeemers resolve **different** rows through
+`FindLinkByCode` and each atomically wins `ConsumeLink` on the row it picked,
+so the limit bounds nothing while every individual consume behaves perfectly.
+`TokenHash` is the same story for an emailed token and `DeleteEmailInvite`.
+The third is what makes re-inviting an address replace rather than duplicate
+when two such calls race — without it a container holds two live tokens where
+its pending-invitations screen shows one row, and revoking the visible one
+leaves the other redeemable. It is a constraint on the *pair*: the same person
+invited to two containers is two legitimate rows.
+
 ### `store/memory`
 
 An in-process, generic store backed by maps. Zero dependencies, concurrency
@@ -552,15 +620,29 @@ and `auth.Store` counterparts. The auth one enforces every uniqueness
 constraint its port describes — one account per normalized email, no id
 collision on any `Create*`, and the `token_hash` uniqueness `auth.Store`
 requires of a backend on both `Session` and `Verification`, reported as
-`memory.ErrTokenHashTaken`. It used to defer that last one to `store/drops`,
-the way the invite store still defers `TokenHash` and `Code`; that left a
-caller who developed here and deployed there meeting the constraint for the
-first time in production, so it went away. A hash collision gets a
-backend-level error rather than a port sentinel because `auth.Store`
-classifies only `ErrIDTaken` on the `Create*` methods — `store/drops` answers
-the same case with the driver's own unique violation. It satisfies every
-atomicity MUST the port states by holding one mutex for each method's entire
-body, so no check-then-write can be split by a concurrent call.
+`memory.ErrTokenHashTaken`. The invite one enforces all three of its port's:
+`EmailInvite.TokenHash` (also `memory.ErrTokenHashTaken` — same column
+meaning, same failure), `(ContainerID, Email)` as
+`memory.ErrInviteEmailTaken`, and `Link.Code` as `memory.ErrLinkCodeTaken`.
+
+Both used to defer those to `store/drops`, which has always had them as
+`UNIQUE` constraints; that left a caller who developed here and deployed there
+meeting the constraint for the first time in production, so it went away.
+A collision gets a backend-level error rather than a port sentinel because
+`auth.Store` classifies only `ErrIDTaken` on the `Create*` methods and
+`invite.Store` classifies no conflict-on-create at all — `store/drops` answers
+the same cases with the driver's own unique violation. Both stores satisfy
+every atomicity MUST their ports state by holding one mutex for each method's
+entire body, so no check-then-write can be split by a concurrent call.
+
+One divergence from `store/drops` remains, in the invite store, and is
+recorded rather than closed: `store/drops` types an invite's and a link's `id`
+as a `PRIMARY KEY`, so re-using one is a unique violation there, while
+`memory.InviteStore` keys its maps by ID and a create under an id already
+present overwrites the row. `invite.Store` documents no id-collision contract
+and `authlayer/invite` has no sentinel for one (unlike `auth.ErrIDTaken`), so
+nothing in the backend is entitled to invent one; the service mints a fresh
+UUIDv7 for every record, so the case does not arise in practice.
 
 ### `store/drops`
 
@@ -574,12 +656,41 @@ organization_roles    id PK, container_id, key, name, permissions BYTEA,
                       created_at, UNIQUE (container_id, key)
 ```
 
+This is the one place production wiring is written down, so it is written out
+in full — imports included, because two of the packages involved are both
+named `stdlib` and one of them is imported only for its side effect:
+
 ```go
-db := pg.New(stdlib.New(sqlDB)) // sqlDB is a *sql.DB on a pgx connection
-st := dropsstore.New[org.Organization, org.Member](db)
-st.CreateSchema(ctx)            // or manage the tables with your migrations
-svc := org.New(org.NewAccess(nil), st)
+import (
+    "context"
+    "database/sql"
+
+    "github.com/bernardoforcillo/drops/pg"
+    "github.com/bernardoforcillo/drops/stdlib" // used by name: wraps a *sql.DB
+    _ "github.com/jackc/pgx/v5/stdlib"         // blank: registers the "pgx" driver
+
+    "github.com/bernardoforcillo/authlayer/org"
+    dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
+)
+
+func newOrgService(ctx context.Context, dsn string) (*org.Service, error) {
+    sqlDB, err := sql.Open("pgx", dsn) // "pgx" comes from the blank import above
+    if err != nil {
+        return nil, err
+    }
+    db := pg.New(stdlib.New(sqlDB))                        // a drops handle
+    st := dropsstore.New[org.Organization, org.Member](db) // the scope.Store
+    if err := st.CreateSchema(ctx); err != nil {           // or use your own migrations
+        return nil, err
+    }
+    return org.New(org.NewAccess(nil), st), nil
+}
 ```
+
+`drops/stdlib` is the adapter that turns a `database/sql` handle into a drops
+driver; `pgx/v5/stdlib` is the pgx driver itself, blank-imported so that its
+`init` registers the name `sql.Open` is given. Neither is optional, and only
+one of them can own the identifier `stdlib`.
 
 Columns are derived from the `drop:` tags on your types, so a different scope
 needs only table names:
@@ -756,6 +867,74 @@ before it waits — paired into nineteen defect/check cases, each asserted to
 **fail** the check that covers it. A contract suite that passes everything is
 worthless, and that is not visible without controls.
 
+### Writing your own `invite.Store`
+
+`invite.Store`'s seven **MUST**s — four on methods, three on the record types
+— are listed in [Storage](#storage) above, along with what each one costs when
+it is violated. They ship as an executable suite too, built the same way and
+placed the same way:
+
+```go
+import "github.com/bernardoforcillo/authlayer/invite/invitetest"
+
+func TestMyStoreSatisfiesTheInviteContract(t *testing.T) {
+    invitetest.RunStoreContract(t, func(t *testing.T) invite.Store {
+        return myStoreWithEmptyTables(t)   // called once per check
+    })
+}
+```
+
+The factory must hand back a store with **no** email invites and no links in
+it — several checks assert counts over the whole table — and may register
+teardown with `t.Cleanup` or call `t.Skip`. Ids and container ids are UUIDv7,
+and addresses, token hashes and codes are unique per call unless a check is
+deliberately forcing a collision, so the suite runs unchanged against a backend
+that types its id columns as `uuid`. If your store opens connections on demand,
+raise your pool limits and warm it to `invitetest.RaceGoroutines` connections
+first: goroutines that trickle in across a connection-setup window never
+actually contend, which silently weakens every race in the suite.
+
+Eight of the forty-three checks are races, because the obligations behind them
+are unreachable sequentially: `ConsumeLink`'s single winner against a
+`MaxUses: 1` link, its ceiling against a `MaxUses: 4` one, and the lost update
+its increment must not have on an unlimited one; `DeleteEmailInvite`'s
+at-most-one-nil claim; each of the three uniqueness constraints under
+concurrent creates; and a `DeleteEmailInvitesFor` racing the
+`CreateEmailInvite` that re-invites the same address. That last one asserts a
+*linearizability* property rather than a timing guess — the end state it
+rejects (the create reporting success while the container ends up holding no
+invitation for the address) is one no serial order of the two calls can
+produce.
+
+Points the port leaves unspecified are deliberately not asserted: list order,
+empty-slice-versus-nil, and — for every one of the three uniqueness checks —
+*which error* a rejected duplicate comes back as, since `invite.Store`
+classifies no conflict-on-create at all and the two shipped backends answer
+differently on purpose. Each of those checks requires only that the write
+failed and that the original row survived it.
+
+One thing it does **not** do, stated here rather than left to be discovered:
+`ConsumeLink`'s MUST names the two acceptable shapes (one `UPDATE ... WHERE`
+whose rows-affected count *is* `ok`, or one critical section spanning the check
+and the write), and which shape your backend used is invisible to a caller. The
+suite asserts the consequences. Two of them — one winner against `MaxUses: 1`,
+exactly four against `MaxUses: 4` — catch a grossly non-atomic implementation
+every time and a subtly non-atomic one only sometimes: `store/memory` measured
+a deliberately split-lock `ConsumeLink` passing that race 20 times out of 20,
+even at 2000 goroutines. The third is the deterministic one. Against an
+*unlimited* link every caller wins on any implementation, but a read-then-write
+loses increments — N callers each read the same `UseCount` and each write
+`read+1` — so the stored count comes back far below N whatever the timing. Run
+all three; none of them proves the mechanism.
+
+The suite's own tests include thirty-two deliberately non-compliant stores —
+one whose `ConsumeLink` decides under one lock and increments under a second,
+one that lets two links share a code, one that reads `MaxUses: 0` as exhausted
+rather than unlimited, one that reads a nil `ExpiresAt` as a zero time —
+paired into forty-four defect/check cases, each asserted to **fail** the check
+that covers it. A further test fails if a check is ever added without a control,
+so a check that asserts nothing cannot slip in green.
+
 ## Custom scopes
 
 `org` fixes the container type to `Organization` and the member type to `Member`.
@@ -902,11 +1081,10 @@ bob := org.WithSubject(context.Background(), "bob")
 _, _ = isvc.AcceptInvite(bob, token) // bob is now a member of acme, holding org.RoleMember
 ```
 
-A link works the same way, minus the email step — reusing `ctx`/`acme`/`isvc`
-above:
+A link works the same way, minus the email step — continuing from the snippet
+above, with the same `owner` context:
 
 ```go
-owner := org.WithOrg(ctx, acme.ID)
 _, code, _ := isvc.CreateLink(owner, org.RoleMember, 5, nil) // up to 5 uses, never expires
 
 carol := org.WithSubject(context.Background(), "carol")
@@ -1113,7 +1291,39 @@ It is also the one place the `auth` + `invite` seam is written down — see
 [Wiring `auth`, `org` and `invite` together](#wiring-auth-org-and-invite-together)
 at the end of this section.
 
+[`examples/reset`](examples/reset/main.go) is the companion for the flows
+`examples/auth` does not reach — `RequestPasswordReset`, `ResetPassword` and
+`RequestEmailChange`, [the password lifecycle](#the-password-lifecycle) — and
+prints the same kind of trace:
+
+```sh
+go run ./examples/reset
+```
+
 ### Sign-up, verification, login
+
+The snippets in this section are one program, each continuing the last, and it
+opens with an `auth.Store`. `memory.NewAuthStore()` is the in-process one,
+from [`store/memory`](store/memory/) — that is the whole of what "swap for
+drops" below means: `dropsstore.NewAuthStore(db)` from
+[`store/drops`](store/drops/), whose `db` the
+[`store/drops` section](#storedrops) builds. The imports for the section:
+
+```go
+import (
+    "context"
+    "errors"
+    "fmt"
+    "time"
+
+    "github.com/bernardoforcillo/authlayer/access"
+    "github.com/bernardoforcillo/authlayer/auth"
+    "github.com/bernardoforcillo/authlayer/invite"
+    "github.com/bernardoforcillo/authlayer/org"
+    "github.com/bernardoforcillo/authlayer/store/memory" // memory.NewAuthStore
+    "github.com/bernardoforcillo/authlayer/token"
+)
+```
 
 ```go
 key := []byte("32-bytes-or-more-from-your-vault") // the HS256 floor, RFC 7518 §3.2
@@ -1368,6 +1578,13 @@ inside the store. This is a joint property, not one `SignUp` can guarantee
 alone.
 
 ### The password lifecycle
+
+Every claim in this section is demonstrated, in order, by
+[`examples/reset`](examples/reset/main.go) — `go run ./examples/reset`. It is
+the runnable form of what follows: the enumeration-safe request shape, the
+one-time redemption, the session revocation, the `EmailVerifiedAt` stamp, the
+current-password gate on `RequestEmailChange`, and the sweep that kills a
+parked reset token.
 
 `ChangePassword(ctx, userID, currentSessionID, current, next)` requires the
 current password, then revokes every session **except** the caller's own
@@ -1729,13 +1946,16 @@ rules and `Verify` returns a bool, so there is nothing to compare with
 | [`org`](org/) | Organization RBAC — `scope` with the type parameters fixed and the names spelled "organization". |
 | [`team`](team/) | Team RBAC nested inside `org` via `scope.WithParent` — the worked example of [nesting](#nested-scopes). |
 | [`invite`](invite/) | [Invitations](#invitations) — email tokens and reusable links admitting a user with no standing yet, via `scope.Service.GrantMembership`. |
+| [`invite/invitetest`](invite/invitetest/) | `invite.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-invitestore) and run it. Test-only; imports `testing`. |
 | [`auth`](auth/) | [Authentication](#authentication) — `Service`, its `Store` port, and the user/session/verification records. Sign-up, login, email verification, refresh rotation, and the password lifecycle. |
+| [`auth/authtest`](auth/authtest/) | `auth.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-authstore) and run it. Test-only; imports `testing`. |
 | [`token`](token/) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled, [single-algorithm](#the-jwt-and-why-hand-rolling-it-is-defensible) HS256 JWT. Standard library only. |
 | [`password`](password/) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` for a strength policy. The only package that pulls in `golang.org/x/crypto`. |
 | [`store/memory`](store/memory/) | In-memory `scope.Store`, `invite.Store` and `auth.Store` for dev, tests, and examples. |
 | [`store/drops`](store/drops/) | PostgreSQL stores built on drops — RBAC (composite-key membership), invitations, and the three auth tables. |
 | [`examples/basic`](examples/basic/) | Runnable, database-free tour of the RBAC half. |
 | [`examples/auth`](examples/auth/) | Runnable, database-free tour of `auth` + `org` + `invite` wired together. |
+| [`examples/reset`](examples/reset/) | Runnable, database-free tour of [the password lifecycle](#the-password-lifecycle) — `RequestPasswordReset`, `ResetPassword`, `RequestEmailChange`. |
 
 Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
 
@@ -1746,7 +1966,7 @@ gofmt -l .                      # must print nothing
 go vet ./... && go vet -tags integration ./...
 go test ./... -count=1          # database-free
 golangci-lint run ./...         # v2 required; the config is .golangci.yml
-go run ./examples/basic && go run ./examples/auth
+go run ./examples/basic && go run ./examples/auth && go run ./examples/reset
 ```
 
 `.golangci.yml` is a v2 config and runs clean at zero issues. It lints the
@@ -1781,14 +2001,19 @@ default*, which is right for the UUIDv7 generator authlayer ships and wrong for
 any other. Pass the option for each store you use:
 
 ```go
+// ulid here is github.com/oklog/ulid/v2 — illustrative, and not a dependency
+// of authlayer. Both options take a func() string, and ulid.Make returns a
+// ulid.ULID, so the adapter is yours to write.
+newID := func() string { return ulid.Make().String() }
+
 scopeSt := dropsstore.New[org.Organization, org.Member](db,
     dropsstore.WithTextLibraryIDs(), dropsstore.WithTextUserIDs())
 inviteSt := dropsstore.NewInviteStore(db,
     dropsstore.WithInviteTextLibraryIDs(), dropsstore.WithInviteTextUserIDs())
 authSt := dropsstore.NewAuthStore(db, dropsstore.WithAuthTextLibraryIDs())
 
-orgSvc := org.New(ac, scopeSt, org.WithIDGenerator(ulid.Make))
-authSvc := auth.New(authSt, auth.WithIDGenerator(ulid.Make))
+orgSvc := org.New(ac, scopeSt, org.WithIDGenerator(newID))
+authSvc := auth.New(authSt, auth.WithIDGenerator(newID))
 ```
 
 The `WithTextUserIDs` / `WithInviteTextUserIDs` calls are there because in this
