@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/auth/authtest"
 	"github.com/bernardoforcillo/authlayer/store/memory"
 )
 
@@ -912,101 +913,159 @@ func TestCreateSuccessorSessionIDTakenCheckedEvenWhenPredecessorGone(t *testing.
 	}
 }
 
-// raceMarkRotated drives n goroutines to call MarkRotated(tokenHash, now) on
-// st concurrently, all released by the same closed channel to maximize
-// contention, and reports how many saw ok=true and how many saw a non-nil
-// error. It is the driver behind markRotatedContract only — NOT behind
-// TestSplitLockStoreProducesTwoWinners below, which needs a different,
-// explicitly-sequenced two-goroutine construction instead of mass
-// concurrency; see that test's own doc for why the two cannot share this
-// driver. It is reusable verbatim by a future backend's own concurrency
-// suite via markRotatedContract, which is the intended reuse seam.
-func raceMarkRotated(ctx context.Context, st auth.Store, tokenHash string, now time.Time, n int) (successes, errs int) {
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	var mu sync.Mutex
+// --- token-hash uniqueness ---
+//
+// authtest's contract suite already asserts that CreateSession and
+// CreateVerification REFUSE a colliding hash; it deliberately does not
+// assert which error they refuse with, because auth.Store classifies only
+// ErrIDTaken on those methods. These tests pin this store's own answer —
+// memory.ErrTokenHashTaken, matchable with errors.Is — and cover the one
+// insert path the port-level suite cannot reach, CreateSuccessorSession's.
 
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func() {
-			defer wg.Done()
-			<-start
-			_, ok, err := st.MarkRotated(ctx, tokenHash, now)
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				errs++
-				return
-			}
-			if ok {
-				successes++
-			}
-		}()
+// TestCreateSessionDuplicateTokenHashReturnsErrTokenHashTaken pins both
+// halves of the refusal: the sentinel is ErrTokenHashTaken and NOT
+// auth.ErrIDTaken (the ids differ — only the hash collides, and reporting
+// ErrIDTaken would tell the caller something false about which column
+// collided), and the row that already held the hash is left exactly as it
+// was.
+func TestCreateSessionDuplicateTokenHashReturnsErrTokenHashTaken(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	first := auth.Session{ID: "sess1", UserID: "user1", FamilyID: "fam1", TokenHash: "shared-hash"}
+	if _, err := st.CreateSession(ctx, first); err != nil {
+		t.Fatalf("CreateSession(first): %v", err)
 	}
-	close(start)
-	wg.Wait()
-	return successes, errs
+
+	_, err := st.CreateSession(ctx, auth.Session{ID: "sess2", UserID: "user2", FamilyID: "fam2", TokenHash: "shared-hash"})
+	if !errors.Is(err, memory.ErrTokenHashTaken) {
+		t.Fatalf("CreateSession(duplicate token hash) err = %v, want ErrTokenHashTaken", err)
+	}
+	if errors.Is(err, auth.ErrIDTaken) {
+		t.Fatalf("CreateSession(duplicate token hash) err = %v, want it NOT to be auth.ErrIDTaken — the ids differ, only the hash collides", err)
+	}
+
+	got, err := st.FindSessionByHash(ctx, "shared-hash")
+	if err != nil {
+		t.Fatalf("FindSessionByHash: %v", err)
+	}
+	if got != first {
+		t.Fatalf("FindSessionByHash = %+v, want the original row %+v — the refused write must not have disturbed it", got, first)
+	}
+}
+
+// TestCreateVerificationDuplicateTokenHashReturnsErrTokenHashTaken is
+// TestCreateSessionDuplicateTokenHashReturnsErrTokenHashTaken's counterpart
+// for the other record kind that carries the same MUST.
+func TestCreateVerificationDuplicateTokenHashReturnsErrTokenHashTaken(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	first := auth.Verification{ID: "ver1", UserID: "user1", Purpose: "signup", Email: "a@example.test", TokenHash: "shared-hash"}
+	if _, err := st.CreateVerification(ctx, first); err != nil {
+		t.Fatalf("CreateVerification(first): %v", err)
+	}
+
+	_, err := st.CreateVerification(ctx, auth.Verification{ID: "ver2", UserID: "user2", Purpose: "signup", Email: "b@example.test", TokenHash: "shared-hash"})
+	if !errors.Is(err, memory.ErrTokenHashTaken) {
+		t.Fatalf("CreateVerification(duplicate token hash) err = %v, want ErrTokenHashTaken", err)
+	}
+	if errors.Is(err, auth.ErrIDTaken) {
+		t.Fatalf("CreateVerification(duplicate token hash) err = %v, want it NOT to be auth.ErrIDTaken", err)
+	}
+
+	got, err := st.FindVerificationByHash(ctx, "shared-hash")
+	if err != nil {
+		t.Fatalf("FindVerificationByHash: %v", err)
+	}
+	if got != first {
+		t.Fatalf("FindVerificationByHash = %+v, want the original row %+v", got, first)
+	}
+}
+
+// TestCreateSuccessorSessionDuplicateTokenHashReturnsErrTokenHashTaken
+// covers the store's other Session insert path. The port-level suite cannot
+// reach it: CreateSuccessorSession is gated on a live predecessor, so a
+// backend-agnostic check cannot separate "refused for the hash" from
+// "refused because the predecessor was gone".
+func TestCreateSuccessorSessionDuplicateTokenHashReturnsErrTokenHashTaken(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateSession(ctx, auth.Session{ID: "pred1", FamilyID: "fam1", TokenHash: "shared-hash"}); err != nil {
+		t.Fatalf("CreateSession(predecessor): %v", err)
+	}
+
+	_, ok, err := st.CreateSuccessorSession(ctx, "pred1", auth.Session{ID: "succ1", FamilyID: "fam1", TokenHash: "shared-hash"})
+	if !errors.Is(err, memory.ErrTokenHashTaken) {
+		t.Fatalf("CreateSuccessorSession(duplicate token hash) err = %v, want ErrTokenHashTaken", err)
+	}
+	if ok {
+		t.Fatal("CreateSuccessorSession ok = true despite a colliding token hash")
+	}
+}
+
+// TestCreateSuccessorSessionPredecessorGoneOutranksTokenHashTaken pins the
+// precedence between this method's two refusals, the way
+// TestCreateSuccessorSessionIDTakenCheckedEvenWhenPredecessorGone pins the
+// other pair. The id check runs first and is independent of the
+// predecessor, as auth.Store requires; the token-hash check runs AFTER the
+// liveness gate, so a rotation that has already lost its family reports
+// that loss — (zero, false, nil), which the service layer reads as a replay
+// — rather than a hash conflict on a row it would never have inserted.
+func TestCreateSuccessorSessionPredecessorGoneOutranksTokenHashTaken(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	if _, err := st.CreateSession(ctx, auth.Session{ID: "other", FamilyID: "fam1", TokenHash: "shared-hash"}); err != nil {
+		t.Fatalf("CreateSession(other): %v", err)
+	}
+
+	got, ok, err := st.CreateSuccessorSession(ctx, "no-such-predecessor", auth.Session{ID: "succ1", FamilyID: "fam1", TokenHash: "shared-hash"})
+	if err != nil {
+		t.Fatalf("CreateSuccessorSession err = %v, want nil — a lost race is not a failure, and must not surface as ErrTokenHashTaken", err)
+	}
+	if ok {
+		t.Fatal("CreateSuccessorSession ok = true despite a nonexistent predecessor")
+	}
+	if got != (auth.Session{}) {
+		t.Fatalf("CreateSuccessorSession returned %+v, want the zero value", got)
+	}
 }
 
 // oneWinner reports whether (successes, errs) — a tally of MarkRotated
 // outcomes from some race — satisfies "exactly one winner, no errors". It is
 // a plain boolean predicate, not a t.Fatalf-calling assertion, specifically
-// so it can be reused with opposite polarity: markRotatedContract below
-// asserts oneWinner is true of a real auth.Store's results (its PASS
+// so it can be reused with opposite polarity: it is the same condition
+// authtest's own MarkRotated race asserts of a real auth.Store (its PASS
 // condition is "one winner"), while TestSplitLockStoreProducesTwoWinners
-// asserts oneWinner is false of splitLockStore's results (its PASS condition
-// is "the one-winner predicate correctly rejects two winners"). Both call
-// this identical function — not two independently-worded checks that happen
-// to agree — which is what makes the second test genuine evidence about the
-// first's assertion rather than a parallel test that merely resembles it.
+// below asserts oneWinner is false of splitLockStore's results (its PASS
+// condition is "the one-winner predicate correctly rejects two winners").
+// Stating it once, here, is what makes that control genuine evidence about
+// the shared suite's assertion rather than a parallel test that merely
+// resembles it.
 func oneWinner(successes, errs int) bool {
 	return errs == 0 && successes == 1
 }
 
-// markRotatedContract is the reusable driver behind
-// TestMarkRotatedConcurrencyExactlyOneWinner: N=500 goroutines race
-// MarkRotated against one freshly created, unrotated session, and the
-// contract is exactly one winner, no errors (checked via oneWinner — see its
-// doc), and a final RotatedAt equal to the shared instant every goroutine
-// raced with. factory must return a fresh, empty auth.Store each call. Task
-// 4's live-Postgres suite is meant to call this directly against its own
-// store, so both backends assert literally the same contract rather than a
-// re-derived approximation of it.
-func markRotatedContract(t *testing.T, factory func() auth.Store) {
-	t.Helper()
-	ctx := context.Background()
-	st := factory()
-	if _, err := st.CreateSession(ctx, auth.Session{ID: "sess1", TokenHash: "hash1"}); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-
-	const n = 500
-	now := time.Now()
-	successes, errs := raceMarkRotated(ctx, st, "hash1", now, n)
-
-	if !oneWinner(successes, errs) {
-		t.Fatalf("got successes=%d errs=%d from MarkRotated, want exactly one winner and no errors", successes, errs)
-	}
-
-	got, err := st.FindSessionByHash(ctx, "hash1")
-	if err != nil {
-		t.Fatalf("FindSessionByHash: %v", err)
-	}
-	if got.RotatedAt == nil || !got.RotatedAt.Equal(now) {
-		t.Fatalf("final RotatedAt = %v, want %v", got.RotatedAt, now)
-	}
-}
-
-// TestMarkRotatedConcurrencyExactlyOneWinner pins the observable contract: N
-// goroutines race to rotate one session's token, and exactly one of them must
-// observe ok=true, the rest ok=false with no error, and the session's final
-// RotatedAt must be the shared instant every goroutine raced with. Every N
-// goroutine is started ahead of time and blocked on a channel so they all
-// enter MarkRotated at effectively the same instant once it closes,
-// maximizing contention — the same construction as
-// store/memory/invite_test.go's TestConsumeLinkConcurrencyExactlyOneWinner.
-// The driver and the assertion both live in markRotatedContract above, so
-// this test is now just "run the shared contract against memory.AuthStore".
+// TestAuthStoreSatisfiesTheStoreContract runs the exported
+// [github.com/bernardoforcillo/authlayer/auth/authtest] suite against this
+// package's store: every documented obligation of auth.Store, including the
+// MarkRotated race this test used to drive from a local copy of the driver.
+// That copy is gone — the suite is the one implementation of the contract
+// now, shared with store/drops' live-PostgreSQL lane, which previously had
+// to reimplement it because an unexported helper in a _test.go file is
+// reachable from nowhere else.
+//
+// The suite's MarkRotated check pins the same observable contract the local
+// copy did: N goroutines started ahead of time and blocked on a channel so
+// they all enter MarkRotated at effectively the same instant once it closes
+// (the same construction as store/memory/invite_test.go's
+// TestConsumeLinkConcurrencyExactlyOneWinner), exactly one observing
+// ok=true, the rest ok=false with no error, and a final RotatedAt equal to
+// the shared instant every goroutine raced with.
+//
+// Session.TokenHash's and Verification.TokenHash's uniqueness MUSTs are
+// part of that suite, and this store enforces them — it did not always, and
+// authtest carried them as a separate opt-in entry point for exactly as long
+// as that was true. See [AuthStore]'s own doc for why deferring them to
+// store/drops did not survive the port's text.
 //
 // What this test does NOT reliably do is catch a broken, split-lock
 // (read-then-write) MarkRotated — read the session under one lock
@@ -1068,15 +1127,15 @@ func markRotatedContract(t *testing.T, factory func() auth.Store) {
 // implements exactly the split-lock shape, with a gate channel guaranteeing
 // — not merely risking — that a second caller completes its full cycle while
 // the first is parked mid-method, then applies the identical oneWinner
-// predicate markRotatedContract depends on (see that function's doc) and
-// asserts it is false. That control does NOT reuse raceMarkRotated's
-// N-goroutine channel-barrier driver: raceMarkRotated has no hook to release
-// a parked goroutine only after the others have finished, so driving it
-// verbatim here would either deadlock (nothing would ever close the gate) or
-// require releasing on a timer, reintroducing exactly the timing-dependence
-// this control exists to eliminate. It uses its own minimal, two-goroutine,
-// explicitly-sequenced driver instead — see its own doc for the construction
-// — and shares the assertion, not the driver, with markRotatedContract. That
+// predicate the shared suite's own MarkRotated race asserts (see that
+// function's doc) and asserts it is false. That control does NOT reuse the
+// suite's N-goroutine channel-barrier driver: that driver has no hook to
+// release a parked goroutine only after the others have finished, so driving
+// it verbatim here would either deadlock (nothing would ever close the gate)
+// or require releasing on a timer, reintroducing exactly the
+// timing-dependence this control exists to eliminate. It uses its own
+// minimal, two-goroutine, explicitly-sequenced driver instead — see its own
+// doc for the construction — and shares the assertion, not the driver. That
 // control passes 100% of the time, every run, with no sleep anywhere. It
 // does not prove memory.AuthStore is atomic — nothing outside the method can
 // force that interleaving on it — but it does prove oneWinner itself is a
@@ -1095,8 +1154,8 @@ func markRotatedContract(t *testing.T, factory func() auth.Store) {
 // mutex-protected, so `go test -race` sees nothing unsynchronized and will
 // not flag it either. Run -race anyway — it catches a different class of
 // mutation, such as dropping the locking altogether — just not this one.
-func TestMarkRotatedConcurrencyExactlyOneWinner(t *testing.T) {
-	markRotatedContract(t, func() auth.Store { return newAuthStore() })
+func TestAuthStoreSatisfiesTheStoreContract(t *testing.T) {
+	authtest.RunStoreContract(t, func(*testing.T) auth.Store { return newAuthStore() })
 }
 
 // splitLockStore is a small, standalone, test-only auth.Store double that
@@ -1106,7 +1165,7 @@ func TestMarkRotatedConcurrencyExactlyOneWinner(t *testing.T) {
 // hand-run, timing-dependent experiment into a committed, deterministic
 // check — see TestSplitLockStoreProducesTwoWinners. It only implements
 // CreateSession and MarkRotated; it is never asserted to satisfy auth.Store
-// and is never passed to markRotatedContract, which requires a real,
+// and is never handed to the shared contract suite, which requires a real,
 // correct implementation.
 type splitLockStore struct {
 	mu       sync.Mutex
@@ -1186,26 +1245,26 @@ func (s *splitLockStore) MarkRotated(_ context.Context, tokenHash string, now ti
 }
 
 // TestSplitLockStoreProducesTwoWinners is the deterministic negative control
-// TestMarkRotatedConcurrencyExactlyOneWinner's doc comment describes: it
-// proves oneWinner (the predicate markRotatedContract's pass condition
-// depends on) actually rejects the check-then-act bug shape, with no timing
+// TestAuthStoreSatisfiesTheStoreContract's doc comment describes: it
+// proves oneWinner (the predicate the shared suite's MarkRotated race
+// asserts) actually rejects the check-then-act bug shape, with no timing
 // dependency and no sleep anywhere — unlike the hand-run mutation experiment
 // (3/70 or 1/160 naive, 20/20 only once widened with a sleep), this test
 // gets the intended, correct verdict 100% of the time, by construction,
 // every run.
 //
-// It does NOT drive splitLockStore through raceMarkRotated's N-goroutine
+// It does NOT drive splitLockStore through the shared suite's N-goroutine
 // channel-barrier driver — splitLockStore implements only CreateSession and
 // MarkRotated (with a CreateSession signature that doesn't even match
 // auth.Store's), it is never asserted to satisfy auth.Store, and is never
-// passed to markRotatedContract, which requires a real, correct
+// handed to the shared contract suite, which requires a real, correct
 // implementation. It also could not be, even if it did satisfy the
-// interface: raceMarkRotated's driver has no way to release the one parked
+// interface: that driver has no way to release the one parked
 // goroutine only after every other goroutine has already finished, so
 // launching splitLockStore's two callers through it would either deadlock
 // (nothing would ever close gate) or force releasing on a timer, which is
 // exactly the timing-dependence this control exists to eliminate. What is
-// genuinely shared with markRotatedContract is the assertion, via oneWinner:
+// genuinely shared with the suite is the assertion, via oneWinner:
 // this test computes its own (successes, errs) from a minimal, two-goroutine,
 // explicitly-sequenced driver below, then evaluates the identical oneWinner
 // function and asserts it is false — proving that function is a real
@@ -1281,8 +1340,9 @@ func TestSplitLockStoreProducesTwoWinners(t *testing.T) {
 	if successes != 2 {
 		t.Fatalf("got successes=%d, want exactly 2 — splitLockStore's broken shape must let both callers win, or it isn't reproducing the bug shape this control exists to demonstrate", successes)
 	}
-	// The genuine warrant: apply the identical predicate markRotatedContract
-	// depends on, to this double's results, and confirm it correctly says no.
+	// The genuine warrant: apply the identical predicate the shared suite's
+	// MarkRotated race depends on, to this double's results, and confirm it
+	// correctly says no.
 	if oneWinner(successes, errs) {
 		t.Fatalf("oneWinner(successes=%d, errs=%d) = true, want false — this predicate must reject a check-then-act MarkRotated's results, and it did not", successes, errs)
 	}

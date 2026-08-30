@@ -6,6 +6,136 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 once a 1.0 is cut. Until then, minor versions may break API.
 
+## [Unreleased]
+
+### Added
+
+- **Continuous integration** (`.github/workflows/ci.yml`) — the gate this
+  project ran by hand through v0.1.0 now runs on GitHub Actions, on every push
+  and every pull request: `go build`, `go vet` with and without
+  `-tags integration`, a `gofmt -l` check, `golangci-lint` pinned to the
+  version the gate was last run with, and `go test ./... -count=1`. Two
+  additions beyond the hand gate. The unit tests also run under `-race`,
+  which they never had in CI — this package's correctness rests on a
+  compare-and-set session rotation and a mutex-guarded memory store. And the
+  live PostgreSQL lane runs too, against a `postgres:17-alpine` service
+  container holding a dedicated `authlayer_test` database, so the
+  drop-and-recreate the live fixtures perform has a database it exclusively
+  owns. That lane is where several of this project's Criticals were found; a
+  CI that skipped it would not protect the thing that needed protecting. The
+  Go version comes from `go.mod`'s own directive via
+  `setup-go`'s `go-version-file`, so it cannot drift from the module.
+
+- **A text-library-ids escape hatch** (`authlayer/store/drops`) —
+  `WithTextLibraryIDs()`, `WithInviteTextLibraryIDs()` and
+  `WithAuthTextLibraryIDs()` type the ids authlayer mints for itself — `id`,
+  `container_id`, `parent_id`, and the auth store's
+  `users`/`sessions`/`verifications` ids — as `text` rather than `uuid`. This
+  is what makes `scope.WithIDGenerator` and `auth.WithIDGenerator` true rather
+  than merely constrained: v0.1.0 typed those columns `uuid`
+  unconditionally, so a ULID, a database sequence, or a readable `usr_a1b2c3`
+  failed the first write with `SQLSTATE 22P02` and both options carried a
+  documented warning saying so. The auth store's option deliberately moves
+  `sessions.user_id` and `verifications.user_id` with `users.id`, since it owns
+  the table they reference — a hatch that moved only the three primary keys
+  would have fixed `SignUp` and broken `Login`. `WithTextUserIDs` and
+  `WithInviteTextUserIDs` remain separate options answering a separate
+  question (pointing the RBAC half at an existing non-UUID user table), and
+  the two families compose.
+
+  **`uuid` remains the default everywhere**, since authlayer generates UUIDv7,
+  and the live lane asserts that in both directions by reading
+  `information_schema` back. `CreateSchema` emits the correct `CREATE TABLE`
+  in either mode and stays idempotent; like every other part of that call it
+  will not retype a table that already exists, so choose before the tables are
+  created or retype the columns in your own migration.
+
+  Proven against live PostgreSQL, not only in schema-shape unit tests:
+  `TestTextLibraryIDsRoundTripANonUUIDGeneratorLive` drives one ULID generator
+  through a full sign-up / verify / login / refresh arc and a full
+  organization / member / custom-role arc with the options on, reading every
+  value back; `TestNonUUIDIDGeneratorFailsAgainstDropsLive` and
+  `TestNonUUIDIDGeneratorFailsAgainstTheScopeStoreLive` pin the `22P02`
+  without them.
+
+- **`auth/authtest` — an exported contract-test suite for `auth.Store`**
+  (`authtest.RunStoreContract(t, newStore)`). `auth.Store` is an eighteen-method
+  port, seven of whose methods carry a normative **MUST**; until now those were
+  enforced by prose and by the two backends this repository happens to ship, so
+  a third-party backend author had no way to check their work. The suite covers
+  every one of them plus the ordinary behavioural contract — error
+  classification, email normalization on every read and write path, and
+  `PurgeExpired`'s strict cutoff. Six of its fifty-two checks are races, because the
+  obligations behind them are unreachable sequentially: `MarkRotated`'s single
+  winner; `CreateUser`'s and `UpdateUserEmail`'s one-address-one-account
+  atomicity, one check each; a `MarkEmailVerified` racing the `UpdateUserEmail`
+  that moves the address out from under it; a `CreateSuccessorSession` racing
+  the family revocation that must not leave it alive; and concurrent revocations
+  of one family. Points the port
+  leaves unspecified are deliberately not asserted. Fifteen negative controls —
+  each a store exactly one defect away from a correct one, paired into nineteen
+  defect/check cases — assert the suite *fails* a non-compliant implementation;
+  without them a suite that passes everything would look identical to one that
+  works. Two of the seven are only partly reachable from outside the port and
+  the package doc says so rather than implying coverage: `CreateUser`'s
+  requirement that `ErrEmailTaken` come from the write attempt rather than a
+  separately-authorized read is a property of the backend's failure topology,
+  invisible to a caller, so only its atomicity consequence is asserted; and
+  `DeleteSessionsByFamily`'s serialization **MUST** is asserted through its
+  consequence, because forcing the lock-order inversion needs backend-specific
+  SQL on a second connection. `store/drops` carries that one itself.
+- **Token-hash uniqueness is part of that suite**, as
+  `CreateSession/TokenHashIsUnique` and `CreateVerification/TokenHashIsUnique`.
+  `Session.TokenHash` and `Verification.TokenHash` carry their **MUST** on the
+  record type rather than on a method, and a backend that satisfies every
+  method obligation and skips these is still wrong: a shared hash defeats
+  `MarkRotated`'s single-winner contract *with no atomicity defect at all*,
+  because two concurrent callers each atomically win a different one of the
+  colliding rows. It shipped briefly as a separate entry point,
+  `RunTokenHashUniquenessContract`, because `store/memory` did not enforce it —
+  the backend changed instead (see below), and the second entry point is gone.
+  What a rejected duplicate *returns* is still not asserted, since the port
+  classifies only `ErrIDTaken` there.
+
+### Changed
+
+- **`scope.WithIDGenerator` and `auth.WithIDGenerator` no longer document a
+  constraint they no longer have.** Both carried a section headed "A generator
+  MUST produce UUID-parseable ids to use store/drops"; both now name the
+  option to pass instead. The readme's `Ids` section, its `store/drops` and
+  auth-store sections, and its scope options table say the same. The
+  behaviour those paragraphs described is still the default and is still
+  pinned by test — what changed is that it is now a default with a documented
+  way out, rather than a limit.
+
+- **`store/memory`'s `AuthStore` now enforces `Session.TokenHash` and
+  `Verification.TokenHash` uniqueness**, which `auth.Store` requires of a
+  backend and which this store previously deferred to `store/drops` (its
+  package doc said so). The port's own text is why that did not hold: a shared
+  hash breaks `MarkRotated`'s single-winner contract with no atomicity defect
+  at all, which is the property refresh rotation rests on, and a caller who
+  developed against `store/memory` and deployed against `store/drops` met the
+  divergence for the first time in production. `CreateSession`,
+  `CreateSuccessorSession` and `CreateVerification` now reject a colliding hash
+  under the same acquisition of `mu` as the write, exactly as `CreateUser`'s
+  email check already worked.
+- **New: `memory.ErrTokenHashTaken`**, what those three methods return on a
+  collision. Deliberately not `auth.ErrIDTaken` and not a new `auth` sentinel:
+  `auth.Store`'s error contract classifies exactly one conflict on the
+  `Create*` methods — an id that already identifies a row of that same kind —
+  and explicitly leaves token-hash uniqueness to the backend's own constraint.
+  `store/drops` answers the same case with the driver's `pg.ErrUniqueViolation`
+  unwrapped; both backends now agree the write must fail, and neither pretends
+  the port classifies it. `invite`'s parallel (`EmailInvite.TokenHash`,
+  `Link.Code`) is unchanged and still deferred: `invite.Store` is a separate
+  port with its own obligations.
+- **`store/drops`' live lane no longer reimplements the `MarkRotated` contract.**
+  It ran an independent copy because the original lived in an unexported helper
+  in a `_test.go` file, reachable from nowhere else; both backends now run the
+  same exported suite. The backend-specific live tests — the ones that stage a
+  lock ordering with raw SQL on a second connection, which no port-level suite
+  can express — are unchanged.
+
 ## [0.1.0] - 2026-08-29
 
 ### Added

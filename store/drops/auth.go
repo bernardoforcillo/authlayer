@@ -37,6 +37,7 @@ func (n AuthNames) withDefaults() AuthNames {
 
 type authSettings struct {
 	names AuthNames
+	ids   idTypes
 }
 
 // AuthOption customizes an [AuthSchema] or [AuthStore] at construction.
@@ -47,6 +48,46 @@ type AuthOption func(*authSettings)
 // elsewhere.
 func WithAuthNames(n AuthNames) AuthOption {
 	return func(s *authSettings) { s.names = n }
+}
+
+// WithAuthTextLibraryIDs types every id column on the three auth tables as
+// text rather than uuid: users.id, sessions.id, verifications.id, and — the
+// part that distinguishes this option from [WithTextLibraryIDs] — the
+// sessions.user_id and verifications.user_id columns that reference users.id.
+//
+// authlayer generates UUIDv7 ids (internal/uid) for every user, session and
+// verification it mints, so uuid is the default and stays the default. Use
+// this when [github.com/bernardoforcillo/authlayer/auth.WithIDGenerator] has
+// replaced that generator with one whose output PostgreSQL's uuid parser does
+// not accept — a ULID, a database sequence, a readable "usr_a1b2c3":
+//
+//	svc := auth.New(dropsstore.NewAuthStore(db, dropsstore.WithAuthTextLibraryIDs()),
+//	    auth.WithIDGenerator(ulid.Make))
+//
+// Without it, such a generator fails the first [auth.Service.SignUp] with
+// SQLSTATE 22P02 (invalid_text_representation) — at the store, on the first
+// write, which store/memory never reproduces.
+//
+// Unlike [WithTextLibraryIDs] and [WithTextUserIDs] on the scope Store, this
+// is ONE option covering both id families rather than two, and that is not an
+// oversight. This store owns the users table the other two point at, so
+// sessions.user_id and verifications.user_id are references to users.id, not
+// values supplied from outside. Leaving them uuid while users.id went text
+// would produce a hatch that fixed SignUp and then failed the first Login
+// with the very error it was added to remove. For the same reason there is no
+// text-USER-id option here at all: there is no coherent configuration in
+// which those columns differ from users.id.
+//
+// Pass it alongside [WithTextLibraryIDs] and [WithInviteTextLibraryIDs] when
+// the same deployment also uses the RBAC and invitation halves, and alongside
+// [WithTextUserIDs] / [WithInviteTextUserIDs] on those two, whose user-id
+// columns then hold ids minted by this same non-UUID generator.
+//
+// Changing it changes the DDL [AuthStore.CreateSchema] emits for a table that
+// does not exist yet; like every other part of that call it will not migrate
+// a table that already exists.
+func WithAuthTextLibraryIDs() AuthOption {
+	return func(s *authSettings) { s.ids = idTypes{library: false, user: false} }
 }
 
 // AuthSchema holds the three authentication tables and their derived
@@ -90,13 +131,14 @@ func WithAuthNames(n AuthNames) AuthOption {
 // [AuthStore.CreateSchema] emits all three ALTER TABLE statements CREATE
 // TABLE cannot carry (or, for email on a fresh table, does not need to).
 //
-// user_id on sessions and verifications is always typed uuid, unlike
-// [Schema]'s or [InviteSchema]'s user-id columns: this store owns the users
-// table it is pointing at, and that table's own id (a library-minted
-// column — see columns.go's libraryIDColumns) is uuid unconditionally, so
-// there is no configuration under which a text user_id would still be
-// consistent with it. Unlike [WithTextUserIDs] or
-// [WithInviteTextUserIDs], no such option is offered here.
+// user_id on sessions and verifications is typed exactly as users.id is,
+// unlike [Schema]'s or [InviteSchema]'s user-id columns, which are configured
+// separately from the library ids: this store owns the users table it is
+// pointing at, so those two columns are references to users.id rather than
+// values supplied from outside, and no configuration in which they differ
+// from it would be consistent. That is why this store offers no equivalent of
+// [WithTextUserIDs] or [WithInviteTextUserIDs], and why the one id option it
+// does offer, [WithAuthTextLibraryIDs], moves all five columns together.
 //
 // [auth.UserBase], [auth.Session] and [auth.Verification] are fixed
 // shapes, unlike the generic scope Store, so unlike [Schema] this type is
@@ -121,7 +163,7 @@ type AuthSchema struct {
 // calls it, so use it directly only when you need the table definitions
 // without a store — to generate DDL for a migration, for instance.
 func NewAuthSchema(opts ...AuthOption) *AuthSchema {
-	cfg := authSettings{}
+	cfg := authSettings{ids: uuidIDs()}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -132,13 +174,14 @@ func NewAuthSchema(opts ...AuthOption) *AuthSchema {
 		Sessions:      pg.NewTable(names.Sessions),
 		Verifications: pg.NewTable(names.Verifications),
 	}
-	// uuidUserIDs is always true here — see [AuthSchema]'s doc for why this
-	// store, unlike Schema/InviteSchema, offers no text-user-id escape
-	// hatch: it owns the users table these two reference, and that table's
-	// own id is uuid unconditionally.
-	s.users = newColSet(s.Users, auth.UserBase{}, true)
-	s.sessions = newColSet(s.Sessions, auth.Session{}, true)
-	s.verifications = newColSet(s.Verifications, auth.Verification{}, true)
+	// One idTypes for all three tables, with both families always set the
+	// same way — see [AuthSchema]'s doc and [WithAuthTextLibraryIDs] for why
+	// this store, unlike Schema/InviteSchema, has no text-user-id option of
+	// its own: it owns the users table sessions and verifications reference,
+	// so their user_id must be typed as users.id is, whichever that is.
+	s.users = newColSet(s.Users, auth.UserBase{}, cfg.ids)
+	s.sessions = newColSet(s.Sessions, auth.Session{}, cfg.ids)
+	s.verifications = newColSet(s.Verifications, auth.Verification{}, cfg.ids)
 
 	s.Sessions.AddUnique(names.Sessions+"_token_hash", s.sessions.col("token_hash"))
 	s.Verifications.AddUnique(names.Verifications+"_token_hash", s.verifications.col("token_hash"))

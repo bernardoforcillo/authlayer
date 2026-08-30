@@ -36,10 +36,13 @@ func TestAuthSchemaHonoursCustomNames(t *testing.T) {
 	}
 }
 
-// user_id (and the users table's own id) are always uuid — this store owns
-// the users table it points at, so unlike Schema/InviteSchema there is no
-// text-user-id escape hatch.
-func TestAuthSchemaUserIDColumnsAreAlwaysUUID(t *testing.T) {
+// uuid is the default for every id column here, users.id and the two
+// referencing user_id columns alike, because authlayer mints UUIDv7. There is
+// still no text-USER-id option on this store — it owns the users table it
+// points at, so a text user_id against a uuid users.id would be incoherent.
+// The knob that does exist is [WithAuthTextLibraryIDs], which moves all five
+// id columns together; see TestAuthSchemaWithAuthTextLibraryIDs.
+func TestAuthSchemaIDColumnsDefaultToUUID(t *testing.T) {
 	s := NewAuthSchema()
 	if got := s.Users.Col("id").Type().TypeSQL(); got != "uuid" {
 		t.Fatalf("users.id type = %q, want uuid", got)
@@ -50,9 +53,52 @@ func TestAuthSchemaUserIDColumnsAreAlwaysUUID(t *testing.T) {
 	if got := s.Verifications.Col("user_id").Type().TypeSQL(); got != "uuid" {
 		t.Fatalf("verifications.user_id type = %q, want uuid", got)
 	}
+	if got := s.Sessions.Col("id").Type().TypeSQL(); got != "uuid" {
+		t.Fatalf("sessions.id type = %q, want uuid", got)
+	}
+	if got := s.Verifications.Col("id").Type().TypeSQL(); got != "uuid" {
+		t.Fatalf("verifications.id type = %q, want uuid", got)
+	}
 	// token_hash is a hashed opaque token, not an id, so it stays text.
 	if got := s.Sessions.Col("token_hash").Type().TypeSQL(); got != "text" {
 		t.Fatalf("sessions.token_hash type = %q, want text", got)
+	}
+}
+
+// WithAuthTextLibraryIDs types every id this store mints as text, so
+// auth.WithIDGenerator can be honoured against PostgreSQL at all.
+//
+// The load-bearing detail is that sessions.user_id and verifications.user_id
+// move WITH it rather than staying uuid. They are foreign references to
+// users.id, which this store owns; leaving them uuid while users.id went text
+// would fail the first CreateSession with the same 22P02 the option exists to
+// remove — a hatch that fixed SignUp and broke Login. That is why this store
+// takes one option covering both families rather than mirroring
+// Schema/InviteSchema's independent pair.
+func TestAuthSchemaWithAuthTextLibraryIDs(t *testing.T) {
+	s := NewAuthSchema(WithAuthTextLibraryIDs())
+	for tag, got := range map[string]string{
+		"users.id":              s.Users.Col("id").Type().TypeSQL(),
+		"sessions.id":           s.Sessions.Col("id").Type().TypeSQL(),
+		"sessions.user_id":      s.Sessions.Col("user_id").Type().TypeSQL(),
+		"verifications.id":      s.Verifications.Col("id").Type().TypeSQL(),
+		"verifications.user_id": s.Verifications.Col("user_id").Type().TypeSQL(),
+	} {
+		if got != "text" {
+			t.Fatalf("%s type = %q, want text under WithAuthTextLibraryIDs", tag, got)
+		}
+	}
+	// The three UNIQUE constraints and the two indexes are what make this
+	// store correct, and none of them is an id column, so the option must
+	// leave every one of them registered exactly as before.
+	if len(s.Sessions.CompositeUniques()) != 1 || len(s.Verifications.CompositeUniques()) != 1 ||
+		len(s.Users.CompositeUniques()) != 1 {
+		t.Fatalf("WithAuthTextLibraryIDs disturbed the unique constraints: users=%v sessions=%v verifications=%v",
+			s.Users.CompositeUniques(), s.Sessions.CompositeUniques(), s.Verifications.CompositeUniques())
+	}
+	if len(s.Sessions.Indexes()) != 1 || len(s.Verifications.Indexes()) != 1 {
+		t.Fatalf("WithAuthTextLibraryIDs disturbed the indexes: sessions=%d verifications=%d",
+			len(s.Sessions.Indexes()), len(s.Verifications.Indexes()))
 	}
 }
 

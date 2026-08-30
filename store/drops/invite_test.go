@@ -50,9 +50,47 @@ func TestInviteSchemaUserIDColumnsFollowTheOption(t *testing.T) {
 	if got := textSchema.Links.Col("created_by").Type().TypeSQL(); got != "text" {
 		t.Fatalf("created_by type = %q, want text under WithInviteTextUserIDs", got)
 	}
-	// container_id is library-minted, so it must stay uuid regardless.
+	// container_id is library-minted, so it follows the other option and must
+	// stay uuid under this one.
 	if got := textSchema.EmailInvites.Col("container_id").Type().TypeSQL(); got != "uuid" {
 		t.Fatalf("WithInviteTextUserIDs leaked into container_id: %q", got)
+	}
+}
+
+// WithInviteTextLibraryIDs is the library-id half, mirroring
+// [WithTextLibraryIDs] on the scope Store: without it an invitation minted by
+// a ULID generator cannot be persisted at all, and its container_id could not
+// reference a text-keyed containers table either.
+func TestInviteSchemaLibraryIDColumnsFollowTheOption(t *testing.T) {
+	uuidSchema := NewInviteSchema()
+	for tag, got := range map[string]string{
+		"invites.id":           uuidSchema.EmailInvites.Col("id").Type().TypeSQL(),
+		"invites.container_id": uuidSchema.EmailInvites.Col("container_id").Type().TypeSQL(),
+		"links.id":             uuidSchema.Links.Col("id").Type().TypeSQL(),
+		"links.container_id":   uuidSchema.Links.Col("container_id").Type().TypeSQL(),
+	} {
+		if got != "uuid" {
+			t.Fatalf("%s type = %q, want uuid by default", tag, got)
+		}
+	}
+
+	textSchema := NewInviteSchema(WithInviteTextLibraryIDs())
+	for tag, got := range map[string]string{
+		"invites.id":           textSchema.EmailInvites.Col("id").Type().TypeSQL(),
+		"invites.container_id": textSchema.EmailInvites.Col("container_id").Type().TypeSQL(),
+		"links.id":             textSchema.Links.Col("id").Type().TypeSQL(),
+		"links.container_id":   textSchema.Links.Col("container_id").Type().TypeSQL(),
+	} {
+		if got != "text" {
+			t.Fatalf("%s type = %q, want text under WithInviteTextLibraryIDs", tag, got)
+		}
+	}
+	// The user-id family is a separate decision.
+	if got := textSchema.EmailInvites.Col("invited_by").Type().TypeSQL(); got != "uuid" {
+		t.Fatalf("WithInviteTextLibraryIDs leaked into invited_by: %q", got)
+	}
+	if got := textSchema.Links.Col("created_by").Type().TypeSQL(); got != "uuid" {
+		t.Fatalf("WithInviteTextLibraryIDs leaked into created_by: %q", got)
 	}
 }
 

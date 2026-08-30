@@ -4927,20 +4927,24 @@ func TestPurgeExpiredDelegatesToStore(t *testing.T) {
 	}
 }
 
-// TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore is one half of the pair
-// pinning WithIDGenerator's documented backend constraint; the other half,
-// TestNonUUIDIDGeneratorFailsAgainstDropsLive, lives in store/drops's
-// integration lane and asserts the SQLSTATE 22P02 the same generator
-// produces there.
+// TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore pins that the memory
+// store has no id-shape opinion at all: a readable, non-UUID generator works
+// end to end there — sign up, verify, log in — whatever the backend would
+// have said.
 //
-// This half exists to pin the TRAP rather than the failure: a service built
-// over store/memory with a readable, non-UUID generator works perfectly —
-// sign up, verify, log in — so a caller who develops and tests entirely
-// against the memory store gets no signal at all before deploying onto
-// store/drops. If this test ever starts failing because the memory store
-// gained an id-shape opinion of its own, WithIDGenerator's doc (and the
-// readme's) has to be revisited, because the trap it warns about would no
-// longer exist.
+// That is what makes the store/drops default worth a doc paragraph. Under
+// store/drops a non-UUID generator needs
+// dropsstore.WithAuthTextLibraryIDs (see WithIDGenerator), and a caller who
+// misses that gets no signal from the memory store before deploying:
+// TestNonUUIDIDGeneratorFailsAgainstDropsLive in store/drops's integration
+// lane asserts the SQLSTATE 22P02 the same generator produces there, and
+// TestTextLibraryIDsRoundTripANonUUIDGeneratorLive alongside it shows the
+// option removing it.
+//
+// If this test ever starts failing because the memory store gained an
+// id-shape opinion of its own, WithIDGenerator's doc (and the readme's) has
+// to be revisited, because the asymmetry it warns about would no longer
+// exist.
 func TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore(t *testing.T) {
 	ctx := context.Background()
 	n := 0

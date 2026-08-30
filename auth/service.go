@@ -470,34 +470,49 @@ func WithClock(now func() time.Time) Option {
 // and a b-tree index on a primary key stays dense. A nil generator is
 // ignored, leaving the default (or a prior option) in place.
 //
-// # A generator MUST produce UUID-parseable ids to use store/drops
+// # A non-UUID generator needs WithAuthTextLibraryIDs on store/drops
 //
-// This is not a general "any id scheme you like" knob against the shipped
-// PostgreSQL backend.
+// The shipped PostgreSQL backend has to declare a column type.
 // [github.com/bernardoforcillo/authlayer/store/drops] types users.id,
-// sessions.id and verifications.id as PostgreSQL uuid unconditionally, and
-// offers NO option to make them text — the escape hatch that exists there,
-// [github.com/bernardoforcillo/authlayer/store/drops.WithTextUserIDs], types
-// the columns that hold a user id supplied from OUTSIDE this library
-// (user_id, owner_id, invited_by, created_by), never the ids this library
-// mints for itself.
+// sessions.id and verifications.id — and the sessions/verifications user_id
+// columns referencing users.id — as PostgreSQL uuid BY DEFAULT, which is
+// correct for the default generator and wrong for any other. Override this
+// option and you must pass
+// [github.com/bernardoforcillo/authlayer/store/drops.WithAuthTextLibraryIDs]
+// as well, which types all five columns text instead:
 //
-// So a generator returning anything PostgreSQL's uuid parser rejects — a
-// ULID, a database sequence, a readable "usr_a1b2c3" — fails the very first
-// [Service.SignUp] with SQLSTATE 22P02 (invalid_text_representation). It
-// fails at the Store, not at construction, and
-// [github.com/bernardoforcillo/authlayer/store/memory] accepts any string
+//	st := dropsstore.NewAuthStore(db, dropsstore.WithAuthTextLibraryIDs())
+//	svc := auth.New(st, auth.WithIDGenerator(ulid.Make))
+//
+// If the same deployment uses the RBAC or invitation halves, pass
+// [github.com/bernardoforcillo/authlayer/store/drops.WithTextLibraryIDs] and
+// [github.com/bernardoforcillo/authlayer/store/drops.WithInviteTextLibraryIDs]
+// to those stores, and
+// [github.com/bernardoforcillo/authlayer/store/drops.WithTextUserIDs] /
+// [github.com/bernardoforcillo/authlayer/store/drops.WithInviteTextUserIDs]
+// too, since their user-id columns then hold ids minted by this generator.
+// Note that WithTextUserIDs is a different option from the library-id ones
+// and covers only those externally supplied columns; this store offers no
+// equivalent, because it owns the users table its user_id columns reference.
+//
+// Without the option, a generator returning anything PostgreSQL's uuid parser
+// rejects — a ULID, a database sequence, a readable "usr_a1b2c3" — fails the
+// very first [Service.SignUp] with SQLSTATE 22P02
+// (invalid_text_representation). It fails at the Store, not at construction,
+// and [github.com/bernardoforcillo/authlayer/store/memory] accepts any string
 // happily: a service developed and tested entirely against the memory store
 // with such a generator passes every test and breaks on its first real
-// sign-up. Both halves of that are pinned by test —
-// TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore in this package, and
+// sign-up. All three of those are pinned by test —
+// TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore in this package,
 // TestNonUUIDIDGeneratorFailsAgainstDropsLive in store/drops's integration
-// lane, which asserts the 22P02 specifically.
+// lane, which asserts the 22P02 specifically, and
+// TestTextLibraryIDsRoundTripANonUUIDGeneratorLive in the same lane, which
+// round-trips a ULID generator end to end with the option on.
 //
 // Against a Store of your own the only requirement is that ids are unique
 // and stable; use whatever that schema accepts.
 // [github.com/bernardoforcillo/authlayer/scope.WithIDGenerator] carries the
-// identical constraint, for the identical reason.
+// identical requirement, for the identical reason.
 func WithIDGenerator(gen func() string) Option {
 	return func(c *config) {
 		if gen != nil {

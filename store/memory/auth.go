@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -16,29 +17,58 @@ import (
 // that split would be a security bug, not a cosmetic one.
 //
 // Like [InviteStore] and unlike [Store], it is not generic — auth.UserBase,
-// auth.Session and auth.Verification are fixed shapes — and, matching
-// InviteStore's stance on EmailInvite.TokenHash and Link.Code (see that
-// type's package doc), it does not enforce uniqueness of Session.TokenHash or
-// Verification.TokenHash here, even though [auth.Store] requires a backend to
-// — see auth.Session.TokenHash's and auth.Verification.TokenHash's doc
-// comments for why that is a MUST on the port and what breaks without it.
-// That enforcement is deferred to store/drops, exactly where InviteStore
-// defers EmailInvite.TokenHash and Link.Code. UserBase.Email is the one
-// exception — CreateUser does check for a normalized-email collision here,
-// because "one email, one account" is the property this whole package exists
-// to guarantee, not an optional application-level constraint the way a token
-// hash collision is.
+// auth.Session and auth.Verification are fixed shapes.
+//
+// It enforces every uniqueness constraint [auth.Store] states, including the
+// two on the record types: UserBase.Email (one email, one account),
+// Session.TokenHash and Verification.TokenHash. It did NOT always enforce the
+// two TokenHash ones — they were deferred to store/drops, matching
+// InviteStore's stance on EmailInvite.TokenHash and Link.Code, on the reading
+// that a hash collision is an application-level constraint the way a slug is.
+// That reading does not survive the port's own text: auth.Session.TokenHash
+// says a shared hash breaks MarkRotated's single-winner contract "with no
+// atomicity defect at all", because two concurrent callers can each
+// atomically win a DIFFERENT one of the colliding rows and both report a
+// successful rotation. That is the same property refresh-token rotation rests
+// on, defeated by another route — not a nicety — so this store honours it
+// too, and a caller who develops here and deploys against store/drops no
+// longer meets the constraint for the first time in production. See
+// [ErrTokenHashTaken] for what a collision reports.
+//
+// [InviteStore]'s equivalent split is untouched and remains as its own doc
+// describes; invite.Store is a separate port with its own obligations.
 //
 // It also enforces the id-collision contract [auth.Store] documents on every
 // Create* method: CreateUser, CreateSession and CreateVerification all check
 // for an existing row under the same id before writing, and return
-// auth.ErrIDTaken rather than silently overwriting it.
+// auth.ErrIDTaken rather than silently overwriting it. Every one of those
+// checks — id, email, token hash — happens under the same acquisition of mu
+// as the write it guards.
 type AuthStore struct {
 	mu            sync.Mutex
 	users         map[string]auth.UserBase
 	sessions      map[string]auth.Session
 	verifications map[string]auth.Verification
 }
+
+// ErrTokenHashTaken reports that a Create* call would have stored a second
+// Session or Verification under a token hash another row of the same kind
+// already holds — the uniqueness [auth.Session.TokenHash] and
+// [auth.Verification.TokenHash] require of a backend.
+//
+// It is deliberately NOT one of authlayer/auth's sentinels, and deliberately
+// not auth.ErrIDTaken. [auth.Store]'s error contract classifies exactly one
+// conflict on the Create* methods — ErrIDTaken, defined as "an id that
+// already identifies a row of that same kind" — and says of token-hash
+// uniqueness that CreateSession "does not itself check" it, leaving it to the
+// backend's own constraint. Reporting a hash collision as ErrIDTaken would
+// therefore tell a caller something false about which column collided. This
+// store answers with its own backend-level error instead, exactly as
+// store/drops answers with the driver's own unique violation
+// (pg.ErrUniqueViolation) unwrapped on the same path — so the two backends
+// agree that the write must fail, and neither pretends the port classifies
+// it.
+var ErrTokenHashTaken = errors.New("authlayer/store/memory: token hash already exists")
 
 // NewAuthStore returns an empty in-memory auth.Store.
 func NewAuthStore() *AuthStore {
@@ -195,17 +225,35 @@ func (s *AuthStore) UpdateUserEmail(_ context.Context, userID, email string, now
 // --- Sessions ---
 
 // CreateSession stores the session under its ID and returns it unchanged, or
-// returns auth.ErrIDTaken if a session with this ID already exists — the
-// check and the write happen under one acquisition of mu, so the row is
-// never silently overwritten.
+// returns auth.ErrIDTaken if a session with this ID already exists, or
+// [ErrTokenHashTaken] if another session already holds sess.TokenHash — all
+// three checks and the write happen under one acquisition of mu, so the row
+// is never silently overwritten and no two rows can end up sharing a hash.
+// See [ErrTokenHashTaken] for why a hash collision is not reported as
+// ErrIDTaken.
 func (s *AuthStore) CreateSession(_ context.Context, sess auth.Session) (auth.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.sessions[sess.ID]; exists {
 		return auth.Session{}, auth.ErrIDTaken
 	}
+	if s.sessionHashTaken(sess.TokenHash) {
+		return auth.Session{}, ErrTokenHashTaken
+	}
 	s.sessions[sess.ID] = sess
 	return sess, nil
+}
+
+// sessionHashTaken reports whether any stored session already holds
+// tokenHash. Callers hold mu. A linear scan is fine for a reference store;
+// store/drops has a UNIQUE index do the same job.
+func (s *AuthStore) sessionHashTaken(tokenHash string) bool {
+	for _, sess := range s.sessions {
+		if sess.TokenHash == tokenHash {
+			return true
+		}
+	}
+	return false
 }
 
 // FindSessionByHash scans for the session whose TokenHash matches, or
@@ -298,6 +346,12 @@ func (s *AuthStore) MarkRotated(_ context.Context, tokenHash string, now time.Ti
 // itself blocks on mu for its own entire body) is exactly the race this
 // method exists to close, the identical discipline [AuthStore.MarkRotated]
 // already applies to ITS OWN check-and-mark.
+//
+// It carries [AuthStore.CreateSession]'s [ErrTokenHashTaken] check too, since
+// it is the store's other insert path for a Session — checked after the
+// predecessor's liveness, so a rotation that has already lost its family
+// reports that loss (ok=false, nil) rather than a hash conflict it would
+// never have reached.
 func (s *AuthStore) CreateSuccessorSession(_ context.Context, predecessorID string, sess auth.Session) (auth.Session, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -307,6 +361,9 @@ func (s *AuthStore) CreateSuccessorSession(_ context.Context, predecessorID stri
 	}
 	if _, exists := s.sessions[predecessorID]; !exists {
 		return auth.Session{}, false, nil
+	}
+	if s.sessionHashTaken(sess.TokenHash) {
+		return auth.Session{}, false, ErrTokenHashTaken
 	}
 	s.sessions[sess.ID] = sess
 	return sess, true, nil
@@ -318,17 +375,34 @@ func (s *AuthStore) CreateSuccessorSession(_ context.Context, predecessorID stri
 // unconditionally, regardless of v.Purpose; see Verification.Email's doc for
 // why this must never be purpose-conditional — stores the result under v's
 // ID, and returns it, or returns auth.ErrIDTaken if a verification with this
-// ID already exists — the check, the normalization, and the write happen
-// under one acquisition of mu, so the row is never silently overwritten.
+// ID already exists, or [ErrTokenHashTaken] if another verification already
+// holds v.TokenHash — every check, the normalization, and the write happen
+// under one acquisition of mu, so the row is never silently overwritten and
+// no two rows can end up sharing a hash.
 func (s *AuthStore) CreateVerification(_ context.Context, v auth.Verification) (auth.Verification, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.verifications[v.ID]; exists {
 		return auth.Verification{}, auth.ErrIDTaken
 	}
+	if s.verificationHashTaken(v.TokenHash) {
+		return auth.Verification{}, ErrTokenHashTaken
+	}
 	v.Email = auth.NormalizeEmail(v.Email)
 	s.verifications[v.ID] = v
 	return v, nil
+}
+
+// verificationHashTaken reports whether any stored verification already
+// holds tokenHash. Callers hold mu. Mirrors [AuthStore.sessionHashTaken];
+// see it for why a linear scan is enough here.
+func (s *AuthStore) verificationHashTaken(tokenHash string) bool {
+	for _, v := range s.verifications {
+		if v.TokenHash == tokenHash {
+			return true
+		}
+	}
+	return false
 }
 
 // FindVerificationByHash scans for the verification whose TokenHash

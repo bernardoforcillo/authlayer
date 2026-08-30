@@ -8,6 +8,7 @@ import (
 
 	"github.com/bernardoforcillo/authlayer/org"
 	"github.com/bernardoforcillo/authlayer/scope"
+	"github.com/bernardoforcillo/authlayer/team"
 )
 
 func TestSchemaDefaultTableNames(t *testing.T) {
@@ -85,6 +86,87 @@ func TestSchemaWithTextUserIDs(t *testing.T) {
 	}
 	if got := s.Roles.Col("id").Type().TypeSQL(); got != "uuid" {
 		t.Fatalf("WithTextUserIDs leaked into the role id: %q", got)
+	}
+}
+
+// WithTextLibraryIDs is the other half of the pair: it types the ids
+// authlayer mints for itself as text, so a caller who overrode
+// scope.WithIDGenerator with a ULID (or a sequence, or a readable prefix
+// scheme) can persist through this store at all. Without it those columns are
+// uuid and the first CreateContainer fails with SQLSTATE 22P02.
+//
+// It must not reach the user-id columns: a deployment can perfectly well mint
+// ULIDs of its own while pointing at a users table that is genuinely UUID
+// keyed, and retyping owner_id under this option would break it.
+func TestSchemaWithTextLibraryIDs(t *testing.T) {
+	s := NewSchema[org.Organization, org.Member](WithTextLibraryIDs())
+	for _, c := range []struct {
+		tag string
+		col func() string
+	}{
+		{"containers.id", func() string { return s.Containers.Col("id").Type().TypeSQL() }},
+		{"members.container_id", func() string { return s.Members.Col("container_id").Type().TypeSQL() }},
+		{"roles.id", func() string { return s.Roles.Col("id").Type().TypeSQL() }},
+		{"roles.container_id", func() string { return s.Roles.Col("container_id").Type().TypeSQL() }},
+	} {
+		if got := c.col(); got != "text" {
+			t.Fatalf("%s type = %q, want text under WithTextLibraryIDs", c.tag, got)
+		}
+	}
+	// The user-id family is a separate decision and keeps its uuid default.
+	if got := s.Members.Col("user_id").Type().TypeSQL(); got != "uuid" {
+		t.Fatalf("WithTextLibraryIDs leaked into user_id: %q", got)
+	}
+	if got := s.Containers.Col("owner_id").Type().TypeSQL(); got != "uuid" {
+		t.Fatalf("WithTextLibraryIDs leaked into owner_id: %q", got)
+	}
+
+	// parent_id is the third library id column and only exists on a nested
+	// container type, so it needs its own schema to be asserted at all. A
+	// nested scope whose parent_id stayed uuid while its id went text could
+	// not store the link at all.
+	nested := NewSchema[team.Team, team.Member](WithTextLibraryIDs())
+	if got := nested.Containers.Col("parent_id").Type().TypeSQL(); got != "text" {
+		t.Fatalf("parent_id type = %q, want text under WithTextLibraryIDs", got)
+	}
+	if got := NewSchema[team.Team, team.Member]().Containers.Col("parent_id").Type().TypeSQL(); got != "uuid" {
+		t.Fatalf("parent_id type = %q, want uuid by default", got)
+	}
+}
+
+// The two options compose, which is the combination an auth-integrated
+// deployment on a non-UUID id scheme actually needs: its user ids come from
+// the same generator as its container ids.
+func TestSchemaWithBothTextIDOptions(t *testing.T) {
+	s := NewSchema[org.Organization, org.Member](WithTextLibraryIDs(), WithTextUserIDs())
+	for tag, got := range map[string]string{
+		"containers.id":        s.Containers.Col("id").Type().TypeSQL(),
+		"containers.owner_id":  s.Containers.Col("owner_id").Type().TypeSQL(),
+		"members.container_id": s.Members.Col("container_id").Type().TypeSQL(),
+		"members.user_id":      s.Members.Col("user_id").Type().TypeSQL(),
+		"roles.id":             s.Roles.Col("id").Type().TypeSQL(),
+	} {
+		if got != "text" {
+			t.Fatalf("%s type = %q, want text with both options", tag, got)
+		}
+	}
+}
+
+// The default must not move: authlayer mints UUIDv7, so a caller who passes
+// no id option keeps uuid columns everywhere.
+func TestSchemaDefaultsToUUIDForBothIDFamilies(t *testing.T) {
+	s := NewSchema[org.Organization, org.Member]()
+	for tag, got := range map[string]string{
+		"containers.id":        s.Containers.Col("id").Type().TypeSQL(),
+		"containers.owner_id":  s.Containers.Col("owner_id").Type().TypeSQL(),
+		"members.container_id": s.Members.Col("container_id").Type().TypeSQL(),
+		"members.user_id":      s.Members.Col("user_id").Type().TypeSQL(),
+		"roles.id":             s.Roles.Col("id").Type().TypeSQL(),
+		"roles.container_id":   s.Roles.Col("container_id").Type().TypeSQL(),
+	} {
+		if got != "uuid" {
+			t.Fatalf("%s type = %q, want uuid by default", tag, got)
+		}
 	}
 }
 

@@ -31,8 +31,8 @@ func (n InviteNames) withDefaults() InviteNames {
 }
 
 type inviteSettings struct {
-	names       InviteNames
-	uuidUserIDs bool
+	names InviteNames
+	ids   idTypes
 }
 
 // InviteOption customizes an [InviteSchema] or [InviteStore] at construction.
@@ -48,8 +48,24 @@ func WithInviteNames(n InviteNames) InviteOption {
 // WithInviteTextUserIDs types invited_by and created_by as text rather than
 // uuid. Mirrors [WithTextUserIDs] on the scope Store: use it only when
 // invitations are used against an existing, non-UUID user table.
+//
+// It does not reach the ids authlayer mints for itself;
+// [WithInviteTextLibraryIDs] is the option for those, and the two compose.
 func WithInviteTextUserIDs() InviteOption {
-	return func(s *inviteSettings) { s.uuidUserIDs = false }
+	return func(s *inviteSettings) { s.ids.user = false }
+}
+
+// WithInviteTextLibraryIDs types the library-minted id columns — an
+// invitation's or link's own id, and the container_id referencing the scope
+// it belongs to — as text rather than uuid. Mirrors [WithTextLibraryIDs] on
+// the scope Store, and must be passed alongside it: the container_id here
+// references that store's containers table, so the two have to agree.
+//
+// uuid remains the default, since authlayer mints UUIDv7. Use this when
+// [github.com/bernardoforcillo/authlayer/scope.WithIDGenerator] produces
+// something PostgreSQL's uuid parser rejects.
+func WithInviteTextLibraryIDs() InviteOption {
+	return func(s *inviteSettings) { s.ids.library = false }
 }
 
 // InviteSchema holds the two invitation tables and their derived columns:
@@ -102,7 +118,7 @@ type InviteSchema struct {
 // definitions without a store — to generate DDL for a migration, for
 // instance.
 func NewInviteSchema(opts ...InviteOption) *InviteSchema {
-	cfg := inviteSettings{uuidUserIDs: true}
+	cfg := inviteSettings{ids: uuidIDs()}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -112,8 +128,8 @@ func NewInviteSchema(opts ...InviteOption) *InviteSchema {
 		EmailInvites: pg.NewTable(names.EmailInvites),
 		Links:        pg.NewTable(names.Links),
 	}
-	s.emailInvites = newColSet(s.EmailInvites, invite.EmailInvite{}, cfg.uuidUserIDs)
-	s.links = newColSet(s.Links, invite.Link{}, cfg.uuidUserIDs)
+	s.emailInvites = newColSet(s.EmailInvites, invite.EmailInvite{}, cfg.ids)
+	s.links = newColSet(s.Links, invite.Link{}, cfg.ids)
 
 	s.EmailInvites.AddUnique(names.EmailInvites+"_container_email",
 		s.emailInvites.col("container_id"), s.emailInvites.col("email"))
