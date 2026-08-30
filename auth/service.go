@@ -276,6 +276,10 @@ type config struct {
 	resetLimiter         RateLimiter
 	claimsExtender       func(UserBase) map[string]any
 	requireVerifiedEmail bool
+	// accountDeletionHook is the application's own pre-delete cleanup —
+	// see [WithAccountDeletionHook] and [Service.DeleteAccount], both in
+	// deletion.go. nil means no hook, which is the default.
+	accountDeletionHook func(ctx context.Context, userID string) error
 }
 
 func defaultConfig() config {
