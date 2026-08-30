@@ -79,7 +79,9 @@ import (
 //
 // [ErrLinkRequiresVerification] is a "not like this", not a dead end: the
 // remedy is for the application to authenticate the user by some other means
-// and link deliberately.
+// and link deliberately with [Service.LinkIdentity], which this policy
+// does NOT gate — see that method's doc for why the remedy cannot be
+// gated by the rule that produced the refusal.
 //
 // A [SignInRequest.FallbackEmail] is NEVER treated as verified, whatever
 // Identity.EmailVerified says. That flag is the provider's claim about the
@@ -87,6 +89,42 @@ import (
 // nothing, and crediting it to an address the application supplied would let
 // a verification of some entirely different address stand in for one of the
 // victim's.
+//
+// # Why [WithRequireVerifiedEmail] does not apply here
+//
+// That option gates [Service.Login] and is deliberately NOT honoured by this
+// method. The asymmetry is not an oversight; it follows from what the
+// address MEANS on each path.
+//
+// In a password login the address IS the claim: it is the identifier the
+// user is asserting they hold, and an unverified one proves nothing about
+// whether they hold it — the option exists so that someone who signed up
+// with somebody else's address cannot use the account before the real owner
+// notices. Here the account is identified by (Provider, Subject), which the
+// provider actually authenticated. The address is corroborating detail, not
+// the claim being made.
+//
+// Both rungs it could apply to are already covered, and more strictly:
+//
+//   - On the LINK rung, [LinkVerified] already requires the local account to
+//     be verified — strictly stronger than this option, since it demands the
+//     provider's half as well. [LinkAlways] is a deliberate opt-out of
+//     exactly that check, and re-imposing half of it through a second option
+//     would make the policy a caller chose mean something they did not choose.
+//   - On the PROVISIONING rung the address lookup MISSED. No other account
+//     holds that address, so there is nobody to take over from; the account
+//     being created is the first claim on it, and refusing to create it
+//     protects no one.
+//
+// What remains is a real if narrow inconsistency, stated plainly: an
+// application that sets WithRequireVerifiedEmail(true) can still end up with
+// an active, unverified account — provisioned here when the provider
+// reports the address unverified. That account holds no password, so it can
+// never reach Login's check at all (Login refuses an empty PasswordHash
+// first). The remedy available today is to configure only providers that
+// report verification status honestly, and to map a provider that does not
+// report it to false. TestSignInWithIgnoresRequireVerifiedEmail pins both
+// halves of this so it cannot drift into an accident.
 //
 // # Fail closed
 //
@@ -304,4 +342,199 @@ func (s *Service) mayLink(providerVerified bool, u UserBase) bool {
 	default:
 		return false
 	}
+}
+
+// LinkIdentity attaches an external account to a local one DELIBERATELY:
+// the application has already authenticated userID by some other means, ran
+// the provider's dance, and is now recording the result. It mints no
+// session and authenticates nobody — the caller supplies the account, and
+// this method takes that as given.
+//
+// It requires [WithIdentityStore]; without it the call fails with
+// [ErrOAuthNotConfigured] before anything is read or written.
+//
+// # It is not gated by the [Linking] policy, on purpose
+//
+// [WithLinking] governs the IMPLICIT link inside [Service.SignInWith] — the
+// one decided on nothing but a matching email address, where the policy is
+// the only thing standing between a provider's assertion and somebody
+// else's account. Here the trust basis is different in kind: the
+// application has authenticated the user, and is attaching an identity to
+// the account that user just proved they hold.
+//
+// So [LinkNever] does NOT disable this method, and [LinkVerified] does not
+// require either side to be verified here. That matters because this method
+// is the documented remedy for [ErrLinkRequiresVerification]: an
+// application that hits that refusal is meant to re-authenticate the user
+// and call this. If the policy that produced the refusal also blocked the
+// remedy, the error would be a dead end — and under LinkNever, which
+// produces it most often, there would be no way to link an identity at all.
+//
+// # What it refuses
+//
+//   - The (Provider, Subject) pair is already linked to a DIFFERENT user:
+//     [ErrIdentityLinked], and nothing is written. An existing link is never
+//     re-pointed. Re-pointing would let anyone able to authenticate as
+//     themselves claim a subject that then signs in as the victim, which is
+//     the same end state as forging the victim's password.
+//   - userID names no account: [ErrUserNotFound]. The account is read before
+//     the link is written, so a row is never left dangling — pointing at a
+//     user that does not exist, occupying a (Provider, Subject) pair nobody
+//     can then use, and failing every sign-in that resolves it.
+//
+// Already linked to THIS user is not a refusal: the existing [Identity] is
+// returned unchanged with a nil error, so a retried or repeated call is a
+// no-op. "Unchanged" is the operative word — CreatedAt, LastUsedAt and Email
+// keep recording what happened when the link was actually made, rather than
+// being rewritten from today's assertion.
+//
+// # What it records
+//
+// [Identity.Email] is set to what the PROVIDER asserted, normalized. It is
+// an audit and display field: it may legitimately differ from
+// [UserBase.Email], it is never an authentication input once the link
+// exists, and nothing here copies it onto the account. Linking likewise
+// certifies nothing about the local address — [UserBase.EmailVerifiedAt] is
+// untouched on every path.
+//
+// [Identity.LastUsedAt] is left nil, because no sign-in has happened. The
+// sign-in paths stamp it at creation for exactly this reason: nil then means
+// "this link has never signed the user in", which is a fact an application
+// can act on, rather than an artifact of which code path created the row.
+//
+// # What is not atomic here
+//
+// The same cross-store reality [Service.SignInWith] documents applies, in a
+// smaller form. The user read, the (Provider, Subject) lookup and the write
+// are three steps, and [Store] and [IdentityStore] may be different backends
+// with no transaction spanning them. Two concurrent links of the same pair
+// can both pass the lookup; the loser is failed by
+// [IdentityStore.CreateIdentity]'s (provider, subject) uniqueness with
+// [ErrIdentityLinked], which is propagated rather than retried into a link —
+// a retry would attach an external account somebody else just claimed. A
+// user deleted between the read and the write is the residual window, and it
+// leaves the same dangling row [Service.SignInWith] fails closed on.
+func (s *Service) LinkIdentity(ctx context.Context, userID string, ext ExternalIdentity) (Identity, error) {
+	var zero Identity
+
+	identities, err := s.identities()
+	if err != nil {
+		return zero, err
+	}
+
+	// The account is read FIRST: nothing is ever linked to a user that does
+	// not exist, not even idempotently.
+	if _, err := s.store.FindUserByID(ctx, userID); err != nil {
+		return zero, err
+	}
+
+	existing, err := identities.FindIdentityByProviderSubject(ctx, ext.Provider, ext.Subject)
+	switch {
+	case err == nil:
+		if existing.UserID != userID {
+			return zero, ErrIdentityLinked
+		}
+		// Already this user's. Hand back what is stored, untouched.
+		return existing, nil
+	case !errors.Is(err, ErrIdentityNotFound):
+		// Fail closed: a store that could not answer is not a store that
+		// answered "nobody holds this pair".
+		return zero, err
+	}
+
+	return identities.CreateIdentity(ctx, Identity{
+		ID:        s.cfg.idGen(),
+		UserID:    userID,
+		Provider:  ext.Provider,
+		Subject:   ext.Subject,
+		Email:     NormalizeEmail(ext.Email),
+		CreatedAt: s.cfg.clock(),
+		// LastUsedAt stays nil: this link was made without a sign-in, and
+		// nil is how a caller tells the two apart.
+	})
+}
+
+// UnlinkIdentity removes userID's identities at provider — every row for
+// that pair, since nothing in the data model forbids a user holding two
+// identities at the same provider and "unlink this provider" means all of
+// them.
+//
+// It requires [WithIdentityStore]; without it the call fails with
+// [ErrOAuthNotConfigured].
+//
+// It refuses to remove the account's last way in: with no other identity
+// surviving the delete and no password credential, the call fails with
+// [ErrLastCredential] and removes NOTHING. That is not a formality. An
+// account with no identity and no password cannot be authenticated by
+// anything in this package — not by [Service.Login], which refuses an empty
+// PasswordHash, and not by [Service.SignInWith], which has no link left to
+// resolve. The lockout would be permanent. [ErrIdentityNotFound] means
+// there was nothing to unlink at that provider, which is a different answer
+// an application's connected-accounts screen acts on differently.
+//
+// The decision and the delete happen inside
+// [IdentityStore.DeleteIdentityIfNotLast] as ONE atomic step, which is why
+// that method has the shape it does — see its doc for the read-then-write
+// race that a "list, decide, delete" here would reopen, and that this
+// project has shipped four times elsewhere.
+//
+// # Why the password state is read here and passed in
+//
+// The identity store owns `identities` and cannot see `users`, so this
+// method reads the account and hands the answer down. [IdentityStore]'s own
+// doc argues why that value cannot go stale in the dangerous direction: no
+// [Service] method removes a password (both writers store a freshly hashed,
+// non-empty value, and there is no "remove my password" and no account
+// deletion in this package), so a true observed here cannot become a false
+// under the delete. The other direction merely refuses a delete that would
+// have been safe, which is self-correcting on retry.
+//
+// That argument depends on the read being FRESH and being the account's real
+// state. It is performed on every call rather than cached, and the flag is
+// derived from the stored [UserBase.PasswordHash] rather than assumed —
+// passing a constant true would be exactly the lockout above, wearing a
+// successful return.
+func (s *Service) UnlinkIdentity(ctx context.Context, userID, provider string) error {
+	identities, err := s.identities()
+	if err != nil {
+		return err
+	}
+
+	// Read the credential state fresh, immediately before the delete: see
+	// "Why the password state is read here and passed in", and
+	// [IdentityStore.DeleteIdentityIfNotLast]'s own staleness argument,
+	// which this ordering is what makes true.
+	u, err := s.store.FindUserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	return identities.DeleteIdentityIfNotLast(ctx, userID, provider, u.PasswordHash != "")
+}
+
+// ListIdentities returns the external accounts linked to userID, and only
+// that user's — it is a scoped pass-through to
+// [IdentityStore.ListIdentitiesByUser], never a listing of anyone else's
+// rows. An application renders it as a connected-accounts screen.
+//
+// It requires [WithIdentityStore]; without it the call fails with
+// [ErrOAuthNotConfigured].
+//
+// A user with no linked accounts is not an error, and neither is a userID
+// that names no account: both come back empty, which keeps this from
+// answering "does this account exist?" for a caller who should not be asking.
+// A store failure IS an error and is returned as-is — an empty list is a
+// statement an application acts on, so an outage must not be able to make
+// one. Whether "none" arrives as an empty or a nil slice is the port's
+// business and deliberately unspecified: use len().
+//
+// Each [Identity.Email] is what the provider asserted at link time. It is an
+// audit and display field, may differ from [UserBase.Email], and is never an
+// authentication input.
+func (s *Service) ListIdentities(ctx context.Context, userID string) ([]Identity, error) {
+	identities, err := s.identities()
+	if err != nil {
+		return nil, err
+	}
+	return identities.ListIdentitiesByUser(ctx, userID)
 }

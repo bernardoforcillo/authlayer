@@ -1129,3 +1129,655 @@ func TestOAuthProvisionedUserGetsAPasswordThroughTheResetFlow(t *testing.T) {
 		t.Fatalf("SignInWith after reset = %+v, want the same account and Created false", again)
 	}
 }
+
+// ============================================================
+// LinkIdentity / UnlinkIdentity / ListIdentities
+// ============================================================
+
+// --- fixtures for the explicit-link suite ----------------------------------
+
+// extOf builds an assertion for an arbitrary provider and subject, for the
+// tests that need a SECOND external account — googleExt is fixed to one
+// (provider, subject) pair on purpose, since most of the suite above is
+// about that one pair being resolved consistently.
+func extOf(provider, subject, email string, verified bool) auth.ExternalIdentity {
+	return auth.ExternalIdentity{Provider: provider, Subject: subject, Email: email, EmailVerified: verified}
+}
+
+// oauthAccount provisions a PASSWORD-LESS account by signing in with ext for
+// the first time, and returns it. Its whole point is the credential state:
+// the account it produces holds no password, so its identities are the only
+// way into it — which is the precondition for every ErrLastCredential test.
+func oauthAccount(t *testing.T, svc *auth.Service, ext auth.ExternalIdentity) auth.UserBase {
+	t.Helper()
+	res, err := svc.SignInWith(context.Background(), signInReq(ext))
+	if err != nil || !res.Created {
+		t.Fatalf("SignInWith(%q/%q): created=%v err=%v", ext.Provider, ext.Subject, res.Created, err)
+	}
+	return res.User
+}
+
+// mustLink links ext to userID and fails the test on any error.
+func mustLink(t *testing.T, svc *auth.Service, userID string, ext auth.ExternalIdentity) auth.Identity {
+	t.Helper()
+	got, err := svc.LinkIdentity(context.Background(), userID, ext)
+	if err != nil {
+		t.Fatalf("LinkIdentity(%q, %q/%q): %v", userID, ext.Provider, ext.Subject, err)
+	}
+	return got
+}
+
+// --- test doubles for the explicit-link suite ------------------------------
+
+// linkedOnCreateIdentityStore reports every (provider, subject) as unknown
+// and then refuses the write with ErrIdentityLinked. That is exactly the
+// shape of losing a race: the lookup said the pair was free, and by the time
+// the row was written somebody else owned it. The store's uniqueness
+// constraint is the only thing that can see it, so its verdict must reach
+// the caller unchanged rather than being retried into a link.
+type linkedOnCreateIdentityStore struct {
+	auth.IdentityStore
+}
+
+func (s linkedOnCreateIdentityStore) CreateIdentity(context.Context, auth.Identity) (auth.Identity, error) {
+	return auth.Identity{}, auth.ErrIdentityLinked
+}
+
+// listFailIdentityStore fails every list. A listing that cannot be produced
+// must be an error, never an empty slice: "you have no linked accounts" is a
+// statement an application acts on.
+type listFailIdentityStore struct {
+	auth.IdentityStore
+}
+
+func (s listFailIdentityStore) ListIdentitiesByUser(context.Context, string) ([]auth.Identity, error) {
+	return nil, errIdentityBoom
+}
+
+// unlinkFlagSpy records, in order, the userHasPassword value UnlinkIdentity
+// computes for each call, while still delegating to a real store so the
+// outcomes stay honest. It is how the suite pins that the flag comes from
+// the account's ACTUAL credential state rather than from a constant — the
+// single parameter standing between a password-less user and a permanent
+// lockout.
+type unlinkFlagSpy struct {
+	auth.IdentityStore
+
+	seen []bool
+}
+
+func (s *unlinkFlagSpy) DeleteIdentityIfNotLast(ctx context.Context, userID, provider string, userHasPassword bool) error {
+	s.seen = append(s.seen, userHasPassword)
+	return s.IdentityStore.DeleteIdentityIfNotLast(ctx, userID, provider, userHasPassword)
+}
+
+// --- the port must be configured -------------------------------------------
+
+// TestExplicitIdentityMethodsRefuseWithoutAnIdentityStore pins that all three
+// explicit methods pass through the same guard SignInWith does: an absent
+// optional port is a typed refusal, not a nil dereference.
+func TestExplicitIdentityMethodsRefuseWithoutAnIdentityStore(t *testing.T) {
+	svc, _ := newTestService(t) // no WithIdentityStore
+	ctx := context.Background()
+
+	got, err := svc.LinkIdentity(ctx, "u1", googleExt("nia@example.com", true))
+	if !errors.Is(err, auth.ErrOAuthNotConfigured) {
+		t.Fatalf("LinkIdentity err = %v, want ErrOAuthNotConfigured", err)
+	}
+	if got.ID != "" {
+		t.Fatalf("LinkIdentity returned %+v alongside its error, want the zero Identity", got)
+	}
+	if err := svc.UnlinkIdentity(ctx, "u1", "google"); !errors.Is(err, auth.ErrOAuthNotConfigured) {
+		t.Fatalf("UnlinkIdentity err = %v, want ErrOAuthNotConfigured", err)
+	}
+	list, err := svc.ListIdentities(ctx, "u1")
+	if !errors.Is(err, auth.ErrOAuthNotConfigured) {
+		t.Fatalf("ListIdentities err = %v, want ErrOAuthNotConfigured", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("ListIdentities returned %d rows alongside its error, want none", len(list))
+	}
+}
+
+// --- LinkIdentity ----------------------------------------------------------
+
+// TestLinkIdentityLinksAnAuthenticatedAccount pins every field of a
+// deliberate link, and the two things it must NOT do: mint a session (the
+// user is already authenticated — that is the premise of the call) and touch
+// the account row (the provider's address is recorded as audit detail, not
+// copied onto the user, and linking certifies nothing about the local
+// address).
+//
+// It also pins LastUsedAt nil at link time and stamped by the first sign-in
+// afterwards. That pair is what makes "nil means this link has never signed
+// the user in" a fact rather than a hope: the sign-in paths stamp it at
+// creation precisely so this path can leave it nil.
+func TestLinkIdentityLinksAnAuthenticatedAccount(t *testing.T) {
+	linked := time.Date(2026, 5, 4, 8, 0, 0, 0, time.UTC)
+	used := linked.Add(72 * time.Hour)
+	now := linked
+	svc, store, ids := newOAuthService(t, auth.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	u := mustSignUp(t, svc, "ada@example.com", validPassword)
+
+	got, err := svc.LinkIdentity(ctx, u.ID, googleExt("  Ada.Work@Example.COM ", false))
+	if err != nil {
+		t.Fatalf("LinkIdentity: %v", err)
+	}
+	if got.ID == "" {
+		t.Fatal("LinkIdentity returned an identity with no id")
+	}
+	if got.UserID != u.ID {
+		t.Fatalf("Identity.UserID = %q, want the account being linked %q", got.UserID, u.ID)
+	}
+	if got.Provider != "google" || got.Subject != "google-subject-1" {
+		t.Fatalf("Identity (provider,subject) = (%q,%q), want (google, google-subject-1)", got.Provider, got.Subject)
+	}
+	if got.Email != "ada.work@example.com" {
+		t.Fatalf("Identity.Email = %q, want the provider's asserted address, normalized", got.Email)
+	}
+	if !got.CreatedAt.Equal(linked) {
+		t.Fatalf("Identity.CreatedAt = %v, want the service clock %v", got.CreatedAt, linked)
+	}
+	if got.LastUsedAt != nil {
+		t.Fatalf("Identity.LastUsedAt = %v, want nil — a link made without a sign-in has never been used", got.LastUsedAt)
+	}
+
+	list := identitiesOf(t, ids, u.ID)
+	if len(list) != 1 {
+		t.Fatalf("identity rows = %d, want exactly 1", len(list))
+	}
+	if list[0].ID != got.ID || list[0].LastUsedAt != nil {
+		t.Fatalf("stored identity = %+v, want the returned row with LastUsedAt still nil", list[0])
+	}
+
+	if n := sessionCount(t, store, u.ID); n != 0 {
+		t.Fatalf("sessions = %d, want 0 — LinkIdentity authenticates nobody and must mint nothing", n)
+	}
+	stored, err := store.FindUserByID(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.Email != "ada@example.com" {
+		t.Fatalf("account Email = %q, want it unchanged — the provider's address is an audit field, not a new identifier", stored.Email)
+	}
+	if stored.EmailVerifiedAt != nil {
+		t.Fatalf("account EmailVerifiedAt = %v, want nil — linking certifies nothing about the local address", stored.EmailVerifiedAt)
+	}
+	if stored.PasswordHash == "" {
+		t.Fatal("account PasswordHash was cleared — linking must not disturb the password credential")
+	}
+
+	// The link now resolves a sign-in by subject, which is the first use of
+	// it and therefore the first LastUsedAt stamp.
+	now = used
+	res, err := svc.SignInWith(ctx, signInReq(googleExt("ada.work@example.com", false)))
+	if err != nil {
+		t.Fatalf("SignInWith after LinkIdentity: %v", err)
+	}
+	if res.Created || res.User.ID != u.ID {
+		t.Fatalf("SignInWith = %+v, want the linked account %q and Created false", res, u.ID)
+	}
+	list = identitiesOf(t, ids, u.ID)
+	if list[0].LastUsedAt == nil || !list[0].LastUsedAt.Equal(used) {
+		t.Fatalf("LastUsedAt = %v, want the sign-in's clock %v — nil must mean never used, not never stamped", list[0].LastUsedAt, used)
+	}
+}
+
+// TestLinkIdentityIsTheRemedyForErrLinkRequiresVerification walks the whole
+// story the refusal points at: the implicit link is refused, the application
+// authenticates the user by password instead, links deliberately, and the
+// external sign-in works from then on.
+//
+// If LinkIdentity were gated by the same policy that produced the refusal,
+// ErrLinkRequiresVerification would be a dead end rather than a "not like
+// this" — and the doc that calls it a remedy would be wrong.
+func TestLinkIdentityIsTheRemedyForErrLinkRequiresVerification(t *testing.T) {
+	svc, _, ids := newOAuthService(t)
+	ctx := context.Background()
+	u := signUpVerified(t, svc, "bo@example.com", validPassword)
+
+	// The provider will not vouch for the address, so the implicit link is
+	// refused under the default policy.
+	if _, err := svc.SignInWith(ctx, signInReq(googleExt("bo@example.com", false))); !errors.Is(err, auth.ErrLinkRequiresVerification) {
+		t.Fatalf("SignInWith err = %v, want ErrLinkRequiresVerification", err)
+	}
+	assertNoIdentityRow(t, ids, "google", "google-subject-1")
+
+	// The application authenticates the user locally instead...
+	if _, err := svc.Login(ctx, "bo@example.com", validPassword, "198.51.100.7", "agent"); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	// ...and links on the strength of that, not of the provider's claim.
+	if _, err := svc.LinkIdentity(ctx, u.ID, googleExt("bo@example.com", false)); err != nil {
+		t.Fatalf("LinkIdentity err = %v, want success — the deliberate link is the documented remedy for the refusal above", err)
+	}
+
+	res, err := svc.SignInWith(ctx, signInReq(googleExt("bo@example.com", false)))
+	if err != nil {
+		t.Fatalf("SignInWith after LinkIdentity: %v", err)
+	}
+	if res.Created || res.User.ID != u.ID {
+		t.Fatalf("SignInWith = %+v, want the existing account %q and Created false", res, u.ID)
+	}
+}
+
+// TestLinkIdentityIgnoresTheLinkingPolicy pins the same property across all
+// three modes with BOTH sides unverified — the case every restrictive policy
+// refuses implicitly. LinkNever is the one that matters: a reader who
+// assumes it disables this method too would conclude the remedy for
+// ErrLinkRequiresVerification is unavailable under exactly the policy most
+// likely to produce that error.
+//
+// The policy governs the IMPLICIT link inside SignInWith, where the only
+// evidence is a matching address. Here the application has already
+// authenticated the user; the trust basis is different, so the gate is not
+// the same gate.
+func TestLinkIdentityIgnoresTheLinkingPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode auth.Linking
+	}{
+		{"LinkVerified", auth.LinkVerified},
+		{"LinkNever", auth.LinkNever},
+		{"LinkAlways", auth.LinkAlways},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, ids := newOAuthService(t, auth.WithLinking(tc.mode))
+			ctx := context.Background()
+			u := mustSignUp(t, svc, "cleo@example.com", validPassword) // never verified
+			ext := googleExt("cleo@example.com", false)                // and the provider does not vouch either
+
+			got, err := svc.LinkIdentity(ctx, u.ID, ext)
+			if err != nil {
+				t.Fatalf("LinkIdentity under %s err = %v, want success — the policy gates SignInWith's implicit link, not an explicit one", tc.name, err)
+			}
+			if got.UserID != u.ID {
+				t.Fatalf("Identity.UserID = %q, want %q", got.UserID, u.ID)
+			}
+			if n := len(identitiesOf(t, ids, u.ID)); n != 1 {
+				t.Fatalf("identity rows = %d, want 1", n)
+			}
+		})
+	}
+}
+
+// TestLinkIdentityRefusesAnIdentityOwnedByAnotherUser is the takeover test
+// for the explicit path. An external account already linked to somebody must
+// never be re-pointed: doing so would let anyone who can authenticate as
+// themselves claim a subject that signs in as the victim, which is the same
+// end state as forging the victim's password.
+//
+// The refusal must also be inert — the existing row unchanged, no row for
+// the caller, and the subject still resolving to its real owner.
+func TestLinkIdentityRefusesAnIdentityOwnedByAnotherUser(t *testing.T) {
+	svc, _, ids := newOAuthService(t)
+	ctx := context.Background()
+	owner := oauthAccount(t, svc, googleExt("dara@example.com", true))
+	intruder := mustSignUp(t, svc, "eve@example.com", validPassword)
+
+	got, err := svc.LinkIdentity(ctx, intruder.ID, googleExt("eve@example.com", true))
+	if !errors.Is(err, auth.ErrIdentityLinked) {
+		t.Fatalf("LinkIdentity err = %v, want ErrIdentityLinked", err)
+	}
+	if got.ID != "" {
+		t.Fatalf("LinkIdentity returned %+v alongside its error, want the zero Identity", got)
+	}
+
+	if n := len(identitiesOf(t, ids, intruder.ID)); n != 0 {
+		t.Fatalf("intruder identity rows = %d, want 0 — a refused link must write nothing", n)
+	}
+	existing, err := ids.FindIdentityByProviderSubject(ctx, "google", "google-subject-1")
+	if err != nil {
+		t.Fatalf("FindIdentityByProviderSubject: %v", err)
+	}
+	if existing.UserID != owner.ID {
+		t.Fatalf("identity UserID = %q, want the original owner %q — the link must never be re-pointed", existing.UserID, owner.ID)
+	}
+	if existing.Email != "dara@example.com" {
+		t.Fatalf("identity Email = %q, want the owner's asserted address unchanged", existing.Email)
+	}
+
+	res, err := svc.SignInWith(ctx, signInReq(googleExt("eve@example.com", true)))
+	if err != nil {
+		t.Fatalf("SignInWith: %v", err)
+	}
+	if res.User.ID != owner.ID {
+		t.Fatalf("SignInWith user = %q, want the owner %q — the subject still identifies its own account", res.User.ID, owner.ID)
+	}
+}
+
+// TestLinkIdentityIsIdempotentForTheSameUser pins that re-linking a pair the
+// user already holds is a no-op returning the EXISTING row, not an error and
+// not a second row.
+//
+// "Returns the existing row" is the load-bearing half: an implementation
+// that deleted and recreated, or that rewrote the row from the new
+// assertion, would reset CreatedAt, drop LastUsedAt, and overwrite the
+// address recorded at link time — an audit record silently rewritten by
+// whatever the provider says today.
+func TestLinkIdentityIsIdempotentForTheSameUser(t *testing.T) {
+	first := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	now := first
+	svc, _, ids := newOAuthService(t, auth.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	u := oauthAccount(t, svc, googleExt("fay@example.com", true))
+
+	before := identitiesOf(t, ids, u.ID)
+	if len(before) != 1 {
+		t.Fatalf("identity rows = %d, want 1", len(before))
+	}
+
+	now = first.Add(24 * time.Hour)
+	again, err := svc.LinkIdentity(ctx, u.ID, googleExt("fay.new@example.com", true))
+	if err != nil {
+		t.Fatalf("LinkIdentity err = %v, want nil — re-linking the same pair to the same user is idempotent", err)
+	}
+	if again.ID != before[0].ID {
+		t.Fatalf("Identity.ID = %q, want the existing row %q", again.ID, before[0].ID)
+	}
+	if !again.CreatedAt.Equal(first) {
+		t.Fatalf("Identity.CreatedAt = %v, want the original link time %v", again.CreatedAt, first)
+	}
+	if again.LastUsedAt == nil || !again.LastUsedAt.Equal(first) {
+		t.Fatalf("Identity.LastUsedAt = %v, want the original stamp %v", again.LastUsedAt, first)
+	}
+	if again.Email != "fay@example.com" {
+		t.Fatalf("Identity.Email = %q, want the address asserted at link time", again.Email)
+	}
+	if n := len(identitiesOf(t, ids, u.ID)); n != 1 {
+		t.Fatalf("identity rows = %d, want 1 — an idempotent link must not add one", n)
+	}
+}
+
+// TestLinkIdentityRequiresAnExistingUser pins the third refusal: an identity
+// is only ever attached to an account that exists. Writing the row first and
+// discovering the user later would leave a dangling link that SignInWith has
+// to fail on (see TestSignInWithFailsClosedOnADanglingIdentity) and that
+// permanently occupies a (provider, subject) pair nobody can use.
+func TestLinkIdentityRequiresAnExistingUser(t *testing.T) {
+	svc, _, ids := newOAuthService(t)
+	ctx := context.Background()
+
+	got, err := svc.LinkIdentity(ctx, "user-that-does-not-exist", googleExt("gwen@example.com", true))
+	if !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("LinkIdentity err = %v, want ErrUserNotFound", err)
+	}
+	if got.ID != "" {
+		t.Fatalf("LinkIdentity returned %+v alongside its error, want the zero Identity", got)
+	}
+	assertNoIdentityRow(t, ids, "google", "google-subject-1")
+}
+
+// TestLinkIdentityPropagatesALostRace pins the fail-closed edge on the one
+// window this method cannot close from the service: the lookup finds the
+// pair free, and the write finds it taken. Only the store's uniqueness
+// constraint sees that, and its verdict must reach the caller as
+// ErrIdentityLinked rather than being retried into a link — a retry would
+// attach an external account somebody else just claimed.
+func TestLinkIdentityPropagatesALostRace(t *testing.T) {
+	svc, _, _ := newOAuthService(t, auth.WithIdentityStore(linkedOnCreateIdentityStore{memory.NewIdentityStore()}))
+	ctx := context.Background()
+	u := mustSignUp(t, svc, "hugo@example.com", validPassword)
+
+	if _, err := svc.LinkIdentity(ctx, u.ID, googleExt("hugo@example.com", true)); !errors.Is(err, auth.ErrIdentityLinked) {
+		t.Fatalf("LinkIdentity err = %v, want the store's ErrIdentityLinked propagated", err)
+	}
+}
+
+// --- UnlinkIdentity --------------------------------------------------------
+
+// TestUnlinkIdentityRefusesTheLastCredential is the lockout test. An
+// OAuth-provisioned account holds no password, so its single identity is the
+// only way in; removing it would leave an account nothing in this package
+// can ever authenticate again. The refusal must also leave the row in place
+// — an error alongside a completed delete is the same lockout with a better
+// message.
+func TestUnlinkIdentityRefusesTheLastCredential(t *testing.T) {
+	svc, store, ids := newOAuthService(t)
+	ctx := context.Background()
+	u := oauthAccount(t, svc, googleExt("gil@example.com", true))
+
+	// Guard the fixture: the whole test is about an account with no password.
+	stored, err := store.FindUserByID(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if stored.PasswordHash != "" {
+		t.Fatalf("fixture holds a password hash %q, want none — this test is about the password-less case", stored.PasswordHash)
+	}
+
+	if err := svc.UnlinkIdentity(ctx, u.ID, "google"); !errors.Is(err, auth.ErrLastCredential) {
+		t.Fatalf("UnlinkIdentity err = %v, want ErrLastCredential — this is the account's only way in", err)
+	}
+	if n := len(identitiesOf(t, ids, u.ID)); n != 1 {
+		t.Fatalf("identity rows = %d, want 1 — the refusal must remove nothing", n)
+	}
+
+	res, err := svc.SignInWith(ctx, signInReq(googleExt("gil@example.com", true)))
+	if err != nil {
+		t.Fatalf("SignInWith after the refused unlink: %v", err)
+	}
+	if res.Created || res.User.ID != u.ID {
+		t.Fatalf("SignInWith = %+v, want the same account %q still reachable", res, u.ID)
+	}
+}
+
+// TestUnlinkIdentityRemovesOneOfTwo pins the ordinary case and then walks
+// straight into the refusal: with two identities and no password, the first
+// unlink succeeds and the second is refused. The reachability test is on
+// what would REMAIN, so the same call is allowed or refused depending only
+// on what else the account holds at the time.
+func TestUnlinkIdentityRemovesOneOfTwo(t *testing.T) {
+	svc, _, ids := newOAuthService(t)
+	ctx := context.Background()
+	u := oauthAccount(t, svc, googleExt("hana@example.com", true))
+	mustLink(t, svc, u.ID, extOf("github", "github-hana", "hana@example.com", true))
+
+	if err := svc.UnlinkIdentity(ctx, u.ID, "google"); err != nil {
+		t.Fatalf("UnlinkIdentity(google) err = %v, want success — another identity survives it", err)
+	}
+	list := identitiesOf(t, ids, u.ID)
+	if len(list) != 1 || list[0].Provider != "github" {
+		t.Fatalf("identities left = %+v, want exactly the github one", list)
+	}
+	assertNoIdentityRow(t, ids, "google", "google-subject-1")
+
+	if err := svc.UnlinkIdentity(ctx, u.ID, "github"); !errors.Is(err, auth.ErrLastCredential) {
+		t.Fatalf("UnlinkIdentity(github) err = %v, want ErrLastCredential — it is now the last way in", err)
+	}
+	if n := len(identitiesOf(t, ids, u.ID)); n != 1 {
+		t.Fatalf("identity rows = %d, want 1", n)
+	}
+}
+
+// TestUnlinkIdentityRemovesTheLastIdentityWhenTheAccountHasAPassword pins the
+// other side of the guard: it protects reachability, not identity rows. An
+// account with a password may drop its last external identity, and the
+// password must still open it afterwards.
+func TestUnlinkIdentityRemovesTheLastIdentityWhenTheAccountHasAPassword(t *testing.T) {
+	svc, _, ids := newOAuthService(t)
+	ctx := context.Background()
+	u := mustSignUp(t, svc, "iris@example.com", validPassword)
+	mustLink(t, svc, u.ID, googleExt("iris@example.com", true))
+
+	if err := svc.UnlinkIdentity(ctx, u.ID, "google"); err != nil {
+		t.Fatalf("UnlinkIdentity err = %v, want success — the password is still a way in", err)
+	}
+	if n := len(identitiesOf(t, ids, u.ID)); n != 0 {
+		t.Fatalf("identity rows = %d, want 0", n)
+	}
+	if _, err := svc.Login(ctx, "iris@example.com", validPassword, "198.51.100.7", "agent"); err != nil {
+		t.Fatalf("Login after unlinking: %v", err)
+	}
+}
+
+// TestUnlinkIdentityReportsAnAbsentProvider pins that "there is nothing to
+// unlink" is its own typed answer, distinct from "there is, and removing it
+// would lock you out". An application showing a connected-accounts screen
+// acts on the difference.
+func TestUnlinkIdentityReportsAnAbsentProvider(t *testing.T) {
+	svc, _, ids := newOAuthService(t)
+	ctx := context.Background()
+	u := mustSignUp(t, svc, "jed@example.com", validPassword)
+	mustLink(t, svc, u.ID, googleExt("jed@example.com", true))
+
+	if err := svc.UnlinkIdentity(ctx, u.ID, "github"); !errors.Is(err, auth.ErrIdentityNotFound) {
+		t.Fatalf("UnlinkIdentity(github) err = %v, want ErrIdentityNotFound", err)
+	}
+	if n := len(identitiesOf(t, ids, u.ID)); n != 1 {
+		t.Fatalf("identity rows = %d, want the google link untouched", n)
+	}
+}
+
+// TestUnlinkIdentityRequiresAnExistingUser pins that the user read happens
+// and that its failure stops the call. That read is not a courtesy check: it
+// is where userHasPassword comes from, and skipping it would mean deciding
+// the last-credential question with a value nobody looked up.
+func TestUnlinkIdentityRequiresAnExistingUser(t *testing.T) {
+	svc, _, ids := newOAuthService(t)
+	ctx := context.Background()
+
+	if _, err := ids.CreateIdentity(ctx, auth.Identity{
+		ID:       "identity-dangling",
+		UserID:   "user-that-does-not-exist",
+		Provider: "google",
+		Subject:  "google-subject-1",
+		Email:    "kai@example.com",
+	}); err != nil {
+		t.Fatalf("CreateIdentity: %v", err)
+	}
+
+	if err := svc.UnlinkIdentity(ctx, "user-that-does-not-exist", "google"); !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("UnlinkIdentity err = %v, want ErrUserNotFound", err)
+	}
+	if n := len(identitiesOf(t, ids, "user-that-does-not-exist")); n != 1 {
+		t.Fatalf("identity rows = %d, want 1 — nothing may be deleted for an account that could not be read", n)
+	}
+}
+
+// TestUnlinkIdentityPassesTheAccountsRealPasswordState pins the parameter
+// itself, in all three states a single account passes through: no password
+// (false), a password (true), and a password acquired through the reset flow
+// (false, then true).
+//
+// The store cannot check this for itself — it owns `identities`, not `users`
+// — so the value it is handed IS the last-credential decision. A constant
+// true would unlink a password-less user's only identity and lock them out;
+// a constant false would refuse every legitimate unlink of a last identity.
+// The direction that matters is the first one, and it is the one the
+// mandatory mutation check inverts.
+func TestUnlinkIdentityPassesTheAccountsRealPasswordState(t *testing.T) {
+	spy := &unlinkFlagSpy{IdentityStore: memory.NewIdentityStore()}
+	svc, _, _ := newOAuthService(t, auth.WithIdentityStore(spy))
+	ctx := context.Background()
+
+	noPassword := oauthAccount(t, svc, googleExt("jo@example.com", true))
+	withPassword := mustSignUp(t, svc, "kit@example.com", validPassword)
+	mustLink(t, svc, withPassword.ID, extOf("github", "github-kit", "kit@example.com", true))
+
+	if err := svc.UnlinkIdentity(ctx, noPassword.ID, "google"); !errors.Is(err, auth.ErrLastCredential) {
+		t.Fatalf("UnlinkIdentity(password-less) err = %v, want ErrLastCredential", err)
+	}
+	if err := svc.UnlinkIdentity(ctx, withPassword.ID, "github"); err != nil {
+		t.Fatalf("UnlinkIdentity(with password) err = %v, want success", err)
+	}
+
+	// The same account, once it has been through the reset flow, is a
+	// different answer — which is why the value is read per call.
+	tok, ok, err := svc.RequestPasswordReset(ctx, "jo@example.com", "198.51.100.7")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+	if err := svc.ResetPassword(ctx, tok, "First-Password-Ever-4!"); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+	if err := svc.UnlinkIdentity(ctx, noPassword.ID, "google"); err != nil {
+		t.Fatalf("UnlinkIdentity after the reset err = %v, want success — the account now has a password", err)
+	}
+
+	want := []bool{false, true, true}
+	if len(spy.seen) != len(want) {
+		t.Fatalf("userHasPassword calls = %v, want %v", spy.seen, want)
+	}
+	for i := range want {
+		if spy.seen[i] != want[i] {
+			t.Fatalf("userHasPassword call %d = %v, want %v (all: %v)", i, spy.seen[i], want[i], spy.seen)
+		}
+	}
+}
+
+// --- ListIdentities --------------------------------------------------------
+
+// TestListIdentitiesReturnsOnlyTheGivenUsersRows pins the scoping. A listing
+// that leaked another account's rows would disclose which external accounts
+// somebody else holds, and would invite an application to offer an unlink
+// for a row that is not the caller's.
+func TestListIdentitiesReturnsOnlyTheGivenUsersRows(t *testing.T) {
+	svc, _, _ := newOAuthService(t)
+	ctx := context.Background()
+	a := oauthAccount(t, svc, googleExt("lena@example.com", true))
+	mustLink(t, svc, a.ID, extOf("github", "github-lena", "lena@example.com", true))
+	b := oauthAccount(t, svc, extOf("google", "google-subject-2", "milo@example.com", true))
+
+	got, err := svc.ListIdentities(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("ListIdentities: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("identities = %d, want 2", len(got))
+	}
+	providers := map[string]bool{}
+	for _, i := range got {
+		if i.UserID != a.ID {
+			t.Fatalf("ListIdentities returned another account's row: %+v (asked for %q)", i, a.ID)
+		}
+		providers[i.Provider] = true
+	}
+	if !providers["google"] || !providers["github"] {
+		t.Fatalf("providers = %v, want both google and github", providers)
+	}
+
+	other, err := svc.ListIdentities(ctx, b.ID)
+	if err != nil {
+		t.Fatalf("ListIdentities(b): %v", err)
+	}
+	if len(other) != 1 || other[0].Subject != "google-subject-2" {
+		t.Fatalf("b's identities = %+v, want exactly its own google-subject-2 row", other)
+	}
+}
+
+// TestListIdentitiesIsEmptyForAnAccountWithNoneAndForAnUnknownUser pins that
+// an empty listing is not an error, and — for an id that names no account —
+// not an existence oracle either. An unknown user and a user with no linked
+// accounts are deliberately indistinguishable here.
+func TestListIdentitiesIsEmptyForAnAccountWithNoneAndForAnUnknownUser(t *testing.T) {
+	svc, _, _ := newOAuthService(t)
+	ctx := context.Background()
+	u := mustSignUp(t, svc, "nell@example.com", validPassword)
+
+	for _, id := range []string{u.ID, "user-that-does-not-exist"} {
+		got, err := svc.ListIdentities(ctx, id)
+		if err != nil {
+			t.Fatalf("ListIdentities(%q) err = %v, want nil", id, err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("ListIdentities(%q) = %+v, want no rows", id, got)
+		}
+	}
+}
+
+// TestListIdentitiesFailsClosedWhenTheStoreFails pins that a store outage is
+// reported rather than rendered as "you have no linked accounts" — a
+// listing an application would happily act on.
+func TestListIdentitiesFailsClosedWhenTheStoreFails(t *testing.T) {
+	svc, _, _ := newOAuthService(t, auth.WithIdentityStore(listFailIdentityStore{memory.NewIdentityStore()}))
+
+	got, err := svc.ListIdentities(context.Background(), "u1")
+	if !errors.Is(err, errIdentityBoom) {
+		t.Fatalf("ListIdentities err = %v, want the store's own error", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ListIdentities returned %d rows alongside its error, want none", len(got))
+	}
+}
