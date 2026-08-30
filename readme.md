@@ -22,7 +22,7 @@ RBAC engine pulls in `drops`, and `pgx/v5` comes with the PostgreSQL store.
 
 ## Contents
 
-- [The model](#the-model) · [Quick start](#quick-start)
+- [The model](#the-model) · [Imports](#imports) · [Quick start](#quick-start)
 - [Statements & permissions](#statements--permissions) · [Roles](#roles) ·
   [How a decision is made](#how-a-decision-is-made)
 - [Context](#context) · [Checking permissions](#checking-permissions) ·
@@ -75,6 +75,46 @@ RBAC engine pulls in `drops`, and `pgx/v5` comes with the PostgreSQL store.
   referenced, but it does have `dropsstore.WithAuthTextLibraryIDs()`, which
   moves all five of its id columns together.
 
+## Imports
+
+Snippets below name packages rather than repeating an import block each time,
+so here is the whole set once. Three of these are not guessable from the
+identifier they introduce, which is why this section exists at all: `memory`
+lives at `store/memory`, `store/drops` declares `package dropsstore`, and the
+PostgreSQL wiring needs **two different packages both called `stdlib`**.
+
+```go
+import (
+    "github.com/bernardoforcillo/authlayer/access"
+    "github.com/bernardoforcillo/authlayer/auth"
+    "github.com/bernardoforcillo/authlayer/auth/authtest"
+    "github.com/bernardoforcillo/authlayer/invite"
+    "github.com/bernardoforcillo/authlayer/org"
+    "github.com/bernardoforcillo/authlayer/scope"
+    "github.com/bernardoforcillo/authlayer/team"
+    "github.com/bernardoforcillo/authlayer/token"
+
+    "github.com/bernardoforcillo/authlayer/store/memory"           // memory.New, NewInviteStore, NewAuthStore
+    dropsstore "github.com/bernardoforcillo/authlayer/store/drops" // package name is dropsstore, not drops
+
+    // Only the PostgreSQL store needs these three — see Storage.
+    "github.com/bernardoforcillo/drops/pg"     // pg.New, pg.Guard, pg.AnyOf, pg.OwnerGuard
+    "github.com/bernardoforcillo/drops/stdlib" // stdlib.New: wraps a *sql.DB as a drops driver
+    _ "github.com/jackc/pgx/v5/stdlib"         // registers the "pgx" database/sql driver
+)
+```
+
+The last two are the trap. `drops/stdlib` is used **by name** —
+`stdlib.New(sqlDB)` — and `pgx/v5/stdlib` is **blank-imported** purely for its
+`init`, which is what makes `sql.Open("pgx", dsn)` resolve; only one of them
+can hold the identifier `stdlib`, and it is the drops one. The
+[`store/drops` wiring snippet](#storedrops) writes both out in full rather
+than leaving you to work that out.
+
+Snippets also use `context`, `database/sql`, `errors`, `fmt` and `time` from
+the standard library. Where a snippet needs an import beyond this list, it
+carries its own block.
+
 ## Quick start
 
 ```go
@@ -90,18 +130,21 @@ alice := org.WithOrg(ctx, acme.ID)
 svc.AddMember(alice, "bob", org.RoleAdmin)
 
 bob := org.WithOrg(org.WithSubject(context.Background(), "bob"), acme.ID)
-ok, _ := svc.Can(bob, org.ResourceMember, org.ActionCreate)       // true
-ok, _  = svc.Can(bob, org.ResourceOrganization, org.ActionDelete) // false
+canAddMember, _ := svc.Can(bob, org.ResourceMember, org.ActionCreate)
+canDeleteOrg, _ := svc.Can(bob, org.ResourceOrganization, org.ActionDelete)
+fmt.Println(canAddMember, canDeleteOrg) // true false
 ```
 
 A full, database-free tour is in [`examples/basic`](examples/basic/main.go);
 [`examples/auth`](examples/auth/main.go) does the same for the whole library
 wired together — sign-up through log-out, with an org and an invitation in the
-middle:
+middle — and [`examples/reset`](examples/reset/main.go) covers the recovery
+flows the other two do not: password reset and email change.
 
 ```sh
 go run ./examples/basic
 go run ./examples/auth
+go run ./examples/reset
 ```
 
 ## Statements & permissions
@@ -214,8 +257,8 @@ guards. authlayer reuses drops' own keys (`pg.WithSubject` / `pg.WithTenant`).
 ctx = org.WithSubject(ctx, userID) // who is acting
 ctx = org.WithOrg(ctx, orgID)      // which organization
 
-userID, ok := org.SubjectFrom(ctx)
-orgID,  ok := org.OrgFrom(ctx)
+userID, haveSubject := org.SubjectFrom(ctx)
+orgID, haveOrg := org.OrgFrom(ctx)
 ```
 
 A missing subject is `ErrSubjectMissing`; a missing scope is `ErrOrgMissing`.
@@ -229,10 +272,10 @@ needs no scope — there is no organization yet.
 ok, err := svc.Can(ctx, "project", org.ActionDelete)
 
 // Error form: distinguishes 403-denied from 403-not-a-member from 404.
-err := svc.Authorize(ctx, "project", org.ActionCreate, org.ActionUpdate)
+err = svc.Authorize(ctx, "project", org.ActionCreate, org.ActionUpdate)
 
 // Out-of-band: ask about a user who is not the ctx subject.
-ok, err := svc.HasPermission(ctx, orgID, "carol", map[string][]access.Action{
+ok, err = svc.HasPermission(ctx, orgID, "carol", map[string][]access.Action{
     "project": {"create"},
     "billing": {"read"},
 })
@@ -574,12 +617,41 @@ organization_roles    id PK, container_id, key, name, permissions BYTEA,
                       created_at, UNIQUE (container_id, key)
 ```
 
+This is the one place production wiring is written down, so it is written out
+in full — imports included, because two of the packages involved are both
+named `stdlib` and one of them is imported only for its side effect:
+
 ```go
-db := pg.New(stdlib.New(sqlDB)) // sqlDB is a *sql.DB on a pgx connection
-st := dropsstore.New[org.Organization, org.Member](db)
-st.CreateSchema(ctx)            // or manage the tables with your migrations
-svc := org.New(org.NewAccess(nil), st)
+import (
+    "context"
+    "database/sql"
+
+    "github.com/bernardoforcillo/drops/pg"
+    "github.com/bernardoforcillo/drops/stdlib" // used by name: wraps a *sql.DB
+    _ "github.com/jackc/pgx/v5/stdlib"         // blank: registers the "pgx" driver
+
+    "github.com/bernardoforcillo/authlayer/org"
+    dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
+)
+
+func newOrgService(ctx context.Context, dsn string) (*org.Service, error) {
+    sqlDB, err := sql.Open("pgx", dsn) // "pgx" comes from the blank import above
+    if err != nil {
+        return nil, err
+    }
+    db := pg.New(stdlib.New(sqlDB))                        // a drops handle
+    st := dropsstore.New[org.Organization, org.Member](db) // the scope.Store
+    if err := st.CreateSchema(ctx); err != nil {           // or use your own migrations
+        return nil, err
+    }
+    return org.New(org.NewAccess(nil), st), nil
+}
 ```
+
+`drops/stdlib` is the adapter that turns a `database/sql` handle into a drops
+driver; `pgx/v5/stdlib` is the pgx driver itself, blank-imported so that its
+`init` registers the name `sql.Open` is given. Neither is optional, and only
+one of them can own the identifier `stdlib`.
 
 Columns are derived from the `drop:` tags on your types, so a different scope
 needs only table names:
@@ -902,11 +974,10 @@ bob := org.WithSubject(context.Background(), "bob")
 _, _ = isvc.AcceptInvite(bob, token) // bob is now a member of acme, holding org.RoleMember
 ```
 
-A link works the same way, minus the email step — reusing `ctx`/`acme`/`isvc`
-above:
+A link works the same way, minus the email step — continuing from the snippet
+above, with the same `owner` context:
 
 ```go
-owner := org.WithOrg(ctx, acme.ID)
 _, code, _ := isvc.CreateLink(owner, org.RoleMember, 5, nil) // up to 5 uses, never expires
 
 carol := org.WithSubject(context.Background(), "carol")
@@ -1113,7 +1184,39 @@ It is also the one place the `auth` + `invite` seam is written down — see
 [Wiring `auth`, `org` and `invite` together](#wiring-auth-org-and-invite-together)
 at the end of this section.
 
+[`examples/reset`](examples/reset/main.go) is the companion for the flows
+`examples/auth` does not reach — `RequestPasswordReset`, `ResetPassword` and
+`RequestEmailChange`, [the password lifecycle](#the-password-lifecycle) — and
+prints the same kind of trace:
+
+```sh
+go run ./examples/reset
+```
+
 ### Sign-up, verification, login
+
+The snippets in this section are one program, each continuing the last, and it
+opens with an `auth.Store`. `memory.NewAuthStore()` is the in-process one,
+from [`store/memory`](store/memory/) — that is the whole of what "swap for
+drops" below means: `dropsstore.NewAuthStore(db)` from
+[`store/drops`](store/drops/), whose `db` the
+[`store/drops` section](#storedrops) builds. The imports for the section:
+
+```go
+import (
+    "context"
+    "errors"
+    "fmt"
+    "time"
+
+    "github.com/bernardoforcillo/authlayer/access"
+    "github.com/bernardoforcillo/authlayer/auth"
+    "github.com/bernardoforcillo/authlayer/invite"
+    "github.com/bernardoforcillo/authlayer/org"
+    "github.com/bernardoforcillo/authlayer/store/memory" // memory.NewAuthStore
+    "github.com/bernardoforcillo/authlayer/token"
+)
+```
 
 ```go
 key := []byte("32-bytes-or-more-from-your-vault") // the HS256 floor, RFC 7518 §3.2
@@ -1368,6 +1471,13 @@ inside the store. This is a joint property, not one `SignUp` can guarantee
 alone.
 
 ### The password lifecycle
+
+Every claim in this section is demonstrated, in order, by
+[`examples/reset`](examples/reset/main.go) — `go run ./examples/reset`. It is
+the runnable form of what follows: the enumeration-safe request shape, the
+one-time redemption, the session revocation, the `EmailVerifiedAt` stamp, the
+current-password gate on `RequestEmailChange`, and the sweep that kills a
+parked reset token.
 
 `ChangePassword(ctx, userID, currentSessionID, current, next)` requires the
 current password, then revokes every session **except** the caller's own
@@ -1736,6 +1846,7 @@ rules and `Verify` returns a bool, so there is nothing to compare with
 | [`store/drops`](store/drops/) | PostgreSQL stores built on drops — RBAC (composite-key membership), invitations, and the three auth tables. |
 | [`examples/basic`](examples/basic/) | Runnable, database-free tour of the RBAC half. |
 | [`examples/auth`](examples/auth/) | Runnable, database-free tour of `auth` + `org` + `invite` wired together. |
+| [`examples/reset`](examples/reset/) | Runnable, database-free tour of [the password lifecycle](#the-password-lifecycle) — `RequestPasswordReset`, `ResetPassword`, `RequestEmailChange`. |
 
 Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
 
@@ -1746,7 +1857,7 @@ gofmt -l .                      # must print nothing
 go vet ./... && go vet -tags integration ./...
 go test ./... -count=1          # database-free
 golangci-lint run ./...         # v2 required; the config is .golangci.yml
-go run ./examples/basic && go run ./examples/auth
+go run ./examples/basic && go run ./examples/auth && go run ./examples/reset
 ```
 
 `.golangci.yml` is a v2 config and runs clean at zero issues. It lints the
@@ -1781,14 +1892,19 @@ default*, which is right for the UUIDv7 generator authlayer ships and wrong for
 any other. Pass the option for each store you use:
 
 ```go
+// ulid here is github.com/oklog/ulid/v2 — illustrative, and not a dependency
+// of authlayer. Both options take a func() string, and ulid.Make returns a
+// ulid.ULID, so the adapter is yours to write.
+newID := func() string { return ulid.Make().String() }
+
 scopeSt := dropsstore.New[org.Organization, org.Member](db,
     dropsstore.WithTextLibraryIDs(), dropsstore.WithTextUserIDs())
 inviteSt := dropsstore.NewInviteStore(db,
     dropsstore.WithInviteTextLibraryIDs(), dropsstore.WithInviteTextUserIDs())
 authSt := dropsstore.NewAuthStore(db, dropsstore.WithAuthTextLibraryIDs())
 
-orgSvc := org.New(ac, scopeSt, org.WithIDGenerator(ulid.Make))
-authSvc := auth.New(authSt, auth.WithIDGenerator(ulid.Make))
+orgSvc := org.New(ac, scopeSt, org.WithIDGenerator(newID))
+authSvc := auth.New(authSt, auth.WithIDGenerator(newID))
 ```
 
 The `WithTextUserIDs` / `WithInviteTextUserIDs` calls are there because in this

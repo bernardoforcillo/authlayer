@@ -10,6 +10,39 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **`examples/reset` — a runnable tour of the password lifecycle.**
+  `RequestPasswordReset`, `ResetPassword` and `RequestEmailChange` appeared in
+  zero fenced `go` blocks and in neither example, so a newcomer implementing
+  "forgot my password" — the commonest reason to reach for this library — had
+  prose, a signature, and nothing that runs. This one runs against
+  `store/memory`, needs no database, and demonstrates each property rather
+  than describing it: a reset request for a known and an unknown address
+  returning the identical `(token, ok, nil)` shape, with no error on the
+  unknown one; `ErrMissingIP` on a blank ip; a re-issue invalidating the
+  previous token; a redemption burning its token and revoking every session;
+  a completed reset stamping `EmailVerifiedAt` on an account that never
+  confirmed its address — the only way out of `WithRequireVerifiedEmail(true)`,
+  since this package exposes no verification resend — and leaving an existing
+  stamp alone on the next one; `RequestEmailChange` refusing a wrong current
+  password, and `VerifyEmail` then redeeming the result with no authentication
+  at all; and a reset token parked by an attacker being swept by the victim's
+  `ChangePassword`. It is referenced from the readme's Authentication section,
+  its password-lifecycle section, the `Packages` table, the `Checks` block and
+  CI.
+
+- **The readme names its imports.** Not one fenced block showed an `import`
+  line: `dropsstore` appeared in six snippets with its path given nowhere,
+  `memory` living at `store/memory` was not guessable, and the production
+  wiring snippet — `db := pg.New(stdlib.New(sqlDB))`, this project's only
+  production-store guidance — needed three imports the document never named,
+  two of them packages both called `stdlib`, one of those a blank import whose
+  driver name (`"pgx"`) was also unstated. There is now an `Imports` section
+  listing every path the snippets use, with the three non-guessable ones
+  called out; the Authentication section carries its own block, because the
+  table of contents links straight to it and every snippet there opens with
+  `memory.NewAuthStore()`, documented 440 lines earlier; and the `store/drops`
+  wiring snippet is written out as a compiling function with its own imports.
+
 - **Continuous integration** (`.github/workflows/ci.yml`) — the gate this
   project ran by hand through v0.1.0 now runs on GitHub Actions, on every push
   and every pull request: `go build`, `go vet` with and without
@@ -135,6 +168,31 @@ once a 1.0 is cut. Until then, minor versions may break API.
   same exported suite. The backend-specific live tests — the ones that stage a
   lock ordering with raw SQL on a second connection, which no port-level suite
   can express — are unchanged.
+
+### Fixed
+
+- **Four readme snippets that did not compile.** The RBAC quick start — the
+  first snippet anyone copies — declared `ok` and never read it (`declared and
+  not used`); the `Context` snippet redeclared both `userID` and `orgID` with
+  `:=`; the `Checking permissions` snippet used `:=` for three successive
+  assignments to one `err`; and the invitation-link snippet redeclared `owner`
+  while its prose said it continued the block above. The values these snippets
+  claimed were all correct — the code around them was not.
+
+  Every fenced `go` block in the readme is now extracted programmatically and
+  compiled: 30 of the 34 are executed and every `//` output claim in them is
+  diffed against the run, two are compiled but not executed (the `store/drops`
+  wiring, which needs a live PostgreSQL, and the `auth/authtest` snippet,
+  which is a `*testing.T` function), and the two remaining are the import
+  blocks themselves — used verbatim as the extracted programs' own imports, so
+  a missing or surplus path fails the build. That is how the four above were
+  found, and it is why the extraction is programmatic rather than a hand copy.
+
+- **The `Ids` snippet passed `ulid.Make` straight to `WithIDGenerator`**,
+  which takes a `func() string`; `github.com/oklog/ulid/v2`'s `Make` returns a
+  `ulid.ULID`. The module is now named in the snippet and the adapter is
+  written out. This one is not covered by the extraction above — authlayer
+  does not depend on that module and a doc example is not a reason to start.
 
 ## [0.1.0] - 2026-08-29
 
