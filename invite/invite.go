@@ -9,6 +9,13 @@
 // statements, and calls [scope.Service.GrantMembership] to perform the actual
 // admission. store/memory holds the reference Store implementation used by
 // this package's own tests; store/drops is the production one.
+//
+// [github.com/bernardoforcillo/authlayer/invite/invitetest] is [Store]'s
+// contract as an executable suite —
+// invitetest.RunStoreContract(t, newStore) — covering every obligation
+// stated here, the three uniqueness MUSTs and [Store.ConsumeLink]'s
+// single-winner atomicity included. Both shipped backends run it; a
+// third-party one should too.
 package invite
 
 import (
@@ -51,18 +58,61 @@ import (
 //
 // ExpiresAt is a plain time.Time, not a pointer, because an email invite
 // always expires — there is no "never" case to represent, unlike [Link].
+//
+// # One pending invitation per address, per container
+//
+// An implementation MUST enforce that (ContainerID, Email) identifies at most
+// one row — a UNIQUE constraint in a SQL backend, which is what store/drops
+// carries.
+//
+// It is what makes re-inviting an address REPLACE rather than duplicate under
+// concurrency. [Service.InviteByEmail] calls [Store.DeleteEmailInvitesFor]
+// and then CreateEmailInvite, which is enough when the calls do not overlap;
+// two such sequences racing each other both sweep and both write, and without
+// the constraint the container ends up holding two live tokens for one
+// address where its pending-invitations screen shows one row. Whoever revokes
+// the row they can see leaves the other redeemable, at the invited role, with
+// nothing anywhere reporting that it is still out there. The constraint turns
+// that race into a refused write for the loser, which the service surfaces as
+// a failed invitation the caller can retry.
+//
+// It is a constraint on the PAIR, not on the address: one person invited to
+// two different containers is two legitimate rows, and enforcing uniqueness on
+// Email alone would break the ordinary case.
 type EmailInvite struct {
 	// ID is the record's surrogate key, stamped by the service.
 	ID string `drop:"id"`
-	// ContainerID is the scope the invitee is admitted to on acceptance.
+	// ContainerID is the scope the invitee is admitted to on acceptance. It
+	// is half of the uniqueness obligation the type doc states; see there.
 	ContainerID string `drop:"container_id"`
 	// Email is the address the token was sent to. Delivery hint and audit
-	// record only — acceptance never checks it. See the type doc.
+	// record only — acceptance never checks it. See the type doc, which also
+	// states the (ContainerID, Email) uniqueness an implementation owes.
 	Email string `drop:"email"`
 	// RoleKey is the role the invitee holds once admitted.
 	RoleKey string `drop:"role_key"`
 	// TokenHash is sha256(token). See the type doc for why the plain token
 	// itself is never persisted.
+	//
+	// An implementation MUST enforce that TokenHash is unique across every
+	// EmailInvite row — a UNIQUE constraint in a SQL backend.
+	// [Store.FindEmailInviteByTokenHash] assumes at most one row can ever
+	// match a given hash, and acceptance runs through it. Without that
+	// guarantee, a token-generation bug or a hash collision that lets two rows
+	// share a TokenHash defeats the one-time property of an emailed invitation
+	// with no atomicity defect at all: two concurrent presentations of the
+	// same token can each resolve a DIFFERENT one of the colliding rows and
+	// each correctly, atomically win its own [Store.DeleteEmailInvite], so
+	// [Service.AcceptInvite] admits both — reached by a different path than
+	// the one DeleteEmailInvite's own rows-affected gate closes. A lookup that
+	// merely picks whichever colliding row the backend returns first degrades
+	// more mildly but just as silently: PreviewInvite shows one invitation and
+	// acceptance spends another.
+	//
+	// This is the same MUST
+	// [github.com/bernardoforcillo/authlayer/auth.Session] TokenHash carries,
+	// and its doc names this very field as the omission this project has
+	// already shipped once. It is stated here now rather than left implicit.
 	TokenHash string `drop:"token_hash"`
 	// InvitedBy is the user id of whoever minted the invite.
 	InvitedBy string `drop:"invited_by"`
@@ -90,6 +140,18 @@ type Link struct {
 	ContainerID string `drop:"container_id"`
 	// Code is the value presented to redeem the link, stored in clear — see
 	// the type doc for why.
+	//
+	// An implementation MUST enforce that Code is unique across every Link
+	// row — a UNIQUE constraint in a SQL backend. [Store.FindLinkByCode]
+	// assumes at most one row can ever match, and redemption runs through it.
+	// Without that guarantee, two rows sharing a Code defeat
+	// [Store.ConsumeLink]'s single-winner contract with no atomicity defect at
+	// all: [Service.JoinViaLink] resolves the code and then consumes THAT
+	// row's id, so two concurrent redeemers can resolve different colliding
+	// rows and each correctly, atomically win ConsumeLink on the row it
+	// happened to pick — a MaxUses:1 link admitting two people while every
+	// individual consume behaved perfectly. It is the same MUST, for the same
+	// reason, that [EmailInvite] states for TokenHash.
 	Code string `drop:"code"`
 	// RoleKey is the role a redeemer is admitted with.
 	RoleKey string `drop:"role_key"`
@@ -167,9 +229,37 @@ var (
 // scope.Store follows: the service layer decides who may create, list, or
 // revoke an invitation and hands the Store fully-formed values to write, or
 // keys to read by.
+//
+// Four of its methods carry a normative MUST — CreateEmailInvite,
+// DeleteEmailInvite, CreateLink and ConsumeLink — and three more are stated
+// on the record types instead, because they constrain the shape of the table
+// rather than the behaviour of one call: [EmailInvite]'s TokenHash and its
+// (ContainerID, Email) pair, and [Link]'s Code. Every one of the seven is
+// exercised by
+// [github.com/bernardoforcillo/authlayer/invite/invitetest], which is this
+// interface's contract as runnable code; run it against a backend rather than
+// reading these comments and hoping.
 type Store interface {
 	// CreateEmailInvite persists an already-stamped invite and returns what
-	// was stored.
+	// was stored. It stamps nothing of its own and drops nothing it was
+	// given.
+	//
+	// It MUST refuse a write that would break either uniqueness obligation
+	// [EmailInvite] states — a TokenHash another row already holds, or a
+	// (ContainerID, Email) pair that already has a pending invite — and MUST
+	// decide that refusal and perform the write as one atomic step, so two
+	// concurrent callers contending for a hash or a pair cannot both succeed.
+	// A SQL backend gets both from its UNIQUE constraints; an in-process one
+	// needs the check and the write under a single critical section.
+	//
+	// What a refusal RETURNS is deliberately unclassified: none of the
+	// sentinels below covers a conflict on create, and neither shipped backend
+	// pretends otherwise — store/drops lets PostgreSQL's own unique violation
+	// through unwrapped, store/memory answers with its own package-local
+	// error. Callers treat a non-nil error here as "this invitation was not
+	// created"; the service's own re-invite sequence
+	// ([Store.DeleteEmailInvitesFor] first) is what keeps the ordinary,
+	// uncontended case from reaching a conflict at all.
 	CreateEmailInvite(ctx context.Context, inv EmailInvite) (EmailInvite, error)
 	// FindEmailInviteByTokenHash loads the invite whose TokenHash matches,
 	// returning ErrInviteNotFound when none does. This is the acceptance path:
@@ -186,14 +276,44 @@ type Store interface {
 	ListEmailInvites(ctx context.Context, containerID string) ([]EmailInvite, error)
 	// DeleteEmailInvite removes an invite by id, returning ErrInviteNotFound
 	// when no row matched.
+	//
+	// That answer MUST be rows-affected gated: of any number of callers racing
+	// to delete the same id, at most one may see a nil error, and every other
+	// must be told ErrInviteNotFound. This is the claim
+	// [Service.AcceptInvite] performs BEFORE
+	// granting the membership, and it is the only thing standing between one
+	// emailed token and two admissions — two presentations of one token both
+	// resolve the same row through FindEmailInviteByTokenHash, and only the
+	// caller this method reports success to goes on to
+	// [scope.Service.GrantMembership]. A backend that answers nil to a delete
+	// that removed nothing, or that decides "the row exists" and deletes it in
+	// two separable steps, hands that guarantee away. One
+	// DELETE ... WHERE id = ... whose rows-affected count decides the answer
+	// gives it; so does a single critical section spanning the check and the
+	// delete.
 	DeleteEmailInvite(ctx context.Context, id string) error
-	// DeleteEmailInvitesFor removes every invite for (containerID, email),
-	// however many there are. It is what makes re-inviting an address replace
-	// rather than duplicate: the service calls it immediately before minting a
-	// fresh invite for the same address. Deleting zero rows is not an error.
+	// DeleteEmailInvitesFor removes every invite for (containerID, email). It
+	// is what makes re-inviting an address replace rather than duplicate: the
+	// service calls it immediately before minting a fresh invite for the same
+	// address. Deleting zero rows is not an error — the service calls it
+	// unconditionally, including for the first invitation an address ever
+	// gets.
+	//
+	// [EmailInvite]'s (ContainerID, Email) uniqueness means there is at most
+	// one such row to begin with; the method is still specified as a sweep,
+	// both because that is what makes the re-invite sequence correct against a
+	// backend holding rows written before the constraint existed, and because
+	// nothing here depends on the count.
 	DeleteEmailInvitesFor(ctx context.Context, containerID, email string) error
 
-	// CreateLink persists an already-stamped link and returns what was stored.
+	// CreateLink persists an already-stamped link and returns what was
+	// stored, stamping nothing of its own.
+	//
+	// It MUST refuse a Code another link already holds — the uniqueness
+	// obligation [Link] states — and MUST decide that refusal and perform the
+	// write as one atomic step, so two concurrent callers cannot both take one
+	// code. What the refusal returns is unclassified, for the reason
+	// CreateEmailInvite's doc gives.
 	CreateLink(ctx context.Context, l Link) (Link, error)
 	// FindLinkByCode loads the link whose Code matches, returning
 	// ErrLinkNotFound when none does. Code is stored in clear (see [Link]),
@@ -217,6 +337,16 @@ type Store interface {
 	// those three reasons; the caller distinguishes why by re-reading it (see
 	// the sentinel doc above). A not-found id is reported as
 	// (false, ErrLinkNotFound), not as a silent ok=false.
+	//
+	// "Unexpired at now" is strict on both sides: consumption succeeds while
+	// now is strictly before ExpiresAt, and the ExpiresAt instant itself is
+	// already expired, since [Link.ExpiresAt] is when the link STOPS being
+	// redeemable. That is deliberately tighter than PurgeExpired's cutoff,
+	// which removes only rows expired strictly before it, so a link exactly at
+	// its ExpiresAt survives one more purge pass while ConsumeLink already
+	// refuses it. ConsumeLink is a real-time gate that must never admit anyone
+	// at or past the deadline; PurgeExpired is housekeeping that can afford to
+	// lag by an instant. A nil ExpiresAt never expires, at any now.
 	//
 	// An implementation MUST make the check and the increment a single atomic
 	// step whose outcome cannot be split by a concurrent caller of the same

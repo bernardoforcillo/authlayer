@@ -130,6 +130,62 @@ once a 1.0 is cut. Until then, minor versions may break API.
   What a rejected duplicate *returns* is still not asserted, since the port
   classifies only `ErrIDTaken` there.
 
+- **`invite/invitetest` — an exported contract-test suite for `invite.Store`**
+  (`invitetest.RunStoreContract(t, newStore)`), the same shape and the same
+  placement as `auth/authtest`. `invite.Store` had no exported contract at all,
+  and the obligations it carries are the ones that bound *who gets in*: forty-three
+  checks cover every one of them plus the ordinary behavioural contract — error
+  classification, `ConsumeLink`'s three refusal reasons, `PurgeExpired`'s strict
+  cutoff and its two "leave it alone" cases.
+
+  Eight of the forty-three are races. `ConsumeLink`'s single winner against a
+  `MaxUses: 1` link is the one a Critical earlier in this project was about; two
+  more drive its ceiling against a `MaxUses: 4` link and, deterministically, the
+  lost update a read-then-write suffers on an *unlimited* one, where every caller
+  wins on any implementation but a split write leaves `UseCount` far below N
+  whatever the timing. `DeleteEmailInvite`'s at-most-one-nil claim is next — the
+  gate `AcceptInvite`'s one-time-credential property rests on — then each of the
+  three uniqueness constraints under concurrent creates, and finally a
+  `DeleteEmailInvitesFor` racing the `CreateEmailInvite` that re-invites the same
+  address, which asserts a linearizability property: a create reporting success
+  while the container ends up holding no invitation for that address is reachable
+  by no serial order of the two calls. That one alternates its two goroutines'
+  roles by round, because closing a channel readies waiters LIFO and a fixed
+  assignment explores essentially one interleaving — the trap that let two
+  `authtest` checks pass their own broken stores.
+
+  Thirty-two negative controls — each a store exactly one defect away from a
+  correct one, paired into forty-four defect/check cases — assert the suite
+  *fails* a non-compliant implementation, and a further test fails if a check is
+  ever added without one. Points the port leaves unspecified are deliberately not
+  asserted, and the package doc says plainly what the suite cannot reach:
+  `ConsumeLink`'s MUST names two acceptable *shapes*, and which one a backend
+  used is invisible to a caller, so only the consequences are checked.
+
+- **Three uniqueness **MUST**s are now stated on `invite.EmailInvite` and
+  `invite.Link`**, and are part of that suite: `EmailInvite.TokenHash`,
+  `Link.Code`, and `EmailInvite`'s `(ContainerID, Email)` pair. `store/drops`
+  has enforced all three as `UNIQUE` constraints from the start and the port
+  said nothing about any of them — the divergence this work closes was
+  discovered from that gap, not from a failing test. The first two defeat
+  `ConsumeLink`'s and `DeleteEmailInvite`'s single-winner properties *with no
+  atomicity defect at all*: two rows sharing a `Code` means two concurrent
+  redeemers resolve different rows through `FindLinkByCode` and each atomically
+  wins the one it picked, so a `MaxUses: 1` link admits two people. The third is
+  what makes re-inviting an address replace rather than duplicate when two such
+  calls race. It is a constraint on the *pair* — the same person invited to two
+  containers is two legitimate rows — and the suite checks that too, so an
+  over-broad reading cannot pass.
+
+  `CreateEmailInvite`, `DeleteEmailInvite` and `CreateLink` also gained explicit
+  **MUST**s they were relied on for but did not state: refusing a colliding
+  write atomically with performing it, and (for `DeleteEmailInvite`) the
+  rows-affected gate `Service.AcceptInvite`'s doc already described as the only
+  thing standing between one emailed token and two admissions. `ConsumeLink`'s
+  expiry boundary is now written down as well — strictly before `ExpiresAt`,
+  with the instant itself already expired — which both backends already
+  implemented and neither port sentence said.
+
 ### Changed
 
 - **`scope.WithIDGenerator` and `auth.WithIDGenerator` no longer document a
@@ -159,9 +215,7 @@ once a 1.0 is cut. Until then, minor versions may break API.
   and explicitly leaves token-hash uniqueness to the backend's own constraint.
   `store/drops` answers the same case with the driver's `pg.ErrUniqueViolation`
   unwrapped; both backends now agree the write must fail, and neither pretends
-  the port classifies it. `invite`'s parallel (`EmailInvite.TokenHash`,
-  `Link.Code`) is unchanged and still deferred: `invite.Store` is a separate
-  port with its own obligations.
+  the port classifies it.
 - **`store/drops`' live lane no longer reimplements the `MarkRotated` contract.**
   It ran an independent copy because the original lived in an unexported helper
   in a `_test.go` file, reachable from nowhere else; both backends now run the
@@ -169,6 +223,47 @@ once a 1.0 is cut. Until then, minor versions may break API.
   lock ordering with raw SQL on a second connection, which no port-level suite
   can express — are unchanged.
 
+- **`store/memory`'s `InviteStore` now enforces all three of `invite.Store`'s
+  uniqueness constraints** — `EmailInvite.TokenHash`, `(ContainerID, Email)`
+  and `Link.Code` — which `store/drops` has always had as `UNIQUE` and which
+  this store's package doc used to say it deliberately deferred. That is the
+  same develop-here/deploy-there divergence the `AuthStore` change above closed,
+  in the package that motivated it: a caller could develop against
+  `store/memory` and meet a constraint violation for the first time in
+  production. `CreateEmailInvite` and `CreateLink` now reject a colliding write
+  under the same acquisition of `mu` as the write itself, so two concurrent
+  callers contending for a hash, a pair or a code cannot both succeed.
+
+  `memory.ErrTokenHashTaken` is reused for `EmailInvite.TokenHash` — the same
+  column meaning and the same failure as the two `auth` ones, and a caller
+  always knows which store it called — and two new package-local sentinels name
+  the constraints it does not cover: **`memory.ErrInviteEmailTaken`** and
+  **`memory.ErrLinkCodeTaken`**. All three are backend-level errors rather than
+  port sentinels, for a stronger version of `ErrTokenHashTaken`'s own reason:
+  `invite.Store` classifies *no* conflict-on-create at all, so there is nothing
+  to reuse and inventing a meaning for an existing sentinel would tell a caller
+  something false. `store/drops` answers the same three cases with the driver's
+  `pg.ErrUniqueViolation` unwrapped, and a live test pins that.
+
+  **One divergence is recorded rather than closed**: `store/drops` types an
+  invite's and a link's `id` as a `PRIMARY KEY`, so re-using one is a unique
+  violation there, while `memory.InviteStore` overwrites the row. `invite.Store`
+  documents no id-collision contract and `authlayer/invite` has no sentinel for
+  one (unlike `auth.ErrIDTaken`), so the backend is not entitled to invent
+  either; the service mints a fresh UUIDv7 for every record. It is written down
+  in `memory.InviteStore`'s doc and in the readme instead of being closed
+  silently or left unmentioned.
+
+- **`store/memory`'s and `store/drops`' invite tests no longer each carry their
+  own copy of the contract.** Roughly thirty per-method cases in
+  `store/memory/invite_test.go` and six live tests in
+  `store/drops/invite_integration_test.go` — the lifecycle pair, the
+  `ConsumeLink` boundaries, `PurgeExpired`, and the two single-winner races —
+  are replaced by one `invitetest.RunStoreContract` call each. What stays is
+  what the shared suite deliberately does not assert: which sentinel
+  `store/memory` answers a duplicate with, and that `store/drops` answers with
+  `pg.ErrUniqueViolation`, plus the backend-specific DDL test that reads the
+  three constraints back out of `pg_constraint`.
 ### Fixed
 
 - **Four readme snippets that did not compile.** The RBAC quick start — the

@@ -1547,10 +1547,12 @@ func TestAuthStoreCreateSchemaLandsConstraintsOnRealPostgres(t *testing.T) {
 	t.Logf("verifications_user_id_purpose_idx i  %s", idxDef)
 }
 
-// TestAuthPurgeExpiredLive mirrors invite_integration_test.go's
-// TestPurgeExpiredLive: it removes rows expired strictly before the cutoff
-// from both sessions and verifications, sums the count across both, and
-// leaves users (never purged) and live rows untouched.
+// TestAuthPurgeExpiredLive mirrors what the invite store's
+// PurgeExpired/CutoffIsStrictAcrossBothKinds check asserts (via
+// authlayer/invite/invitetest, run in invite_integration_test.go): it removes
+// rows expired strictly before the cutoff from both sessions and
+// verifications, sums the count across both, and leaves users (never purged)
+// and live rows untouched.
 func TestAuthPurgeExpiredLive(t *testing.T) {
 	st := newLiveAuthStore(t)
 	ctx := context.Background()
