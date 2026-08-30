@@ -232,6 +232,49 @@ func (s *AuthStore) UpdateUserEmail(_ context.Context, userID, email string, now
 	return nil
 }
 
+// MarkUserDeleted anonymizes the user in place — under ONE acquisition of
+// mu spanning the not-found check, the uniqueness check against every
+// *other* user, and all five field writes: Email becomes the normalized
+// anonymizedEmail (see [auth.NormalizeEmail]), PasswordHash is cleared,
+// EmailVerifiedAt is cleared to nil, and DeletedAt and UpdatedAt are both
+// stamped with now. Returns auth.ErrUserNotFound when userID matches no
+// row, or auth.ErrEmailTaken when a different user already holds the
+// normalized address; on either, nothing is written.
+//
+// The single lock is what satisfies [auth.Store.MarkUserDeleted]'s
+// atomicity MUST. Every field is written on one local copy of the record
+// and that copy is assigned back to the map in one statement, so no
+// concurrent FindUserByID can observe a row stamped but still holding its
+// real address, nor one scrubbed but unstamped — see that method's doc for
+// why each of those halves is a security bug rather than an untidy
+// intermediate state.
+//
+// The uniqueness scan excludes userID's own row, matching
+// [AuthStore.UpdateUserEmail]. Sessions and verifications belonging to the
+// user are left exactly where they are: this writes the user row only, and
+// the caller sweeps those itself, before calling.
+func (s *AuthStore) MarkUserDeleted(_ context.Context, userID, anonymizedEmail string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return auth.ErrUserNotFound
+	}
+	anonymizedEmail = auth.NormalizeEmail(anonymizedEmail)
+	for otherID, other := range s.users {
+		if otherID != userID && other.Email == anonymizedEmail {
+			return auth.ErrEmailTaken
+		}
+	}
+	u.Email = anonymizedEmail
+	u.PasswordHash = ""
+	u.EmailVerifiedAt = nil
+	u.DeletedAt = &now
+	u.UpdatedAt = now
+	s.users[userID] = u
+	return nil
+}
+
 // DeleteUser removes the user row and nothing else, or returns
 // auth.ErrUserNotFound when userID matches no row. Sessions and
 // verifications belonging to that user are left exactly where they are:

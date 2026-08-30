@@ -547,6 +547,168 @@ func (s notFoundOnEmptySweep) DeleteVerificationsByUser(ctx context.Context, use
 	return s.refStore.DeleteVerificationsByUser(ctx, userID)
 }
 
+// unscrubbedMarkUserDeleted stamps DeletedAt and clears the credential but
+// leaves the address on the row — the "stamped but not scrubbed" half
+// [auth.Store.MarkUserDeleted]'s MUST forbids, frozen into a store that does
+// it every time. The account is refused everywhere while its address is
+// still held against re-registration: the user was told it was anonymized,
+// and it is not.
+type unscrubbedMarkUserDeleted struct{ *refStore }
+
+func (s unscrubbedMarkUserDeleted) MarkUserDeleted(_ context.Context, userID, _ string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return auth.ErrUserNotFound
+	}
+	u.PasswordHash = ""
+	u.EmailVerifiedAt = nil
+	u.DeletedAt = &now
+	u.UpdatedAt = now
+	s.users[userID] = u
+	return nil
+}
+
+// credentialKeepingMarkUserDeleted scrubs and stamps but leaves
+// PasswordHash and EmailVerifiedAt untouched — an "anonymized" row still
+// carrying the live credential digest and the certification of an address it
+// no longer holds.
+type credentialKeepingMarkUserDeleted struct{ *refStore }
+
+func (s credentialKeepingMarkUserDeleted) MarkUserDeleted(_ context.Context, userID, anonymizedEmail string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return auth.ErrUserNotFound
+	}
+	anonymizedEmail = auth.NormalizeEmail(anonymizedEmail)
+	if s.emailHeldBy(anonymizedEmail, userID) {
+		return auth.ErrEmailTaken
+	}
+	u.Email = anonymizedEmail
+	u.DeletedAt = &now
+	u.UpdatedAt = now
+	s.users[userID] = u
+	return nil
+}
+
+// rawMarkUserDeletedEmail stores the anonymized address exactly as it was
+// handed over, skipping [auth.NormalizeEmail] — so the scrubbed value is one
+// the store's own FindUserByEmail cannot resolve, and one a second
+// anonymization differing only in case could duplicate.
+type rawMarkUserDeletedEmail struct{ *refStore }
+
+func (s rawMarkUserDeletedEmail) MarkUserDeleted(_ context.Context, userID, anonymizedEmail string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return auth.ErrUserNotFound
+	}
+	u.Email = anonymizedEmail
+	u.PasswordHash = ""
+	u.EmailVerifiedAt = nil
+	u.DeletedAt = &now
+	u.UpdatedAt = now
+	s.users[userID] = u
+	return nil
+}
+
+// unguardedMarkUserDeleted skips the uniqueness check, letting an
+// anonymization move a row onto an address another user already holds —
+// after which every address-keyed lookup in the package depends on row
+// order. See [auth.UserBase.Email].
+type unguardedMarkUserDeleted struct{ *refStore }
+
+func (s unguardedMarkUserDeleted) MarkUserDeleted(_ context.Context, userID, anonymizedEmail string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return auth.ErrUserNotFound
+	}
+	u.Email = auth.NormalizeEmail(anonymizedEmail)
+	u.PasswordHash = ""
+	u.EmailVerifiedAt = nil
+	u.DeletedAt = &now
+	u.UpdatedAt = now
+	s.users[userID] = u
+	return nil
+}
+
+// removingMarkUserDeleted implements the HARD posture under the soft one's
+// name: it deletes the row instead of anonymizing it. The address does come
+// free, so a check that only asserted that would pass — but everything the
+// soft posture exists for is gone, and any foreign key the deployment holds
+// into the users table now dangles.
+type removingMarkUserDeleted struct{ *refStore }
+
+func (s removingMarkUserDeleted) MarkUserDeleted(ctx context.Context, userID, _ string, _ time.Time) error {
+	// Not s.refStore.DeleteUser: this type overrides only MarkUserDeleted,
+	// so the promoted DeleteUser is the reference store's own.
+	return s.DeleteUser(ctx, userID)
+}
+
+// silentMarkUserDeleted answers a missing user with nil instead of
+// ErrUserNotFound, so a caller anonymizing an account that was never there
+// is told it succeeded.
+type silentMarkUserDeleted struct{ *refStore }
+
+func (s silentMarkUserDeleted) MarkUserDeleted(ctx context.Context, userID, anonymizedEmail string, now time.Time) error {
+	if err := s.refStore.MarkUserDeleted(ctx, userID, anonymizedEmail, now); errors.Is(err, auth.ErrUserNotFound) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return nil
+}
+
+// splitMarkUserDeleted writes the anonymization in TWO steps — the scrub and
+// the credential clear first, then the stamp — holding the window open for
+// [gap] in between. It is the committed form of this task's mandatory
+// atomicity mutation, and the state it exposes is the "scrubbed but not
+// stamped" half: for those few milliseconds the row reports as a LIVE
+// account sitting on an address derived from the user id, which is not a
+// secret.
+//
+// It releases the lock between the two writes on purpose. Holding it would
+// make the intermediate state unobservable through this store's own reads
+// and would prove nothing: the defect being modelled is a backend that
+// issues two statements, and a reader against a real database is not blocked
+// between them.
+type splitMarkUserDeleted struct{ *refStore }
+
+func (s splitMarkUserDeleted) MarkUserDeleted(_ context.Context, userID, anonymizedEmail string, now time.Time) error {
+	s.mu.Lock()
+	u, ok := s.users[userID]
+	if !ok {
+		s.mu.Unlock()
+		return auth.ErrUserNotFound
+	}
+	anonymizedEmail = auth.NormalizeEmail(anonymizedEmail)
+	if s.emailHeldBy(anonymizedEmail, userID) {
+		s.mu.Unlock()
+		return auth.ErrEmailTaken
+	}
+	u.Email = anonymizedEmail
+	u.PasswordHash = ""
+	u.EmailVerifiedAt = nil
+	s.users[userID] = u
+	s.mu.Unlock()
+
+	time.Sleep(gap)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u = s.users[userID]
+	u.DeletedAt = &now
+	u.UpdatedAt = now
+	s.users[userID] = u
+	return nil
+}
+
 // onePurposeOnlyVerificationDelete sweeps only "password_reset", the shape a
 // backend implemented as a delegation to
 // [auth.Store.DeleteVerificationsByUserAndPurpose] over a hard-coded list
@@ -769,6 +931,41 @@ func TestTheContractRejectsNonCompliantStores(t *testing.T) {
 			defect:   "DeleteVerificationsByUser reports a user with no verifications as not found",
 			check:    "DeleteVerificationsByUser/ZeroRowsIsNotAnError",
 			newStore: func() auth.Store { return notFoundOnEmptySweep{newRefStore()} },
+		},
+		{
+			defect:   "MarkUserDeleted stamps the row but leaves the address on it",
+			check:    "MarkUserDeleted/ScrubsClearsAndStampsTheRow",
+			newStore: func() auth.Store { return unscrubbedMarkUserDeleted{newRefStore()} },
+		},
+		{
+			defect:   "MarkUserDeleted keeps the password hash and the verification stamp",
+			check:    "MarkUserDeleted/ScrubsClearsAndStampsTheRow",
+			newStore: func() auth.Store { return credentialKeepingMarkUserDeleted{newRefStore()} },
+		},
+		{
+			defect:   "MarkUserDeleted removes the row instead of anonymizing it",
+			check:    "MarkUserDeleted/KeepsTheRowAndFreesTheOriginalAddress",
+			newStore: func() auth.Store { return removingMarkUserDeleted{newRefStore()} },
+		},
+		{
+			defect:   "MarkUserDeleted stores the anonymized address without normalizing it",
+			check:    "MarkUserDeleted/NormalizesTheAnonymizedAddress",
+			newStore: func() auth.Store { return rawMarkUserDeletedEmail{newRefStore()} },
+		},
+		{
+			defect:   "MarkUserDeleted moves a row onto an address another user holds",
+			check:    "MarkUserDeleted/AnotherUsersAddressReturnsErrEmailTaken",
+			newStore: func() auth.Store { return unguardedMarkUserDeleted{newRefStore()} },
+		},
+		{
+			defect:   "MarkUserDeleted answers a missing user with nil",
+			check:    "MarkUserDeleted/UnknownUserReturnsErrUserNotFound",
+			newStore: func() auth.Store { return silentMarkUserDeleted{newRefStore()} },
+		},
+		{
+			defect:   "MarkUserDeleted scrubs under one lock and stamps under another",
+			check:    "MarkUserDeleted/NoCallerObservesAHalfAnonymizedRow",
+			newStore: func() auth.Store { return splitMarkUserDeleted{newRefStore()} },
 		},
 	}
 

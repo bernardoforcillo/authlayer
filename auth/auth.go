@@ -101,10 +101,12 @@
 //
 // [Store.DeleteUser], [Store.DeleteSessionsByUser] and
 // [Store.DeleteVerificationsByUser] — one per record kind — are what lets a
-// caller remove an account and everything this package holds for it. They
-// are methods on [Store] itself, which is a BREAKING change to an interface
-// that shipped with eighteen: every third-party backend has to grow three
-// methods to keep compiling.
+// caller remove an account and everything this package holds for it, and
+// [Store.MarkUserDeleted] is the soft posture's counterpart to the first of
+// them: it keeps the row and anonymizes it in place. They are methods on
+// [Store] itself, which is a BREAKING change to an interface that shipped
+// with eighteen: every third-party backend has to grow four methods to keep
+// compiling.
 //
 // That was chosen deliberately, and it goes the other way from how this
 // project handles OAuth identities, whose persistence is being added as a
@@ -125,14 +127,21 @@
 // optional port would state the opposite: that a Store which silently
 // cannot remove an account is a conforming Store. Growing the port is the
 // honest cost of saying it is not, and it is a cost a backend author pays
-// once, with a compiler error naming exactly the three methods to write.
+// once, with a compiler error naming exactly the four methods to write.
 //
-// The three are separate methods rather than one DeleteAccount for the same
-// reason the port has no transactions: a Store is pure persistence and the
-// ORDER of the cascade is a policy decision that belongs to the caller,
-// which sequences them fail-safe — sessions first, so access stops before
-// anything irreversible happens, then verifications, then the user row.
-// [Store.DeleteUser]'s own doc says why it must not fold the other two in.
+// The three record-kind deletes are separate methods rather than one
+// DeleteAccount for the same reason the port has no transactions: a Store is
+// pure persistence and the ORDER of the cascade is a policy decision that
+// belongs to the caller, which sequences them fail-safe — sessions first, so
+// access stops before anything irreversible happens, then verifications,
+// then the user row. [Store.DeleteUser]'s own doc says why it must not fold
+// the other two in.
+//
+// [Store.MarkUserDeleted] is the one that is NOT split, and deliberately so:
+// its five field writes are one indivisible act, not a sequence a caller
+// could usefully order, because every intermediate state between "live
+// account" and "anonymized row" is one an attacker or an operator can act
+// on. Its own doc says which, and carries the MUST.
 package auth
 
 import (
@@ -218,24 +227,31 @@ type UserBase struct {
 	//
 	// A non-nil DeletedAt therefore MEANS "no one may authenticate as this
 	// account, by any route". That is a requirement on the layer above this
-	// one, not on a Store: nothing in this package reads the field today —
-	// the method that stamps it and the entry points that have to refuse it
-	// arrive with the anonymization posture itself. Two consequences worth
-	// stating plainly rather than leaving to be discovered:
+	// one, not on a Store: no Store method consults the field to decide
+	// anything, and none may — refusing a stamped account is the SERVICE's
+	// job, and [Service.AnonymizeAccount]'s doc enumerates every entry point
+	// that does it. Two consequences worth stating plainly rather than
+	// leaving to be discovered:
 	//
-	//   - No method on this port writes DeletedAt, and none reads it. A
-	//     Store receives it on the record [Store.CreateUser] is handed and
-	//     must return it faithfully from [Store.FindUserByID] and
-	//     [Store.FindUserByEmail]; the method that stamps it on an existing
-	//     row is owed by the anonymization work and is not on this port
-	//     yet.
+	//   - Exactly one method on this port writes DeletedAt —
+	//     [Store.MarkUserDeleted], which stamps it as part of the one atomic
+	//     step that also scrubs the address and clears the credential — and
+	//     no method on this port reads it. A Store additionally receives it
+	//     on the record [Store.CreateUser] is handed (so a deployment can
+	//     seed or restore an already-anonymized row) and must return it
+	//     faithfully from [Store.FindUserByID] and [Store.FindUserByEmail].
+	//     Nothing else on this port touches it: in particular
+	//     [Store.UpdateUserPassword] and [Store.UpdateUserEmail] leave it
+	//     exactly as they found it, so neither of them can un-anonymize an
+	//     account by accident.
 	//   - A backend that silently drops the field is not merely losing a
 	//     timestamp. It reports every anonymized account as a live one, to
 	//     every caller that asks "is this account still usable" — which is
-	//     why authtest's "CreateUser/RoundTripsDeletedAt" holds a backend to
-	//     it, and why store/drops documents the ALTER TABLE a database
-	//     created before this field existed needs (its CREATE TABLE IF NOT
-	//     EXISTS cannot add a column to a table that is already there).
+	//     why authtest's "CreateUser/RoundTripsDeletedAt" and
+	//     "MarkUserDeleted/ScrubsClearsAndStampsTheRow" hold a backend to it,
+	//     and why store/drops documents the ALTER TABLE a database created
+	//     before this field existed needs (its CREATE TABLE IF NOT EXISTS
+	//     cannot add a column to a table that is already there).
 	//
 	// It is declared last, after UpdatedAt, so a users table that acquires
 	// the column with ALTER TABLE ... ADD COLUMN — which appends — ends up
@@ -408,17 +424,18 @@ func NormalizeEmail(s string) string {
 //     tokenHash matches no session at all — as opposed to matching one
 //     already rotated, which is (Session, false, nil): see that method's own
 //     doc for why those two outcomes are deliberately distinguished. The
-//     three user-mutation methods (MarkEmailVerified, UpdateUserPassword,
-//     UpdateUserEmail) return it too, on the same "no such id" miss, as does
-//     [Store.DeleteUser]. The two by-user sweeps —
+//     four user-mutation methods (MarkEmailVerified, UpdateUserPassword,
+//     UpdateUserEmail, MarkUserDeleted) return it too, on the same "no such
+//     id" miss, as does [Store.DeleteUser]. The two by-user sweeps —
 //     [Store.DeleteSessionsByUser] and [Store.DeleteVerificationsByUser] —
 //     deliberately do NOT: matching no rows is their ordinary case, not a
 //     miss, exactly as it is for [Store.DeleteSessionsByFamily] and
 //     [Store.DeleteVerificationsByUserAndPurpose].
-//   - Conflict — ErrEmailTaken, ErrIDTaken. [Store.CreateUser] and
-//     [Store.UpdateUserEmail] return ErrEmailTaken when the normalized email
-//     already belongs to a different user; see [NormalizeEmail] for why the
-//     comparison is always on the normalized form. CreateUser, CreateSession
+//   - Conflict — ErrEmailTaken, ErrIDTaken. [Store.CreateUser],
+//     [Store.UpdateUserEmail] and [Store.MarkUserDeleted] return
+//     ErrEmailTaken when the normalized email already belongs to a different
+//     user; see [NormalizeEmail] for why the comparison is always on the
+//     normalized form. CreateUser, CreateSession
 //     and CreateVerification return ErrIDTaken when the given id already
 //     identifies a row of that same kind — see each method's own doc.
 //   - Precondition — ErrEmailMismatch. [Store.MarkEmailVerified] returns
@@ -650,9 +667,87 @@ type Store interface {
 	// that backend and no other.
 	//
 	// Nothing here is a soft delete: this removes the row. The posture that
-	// KEEPS the row and marks it is [UserBase.DeletedAt], which no method on
-	// this port writes.
+	// KEEPS the row and marks it is [UserBase.DeletedAt], which
+	// [Store.MarkUserDeleted] — and only it — writes.
 	DeleteUser(ctx context.Context, userID string) error
+	// MarkUserDeleted anonymizes the user identified by userID, in place:
+	// it overwrites Email with anonymizedEmail (normalized — see
+	// [NormalizeEmail]), clears PasswordHash to the empty string, clears
+	// EmailVerifiedAt back to nil, and stamps both DeletedAt and UpdatedAt
+	// with now. ID and CreatedAt are left alone, and so is every session and
+	// verification the user holds — see "What it does not touch" below.
+	//
+	// Returns ErrUserNotFound when there is no such user, or ErrEmailTaken
+	// if a *different* user already holds anonymizedEmail's normalized form,
+	// the same uniqueness [Store.UpdateUserEmail] enforces on the same
+	// column. On either error NOTHING is written.
+	//
+	// This is the SOFT posture's only write, the counterpart to
+	// [Store.DeleteUser]'s hard one: the row survives so that whatever a
+	// deployment keys on the user id — an audit trail, an order history, a
+	// foreign key it cannot drop — keeps resolving, while nothing that
+	// could identify or authenticate the person remains on it. It is the
+	// only method on this port that writes [UserBase.DeletedAt], and the
+	// only one that reads or writes it at all.
+	//
+	// # It MUST be a single atomic step
+	//
+	// All five field writes MUST land together, as one statement or under
+	// one lock. A caller MUST NOT be able to observe some of them — and this
+	// is not a tidiness requirement, because the two halves fail in opposite
+	// directions and both are security-relevant:
+	//
+	//   - STAMPED BUT NOT SCRUBBED. DeletedAt is set while the row still
+	//     holds the real address, the live password hash, or the
+	//     verification stamp. Every authentication entry point above this
+	//     port refuses a stamped row (that is what DeletedAt MEANS — see
+	//     [UserBase.DeletedAt]), so the account is already unusable while
+	//     its address is still held hostage against re-registration and its
+	//     credential digest is still stored. The user was told the account
+	//     was anonymized; it is not.
+	//   - SCRUBBED BUT NOT STAMPED. The address has already moved to the
+	//     anonymized value while DeletedAt is still nil, so the row reports
+	//     as a LIVE account with a password credential nobody holds and an
+	//     address derived from the user id — which is not a secret. A caller
+	//     who can guess it can drive a password-reset flow against an
+	//     account that was supposed to be closed.
+	//
+	// A single UPDATE ... SET (five columns) WHERE id = $1, whose uniqueness
+	// is enforced by the backend's own constraint on the email column,
+	// satisfies this by construction — the shape
+	// [store/drops.AuthStore.MarkUserDeleted] uses — as does a check and a
+	// write under one lock, the shape [store/memory.AuthStore.MarkUserDeleted]
+	// uses. Two UPDATEs, or a SELECT-then-UPDATE, do not, however small the
+	// window between them.
+	//
+	// # What it does not touch
+	//
+	// The user row ONLY, exactly as [Store.DeleteUser] requires of itself
+	// and for the same reason: the caller sweeps the account's sessions and
+	// verifications ITSELF, BEFORE this call, so that access stops before
+	// anything irreversible happens. A backend that swept them here — as a
+	// trigger, or out of helpfulness — would make that ordering
+	// unobservable, and a caller that skipped the sweeps entirely would look
+	// identical to one that ran them, against that backend and no other.
+	//
+	// # Why the caller supplies the address
+	//
+	// anonymizedEmail is a parameter rather than something a backend
+	// invents, because it has to satisfy two constraints only the caller can
+	// see: it must be unique across the whole users table (so two anonymized
+	// accounts cannot collide on Email's UNIQUE constraint), and it must be
+	// recognisable to an operator reading the table. A Store asked to mint
+	// one would be inventing identity data, which is the kind of trust this
+	// port does not extend to a backend anywhere else either (see
+	// [Store.UpdateUserEmail] on why verification is never folded in). The
+	// form the service layer uses is stated on
+	// [github.com/bernardoforcillo/authlayer/auth.Service.AnonymizeAccount].
+	//
+	// Passing the address the user ALREADY holds is legal and is not a
+	// self-conflict — the uniqueness check excludes the row being written,
+	// like UpdateUserEmail's — but it anonymizes nothing, and no caller in
+	// this package does it.
+	MarkUserDeleted(ctx context.Context, userID, anonymizedEmail string, now time.Time) error
 
 	// CreateSession persists an already-stamped session and returns what was
 	// stored. Returns ErrIDTaken if a session with this ID already exists —

@@ -149,7 +149,8 @@ func WithAuthTextLibraryIDs() AuthOption {
 // CREATE TABLE IF NOT EXISTS that no-ops away entirely against a table that
 // already exists. A users table created before this field existed therefore
 // needs one hand-run migration before this store can write to it at all —
-// every INSERT names deleted_at, so the first CreateUser against an
+// every INSERT names deleted_at, and so does
+// [AuthStore.MarkUserDeleted]'s UPDATE, so the first CreateUser against an
 // unmigrated table fails with SQLSTATE 42703 (undefined_column) rather than
 // degrading quietly:
 //
@@ -513,6 +514,59 @@ func (st *AuthStore) UpdateUserEmail(ctx context.Context, userID, email string, 
 		Set(
 			st.s.users.bind("email", email),
 			st.s.users.bind("email_verified_at", (*time.Time)(nil)),
+			st.s.users.bind("updated_at", now),
+		).
+		Where(st.s.users.eq("id", userID)).
+		Exec(ctx)
+	if err != nil {
+		if errors.Is(err, pg.ErrUniqueViolation) {
+			return auth.ErrEmailTaken
+		}
+		return err
+	}
+	return affectedOrErr(res, nil, auth.ErrUserNotFound)
+}
+
+// MarkUserDeleted anonymizes the user row in place as ONE statement:
+//
+//	UPDATE <users> SET email = $1, password_hash = '', email_verified_at = NULL,
+//	                   deleted_at = $2, updated_at = $2
+//	 WHERE id = $3
+//
+// One UPDATE is what satisfies [auth.Store.MarkUserDeleted]'s atomicity
+// MUST, and it is the same mechanism [AuthStore.UpdateUserEmail] relies on
+// for its own: PostgreSQL applies every column of a SET under a single row
+// operation, so no concurrent reader can see a row stamped but still holding
+// its real address, nor one scrubbed but unstamped — the two half-written
+// states that method's doc explains are each a security bug in their own
+// right. Two UPDATEs would reintroduce both, however narrow the window.
+//
+// The address's uniqueness is likewise decided by the table's own
+// UNIQUE(email) index (see [AuthSchema]) rather than by a pre-check SELECT,
+// so a conflict arrives as pg.ErrUniqueViolation and is mapped to
+// auth.ErrEmailTaken with the whole statement rolled back — nothing partial
+// is left behind. Re-anonymizing a row to the address it already holds is
+// not a self-conflict: a UNIQUE index only rejects a value some OTHER row
+// holds.
+//
+// email_verified_at is bound to a typed nil *time.Time, which colSet.bind
+// renders as the NULL keyword (see columns.go); deleted_at is bound to
+// &now, the same non-nil *time.Time form [AuthStore.MarkEmailVerified] uses
+// for email_verified_at. Zero rows affected is auth.ErrUserNotFound —
+// unambiguous here, unlike MarkEmailVerified's, because id is the only
+// predicate.
+//
+// It touches the users table and nothing else. Sessions and verifications
+// are the caller's to sweep, first — see [AuthStore.DeleteUser]'s doc for
+// the same boundary on the hard posture.
+func (st *AuthStore) MarkUserDeleted(ctx context.Context, userID, anonymizedEmail string, now time.Time) error {
+	anonymizedEmail = auth.NormalizeEmail(anonymizedEmail)
+	res, err := st.db.Update(st.s.Users).
+		Set(
+			st.s.users.bind("email", anonymizedEmail),
+			st.s.users.bind("password_hash", ""),
+			st.s.users.bind("email_verified_at", (*time.Time)(nil)),
+			st.s.users.bind("deleted_at", &now),
 			st.s.users.bind("updated_at", now),
 		).
 		Where(st.s.users.eq("id", userID)).

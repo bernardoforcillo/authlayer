@@ -144,6 +144,26 @@ func (s *refStore) UpdateUserEmail(_ context.Context, userID, email string, now 
 	return nil
 }
 
+func (s *refStore) MarkUserDeleted(_ context.Context, userID, anonymizedEmail string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return auth.ErrUserNotFound
+	}
+	anonymizedEmail = auth.NormalizeEmail(anonymizedEmail)
+	if s.emailHeldBy(anonymizedEmail, userID) {
+		return auth.ErrEmailTaken
+	}
+	u.Email = anonymizedEmail
+	u.PasswordHash = ""
+	u.EmailVerifiedAt = nil
+	u.DeletedAt = &now
+	u.UpdatedAt = now
+	s.users[userID] = u
+	return nil
+}
+
 func (s *refStore) DeleteUser(_ context.Context, userID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

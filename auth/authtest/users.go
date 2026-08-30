@@ -40,6 +40,11 @@ func userChecks() []check {
 		{"UpdateUserEmail/UnknownUserReturnsErrUserNotFound", checkUpdateUserEmailUnknownUser},
 		{"DeleteUser/RemovesTheUserRowOnly", checkDeleteUser},
 		{"DeleteUser/UnknownIDReturnsErrUserNotFound", checkDeleteUserUnknownUser},
+		{"MarkUserDeleted/ScrubsClearsAndStampsTheRow", checkMarkUserDeleted},
+		{"MarkUserDeleted/NormalizesTheAnonymizedAddress", checkMarkUserDeletedNormalizes},
+		{"MarkUserDeleted/KeepsTheRowAndFreesTheOriginalAddress", checkMarkUserDeletedFreesTheAddress},
+		{"MarkUserDeleted/AnotherUsersAddressReturnsErrEmailTaken", checkMarkUserDeletedTaken},
+		{"MarkUserDeleted/UnknownUserReturnsErrUserNotFound", checkMarkUserDeletedUnknownUser},
 	}
 }
 
@@ -588,4 +593,189 @@ func checkDeleteUserUnknownUser(t tb, st auth.Store) {
 	t.Helper()
 	err := st.DeleteUser(context.Background(), newID())
 	wantErrIs(t, "DeleteUser(unknown id)", err, auth.ErrUserNotFound)
+}
+
+// checkMarkUserDeleted asserts every field write
+// [auth.Store.MarkUserDeleted] promises, on one row, from one call: the
+// address is replaced with the anonymized one, PasswordHash is cleared,
+// EmailVerifiedAt is cleared, DeletedAt is stamped with now, and UpdatedAt
+// is stamped with now. The fixture is a VERIFIED account with a password
+// hash, so "cleared" is a real transition in both cases rather than a field
+// that was already empty.
+//
+// It also asserts the row is otherwise intact — same id, same CreatedAt —
+// and that the user's sessions and verifications are still there. That last
+// part is [auth.Store.DeleteUser]'s "the user row ONLY" applied to the soft
+// posture: the service sweeps those two kinds itself, BEFORE this call, so
+// that access stops before anything irreversible happens (see
+// [auth.Store.DeleteSessionsByUser]). A store that swept them here as a side
+// effect would make that ordering unobservable, exactly as an ON DELETE
+// CASCADE does for the hard posture.
+//
+// The atomicity half of the MUST is unreachable from a sequential check —
+// a half-written row is only observable while the write is in flight — and
+// is driven by "MarkUserDeleted/NoCallerObservesAHalfAnonymizedRow" in
+// concurrency.go.
+func checkMarkUserDeleted(t tb, st auth.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+
+	target := mustCreateUser(t, st, newUser(newEmail(), at))
+	bystander := mustCreateUser(t, st, newUser(newEmail(), at))
+	verifiedAt := at.Add(time.Minute)
+	wantNoErr(t, "MarkEmailVerified", st.MarkEmailVerified(ctx, target.ID, target.Email, verifiedAt))
+	sess := mustCreateSession(t, st, newSession(target.ID, newID(), at))
+	ver := mustCreateVerification(t, st, newVerification(target.ID, "password_reset", target.Email, at))
+
+	scrubbed := newEmail()
+	deletedAt := verifiedAt.Add(time.Minute)
+	wantNoErr(t, "MarkUserDeleted", st.MarkUserDeleted(ctx, target.ID, scrubbed, deletedAt))
+
+	got, err := st.FindUserByID(ctx, target.ID)
+	wantNoErr(t, "FindUserByID after MarkUserDeleted", err)
+	if got.Email != scrubbed {
+		t.Fatalf("Email = %q after MarkUserDeleted, want the anonymized %q — the address must be scrubbed, not merely stamped over", got.Email, scrubbed)
+	}
+	if got.PasswordHash != "" {
+		t.Fatalf("PasswordHash = %q after MarkUserDeleted, want empty — an anonymized account keeps no credential", got.PasswordHash)
+	}
+	if got.EmailVerifiedAt != nil {
+		t.Fatalf("EmailVerifiedAt = %v after MarkUserDeleted, want nil — the address it certified is gone", got.EmailVerifiedAt)
+	}
+	if got.DeletedAt == nil {
+		t.Fatalf("DeletedAt = nil after MarkUserDeleted, want %v — an unstamped row reports as a live account to every caller that asks", deletedAt)
+	}
+	wantTimeEqual(t, "DeletedAt", *got.DeletedAt, deletedAt)
+	wantTimeEqual(t, "UpdatedAt", got.UpdatedAt, deletedAt)
+	if got.ID != target.ID {
+		t.Fatalf("ID = %q after MarkUserDeleted, want the unchanged %q — the row survives so whatever keys on the user id keeps resolving", got.ID, target.ID)
+	}
+	wantTimeEqual(t, "CreatedAt", got.CreatedAt, at)
+
+	if _, err := st.FindSessionByHash(ctx, sess.TokenHash); err != nil {
+		t.Fatalf("FindSessionByHash(the anonymized user's session) error = %v, want nil — MarkUserDeleted writes the user row ONLY; the caller sweeps sessions first, itself", err)
+	}
+	if _, err := st.FindVerificationByHash(ctx, ver.TokenHash); err != nil {
+		t.Fatalf("FindVerificationByHash(the anonymized user's verification) error = %v, want nil — MarkUserDeleted writes the user row ONLY; the caller sweeps verifications itself", err)
+	}
+
+	other, err := st.FindUserByID(ctx, bystander.ID)
+	wantNoErr(t, "FindUserByID(another user)", err)
+	if other.DeletedAt != nil || other.Email != bystander.Email {
+		t.Fatalf("another user reads back as %+v after MarkUserDeleted on a different id, want it untouched", other)
+	}
+}
+
+// checkMarkUserDeletedNormalizes asserts the anonymizedEmail argument goes
+// through [auth.NormalizeEmail] on the way in, exactly as
+// [auth.Store.UpdateUserEmail]'s does. Every other write path in this port
+// normalizes, and a scrubbed address stored raw would be one the store's own
+// FindUserByEmail could not resolve — and one a second anonymization
+// differing only in case could duplicate.
+func checkMarkUserDeletedNormalizes(t tb, st auth.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+	u := mustCreateUser(t, st, newUser(newEmail(), at))
+
+	scrubbed := newEmail()
+	wantNoErr(t, "MarkUserDeleted", st.MarkUserDeleted(ctx, u.ID, mixedCase(scrubbed), at.Add(time.Minute)))
+
+	got, err := st.FindUserByID(ctx, u.ID)
+	wantNoErr(t, "FindUserByID", err)
+	if got.Email != scrubbed {
+		t.Fatalf("Email = %q after MarkUserDeleted(%q), want the normalized %q", got.Email, mixedCase(scrubbed), scrubbed)
+	}
+	byEmail, err := st.FindUserByEmail(ctx, scrubbed)
+	wantNoErr(t, "FindUserByEmail(the normalized anonymized address)", err)
+	if byEmail.ID != u.ID {
+		t.Fatalf("FindUserByEmail(%q) returned id %q, want %q", scrubbed, byEmail.ID, u.ID)
+	}
+}
+
+// checkMarkUserDeletedFreesTheAddress asserts the two halves that make the
+// soft posture worth having at all: the ROW survives (so a deployment's own
+// foreign keys into the users table keep resolving), and the account's
+// ORIGINAL address becomes free — a new sign-up under it succeeds, and it no
+// longer resolves to the anonymized row.
+//
+// A store that stamped DeletedAt without moving the address off the row
+// would keep the address hostage forever, since [auth.UserBase.Email] is
+// unique across every user; a store that removed the row instead would have
+// implemented the hard posture under the soft one's name.
+func checkMarkUserDeletedFreesTheAddress(t tb, st auth.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+	u := mustCreateUser(t, st, newUser(newEmail(), at))
+	original := u.Email
+
+	wantNoErr(t, "MarkUserDeleted", st.MarkUserDeleted(ctx, u.ID, newEmail(), at.Add(time.Minute)))
+
+	if _, err := st.FindUserByID(ctx, u.ID); err != nil {
+		t.Fatalf("FindUserByID after MarkUserDeleted: %v — the row must SURVIVE; removing it is DeleteUser's posture, not this one", err)
+	}
+	if _, err := st.FindUserByEmail(ctx, original); !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("FindUserByEmail(the original address) error = %v, want ErrUserNotFound — the address must no longer resolve to the anonymized row", err)
+	}
+
+	reused := mustCreateUser(t, st, newUser(original, at.Add(2*time.Minute)))
+	if reused.ID == u.ID {
+		t.Fatalf("fixture error: the reusing account must be a different id than the anonymized one")
+	}
+	back, err := st.FindUserByEmail(ctx, original)
+	wantNoErr(t, "FindUserByEmail(the reused address)", err)
+	if back.ID != reused.ID {
+		t.Fatalf("the reused address resolves to id %q, want the new account %q", back.ID, reused.ID)
+	}
+}
+
+// checkMarkUserDeletedTaken asserts an anonymizedEmail a DIFFERENT user
+// already holds is refused with ErrEmailTaken — the same uniqueness
+// [auth.Store.UpdateUserEmail] enforces, on the same column — and that the
+// refused call wrote NOTHING: no stamp, no cleared credential, no scrub.
+//
+// A store that let the write through would put two rows on one address,
+// which [auth.UserBase.Email]'s own doc says makes every address-keyed
+// lookup in the package stop being well-defined. A store that stamped
+// DeletedAt anyway and only then failed would leave an account marked
+// unusable with its real address and live password still on it, which is
+// the very half-written state this method's MUST forbids.
+func checkMarkUserDeletedTaken(t tb, st auth.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+	held := mustCreateUser(t, st, newUser(newEmail(), at))
+	target := mustCreateUser(t, st, newUser(newEmail(), at))
+
+	err := st.MarkUserDeleted(ctx, target.ID, mixedCase(held.Email), at.Add(time.Minute))
+	wantErrIs(t, "MarkUserDeleted(a case variant of another user's address)", err, auth.ErrEmailTaken)
+
+	got, ferr := st.FindUserByID(ctx, target.ID)
+	wantNoErr(t, "FindUserByID", ferr)
+	if got.Email != target.Email {
+		t.Fatalf("Email = %q after an ErrEmailTaken, want the unchanged %q", got.Email, target.Email)
+	}
+	if got.PasswordHash != target.PasswordHash {
+		t.Fatalf("PasswordHash = %q after an ErrEmailTaken, want the unchanged %q — a refused anonymization must write nothing at all", got.PasswordHash, target.PasswordHash)
+	}
+	if got.DeletedAt != nil {
+		t.Fatalf("DeletedAt = %v after an ErrEmailTaken, want nil — a refused anonymization must not stamp the row", got.DeletedAt)
+	}
+	stillHeld, ferr := st.FindUserByEmail(ctx, held.Email)
+	wantNoErr(t, "FindUserByEmail(the contested address)", ferr)
+	if stillHeld.ID != held.ID {
+		t.Fatalf("the contested address resolves to id %q, want the original holder %q", stillHeld.ID, held.ID)
+	}
+}
+
+// checkMarkUserDeletedUnknownUser asserts an id no user holds is
+// ErrUserNotFound rather than a silent nil — the same shape every other
+// user-mutation method on this port uses, and what tells a caller
+// anonymizing an account that there was an account.
+func checkMarkUserDeletedUnknownUser(t tb, st auth.Store) {
+	t.Helper()
+	err := st.MarkUserDeleted(context.Background(), newID(), newEmail(), stamp())
+	wantErrIs(t, "MarkUserDeleted(unknown user)", err, auth.ErrUserNotFound)
 }

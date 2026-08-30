@@ -22,6 +22,7 @@ func concurrencyChecks() []check {
 		{"CreateUser/ConcurrentSameAddressAdmitsOneWinner", checkCreateUserOneWinner},
 		{"UpdateUserEmail/ConcurrentSameAddressAdmitsOneWinner", checkUpdateUserEmailOneWinner},
 		{"MarkEmailVerified/NeverCertifiesAnAddressBeingChangedAway", checkMarkEmailVerifiedRace},
+		{"MarkUserDeleted/NoCallerObservesAHalfAnonymizedRow", checkMarkUserDeletedAtomic},
 		{"CreateSuccessorSession/NeverSurvivesAConcurrentFamilyRevocation", checkSuccessorVersusRevocation},
 		{"DeleteSessionsByFamily/ConcurrentCallsOnOneFamilyAllSucceed", checkConcurrentFamilyRevocations},
 	}
@@ -438,5 +439,119 @@ func checkConcurrentFamilyRevocations(t tb, st auth.Store) {
 	wantNoErr(t, "ListSessionsByUser after the concurrent revocations", err)
 	if len(left) != 0 {
 		t.Fatalf("%d session(s) survived %d concurrent revocations of family %s, want 0", len(left), callers, familyID)
+	}
+}
+
+// halfAnonymizedPollInterval is how long the reader in
+// [checkMarkUserDeletedAtomic] waits between two FindUserByID calls while
+// the anonymization it is watching runs.
+//
+// It exists so the reader neither spins hot nor blinks. A tight loop would
+// hammer a database-backed store with hundreds of SELECTs per round for no
+// extra coverage; a long one would step straight over the window it is
+// looking for. Fifty microseconds puts roughly a hundred reads inside the
+// millisecond-scale window a split-write implementation leaves open (see
+// gap in negative_test.go, which is what this suite's own control uses),
+// while costing a compliant store — whose window is zero — one or two reads
+// per round.
+const halfAnonymizedPollInterval = 50 * time.Microsecond
+
+// checkMarkUserDeletedAtomic is [auth.Store.MarkUserDeleted]'s MUST, driven
+// the only way it can be observed from outside the port: a reader polling
+// the row while the anonymization runs.
+//
+// The method writes five fields — the scrubbed address, the cleared
+// PasswordHash, the cleared EmailVerifiedAt, the DeletedAt stamp and the
+// UpdatedAt stamp — and the MUST is that no caller ever sees SOME of them.
+// Two of the intermediate states are security-relevant in opposite
+// directions, and both are asserted against:
+//
+//   - STAMPED BUT NOT SCRUBBED: DeletedAt set while the row still holds the
+//     real address, or the live password hash, or the verification stamp.
+//     Every authentication entry point refuses such a row (that is what
+//     [auth.UserBase.DeletedAt] means), so the account is already unusable
+//     while its address is still hostage and its credential digest still
+//     stored — an account the user was told is anonymized, that is not.
+//   - SCRUBBED BUT NOT STAMPED: the address already moved to the anonymized
+//     value while DeletedAt is still nil. That row reports as a LIVE
+//     account, and it is one an attacker who can guess the anonymized
+//     address — it is derived from the user id, which is not secret — could
+//     drive a password reset against.
+//
+// Neither is reachable from any serial order of one MarkUserDeleted call
+// and one read: the call either has not happened yet (everything original)
+// or has (everything anonymized). Observing a mixture proves the write was
+// split, which is exactly what the MUST forbids.
+//
+// The reader stops as soon as the writer returns, so a compliant store —
+// one UPDATE, or one write under one lock — costs a round or two of reads
+// and can never fail this. What it does NOT do is force the split on a
+// subtly non-atomic backend: like every other race in this file, it proves
+// the check detects the interleaving when it occurs, and the window a real
+// split leaves open is the backend's to make wide or narrow.
+func checkMarkUserDeletedAtomic(t tb, st auth.Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	for round := 0; round < RaceRounds; round++ {
+		at := stamp()
+		u := mustCreateUser(t, st, newUser(newEmail(), at))
+		wantNoErr(t, "MarkEmailVerified", st.MarkEmailVerified(ctx, u.ID, u.Email, at))
+		scrubbed := newEmail()
+		when := at.Add(time.Minute)
+
+		var markErr, readErr error
+		var half string
+		done := make(chan struct{})
+
+		pair(round,
+			func() {
+				defer close(done)
+				markErr = st.MarkUserDeleted(ctx, u.ID, scrubbed, when)
+			},
+			func() {
+				for {
+					got, err := st.FindUserByID(ctx, u.ID)
+					switch {
+					case err != nil:
+						if readErr == nil {
+							readErr = err
+						}
+					case got.DeletedAt != nil && half == "":
+						switch {
+						case got.Email != scrubbed:
+							half = "DeletedAt is stamped but Email is still " + got.Email
+						case got.PasswordHash != "":
+							half = "DeletedAt is stamped but PasswordHash is still set"
+						case got.EmailVerifiedAt != nil:
+							half = "DeletedAt is stamped but EmailVerifiedAt is still set"
+						}
+					case got.DeletedAt == nil && got.Email == scrubbed && half == "":
+						half = "Email is already the anonymized " + scrubbed + " but DeletedAt is still nil, so the row reports as a LIVE account"
+					}
+					select {
+					case <-done:
+						return
+					default:
+					}
+					time.Sleep(halfAnonymizedPollInterval)
+				}
+			})
+
+		if markErr != nil {
+			t.Fatalf("round %d: MarkUserDeleted returned %v, want nil", round, markErr)
+		}
+		if readErr != nil {
+			t.Fatalf("round %d: FindUserByID returned %v while MarkUserDeleted was running, want nil — the row exists throughout; an anonymization must never make it unreadable, even briefly", round, readErr)
+		}
+		if half != "" {
+			t.Fatalf("round %d: a concurrent reader observed a HALF-anonymized row: %s. No serial order of one MarkUserDeleted and one read produces that — the five field writes were not applied as a single atomic step, which is what this method's MUST forbids", round, half)
+		}
+
+		got, err := st.FindUserByID(ctx, u.ID)
+		wantNoErr(t, "FindUserByID after the race", err)
+		if got.Email != scrubbed || got.PasswordHash != "" || got.EmailVerifiedAt != nil || got.DeletedAt == nil {
+			t.Fatalf("round %d: the row settled at %+v after a successful MarkUserDeleted, want it fully anonymized", round, got)
+		}
 	}
 }
