@@ -139,6 +139,7 @@ users
   password_hash
   created_at
   updated_at
+  deleted_at NULL
   UNIQUE [email] as users_email_key
   indexes: 0
 sessions
@@ -282,7 +283,7 @@ needed. See [addresses are normalized](/invitations/email-invites#addresses-are-
 Rows written by **v0.1.0**, which normalized nothing, may hold non-normalized
 addresses; the changelog carries the one-time migration.
 
-{/* verify:stdout "organizations\n  id PK\n  owner_id\n  created_at\n  updated_at\n  name\n  slug UNIQUE\n  indexes: 0\norganization_members\n  container_id\n  user_id\n  role_key\n  joined_at\n  PRIMARY KEY [container_id user_id]\n  indexes: 0\norganization_roles\n  id PK\n  container_id\n  key\n  name\n  permissions\n  created_at\n  UNIQUE [container_id key] as organization_roles_container_key\n  indexes: 0\nusers\n  id PK\n  email UNIQUE\n  email_verified_at NULL\n  password_hash\n  created_at\n  updated_at\n  UNIQUE [email] as users_email_key\n  indexes: 0\nsessions\n  id PK\n  user_id\n  token_hash\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  user_agent\n  ip\n  UNIQUE [token_hash] as sessions_token_hash\n  indexes: 1\nverifications\n  id PK\n  user_id\n  token_hash\n  purpose\n  email\n  expires_at\n  created_at\n  UNIQUE [token_hash] as verifications_token_hash\n  indexes: 1\norganization_invites\n  id PK\n  container_id\n  email\n  role_key\n  token_hash\n  invited_by\n  expires_at\n  created_at\n  UNIQUE [container_id email] as organization_invites_container_email\n  UNIQUE [token_hash] as organization_invites_token_hash\n  indexes: 0\norganization_invite_links\n  id PK\n  container_id\n  code\n  role_key\n  created_by\n  max_uses\n  use_count\n  expires_at NULL\n  revoked_at NULL\n  created_at\n  UNIQUE [code] as organization_invite_links_code\n  indexes: 0" */}
+{/* verify:stdout "organizations\n  id PK\n  owner_id\n  created_at\n  updated_at\n  name\n  slug UNIQUE\n  indexes: 0\norganization_members\n  container_id\n  user_id\n  role_key\n  joined_at\n  PRIMARY KEY [container_id user_id]\n  indexes: 0\norganization_roles\n  id PK\n  container_id\n  key\n  name\n  permissions\n  created_at\n  UNIQUE [container_id key] as organization_roles_container_key\n  indexes: 0\nusers\n  id PK\n  email UNIQUE\n  email_verified_at NULL\n  password_hash\n  created_at\n  updated_at\n  deleted_at NULL\n  UNIQUE [email] as users_email_key\n  indexes: 0\nsessions\n  id PK\n  user_id\n  token_hash\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  user_agent\n  ip\n  UNIQUE [token_hash] as sessions_token_hash\n  indexes: 1\nverifications\n  id PK\n  user_id\n  token_hash\n  purpose\n  email\n  expires_at\n  created_at\n  UNIQUE [token_hash] as verifications_token_hash\n  indexes: 1\norganization_invites\n  id PK\n  container_id\n  email\n  role_key\n  token_hash\n  invited_by\n  expires_at\n  created_at\n  UNIQUE [container_id email] as organization_invites_container_email\n  UNIQUE [token_hash] as organization_invites_token_hash\n  indexes: 0\norganization_invite_links\n  id PK\n  container_id\n  code\n  role_key\n  created_by\n  max_uses\n  use_count\n  expires_at NULL\n  revoked_at NULL\n  created_at\n  UNIQUE [code] as organization_invite_links_code\n  indexes: 0" */}
 
 ## Column types
 
@@ -291,9 +292,20 @@ holding a user id, since authlayer mints those too. See
 [Ids](/concepts/ids) for the options that retype them, and for the deployment
 failure that only shows up against a real database.
 
-Timestamps are `timestamptz`-shaped; the two nullable ones above
-(`email_verified_at`, `rotated_at`, plus a link's `expires_at` and `revoked_at`)
-are the only columns that may hold `NULL`.
+Timestamps are `timestamptz`-shaped; the three nullable ones above
+(`email_verified_at`, `deleted_at`, `rotated_at`, plus a link's `expires_at` and
+`revoked_at`) are the only columns that may hold `NULL`.
+
+`users.deleted_at` is the anonymization stamp — `NULL` on every ordinary
+account. It arrives on a **fresh** table only: `CreateSchema` self-heals a
+missing constraint or index, but a column lives inside the
+`CREATE TABLE IF NOT EXISTS` that no-ops against a table that already exists.
+A users table created by **v0.1.0** needs one hand-run migration before this
+store can write to it at all, since every `INSERT` names the column:
+
+```sql
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+```
 
 ## Owning these tables yourself
 
