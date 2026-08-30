@@ -321,6 +321,10 @@ type config struct {
 	// one a future refactor forgets to run through defaultConfig — carries
 	// the safe policy. See [LinkVerified]'s own doc.
 	linking Linking
+	// accountDeletionHook is the application's own pre-delete cleanup —
+	// see [WithAccountDeletionHook] and [Service.DeleteAccount], both in
+	// deletion.go. nil means no hook, which is the default.
+	accountDeletionHook func(ctx context.Context, userID string) error
 }
 
 func defaultConfig() config {
@@ -1183,7 +1187,14 @@ func (s *Service) mintSignupVerification(ctx context.Context, userID, email stri
 //  2. Look up email (normalized). A miss calls [password.Hasher.Dummy]
 //     with plainPassword — spending comparable bcrypt work to the
 //     wrong-password case below — and returns [ErrInvalidCredentials].
-//  3. An account with no password credential (PasswordHash == "" — see
+//  3. An ANONYMIZED account (a non-nil [UserBase.DeletedAt] — see
+//     [Service.AnonymizeAccount]) is likewise treated exactly like a lookup
+//     miss: Dummy, then ErrInvalidCredentials. It is checked HERE, before
+//     the password is looked at, because a stamped account may not be
+//     authenticated by any route whatever its credentials say; and it
+//     answers identically to cases 2 and 4 because anything else would tell
+//     an anonymous caller that this address once had an account.
+//  4. An account with no password credential (PasswordHash == "" — see
 //     [UserBase]'s doc for why that is a real, supported state, an
 //     OAuth-only account being the obvious example) is treated exactly
 //     like a lookup miss: Dummy, then ErrInvalidCredentials. Falling
@@ -1193,16 +1204,16 @@ func (s *Service) mintSignupVerification(ctx context.Context, userID, email stri
 //     exact timing gap Dummy exists to close, this time distinguishing
 //     "exists, no password" from "exists, wrong password" instead of
 //     "exists" from "doesn't".
-//  4. Verify the password. A mismatch is [ErrInvalidCredentials] — the
-//     same sentinel as cases 2 and 3, deliberately: a caller cannot tell
-//     "no such account", "account has no password", and "wrong password"
-//     apart from the error alone.
-//  5. Only once credentials are proven does this check
+//  5. Verify the password. A mismatch is [ErrInvalidCredentials] — the
+//     same sentinel as cases 2, 3 and 4, deliberately: a caller cannot
+//     tell "no such account", "account is anonymized", "account has no
+//     password", and "wrong password" apart from the error alone.
+//  6. Only once credentials are proven does this check
 //     [WithRequireVerifiedEmail]: an unverified account fails with
 //     [ErrEmailNotVerified] here, never earlier, so a caller who does not
 //     already know the password cannot use the verified-or-not distinction
 //     as its own enumeration channel.
-//  6. Only once every check above has passed does this touch the Store
+//  7. Only once every check above has passed does this touch the Store
 //     with a write ([Store.CreateSession]) — and even that is ordered
 //     LAST, after [token.Issue] has already succeeded (see mintSession,
 //     the minting tail this method and [Service.SignInWith] share): a
@@ -1241,6 +1252,17 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 		return zero, ErrInvalidCredentials
 	case err != nil:
 		return zero, err
+	}
+
+	// An ANONYMIZED account is treated exactly like a lookup miss — Dummy,
+	// then ErrInvalidCredentials — so neither the error nor the cost tells
+	// an anonymous caller that this address once had an account. See
+	// [Service.AnonymizeAccount], "Every entry point that refuses a stamped
+	// account"; this check is deliberately its own rather than one shared
+	// guard several paths reach.
+	if u.DeletedAt != nil {
+		s.cfg.hasher.Dummy(plainPassword)
+		return zero, ErrInvalidCredentials
 	}
 
 	if u.PasswordHash == "" {
@@ -1325,9 +1347,9 @@ func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent str
 	if s.cfg.claimsExtender != nil {
 		extra = s.cfg.claimsExtender(u)
 	}
-	// Issued BEFORE CreateSession, deliberately — see [Service.Login]'s
-	// "Order of checks" point 6: a bad signing key must fail before any
-	// Session row exists to be orphaned.
+	// Issued BEFORE CreateSession, deliberately — see "Order of checks"
+	// point 7 above: a bad signing key must fail before any Session row
+	// exists to be orphaned.
 	accessToken, err := token.Issue(token.Claims{
 		Subject:   u.ID,
 		SessionID: sessionID,
@@ -1466,6 +1488,16 @@ func (s *Service) VerifyAccessToken(raw string) (token.Claims, error) {
 // email address, a verification stamp and two timestamps — but an email
 // address handed to the wrong caller is still a disclosure, and the id
 // itself is what every other method in this package authorizes on.
+//
+// It does NOT refuse an ANONYMIZED account, deliberately, and is the one
+// account-reading method that does not — see [Service.AnonymizeAccount],
+// "What deliberately keeps working". Reading the stamped row is how an
+// application discovers that the account is anonymized at all: the record
+// this returns carries [UserBase.DeletedAt], and testing it is what a
+// per-request SessionID ("sid") check is supposed to do. Refusing here
+// would remove the only signal and leave a caller unable to distinguish an
+// anonymized account from a Store outage. A caller that wants "live
+// accounts only" tests DeletedAt itself, on the record it just got.
 func (s *Service) User(ctx context.Context, userID string) (UserBase, error) {
 	u, err := s.store.FindUserByID(ctx, userID)
 	if err != nil {
@@ -1534,7 +1566,13 @@ func (s *Service) PurgeExpired(ctx context.Context, before time.Time) (int, erro
 // [PurposePasswordReset] is [ErrVerificationPurpose] — this method does not
 // redeem that purpose ([Service.ResetPassword] does) — checked
 // before the claim too, so presenting the wrong kind of token here does not
-// burn it.
+// burn it. A token whose account has been ANONYMIZED (a non-nil
+// [UserBase.DeletedAt]) is [ErrUserNotFound], likewise before the claim:
+// redeeming an "email_change" here would call [Store.UpdateUserEmail] and
+// put a real, verified address back onto a scrubbed row. See
+// [Service.AnonymizeAccount], "Every entry point that refuses a stamped
+// account", for why that check is here even though anonymization already
+// deletes every pending verification.
 //
 // # Ordering, and why it is not negotiable
 //
@@ -1639,6 +1677,22 @@ func (s *Service) VerifyEmail(ctx context.Context, plainToken string) (UserBase,
 		return zero, ErrVerificationPurpose
 	}
 
+	// An ANONYMIZED account may not be verified into. This is the refusal
+	// with the sharpest consequence of the whole sweep: an "email_change"
+	// redemption calls [Store.UpdateUserEmail], which would move a real,
+	// VERIFIED address back onto a stamped row — undoing the scrub and
+	// taking that address out of circulation again — and a "signup"
+	// redemption would certify the undeliverable scrubbed address itself.
+	// [Service.AnonymizeAccount] deletes every verification before it
+	// stamps, so this is defence in depth; it is checked BEFORE the claim
+	// below so a call that cannot succeed does not burn the token. See that
+	// method's "Every entry point that refuses a stamped account".
+	if holder, herr := s.store.FindUserByID(ctx, v.UserID); herr != nil {
+		return zero, herr
+	} else if holder.DeletedAt != nil {
+		return zero, ErrUserNotFound
+	}
+
 	// The claim: exactly one caller ever sees a nil error for this id — see
 	// the method doc's "Ordering, and why" section.
 	if err := s.store.DeleteVerification(ctx, v.ID); err != nil {
@@ -1714,7 +1768,12 @@ func (s *Service) VerifyEmail(ctx context.Context, plainToken string) (UserBase,
 //     opaque refresh token (in the SAME FamilyID as the rotated session, so
 //     the chain still traces back to one login) and a fresh access token.
 //     THIS IS THE PROPERTY THE WHOLE METHOD EXISTS TO ENFORCE — see the
-//     next section for why.
+//     next section for why. The account itself is loaded here, and two
+//     states of it stop the rotation dead: a user row that is GONE (the
+//     [Store.FindUserByID] miss propagates as [ErrUserNotFound]) and one
+//     that is ANONYMIZED (a non-nil [UserBase.DeletedAt] — the same
+//     ErrUserNotFound; see [Service.AnonymizeAccount]). In both the
+//     presented token was genuine, won step 3, and still buys nothing.
 //  5. [Store.CreateSuccessorSession] persists the new Session row — but
 //     ONLY if the predecessor rotated in step 3 still exists AT THIS
 //     INSTANT. ok=false here means a DIFFERENT caller's own reuse response
@@ -1898,6 +1957,17 @@ func (s *Service) Refresh(ctx context.Context, refreshPlain string) (LoginResult
 	u, err := s.store.FindUserByID(ctx, rotated.UserID)
 	if err != nil {
 		return zero, err
+	}
+	// An ANONYMIZED account mints nothing, however valid the token was.
+	// AnonymizeAccount revokes every session before it stamps, so reaching
+	// this with a stamped user means the row was stamped by some other
+	// route; either way a rotation must not hand back a live session for an
+	// account no one may authenticate as. ErrUserNotFound, matching what
+	// this same load already returns for a row that is genuinely gone — see
+	// [Service.AnonymizeAccount], "Every entry point that refuses a stamped
+	// account".
+	if u.DeletedAt != nil {
+		return zero, ErrUserNotFound
 	}
 	u.PasswordHash = ""
 
@@ -2428,24 +2498,29 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //
 //  1. [Store.FindUserByID] loads the account; ErrUserNotFound propagates
 //     as-is.
-//  2. An account with no password credential (PasswordHash == "" — see
+//  2. An ANONYMIZED account (a non-nil [UserBase.DeletedAt] — see
+//     [Service.AnonymizeAccount]) is refused with the same ErrUserNotFound,
+//     before the credential is even looked at: there is no password on such
+//     an account to change, and arming a working one would hand the account
+//     back to whoever asked.
+//  3. An account with no password credential (PasswordHash == "" — see
 //     [UserBase]'s doc) is treated like a lookup miss: [password.Hasher.Dummy]
 //     runs (comparable-cost hygiene, mirroring [Service.Login]'s identical
 //     stance on its own no-credential case — see that method's doc), then
 //     [ErrInvalidCredentials].
-//  3. current is checked against the stored hash via [password.Hasher.Verify].
+//  4. current is checked against the stored hash via [password.Hasher.Verify].
 //     A mismatch is ErrInvalidCredentials — nothing is written, and next is
 //     never even validated, so a caller who does not know the current
 //     password learns nothing about next's own validity either.
-//  4. next is validated against the configured [password.Rules];
+//  5. next is validated against the configured [password.Rules];
 //     [ErrWeakPassword] on failure.
-//  5. next is hashed and persisted via [Store.UpdateUserPassword].
-//  6. Every outstanding "password_reset", "email_change" AND "magic_link"
+//  6. next is hashed and persisted via [Store.UpdateUserPassword].
+//  7. Every outstanding "password_reset", "email_change" AND "magic_link"
 //     [Verification] for this account is invalidated, via three
 //     [Store.DeleteVerificationsByUserAndPurpose] calls — one per purpose,
 //     all fail-closed. See "The sweep matrix" and "Why these purposes, and
 //     what the sweep does not cover" below.
-//  7. Every session NOT sharing currentSessionID's family is revoked via
+//  8. Every session NOT sharing currentSessionID's family is revoked via
 //     [Store.DeleteSessionsByFamily], one call per distinct OTHER family —
 //     the same "list, then delete per distinct family" shape
 //     [Service.LogoutAll] uses, so a rotated-but-unexpired predecessor row
@@ -2550,6 +2625,15 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 	u, err := s.store.FindUserByID(ctx, userID)
 	if err != nil {
 		return err
+	}
+	// An ANONYMIZED account has no password to change and must not be given
+	// one: arming a working credential on a stamped row would hand the
+	// account back. Refused before the credential check, and with the same
+	// ErrUserNotFound the load above returns for a row that is gone — see
+	// [Service.AnonymizeAccount], "Every entry point that refuses a stamped
+	// account".
+	if u.DeletedAt != nil {
+		return ErrUserNotFound
 	}
 
 	if u.PasswordHash == "" {
@@ -2721,7 +2805,15 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 //  4. Never an error purely for an unknown address: confirmed structurally
 //     above — the ErrUserNotFound branch falls straight through to the
 //     same return every other "deny" path in this method uses, ("", false,
-//     nil), never propagated as ErrUserNotFound or anything else.
+//     nil), never propagated as ErrUserNotFound or anything else. An
+//     ANONYMIZED account (a non-nil [UserBase.DeletedAt] — see
+//     [Service.AnonymizeAccount]) is folded into that SAME branch rather
+//     than given a refusal of its own, which is why no new error appears
+//     in this method's set: a distinguishable answer there would tell an
+//     anonymous caller that this address once had an account, which is
+//     precisely the fact everything else in this method exists to withhold.
+//     It takes the branch before point 1's two branch-exclusive writes, so
+//     it costs the same as an unknown address as well as reading the same.
 //
 //  5. Timing is the channel that remains, and it is measured, not merely
 //     theoretical. The harness that measures it is in the tree —
@@ -2839,6 +2931,16 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 		return "", false, err
 	}
 	known := err == nil
+	// An ANONYMIZED account is not a known address: it takes the SAME
+	// branch an unknown one takes, with the same calls and the same
+	// ("", false, nil), rather than a new error. A distinguishable refusal
+	// here would be exactly the enumeration oracle this method's whole
+	// shape exists to close — see [Service.AnonymizeAccount], "Every entry
+	// point that refuses a stamped account". u is the zero UserBase when
+	// the lookup missed, so this is only ever consulted on the known path.
+	if known && u.DeletedAt != nil {
+		known = false
+	}
 
 	// Identical on every call, whether or not its result is ever used — see
 	// the method doc's "The enumeration property, again", point 1.
@@ -2913,6 +3015,11 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 // token — the same reasoning VerifyEmail applies to its own pre-claim
 // checks, extended one step further because this method, unlike
 // VerifyEmail, has a "the new value might itself be invalid" step at all.
+// A token whose account has been ANONYMIZED (a non-nil
+// [UserBase.DeletedAt]) is [ErrUserNotFound], also before the claim, and
+// before the hashing: no working password may be set on an account no one
+// may authenticate as. See [Service.AnonymizeAccount], "Every entry point
+// that refuses a stamped account".
 //
 // # Ordering, and why it is not negotiable
 //
@@ -3129,6 +3236,23 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 		return ErrVerificationPurpose
 	}
 
+	// An ANONYMIZED account may not have a working password set on it,
+	// however valid the token. This costs one read on every reset, and it
+	// buys defence in depth rather than a reachable hole:
+	// [Service.AnonymizeAccount] deletes every verification before it
+	// stamps, so a token for a stamped account can only come from a route
+	// this package does not own — but "cannot be reached today" is not a
+	// property to build on, and the failure if it were reached is a live
+	// credential on a closed account. Refused BEFORE the claim below, so
+	// the token is not burned by a call that was never going to succeed.
+	// See [Service.AnonymizeAccount], "Every entry point that refuses a
+	// stamped account".
+	if holder, herr := s.store.FindUserByID(ctx, v.UserID); herr != nil {
+		return herr
+	} else if holder.DeletedAt != nil {
+		return ErrUserNotFound
+	}
+
 	if failed := password.Validate(next, s.cfg.rules); len(failed) > 0 {
 		return fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
 	}
@@ -3248,7 +3372,12 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 //  1. [Store.FindUserByID] loads userID; ErrUserNotFound propagates as-is
 //     rather than being folded into some enumeration-safe shape — an
 //     invalid userID here is a caller bug (a stale or forged id), not an
-//     anonymous probe.
+//     anonymous probe. An ANONYMIZED account (a non-nil
+//     [UserBase.DeletedAt] — see [Service.AnonymizeAccount]) is refused
+//     with the same ErrUserNotFound, before the credential check: this
+//     method ARMS an identifier rotation, and redeeming what it mints
+//     would call [Store.UpdateUserEmail] and put a real, deliverable
+//     address back onto a scrubbed row.
 //  2. current is checked against the stored hash, with the SAME timing
 //     discipline [Service.ChangePassword] and [Service.Login] apply to
 //     their own: an account holding no password credential at all
@@ -3306,6 +3435,15 @@ func (s *Service) RequestEmailChange(ctx context.Context, userID, current, newEm
 	u, err := s.store.FindUserByID(ctx, userID)
 	if err != nil {
 		return "", err
+	}
+	// An ANONYMIZED account may not arm an identifier rotation: redeeming
+	// the token this would mint calls [Store.UpdateUserEmail], which would
+	// move a real, deliverable address back onto a stamped row — undoing
+	// the scrub and taking that address out of circulation again. See
+	// [Service.AnonymizeAccount], "Every entry point that refuses a stamped
+	// account".
+	if u.DeletedAt != nil {
+		return "", ErrUserNotFound
 	}
 
 	// The credential gate, before anything else this method could report —

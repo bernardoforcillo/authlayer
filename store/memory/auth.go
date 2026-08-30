@@ -232,6 +232,66 @@ func (s *AuthStore) UpdateUserEmail(_ context.Context, userID, email string, now
 	return nil
 }
 
+// MarkUserDeleted anonymizes the user in place — under ONE acquisition of
+// mu spanning the not-found check, the uniqueness check against every
+// *other* user, and all five field writes: Email becomes the normalized
+// anonymizedEmail (see [auth.NormalizeEmail]), PasswordHash is cleared,
+// EmailVerifiedAt is cleared to nil, and DeletedAt and UpdatedAt are both
+// stamped with now. Returns auth.ErrUserNotFound when userID matches no
+// row, or auth.ErrEmailTaken when a different user already holds the
+// normalized address; on either, nothing is written.
+//
+// The single lock is what satisfies [auth.Store.MarkUserDeleted]'s
+// atomicity MUST. Every field is written on one local copy of the record
+// and that copy is assigned back to the map in one statement, so no
+// concurrent FindUserByID can observe a row stamped but still holding its
+// real address, nor one scrubbed but unstamped — see that method's doc for
+// why each of those halves is a security bug rather than an untidy
+// intermediate state.
+//
+// The uniqueness scan excludes userID's own row, matching
+// [AuthStore.UpdateUserEmail]. Sessions and verifications belonging to the
+// user are left exactly where they are: this writes the user row only, and
+// the caller sweeps those itself, before calling.
+func (s *AuthStore) MarkUserDeleted(_ context.Context, userID, anonymizedEmail string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return auth.ErrUserNotFound
+	}
+	anonymizedEmail = auth.NormalizeEmail(anonymizedEmail)
+	for otherID, other := range s.users {
+		if otherID != userID && other.Email == anonymizedEmail {
+			return auth.ErrEmailTaken
+		}
+	}
+	u.Email = anonymizedEmail
+	u.PasswordHash = ""
+	u.EmailVerifiedAt = nil
+	u.DeletedAt = &now
+	u.UpdatedAt = now
+	s.users[userID] = u
+	return nil
+}
+
+// DeleteUser removes the user row and nothing else, or returns
+// auth.ErrUserNotFound when userID matches no row. Sessions and
+// verifications belonging to that user are left exactly where they are:
+// this store declares no cascade of its own, matching
+// [auth.Store.DeleteUser]'s "the user row ONLY" — the caller sweeps those
+// with [AuthStore.DeleteSessionsByUser] and
+// [AuthStore.DeleteVerificationsByUser], in the order it chooses.
+func (s *AuthStore) DeleteUser(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.users[userID]; !ok {
+		return auth.ErrUserNotFound
+	}
+	delete(s.users, userID)
+	return nil
+}
+
 // --- Sessions ---
 
 // CreateSession stores the session under its ID and returns it unchanged, or
@@ -313,6 +373,31 @@ func (s *AuthStore) DeleteSessionsByFamily(_ context.Context, familyID string) e
 	defer s.mu.Unlock()
 	for id, sess := range s.sessions {
 		if sess.FamilyID == familyID {
+			delete(s.sessions, id)
+		}
+	}
+	return nil
+}
+
+// DeleteSessionsByUser removes every session belonging to userID, across
+// every family. Deleting zero rows is not an error.
+//
+// It is one scan under one acquisition of mu, not a loop over
+// [AuthStore.DeleteSessionsByFamily] — which the port permits and prefers
+// (see [auth.Store.DeleteSessionsByUser]) — and the two re-snapshot and
+// serialization obligations that port doc inherits from
+// DeleteSessionsByFamily are satisfied here the same way every other method
+// in this store satisfies its own: mu is held for the whole body, so no
+// concurrent [AuthStore.CreateSuccessorSession] can insert a successor
+// part-way through the sweep, and two concurrent calls on one user cannot
+// interleave at all, let alone deadlock. Those obligations bind a backend
+// that takes row-level locks; this one has nothing to re-snapshot because it
+// never releases the lock to wait.
+func (s *AuthStore) DeleteSessionsByUser(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, sess := range s.sessions {
+		if sess.UserID == userID {
 			delete(s.sessions, id)
 		}
 	}
@@ -448,6 +533,23 @@ func (s *AuthStore) DeleteVerificationsByUserAndPurpose(_ context.Context, userI
 	defer s.mu.Unlock()
 	for id, v := range s.verifications {
 		if v.UserID == userID && v.Purpose == purpose {
+			delete(s.verifications, id)
+		}
+	}
+	return nil
+}
+
+// DeleteVerificationsByUser removes every verification belonging to userID,
+// of every purpose. Deleting zero rows is not an error.
+//
+// The filter is on UserID alone — never on UserID and a set of purposes this
+// store knows about — as [auth.Store.DeleteVerificationsByUser] requires: a
+// purpose a later flow introduces must not need a change here to be swept.
+func (s *AuthStore) DeleteVerificationsByUser(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, v := range s.verifications {
+		if v.UserID == userID {
 			delete(s.verifications, id)
 		}
 	}

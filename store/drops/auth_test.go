@@ -466,6 +466,51 @@ func TestUpdateUserEmailNotFound(t *testing.T) {
 	}
 }
 
+// TestMarkUserDeletedIsOneUpdateSettingEveryField pins the mechanism behind
+// [auth.Store.MarkUserDeleted]'s atomicity MUST at the SQL level: ONE
+// statement carrying all five column writes. Two statements would satisfy
+// every field assertion authtest's sequential checks make while leaving open
+// the window that method's doc says must not exist.
+func TestMarkUserDeletedIsOneUpdateSettingEveryField(t *testing.T) {
+	fd := &fakeDriver{affected: 1}
+	st := newAuthStore(fd)
+	if err := st.MarkUserDeleted(context.Background(), "user1", "  Deleted-User1@Example.INVALID  ", time.Now()); err != nil {
+		t.Fatalf("MarkUserDeleted: %v", err)
+	}
+	if len(fd.execs) != 1 {
+		t.Fatalf("MarkUserDeleted issued %d statements, want exactly 1 — the five field writes MUST land together: %q", len(fd.execs), fd.execs)
+	}
+	sql := fd.execs[0]
+	for _, want := range []string{
+		`"email" = $`,
+		`"password_hash" = $`,
+		`"email_verified_at" = NULL`,
+		`"deleted_at" = $`,
+		`"updated_at" = $`,
+		`"id" = $`,
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("the UPDATE is missing %s: %q", want, sql)
+		}
+	}
+}
+
+func TestMarkUserDeletedMapsUniqueViolationToEmailTaken(t *testing.T) {
+	st := newAuthStore(&fakeDriver{execErr: pg.ErrUniqueViolation})
+	err := st.MarkUserDeleted(context.Background(), "user1", "taken@example.com", time.Now())
+	if !errors.Is(err, auth.ErrEmailTaken) {
+		t.Fatalf("err = %v, want ErrEmailTaken", err)
+	}
+}
+
+func TestMarkUserDeletedNotFound(t *testing.T) {
+	st := newAuthStore(&fakeDriver{affected: 0})
+	err := st.MarkUserDeleted(context.Background(), "nonesuch", "deleted-nonesuch@example.invalid", time.Now())
+	if !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("err = %v, want ErrUserNotFound", err)
+	}
+}
+
 // ── Sessions ─────────────────────────────────────────────────────────────
 
 func TestCreateSessionInsertsStampedSession(t *testing.T) {

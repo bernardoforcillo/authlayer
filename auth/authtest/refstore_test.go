@@ -144,6 +144,36 @@ func (s *refStore) UpdateUserEmail(_ context.Context, userID, email string, now 
 	return nil
 }
 
+func (s *refStore) MarkUserDeleted(_ context.Context, userID, anonymizedEmail string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return auth.ErrUserNotFound
+	}
+	anonymizedEmail = auth.NormalizeEmail(anonymizedEmail)
+	if s.emailHeldBy(anonymizedEmail, userID) {
+		return auth.ErrEmailTaken
+	}
+	u.Email = anonymizedEmail
+	u.PasswordHash = ""
+	u.EmailVerifiedAt = nil
+	u.DeletedAt = &now
+	u.UpdatedAt = now
+	s.users[userID] = u
+	return nil
+}
+
+func (s *refStore) DeleteUser(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.users[userID]; !ok {
+		return auth.ErrUserNotFound
+	}
+	delete(s.users, userID)
+	return nil
+}
+
 func (s *refStore) CreateSession(_ context.Context, sess auth.Session) (auth.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -195,6 +225,17 @@ func (s *refStore) DeleteSessionsByFamily(_ context.Context, familyID string) er
 	defer s.mu.Unlock()
 	for id, sess := range s.sessions {
 		if sess.FamilyID == familyID {
+			delete(s.sessions, id)
+		}
+	}
+	return nil
+}
+
+func (s *refStore) DeleteSessionsByUser(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, sess := range s.sessions {
+		if sess.UserID == userID {
 			delete(s.sessions, id)
 		}
 	}
@@ -276,6 +317,17 @@ func (s *refStore) DeleteVerificationsByUserAndPurpose(_ context.Context, userID
 	defer s.mu.Unlock()
 	for id, v := range s.verifications {
 		if v.UserID == userID && v.Purpose == purpose {
+			delete(s.verifications, id)
+		}
+	}
+	return nil
+}
+
+func (s *refStore) DeleteVerificationsByUser(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, v := range s.verifications {
+		if v.UserID == userID {
 			delete(s.verifications, id)
 		}
 	}

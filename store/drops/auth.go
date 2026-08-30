@@ -94,7 +94,7 @@ func WithAuthTextLibraryIDs() AuthOption {
 // columns:
 //
 //	<users>          id PK, email, email_verified_at, password_hash,
-//	                 created_at, updated_at, UNIQUE (email)
+//	                 created_at, updated_at, deleted_at, UNIQUE (email)
 //	<sessions>       id PK, user_id, token_hash, family_id, expires_at,
 //	                 created_at, rotated_at, user_agent, ip,
 //	                 UNIQUE (token_hash), INDEX (family_id)
@@ -139,6 +139,27 @@ func WithAuthTextLibraryIDs() AuthOption {
 // from it would be consistent. That is why this store offers no equivalent of
 // [WithTextUserIDs] or [WithInviteTextUserIDs], and why the one id option it
 // does offer, [WithAuthTextLibraryIDs], moves all five columns together.
+//
+// users.deleted_at is nullable and carries no constraint or index — it is
+// [auth.UserBase.DeletedAt], the anonymization stamp. It arrives on a FRESH
+// table only. [AuthStore.CreateSchema] can self-heal a missing CONSTRAINT or
+// INDEX onto a pre-existing table, because ALTER TABLE ... ADD CONSTRAINT
+// and CREATE INDEX IF NOT EXISTS are statements it issues separately; it
+// cannot self-heal a missing COLUMN, because a column lives inside the
+// CREATE TABLE IF NOT EXISTS that no-ops away entirely against a table that
+// already exists. A users table created before this field existed therefore
+// needs one hand-run migration before this store can write to it at all —
+// every INSERT names deleted_at, and so does
+// [AuthStore.MarkUserDeleted]'s UPDATE, so the first CreateUser against an
+// unmigrated table fails with SQLSTATE 42703 (undefined_column) rather than
+// degrading quietly:
+//
+//	ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+//
+// (with the real table name if [WithAuthNames] moved it). timestamptz and
+// nullable, matching what [colSet] declares for a *time.Time field; no
+// DEFAULT, because NULL — not anonymized — is what every existing row
+// should hold. IF NOT EXISTS makes it re-runnable.
 //
 // [auth.UserBase], [auth.Session] and [auth.Verification] are fixed
 // shapes, unlike the generic scope Store, so unlike [Schema] this type is
@@ -263,6 +284,16 @@ func (st *AuthStore) Schema() *AuthSchema { return st.s }
 // is already there, so production deployments that own these tables via
 // their own migrations should skip it. No foreign keys are declared between
 // the three tables, matching this codebase's other schemas.
+//
+// "Adds what is missing" stops at constraints and indexes. It does NOT add a
+// missing COLUMN: a column exists only inside CREATE TABLE IF NOT EXISTS,
+// which no-ops in full against a table that is already there. So a users
+// table created before users.deleted_at was declared needs the ALTER TABLE
+// [AuthSchema]'s doc gives, run by hand, before this store can insert into
+// it at all.
+// Running CreateSchema against such a table reports success while leaving
+// the column absent — there is nothing this method could return that would
+// say otherwise, since every statement it issued genuinely succeeded.
 func (st *AuthStore) CreateSchema(ctx context.Context) error {
 	for _, t := range []*pg.Table{st.s.Users, st.s.Sessions, st.s.Verifications} {
 		if _, err := st.db.ExecExpr(ctx, pg.CreateTableIfNotExists(t)); err != nil {
@@ -496,6 +527,83 @@ func (st *AuthStore) UpdateUserEmail(ctx context.Context, userID, email string, 
 	return affectedOrErr(res, nil, auth.ErrUserNotFound)
 }
 
+// MarkUserDeleted anonymizes the user row in place as ONE statement:
+//
+//	UPDATE <users> SET email = $1, password_hash = '', email_verified_at = NULL,
+//	                   deleted_at = $2, updated_at = $2
+//	 WHERE id = $3
+//
+// One UPDATE is what satisfies [auth.Store.MarkUserDeleted]'s atomicity
+// MUST, and it is the same mechanism [AuthStore.UpdateUserEmail] relies on
+// for its own: PostgreSQL applies every column of a SET under a single row
+// operation, so no concurrent reader can see a row stamped but still holding
+// its real address, nor one scrubbed but unstamped — the two half-written
+// states that method's doc explains are each a security bug in their own
+// right. Two UPDATEs would reintroduce both, however narrow the window.
+//
+// The address's uniqueness is likewise decided by the table's own
+// UNIQUE(email) index (see [AuthSchema]) rather than by a pre-check SELECT,
+// so a conflict arrives as pg.ErrUniqueViolation and is mapped to
+// auth.ErrEmailTaken with the whole statement rolled back — nothing partial
+// is left behind. Re-anonymizing a row to the address it already holds is
+// not a self-conflict: a UNIQUE index only rejects a value some OTHER row
+// holds.
+//
+// email_verified_at is bound to a typed nil *time.Time, which colSet.bind
+// renders as the NULL keyword (see columns.go); deleted_at is bound to
+// &now, the same non-nil *time.Time form [AuthStore.MarkEmailVerified] uses
+// for email_verified_at. Zero rows affected is auth.ErrUserNotFound —
+// unambiguous here, unlike MarkEmailVerified's, because id is the only
+// predicate.
+//
+// It touches the users table and nothing else. Sessions and verifications
+// are the caller's to sweep, first — see [AuthStore.DeleteUser]'s doc for
+// the same boundary on the hard posture.
+func (st *AuthStore) MarkUserDeleted(ctx context.Context, userID, anonymizedEmail string, now time.Time) error {
+	anonymizedEmail = auth.NormalizeEmail(anonymizedEmail)
+	res, err := st.db.Update(st.s.Users).
+		Set(
+			st.s.users.bind("email", anonymizedEmail),
+			st.s.users.bind("password_hash", ""),
+			st.s.users.bind("email_verified_at", (*time.Time)(nil)),
+			st.s.users.bind("deleted_at", &now),
+			st.s.users.bind("updated_at", now),
+		).
+		Where(st.s.users.eq("id", userID)).
+		Exec(ctx)
+	if err != nil {
+		if errors.Is(err, pg.ErrUniqueViolation) {
+			return auth.ErrEmailTaken
+		}
+		return err
+	}
+	return affectedOrErr(res, nil, auth.ErrUserNotFound)
+}
+
+// DeleteUser removes the user row by id, reporting auth.ErrUserNotFound when
+// no row matched.
+//
+// It is one DELETE against the users table and nothing else. No foreign key
+// ties sessions or verifications to it — this schema declares none between
+// its three tables, by the same choice every other schema in this codebase
+// makes — so there is no ON DELETE CASCADE here to fold the other two sweeps
+// into this call, which is exactly what [auth.Store.DeleteUser] requires:
+// the caller sequences [AuthStore.DeleteSessionsByUser] and
+// [AuthStore.DeleteVerificationsByUser] itself, and that sequence has to stay
+// visible.
+//
+// A deployment that owns these tables through its own migrations and HAS
+// declared ON DELETE CASCADE on them gets a different, non-conforming
+// behaviour from this same method — the rows go with the user, whatever
+// order the caller intended — which is worth knowing before adding the
+// constraint, not after.
+func (st *AuthStore) DeleteUser(ctx context.Context, userID string) error {
+	res, err := st.db.Delete(st.s.Users).
+		Where(st.s.users.eq("id", userID)).
+		Exec(ctx)
+	return affectedOrErr(res, err, auth.ErrUserNotFound)
+}
+
 // ── Sessions ────────────────────────────────────────────────────────────
 
 // CreateSession persists an already-stamped session and returns it
@@ -676,6 +784,97 @@ func (st *AuthStore) DeleteSessionsByFamily(ctx context.Context, familyID string
 		}
 		_, err := txdb.Delete(st.s.Sessions).
 			Where(st.s.sessions.eq("family_id", familyID)).
+			Exec(ctx)
+		return err
+	})
+}
+
+// DeleteSessionsByUser removes every session belonging to userID, across
+// every family. Deleting zero rows is not an error.
+//
+// It is ONE predicate over user_id covering every family at once — the shape
+// [auth.Store.DeleteSessionsByUser] prefers, because the alternative (list
+// the user's families, then revoke them one by one) leaves a window in which
+// a concurrent login mints a family the listing never saw.
+//
+// # It inherits DeleteSessionsByFamily's transaction, not its lock key
+//
+// The statements are the same three, in the same order and for the same
+// reasons [AuthStore.DeleteSessionsByFamily]'s own doc gives at length —
+// read that first; only what DIFFERS is repeated here:
+//
+//   - An advisory transaction lock, taken first. The key is
+//     hashtext(userID) under its own namespace, 'authlayer:sessions:user',
+//     rather than the family namespace: what has to be serialized here is
+//     two concurrent whole-user sweeps of the SAME user, whose unordered
+//     SELECT ... FOR UPDATE scans can otherwise acquire that user's row
+//     locks in opposite orders and deadlock each other — the identical
+//     lock-order inversion measured live for two concurrent family
+//     revocations (8 deadlocks in ~1320 contended rounds), reached over a
+//     wider row set.
+//   - SELECT id ... WHERE user_id = $1 FOR UPDATE, then DELETE ... WHERE
+//     user_id = $1, inside that same transaction. The DELETE is a second
+//     statement, so under READ COMMITTED it takes a fresh snapshot AFTER
+//     the SELECT's wait for any row lock a concurrent
+//     [AuthStore.CreateSuccessorSession] is holding — which is what catches
+//     a successor that transaction committed while this call was blocked. A
+//     single autocommit DELETE would take its only snapshot BEFORE that wait
+//     and leave the successor behind: a fully usable refresh token for an
+//     account being cleared out.
+//
+// Both statements filter on user_id, which carries no index of its own —
+// [NewAuthSchema] indexes sessions.family_id and nothing else on this table,
+// so they scan it, exactly as [AuthStore.ListSessionsByUser] has always
+// done. That is a cost per whole-account revocation, not per request; a
+// deployment large enough to feel it can add the index itself, and
+// [AuthStore.CreateSchema]'s CREATE INDEX IF NOT EXISTS would leave a
+// hand-added one alone.
+//
+// This method takes no FOREIGN KEY or cascade behaviour of its own and does
+// not touch the users table; see [AuthStore.DeleteUser].
+//
+// # The pairing this lock does NOT serialize
+//
+// A concurrent [AuthStore.DeleteSessionsByFamily] on a family belonging to
+// this same user is not excluded by the lock above, and cannot be: the two
+// methods serialize on different keys — one user, one family — and neither
+// key subsumes the other. Both then take unordered row locks over
+// overlapping rows, so a lock-order inversion between them remains possible,
+// and PostgreSQL resolves it by aborting one side with SQLSTATE 40P01, which
+// surfaces to that caller as a wrapped "deadlock detected".
+//
+// It is disclosed rather than closed because closing it costs more than it
+// saves and the failure lands in the safe direction. Closing it would mean
+// either serializing every session revocation in the deployment behind one
+// global key, or having this method acquire the advisory lock of each of the
+// user's families in a deterministic order first — which reintroduces the
+// stale enumeration the single user_id predicate exists to avoid. And when
+// this method is the loser, nothing has been removed: the transaction rolls
+// back whole, the caller sees an error, and an account-clearing sequence
+// that begins with this call has written nothing yet, so it aborts with the
+// account intact. That is the opposite of the family-revocation case the
+// per-family lock was added for, where a deadlocked revocation meant a
+// detected compromise going un-revoked and the family staying live.
+func (st *AuthStore) DeleteSessionsByUser(ctx context.Context, userID string) error {
+	return st.db.InTx(ctx, func(txdb *pg.DB) error {
+		if _, err := txdb.Exec(ctx,
+			"SELECT pg_advisory_xact_lock(hashtext('authlayer:sessions:user'), hashtext($1))",
+			userID); err != nil {
+			return err
+		}
+
+		var locked []struct {
+			ID string `drop:"id"`
+		}
+		if err := txdb.Select(st.s.sessions.col("id")).
+			From(st.s.Sessions).
+			Where(st.s.sessions.eq("user_id", userID)).
+			ForUpdate().
+			All(ctx, &locked); err != nil {
+			return err
+		}
+		_, err := txdb.Delete(st.s.Sessions).
+			Where(st.s.sessions.eq("user_id", userID)).
 			Exec(ctx)
 		return err
 	})
@@ -923,6 +1122,28 @@ func (st *AuthStore) DeleteVerification(ctx context.Context, id string) error {
 func (st *AuthStore) DeleteVerificationsByUserAndPurpose(ctx context.Context, userID, purpose string) error {
 	_, err := st.db.Delete(st.s.Verifications).
 		Where(st.s.verifications.eq("user_id", userID), st.s.verifications.eq("purpose", purpose)).
+		Exec(ctx)
+	return err
+}
+
+// DeleteVerificationsByUser removes every verification belonging to userID,
+// of every purpose. Deleting zero rows is not an error.
+//
+// The WHERE clause names user_id and nothing else. It is deliberately NOT a
+// fan-out over [AuthStore.DeleteVerificationsByUserAndPurpose] for the
+// purposes this codebase happens to define: [auth.Verification.Purpose] is
+// an open string, so a purpose introduced by a later flow — or by the
+// deployment itself — would survive a sweep built from a fixed list, and
+// what survives is a redeemable one-time credential.
+//
+// The verifications (user_id, purpose) index is usable by this predicate as
+// well as by [AuthStore.DeleteVerificationsByUserAndPurpose]'s, because
+// user_id LEADS it — the column order [NewAuthSchema] chose for its own
+// reasons, which happens to leave this wider sweep supported too. A
+// purpose-leading index would have left it nothing to use.
+func (st *AuthStore) DeleteVerificationsByUser(ctx context.Context, userID string) error {
+	_, err := st.db.Delete(st.s.Verifications).
+		Where(st.s.verifications.eq("user_id", userID)).
 		Exec(ctx)
 	return err
 }

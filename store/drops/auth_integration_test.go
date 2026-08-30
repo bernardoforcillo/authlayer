@@ -347,14 +347,19 @@ func TestAuthStoreCreateSchemaSelfHealsMissingEmailUniqueLive(t *testing.T) {
 	}
 	// A hand-built users table with every column CreateSchema expects, but
 	// deliberately missing UNIQUE(email) — simulating a table that predates
-	// the constraint.
+	// the constraint. deleted_at IS present here: what CreateSchema can heal
+	// onto an existing table is a constraint or an index, and that is what
+	// this test is about. A missing COLUMN it cannot heal, which is
+	// TestAuthStoreCreateSchemaCannotAddDeletedAtToAnExistingTableLive's
+	// subject rather than this one's.
 	if _, err := sqlDB.ExecContext(ctx, `CREATE TABLE users (
 		id uuid NOT NULL PRIMARY KEY,
 		email text NOT NULL,
 		email_verified_at timestamptz,
 		password_hash text NOT NULL,
 		created_at timestamptz NOT NULL,
-		updated_at timestamptz NOT NULL
+		updated_at timestamptz NOT NULL,
+		deleted_at timestamptz
 	)`); err != nil {
 		t.Fatal(err)
 	}
@@ -374,6 +379,136 @@ func TestAuthStoreCreateSchemaSelfHealsMissingEmailUniqueLive(t *testing.T) {
 	_, err := st.CreateUser(ctx, auth.UserBase{ID: uid.NewV7(), Email: "heal@example.com", CreatedAt: now, UpdatedAt: now})
 	if !errors.Is(err, auth.ErrEmailTaken) {
 		t.Fatalf("second CreateUser with the same email err = %v, want ErrEmailTaken — UNIQUE(email) did not self-heal onto the pre-existing table", err)
+	}
+}
+
+// TestAuthStoreCreateSchemaCannotAddDeletedAtToAnExistingTableLive is the
+// other half of the test above, and the reason users.deleted_at needs a
+// hand-run migration where UNIQUE(email) did not.
+//
+// CreateSchema self-heals a missing CONSTRAINT or INDEX because it issues
+// those as their own guarded statements. A COLUMN has no such statement: it
+// exists only inside CREATE TABLE IF NOT EXISTS, which no-ops in full
+// against a table that already exists. So a users table created by
+// authlayer v0.1.0 — before [auth.UserBase.DeletedAt] existed — does not
+// gain deleted_at from any number of CreateSchema calls, and since every
+// INSERT this store issues names the column, the very first CreateUser
+// against such a table fails outright.
+//
+// This test builds the exact v0.1.0 users table, proves CreateSchema
+// reports success while leaving the column absent, proves the failure that
+// follows is SQLSTATE 42703 (undefined_column) rather than anything
+// quieter, then runs the ALTER TABLE [dropsstore.AuthSchema]'s doc
+// prescribes and proves the store works afterwards — DeletedAt included,
+// round-tripping through the column the migration added. It is what makes
+// the migration statement in the changelog a tested claim rather than a
+// plausible one.
+func TestAuthStoreCreateSchemaCannotAddDeletedAtToAnExistingTableLive(t *testing.T) {
+	sqlDB, db := openLiveDB(t)
+	ctx := context.Background()
+
+	if _, err := sqlDB.ExecContext(ctx, `DROP TABLE IF EXISTS sessions, verifications, users CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	// The users table exactly as authlayer v0.1.0's own CreateSchema
+	// emitted it: UNIQUE(email) already there, no deleted_at.
+	if _, err := sqlDB.ExecContext(ctx, `CREATE TABLE users (
+		id uuid NOT NULL PRIMARY KEY,
+		email text NOT NULL UNIQUE,
+		email_verified_at timestamptz,
+		password_hash text NOT NULL,
+		created_at timestamptz NOT NULL,
+		updated_at timestamptz NOT NULL
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = sqlDB.ExecContext(context.Background(), `DROP TABLE IF EXISTS sessions, verifications, users CASCADE`)
+	})
+
+	st := dropsstore.NewAuthStore(db)
+	if err := st.CreateSchema(ctx); err != nil {
+		t.Fatalf("CreateSchema against a v0.1.0 users table: %v — it must still succeed; every statement it issues is idempotent", err)
+	}
+
+	hasDeletedAt := func() bool {
+		t.Helper()
+		var n int
+		if err := sqlDB.QueryRowContext(ctx,
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_name = 'users' AND column_name = 'deleted_at'`).Scan(&n); err != nil {
+			t.Fatalf("reading information_schema.columns: %v", err)
+		}
+		return n == 1
+	}
+	if hasDeletedAt() {
+		t.Fatalf("users.deleted_at exists after CreateSchema against a pre-existing table — CREATE TABLE IF NOT EXISTS cannot add a column, so this test's premise is wrong and the migration it documents may be unnecessary")
+	}
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	_, err := st.CreateUser(ctx, auth.UserBase{ID: uid.NewV7(), Email: "premigration@example.com", CreatedAt: now, UpdatedAt: now})
+	if err == nil {
+		t.Fatalf("CreateUser against an unmigrated v0.1.0 users table succeeded — every INSERT names deleted_at, so it cannot")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "42703" {
+		t.Fatalf("CreateUser against an unmigrated table err = %v, want SQLSTATE 42703 (undefined_column) — the failure must name the missing column, not something a reader would misdiagnose", err)
+	}
+
+	// The migration, verbatim as AuthSchema's doc gives it.
+	if _, err := sqlDB.ExecContext(ctx,
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at timestamptz`); err != nil {
+		t.Fatalf("the documented migration failed: %v", err)
+	}
+	if !hasDeletedAt() {
+		t.Fatalf("users.deleted_at still absent after the documented ALTER TABLE")
+	}
+
+	live, err := st.CreateUser(ctx, auth.UserBase{ID: uid.NewV7(), Email: "postmigration@example.com", CreatedAt: now, UpdatedAt: now})
+	if err != nil {
+		t.Fatalf("CreateUser after the migration: %v", err)
+	}
+	if live.DeletedAt != nil {
+		t.Fatalf("CreateUser returned DeletedAt = %v, want nil — the migration adds no DEFAULT, so an account is not anonymized by being migrated", live.DeletedAt)
+	}
+	reread, err := st.FindUserByID(ctx, live.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID after the migration: %v", err)
+	}
+	if reread.DeletedAt != nil {
+		t.Fatalf("FindUserByID returned DeletedAt = %v for a fresh account, want nil", reread.DeletedAt)
+	}
+
+	stamped := now.Add(time.Minute)
+	anon, err := st.CreateUser(ctx, auth.UserBase{
+		ID: uid.NewV7(), Email: "anon@example.com",
+		CreatedAt: now, UpdatedAt: now, DeletedAt: &stamped,
+	})
+	if err != nil {
+		t.Fatalf("CreateUser with DeletedAt set, after the migration: %v", err)
+	}
+	got, err := st.FindUserByID(ctx, anon.ID)
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if got.DeletedAt == nil || !got.DeletedAt.Equal(stamped) {
+		t.Fatalf("DeletedAt = %v after the migration, want %v — the migrated column must hold the stamp, not just exist", got.DeletedAt, stamped)
+	}
+
+	// A v0.1.0 row, inserted before the column existed, must read back as
+	// nil rather than as anything a caller could mistake for anonymized.
+	legacyID := uid.NewV7()
+	if _, err := sqlDB.ExecContext(ctx,
+		`INSERT INTO users (id, email, password_hash, created_at, updated_at)
+		 VALUES ($1, $2, '', $3, $3)`, legacyID, "legacy@example.com", now); err != nil {
+		t.Fatalf("inserting a legacy row: %v", err)
+	}
+	legacy, err := st.FindUserByID(ctx, legacyID)
+	if err != nil {
+		t.Fatalf("FindUserByID(a row that predates the column): %v", err)
+	}
+	if legacy.DeletedAt != nil {
+		t.Fatalf("a row that predates deleted_at reads back DeletedAt = %v, want nil — the migration must not mark existing accounts anonymized", legacy.DeletedAt)
 	}
 }
 

@@ -1,15 +1,19 @@
 // Package authtest is the executable contract for
 // [github.com/bernardoforcillo/authlayer/auth.Store].
 //
-// auth.Store is an eighteen-method port, and seven of those methods carry an
-// explicit MUST — normative requirements on the implementation, not on its
-// callers, several of which exist because violating them reopens a specific
-// security hole (an enumeration oracle at sign-up, a silently certified
-// address nobody proved control of, two successful rotations of one refresh
-// token, a revoked session family resurrected by the rotation that was
-// racing its revocation). Until this package existed those seven were
-// enforced by prose and by the two backends this repository happens to
-// ship. A third-party backend author had no way to check their work.
+// auth.Store is a twenty-two-method port, and eleven of those methods carry
+// an explicit MUST — normative requirements on the implementation, not on
+// its callers, several of which exist because violating them reopens a
+// specific security hole (an enumeration oracle at sign-up, a silently
+// certified address nobody proved control of, two successful rotations of one
+// refresh token, a revoked session family resurrected by the rotation that
+// was racing its revocation, a single live refresh token or one-time
+// credential outliving the sweep that was clearing an account out, an
+// anonymization observable half-done with the account's real address still
+// on the stamped row). Until this package
+// existed they were enforced by prose and by the two backends this
+// repository happens to ship. A third-party backend author had no way to
+// check their work.
 //
 // # Using it
 //
@@ -38,13 +42,14 @@
 // # What it checks, and what it deliberately does not
 //
 // Every check is named for the method and the obligation it exercises, and
-// the doc comment on each one states exactly what it asserts. Six checks are
-// races, because the obligations behind them are unreachable sequentially:
-// [auth.Store.MarkRotated]'s single-winner compare-and-set;
+// the doc comment on each one states exactly what it asserts. Seven checks
+// are races, because the obligations behind them are unreachable
+// sequentially: [auth.Store.MarkRotated]'s single-winner compare-and-set;
 // [auth.Store.CreateUser]'s and [auth.Store.UpdateUserEmail]'s
 // one-address-one-account atomicity, one check each; a
 // [auth.Store.MarkEmailVerified] racing the [auth.Store.UpdateUserEmail]
-// that moves the address out from under it; the
+// that moves the address out from under it; a reader watching
+// [auth.Store.MarkUserDeleted] for a row caught half-anonymized; the
 // [auth.Store.CreateSuccessorSession] versus
 // [auth.Store.DeleteSessionsByFamily] pair that must never leave a revoked
 // family alive; and concurrent [auth.Store.DeleteSessionsByFamily] calls on
