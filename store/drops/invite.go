@@ -183,9 +183,20 @@ func (st *InviteStore) CreateSchema(ctx context.Context) error {
 
 // ── EmailInvite ─────────────────────────────────────────────────────────────
 
-// CreateEmailInvite persists an already-stamped invite and returns it
-// unchanged, matching store/memory's contract.
+// CreateEmailInvite normalizes inv.Email (see [invite.NormalizeEmail]) and
+// persists the otherwise already-stamped invite, returning what was stored —
+// so the returned Email is the normalized form, not the spelling passed in.
+// Matching store/memory's contract.
+//
+// The normalization happens before the INSERT, which is what makes the
+// UNIQUE (container_id, email) constraint (see [InviteSchema]) a constraint
+// on a person rather than on a spelling: two casings of one address would
+// otherwise be two accepted rows, two live tokens, and a revocation that
+// leaves one of them redeemable. See [invite.EmailInvite], "Addresses are
+// normalized". The column stores only normalized values, so the constraint's
+// byte-exact comparison is the right one and needs no functional index.
 func (st *InviteStore) CreateEmailInvite(ctx context.Context, inv invite.EmailInvite) (invite.EmailInvite, error) {
+	inv.Email = invite.NormalizeEmail(inv.Email)
 	_, err := st.db.Insert(st.s.EmailInvites).Row(st.s.emailInvites.row(inv)...).Exec(ctx)
 	if err != nil {
 		return invite.EmailInvite{}, err
@@ -241,13 +252,24 @@ func (st *InviteStore) DeleteEmailInvite(ctx context.Context, id string) error {
 	return affectedOrErr(res, err, invite.ErrInviteNotFound)
 }
 
-// DeleteEmailInvitesFor removes every invite for (containerID, email).
-// Deleting zero rows is not an error — paired with the (container_id,
-// email) UNIQUE constraint (see [InviteSchema]), this is what makes an
-// ordinary re-invite replace rather than duplicate.
+// DeleteEmailInvitesFor normalizes email (see [invite.NormalizeEmail]) and
+// removes every invite for that (containerID, address). Deleting zero rows is
+// not an error — paired with the (container_id, email) UNIQUE constraint (see
+// [InviteSchema]), this is what makes an ordinary re-invite replace rather
+// than duplicate.
+//
+// Normalizing here is the read-side half of what
+// [InviteStore.CreateEmailInvite] does on the write side. The predicate stays
+// a plain equality — every stored address is already normalized, so there is
+// nothing for a lower(email) comparison to catch, and the constraint's index
+// stays usable.
+//
+// Rows written before v0.2.0 may hold a non-normalized address and are NOT
+// matched by this. See the v0.2.0 changelog entry for the one-time migration
+// that folds them.
 func (st *InviteStore) DeleteEmailInvitesFor(ctx context.Context, containerID, email string) error {
 	_, err := st.db.Delete(st.s.EmailInvites).
-		Where(st.s.emailInvites.eq("container_id", containerID), st.s.emailInvites.eq("email", email)).
+		Where(st.s.emailInvites.eq("container_id", containerID), st.s.emailInvites.eq("email", invite.NormalizeEmail(email))).
 		Exec(ctx)
 	return err
 }

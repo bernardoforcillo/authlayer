@@ -130,6 +130,7 @@ package invitetest
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -234,6 +235,13 @@ func newID() string { return uid.NewV7() }
 // they mean to. The unique part is a UUID, whose hyphens and hex digits are
 // all legal in a local part.
 func newEmail() string { return "invitetest-" + uid.NewV7() + "@example.test" }
+
+// mixedCase returns email with its case flipped and surrounding whitespace
+// added — a variant [invite.NormalizeEmail] collapses back to email, and
+// therefore one that must resolve to the same row on every path that writes
+// or matches an address. It is authtest's helper of the same name, for the
+// same obligation on the other half of the library.
+func mixedCase(email string) string { return "  " + strings.ToUpper(email) + "\t" }
 
 // newHash returns a token hash no other call will produce. The suite never
 // hashes anything — the port stores an already-computed hash and the

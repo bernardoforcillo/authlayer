@@ -87,6 +87,10 @@ func (s *refStore) codeTaken(code string) bool {
 func (s *refStore) CreateEmailInvite(_ context.Context, inv invite.EmailInvite) (invite.EmailInvite, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Normalized before the uniqueness check and the write, per
+	// [invite.EmailInvite]'s address-normalization MUST, so the pair check
+	// below constrains a person rather than a spelling.
+	inv.Email = invite.NormalizeEmail(inv.Email)
 	if s.tokenHashTaken(inv.TokenHash) {
 		return invite.EmailInvite{}, errDuplicateTokenHash
 	}
@@ -143,6 +147,9 @@ func (s *refStore) DeleteEmailInvite(_ context.Context, id string) error {
 func (s *refStore) DeleteEmailInvitesFor(_ context.Context, containerID, email string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The read-side half of the same MUST: stored addresses are normalized,
+	// so the one matched against them has to be.
+	email = invite.NormalizeEmail(email)
 	for id, inv := range s.emailInvites {
 		if inv.ContainerID == containerID && inv.Email == email {
 			delete(s.emailInvites, id)
