@@ -2318,7 +2318,7 @@ func TestLogoutAllInvalidatesOutstandingResetAndEmailChangeTokens(t *testing.T) 
 // ResetPassword's do. The double fails ONE purpose at a time, so the error
 // reaching the caller can only be that sweep propagating.
 func TestLogoutAllFailsClosedWhenASweepFails(t *testing.T) {
-	for _, purpose := range []string{auth.PurposePasswordReset, auth.PurposeEmailChange} {
+	for _, purpose := range []string{auth.PurposePasswordReset, auth.PurposeEmailChange, auth.PurposeMagicLink} {
 		t.Run(purpose, func(t *testing.T) {
 			store := &purposeSweepFailStore{AuthStore: memory.NewAuthStore(), failPurpose: purpose}
 			svc := auth.New(store,
@@ -5007,5 +5007,256 @@ func TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore(t *testing.T) {
 		if !strings.HasPrefix(sess.ID, "usr_readable_") {
 			t.Fatalf("session id = %q, want the configured generator's shape", sess.ID)
 		}
+	}
+}
+
+// ============================================================
+// The sweep matrix — one test per cell
+// ============================================================
+//
+// The table these tests pin, and which [auth.Service.ChangePassword]'s doc
+// states in full:
+//
+//	Remediation      password_reset  email_change  magic_link
+//	ChangePassword   swept           swept         swept
+//	ResetPassword    swept           swept         swept
+//	LogoutAll        swept           swept         swept
+//	Logout           not swept       not swept     not swept
+//	RevokeSession    not swept       not swept     not swept
+//	RedeemMagicLink  —               —             burns its own token
+//
+// The first two columns were already covered before magic links existed
+// (TestChangePasswordInvalidatesOutstandingResetToken,
+// TestChangePasswordInvalidatesOutstandingEmailChangeToken,
+// TestResetPasswordInvalidatesSiblingResetToken,
+// TestResetPasswordInvalidatesOutstandingEmailChangeToken,
+// TestLogoutAllInvalidatesOutstandingResetAndEmailChangeTokens,
+// TestLogoutAndRevokeSessionLeavePendingVerificationsAlone). The third
+// column is what follows, plus the RedeemMagicLink cell, which
+// TestRedeemMagicLinkTokenIsSingleUse and
+// TestRedeemMagicLinkBurnsOnlyItsOwnToken pin in magiclink_test.go.
+//
+// Milestone 2's worst Critical was this exact table filled in for only half
+// its purposes: "email_change" survived ChangePassword, ResetPassword and
+// LogoutAll, and redeeming one moved the account to the attacker's address.
+// A magic link is a stronger version of the same hazard — a LOGIN sitting
+// in a mailbox — so each cell gets its own test rather than trusting one
+// check to be reached three times.
+
+// TestChangePasswordInvalidatesOutstandingMagicLink is the
+// ChangePassword × magic_link cell. A password change is what a user does
+// on suspecting compromise; a pending magic link is a working sign-in for
+// whoever can read the mailbox, and mailbox access is the single most
+// common way an account is taken in the first place. Leaving one armed
+// would make the rotation cosmetic.
+func TestChangePasswordInvalidatesOutstandingMagicLink(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "sweep-change@example.com", validPassword)
+
+	magicTok, ok, err := svc.RequestMagicLink(ctx, "sweep-change@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestMagicLink: ok=%v err=%v", ok, err)
+	}
+
+	if err := svc.ChangePassword(ctx, user.ID, "", validPassword, "Changed-Valid-Pass31!"); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(magicTok)); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(magic link) after ChangePassword = %v, want ErrVerificationNotFound", ferr)
+	}
+	res, rerr := svc.RedeemMagicLink(ctx, magicTok, "9.9.9.9", "attacker")
+	if !errors.Is(rerr, auth.ErrVerificationNotFound) {
+		t.Fatalf("RedeemMagicLink after ChangePassword = %v, want ErrVerificationNotFound — a rotation that leaves a working sign-in armed is cosmetic", rerr)
+	}
+	if res.AccessToken != "" || res.RefreshToken != "" {
+		t.Fatalf("a swept magic link still yielded a session (%q/%q)", res.AccessToken, res.RefreshToken)
+	}
+}
+
+// TestChangePasswordFailsClosedWhenMagicLinkSweepFails proves the new sweep
+// is not fire-and-forget. The double fails ONLY the magic_link purpose, so
+// the two long-standing sweeps beside it still succeed and the error
+// reaching the caller can only be this one propagating.
+func TestChangePasswordFailsClosedWhenMagicLinkSweepFails(t *testing.T) {
+	store := &purposeSweepFailStore{AuthStore: memory.NewAuthStore(), failPurpose: auth.PurposeMagicLink}
+	svc := auth.New(store,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "sweep-change2@example.com", validPassword)
+
+	if err := svc.ChangePassword(ctx, user.ID, "", validPassword, "Changed-Valid-Pass32!"); !errors.Is(err, errWriteBoom) {
+		t.Fatalf("ChangePassword err = %v, want the store's own error — a failed magic_link sweep must not be swallowed", err)
+	}
+}
+
+// TestResetPasswordInvalidatesOutstandingMagicLink is the
+// ResetPassword × magic_link cell. A reset is reached precisely when the
+// user has lost control of something, and it revokes every session for
+// that reason; a magic link that outlived it would hand the account
+// straight back.
+func TestResetPasswordInvalidatesOutstandingMagicLink(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	mustSignUp(t, svc, "sweep-reset@example.com", validPassword)
+
+	magicTok, ok, err := svc.RequestMagicLink(ctx, "sweep-reset@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestMagicLink: ok=%v err=%v", ok, err)
+	}
+	resetTok, ok, err := svc.RequestPasswordReset(ctx, "sweep-reset@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+
+	if err := svc.ResetPassword(ctx, resetTok, "Reset-Valid-Pass33!"); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(magicTok)); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(magic link) after ResetPassword = %v, want ErrVerificationNotFound", ferr)
+	}
+	if _, rerr := svc.RedeemMagicLink(ctx, magicTok, "9.9.9.9", "attacker"); !errors.Is(rerr, auth.ErrVerificationNotFound) {
+		t.Fatalf("RedeemMagicLink after ResetPassword = %v, want ErrVerificationNotFound — the reset revoked every session; a live link would undo that immediately", rerr)
+	}
+}
+
+// TestResetPasswordFailsClosedWhenMagicLinkSweepFails: same argument as
+// ChangePassword's, for the other credential-rotation door.
+func TestResetPasswordFailsClosedWhenMagicLinkSweepFails(t *testing.T) {
+	inner := memory.NewAuthStore()
+	seed := auth.New(inner,
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	ctx := context.Background()
+	mustSignUp(t, seed, "sweep-reset2@example.com", validPassword)
+	resetTok, ok, err := seed.RequestPasswordReset(ctx, "sweep-reset2@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
+	}
+
+	svc := auth.New(&purposeSweepFailStore{AuthStore: inner, failPurpose: auth.PurposeMagicLink},
+		auth.WithHasher(password.Bcrypt(testCost)),
+		auth.WithJWT([][]byte{testSigningKey}, 15*time.Minute),
+	)
+	if err := svc.ResetPassword(ctx, resetTok, "Reset-Valid-Pass34!"); !errors.Is(err, errWriteBoom) {
+		t.Fatalf("ResetPassword err = %v, want the store's own error — a failed magic_link sweep must not be swallowed", err)
+	}
+}
+
+// TestLogoutAllInvalidatesOutstandingMagicLink is the
+// LogoutAll × magic_link cell. "Sign out everywhere" is the unambiguous
+// "something is wrong" control; a magic link surviving it is a device the
+// user believes they signed out that can walk straight back in.
+func TestLogoutAllInvalidatesOutstandingMagicLink(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	signup, err := svc.SignUp(ctx, "sweep-logoutall@example.com", validPassword)
+	if err != nil {
+		t.Fatalf("SignUp: %v", err)
+	}
+
+	magicTok, ok, err := svc.RequestMagicLink(ctx, "sweep-logoutall@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestMagicLink: ok=%v err=%v", ok, err)
+	}
+
+	if err := svc.LogoutAll(ctx, signup.User.ID); err != nil {
+		t.Fatalf("LogoutAll: %v", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(magicTok)); !errors.Is(ferr, auth.ErrVerificationNotFound) {
+		t.Fatalf("FindVerificationByHash(magic link) after LogoutAll = %v, want ErrVerificationNotFound", ferr)
+	}
+	if _, rerr := svc.RedeemMagicLink(ctx, magicTok, "9.9.9.9", "attacker"); !errors.Is(rerr, auth.ErrVerificationNotFound) {
+		t.Fatalf("RedeemMagicLink after LogoutAll = %v, want ErrVerificationNotFound", rerr)
+	}
+
+	// Still purpose-scoped: the signup token grants nothing over the
+	// credential and must survive, exactly as it does for the other two
+	// sweeps.
+	if _, verr := svc.VerifyEmail(ctx, signup.VerifyToken); verr != nil {
+		t.Fatalf("VerifyEmail(signup token) after LogoutAll: %v, want success", verr)
+	}
+}
+
+// TestLogoutLeavesAPendingMagicLinkAlone is the Logout × magic_link cell,
+// and it pins a deliberate NON-behaviour. Logout is a per-device, routine
+// action — a browser signing itself out — and sweeping here would break a
+// flow with no attacker in it: request a link on a laptop, log out of the
+// laptop, click the link on a phone. A later, well-meaning "make Logout
+// sweep too, for consistency" would break exactly that, silently, without
+// this test.
+func TestLogoutLeavesAPendingMagicLinkAlone(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	mustSignUp(t, svc, "sweep-logout@example.com", validPassword)
+	_, _, refresh := mustLogin(t, svc, "sweep-logout@example.com", validPassword)
+
+	magicTok, ok, err := svc.RequestMagicLink(ctx, "sweep-logout@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestMagicLink: ok=%v err=%v", ok, err)
+	}
+
+	// The laptop signs itself out.
+	if err := svc.Logout(ctx, refresh); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(magicTok)); ferr != nil {
+		t.Fatalf("magic link after Logout: %v, want it still present — a per-device logout must not break request-on-laptop/click-on-phone", ferr)
+	}
+	// And it still WORKS, which is the property that actually matters:
+	// the phone signs in.
+	res, rerr := svc.RedeemMagicLink(ctx, magicTok, "5.6.7.8", "phone")
+	if rerr != nil {
+		t.Fatalf("RedeemMagicLink after Logout: %v, want success", rerr)
+	}
+	if res.AccessToken == "" || res.RefreshToken == "" {
+		t.Fatal("the phone got no usable session")
+	}
+}
+
+// TestRevokeSessionLeavesAPendingMagicLinkAlone is the
+// RevokeSession × magic_link cell, and the same deliberate non-behaviour
+// reached through the "your devices" control: dropping one device from a
+// listing is routine, not a declaration that the account is compromised.
+// [Service.LogoutAll] is the control that means the latter, and it does
+// sweep.
+func TestRevokeSessionLeavesAPendingMagicLinkAlone(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+	user := mustSignUp(t, svc, "sweep-revoke@example.com", validPassword)
+	mustLogin(t, svc, "sweep-revoke@example.com", validPassword)
+
+	magicTok, ok, err := svc.RequestMagicLink(ctx, "sweep-revoke@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestMagicLink: ok=%v err=%v", ok, err)
+	}
+
+	sessions, err := svc.ListSessions(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) == 0 {
+		t.Fatal("no sessions to revoke")
+	}
+	if err := svc.RevokeSession(ctx, user.ID, sessions[0].ID); err != nil {
+		t.Fatalf("RevokeSession: %v", err)
+	}
+
+	if _, ferr := store.FindVerificationByHash(ctx, token.HashOpaque(magicTok)); ferr != nil {
+		t.Fatalf("magic link after RevokeSession: %v, want it still present", ferr)
+	}
+	res, rerr := svc.RedeemMagicLink(ctx, magicTok, "5.6.7.8", "phone")
+	if rerr != nil {
+		t.Fatalf("RedeemMagicLink after RevokeSession: %v, want success", rerr)
+	}
+	if res.AccessToken == "" || res.RefreshToken == "" {
+		t.Fatal("the phone got no usable session")
 	}
 }

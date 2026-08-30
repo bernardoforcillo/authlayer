@@ -1925,14 +1925,24 @@ func (s *Service) Refresh(ctx context.Context, refreshPlain string) (LoginResult
 //
 // Two things, and both are deliberate.
 //
-// First, VERIFICATIONS. Logout sweeps none: a pending "password_reset" or
-// "email_change" [Verification] survives it untouched and stays redeemable
-// for the rest of its own TTL. This is a per-device, routine action — a
-// browser signing itself out — and sweeping here would break a legitimate
-// flow with no attacker in it: request an email change on a desktop, log
-// out of that desktop, click the link that arrives on a phone.
+// First, VERIFICATIONS. Logout sweeps NONE — not "password_reset", not
+// "email_change", and not "magic_link". Every one of them survives this
+// call untouched and stays redeemable for the rest of its own TTL. That
+// includes a pending magic link, which is a working SIGN-IN for whoever
+// holds it: logging one device out does not invalidate it, and clicking it
+// afterwards signs in again.
+//
+// This is deliberate, and it is the whole bottom half of
+// [Service.ChangePassword]'s doc, "The sweep matrix". Logout is a
+// per-device, routine action — a browser signing itself out — and sweeping
+// here would break a legitimate flow with no attacker in it: request an
+// email change (or a magic link) on a desktop, log out of that desktop,
+// click the link that arrives on a phone. That flow is the ordinary case;
+// a user signing out of one browser is not telling this package the
+// account is compromised.
+//
 // [Service.LogoutAll] is the unambiguous "something is wrong" control and
-// it DOES sweep both purposes; [Service.ChangePassword] and
+// it DOES sweep all three purposes; [Service.ChangePassword] and
 // [Service.ResetPassword] sweep them too. A caller that wants a single
 // device's logout to invalidate those tokens must call LogoutAll instead —
 // this method will not do it for them.
@@ -1996,8 +2006,9 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 // LogoutAll revokes every session belonging to userID, across every
 // family — every device and browser this user is currently signed in on,
 // bounded by "What this does not revoke" below — and invalidates every
-// outstanding "password_reset" and "email_change" [Verification] for that
-// account. A user with neither is not an error.
+// outstanding "password_reset", "email_change" and "magic_link"
+// [Verification] for that account. A user with none of them is not an
+// error.
 //
 // The revocation is implemented as one [Store.DeleteSessionsByFamily] call
 // per DISTINCT family among the user's sessions, rather than one
@@ -2006,8 +2017,8 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 // family's rotated-but-unexpired predecessors (see auth.go's package doc
 // for why those rows are retained rather than deleted at rotation time),
 // not merely whichever rows happened to still exist at the instant the
-// list was read. The sweep is two [Store.DeleteVerificationsByUserAndPurpose]
-// calls, one per purpose, both fail-closed, and both run AFTER the
+// list was read. The sweep is three [Store.DeleteVerificationsByUserAndPurpose]
+// calls, one per purpose, all fail-closed, and all run AFTER the
 // revocation: see the section below.
 //
 // # Why this sweeps verifications, and why Logout and RevokeSession do not
@@ -2015,8 +2026,9 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 // "Sign out everywhere" is an unambiguous security action — the control a
 // user reaches for on spotting an intruder — not routine navigation. Like
 // [Service.ChangePassword] and [Service.ResetPassword], it must therefore
-// leave nothing armed that can quietly undo it. Two verification purposes
-// can:
+// leave nothing armed that can quietly undo it. Three verification purposes
+// can — see [Service.ChangePassword]'s doc, "The sweep matrix", for the
+// whole table:
 //
 // A still-live "password_reset" token grants a full credential rotation to
 // whoever holds it, for the remainder of [WithPasswordResetTTL]'s window.
@@ -2031,10 +2043,19 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 // leaked, or armed by the user themselves and then regretted, is exactly
 // what this sweep is for.
 //
-// [Service.Logout] and [Service.RevokeSession] deliberately sweep NOTHING.
+// A still-live "magic_link" token is the most direct of the three: it is
+// not a step towards a credential, it IS one, and
+// [Service.RedeemMagicLink] exchanges it for a live session with nothing
+// else asked. Leaving one armed would mean the very call that removed
+// every session an intruder had also left them a way to make a new one,
+// for the remainder of [WithMagicLinkTTL]'s window.
+//
+// [Service.Logout] and [Service.RevokeSession] deliberately sweep NOTHING,
+// for any of the three purposes.
 // They are per-device and routine — a browser signing itself out, a device
 // dropped from a "your devices" listing — and sweeping there would break a
-// legitimate flow with no attacker in it: request an email change on a
+// legitimate flow with no attacker in it: request an email change or a
+// magic link on a
 // desktop, log out of that desktop, click the link that arrives on a phone.
 // Each of those methods says so in its own doc.
 //
@@ -2043,9 +2064,11 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 // and destroying it would strand a user who signed out everywhere before
 // confirming their address, since this package exposes no resend path.
 //
-// Both sweeps carry the SAME guarantee, and it is SEQUENTIAL ONLY: nothing
-// orders either against a concurrently-running [Service.RequestPasswordReset]
-// or [Service.RequestEmailChange] whose own [Store.CreateVerification] has
+// All three sweeps carry the SAME guarantee, and it is SEQUENTIAL ONLY:
+// nothing
+// orders any of them against a concurrently-running [Service.RequestPasswordReset],
+// [Service.RequestEmailChange] or [Service.RequestMagicLink] whose own
+// [Store.CreateVerification] has
 // not yet committed — see [Service.ChangePassword]'s doc, point 6, for the
 // deterministic demonstration and for why closing that window would need a
 // transaction [Store] does not offer.
@@ -2093,16 +2116,20 @@ func (s *Service) LogoutAll(ctx context.Context, userID string) error {
 		}
 	}
 
-	// Then close BOTH token side doors — see the method doc's "Why this
-	// sweeps verifications, and why Logout and RevokeSession do not". The
-	// revocation runs FIRST, deliberately: it is what this caller actually
-	// asked for, so a sweep failure still leaves every session gone and an
-	// error telling the caller to retry, rather than leaving the intruder
-	// the live sessions this call exists to cut.
+	// Then close ALL THREE token side doors — see the method doc's "Why
+	// this sweeps verifications, and why Logout and RevokeSession do not",
+	// and [Service.ChangePassword]'s "The sweep matrix". The revocation
+	// runs FIRST, deliberately: it is what this caller actually asked for,
+	// so a sweep failure still leaves every session gone and an error
+	// telling the caller to retry, rather than leaving the intruder the
+	// live sessions this call exists to cut.
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposePasswordReset); err != nil {
 		return err
 	}
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeEmailChange); err != nil {
+		return err
+	}
+	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeMagicLink); err != nil {
 		return err
 	}
 	return nil
@@ -2189,14 +2216,20 @@ func (s *Service) ListSessions(ctx context.Context, userID string) ([]Session, e
 // Two things, and both are deliberate.
 //
 // First, VERIFICATIONS. Like [Service.Logout] and unlike
-// [Service.LogoutAll], this method sweeps none: a pending "password_reset"
-// or "email_change" [Verification] survives it and stays redeemable for the
-// rest of its own TTL. Dropping one device from a listing is routine, not a
+// [Service.LogoutAll], this method sweeps NONE: a pending "password_reset",
+// "email_change" or "magic_link" [Verification] survives it and stays
+// redeemable for the rest of its own TTL — the magic link included, so the
+// device dropped from the listing is not the only way back in, and a link
+// already delivered still signs its holder in.
+//
+// Dropping one device from a listing is routine, not a
 // declaration that the account is compromised, and sweeping here would
 // break a legitimate flow with no attacker in it — request an email change
-// on a desktop, drop that desktop from the device list, click the link that
-// arrives on a phone. [Service.LogoutAll] is the control that means "sign
-// out everywhere, something is wrong", and it sweeps both purposes.
+// (or a magic link) on a desktop, drop that desktop from the device list,
+// click the link that arrives on a phone. [Service.LogoutAll] is the
+// control that means "sign out everywhere, something is wrong", and it
+// sweeps all three purposes. See [Service.ChangePassword]'s doc, "The
+// sweep matrix", for the whole table this row belongs to.
 //
 // Second, ACCESS TOKENS. "Sign this device out" is a claim about [Session]
 // rows, which is to say about the family's REFRESH tokens: they are gone,
@@ -2307,11 +2340,11 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //  4. next is validated against the configured [password.Rules];
 //     [ErrWeakPassword] on failure.
 //  5. next is hashed and persisted via [Store.UpdateUserPassword].
-//  6. Every outstanding "password_reset" AND "email_change" [Verification]
-//     for this account is invalidated, via two
+//  6. Every outstanding "password_reset", "email_change" AND "magic_link"
+//     [Verification] for this account is invalidated, via three
 //     [Store.DeleteVerificationsByUserAndPurpose] calls — one per purpose,
-//     both fail-closed. See "Why both purposes, and what the sweep does
-//     not cover" below.
+//     all fail-closed. See "The sweep matrix" and "Why these purposes, and
+//     what the sweep does not cover" below.
 //  7. Every session NOT sharing currentSessionID's family is revoked via
 //     [Store.DeleteSessionsByFamily], one call per distinct OTHER family —
 //     the same "list, then delete per distinct family" shape
@@ -2319,11 +2352,45 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //     in another family is swept too, not just the currently-live session
 //     in that family.
 //
-// # Why both purposes, and what the sweep does not cover
+// # The sweep matrix
+//
+// This table is the whole of this package's doctrine on which actions
+// destroy which pending [Verification] tokens. It is stated here, in full,
+// because the last time it existed only as an assumption spread across five
+// method docs, it was filled in for two of its three columns and the third
+// was a full account takeover:
+//
+//	Remediation       | password_reset | email_change | magic_link
+//	------------------|----------------|--------------|---------------------
+//	ChangePassword    | swept          | swept        | swept
+//	ResetPassword     | swept          | swept        | swept
+//	LogoutAll         | swept          | swept        | swept
+//	Logout            | not swept      | not swept    | not swept
+//	RevokeSession     | not swept      | not swept    | not swept
+//	RedeemMagicLink   | —              | —            | burns its own token
+//
+// The top three rows are the REMEDIATION actions: each is something a user
+// does because they believe, or have just been told, that the account is at
+// risk. Each therefore leaves nothing armed that can quietly undo it, and
+// each sweeps fail-closed — a sweep that errors is returned to the caller,
+// never swallowed.
+//
+// The bottom two rows are ROUTINE, per-device actions, and their emptiness
+// is deliberate, not an omission — see [Service.Logout] and
+// [Service.RevokeSession], which each say so in their own docs. Sweeping
+// there would break a legitimate flow with no attacker in it: request a
+// link (or an email change) on a laptop, sign that laptop out, click the
+// link that arrives on a phone.
+//
+// "signup" appears in no column: it grants nothing over the credential or
+// the address, and destroying it would strand a user who remediated before
+// confirming their address, since this package exposes no resend path.
+//
+// # Why these purposes, and what the sweep does not cover
 //
 // A password change is the one action a user takes when they suspect
 // compromise, so it must leave nothing armed that can quietly undo it.
-// Two verification purposes can:
+// Three verification purposes can:
 //
 // A still-valid reset link — one whose [Service.RequestPasswordReset] call
 // ran and returned BEFORE this call started — would otherwise stay
@@ -2350,9 +2417,20 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // the credential — but purpose-scoping was never a reason to leave a
 // credential-rotation bypass armed.
 //
-// Both sweeps carry the SAME guarantee, and it is SEQUENTIAL ONLY: nothing
+// A still-valid "magic_link" token is the third door, and it is the most
+// direct of the three: it does not let its holder SET a credential, it IS
+// one. [Service.RedeemMagicLink] exchanges it for a live session with
+// nothing else asked, so a link left armed hands the account back the
+// moment this rotation finishes, for the remainder of [WithMagicLinkTTL]'s
+// window. That window is the shortest of the three by default (fifteen
+// minutes), which narrows the exposure but does not remove it: the user
+// changing their password because they suspect a compromised mailbox is
+// exactly the user whose pending link is already in the wrong hands.
+//
+// All three sweeps carry the SAME guarantee, and it is SEQUENTIAL ONLY: nothing
 // orders either against a concurrently-running [Service.RequestPasswordReset]
-// or [Service.RequestEmailChange] call. If that other call's own
+// or [Service.RequestEmailChange] or [Service.RequestMagicLink] call. If
+// that other call's own
 // [Store.CreateVerification] has not yet committed at the instant the sweep
 // runs, the sweep finds nothing, the concurrent mint proceeds moments
 // later, and the resulting token survives — demonstrated deterministically
@@ -2395,13 +2473,19 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 		return err
 	}
 
-	// Close BOTH token side doors — see the method doc's point 6. The
-	// email_change sweep is not a tidier variant of the reset one; it is
-	// the stronger of the two doors.
+	// Close ALL THREE token side doors — see the method doc's point 6 and
+	// "The sweep matrix". The email_change sweep is not a tidier variant of
+	// the reset one, and the magic_link sweep is not a tidier variant of
+	// either: each is a separate door, and shipping the fix for one of them
+	// only is precisely the defect this matrix exists to prevent
+	// recurring.
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposePasswordReset); err != nil {
 		return err
 	}
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeEmailChange); err != nil {
+		return err
+	}
+	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeMagicLink); err != nil {
 		return err
 	}
 
@@ -2748,10 +2832,13 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 // AFTER the token is irrevocably burned is a write already known to hold
 // valid input.
 //
-// After [Store.UpdateUserPassword] succeeds, two
-// [Store.DeleteVerificationsByUserAndPurpose] calls — one per purpose, both
-// fail-closed — invalidate every OTHER outstanding "password_reset" token
-// AND every outstanding "email_change" token for the same user.
+// After [Store.UpdateUserPassword] succeeds, three
+// [Store.DeleteVerificationsByUserAndPurpose] calls — one per purpose, all
+// fail-closed — invalidate every OTHER outstanding "password_reset" token,
+// every outstanding "email_change" token, AND every outstanding
+// "magic_link" token for the same user. See [Service.ChangePassword]'s
+// doc, "The sweep matrix", for the whole table these three rows belong
+// to.
 //
 // The reset sweep: the token THIS call redeemed is already gone via the
 // claim above, but a second, still-live token from an earlier
@@ -2773,7 +2860,16 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 // precisely because the account may be compromised, so it must not leave
 // that armed.
 //
-// These are the same two side doors [Service.ChangePassword] closes for its
+// The magic_link sweep closes the most direct door of the three. A magic
+// link is not a step towards a credential, it IS one:
+// [Service.RedeemMagicLink] exchanges it for a live session with nothing
+// else asked of its holder. This method has just revoked every session the
+// account had, precisely because whoever forced the reset may be holding
+// one; a pending link left armed hands a fresh session straight back for
+// the remainder of [WithMagicLinkTTL]'s window, and the mailbox it is
+// sitting in is a plausible part of what went wrong in the first place.
+//
+// These are the same three side doors [Service.ChangePassword] closes for its
 // own, differently-triggered path, with the identical SEQUENTIAL-ONLY scope
 // that method's doc discloses: nothing orders either sweep against a
 // [Service.RequestPasswordReset] or [Service.RequestEmailChange] call whose
@@ -2883,13 +2979,17 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 		return err
 	}
 
-	// Close BOTH token side doors — see the method doc above. The
-	// email_change sweep is not a tidier variant of the reset one; it is
-	// the stronger of the two doors.
+	// Close ALL THREE token side doors — see the method doc above and
+	// [Service.ChangePassword]'s "The sweep matrix". Each is a separate
+	// door; sweeping a subset is the shape of the defect this matrix
+	// exists to prevent recurring.
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposePasswordReset); err != nil {
 		return err
 	}
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposeEmailChange); err != nil {
+		return err
+	}
+	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposeMagicLink); err != nil {
 		return err
 	}
 
