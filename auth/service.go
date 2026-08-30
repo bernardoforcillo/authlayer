@@ -56,7 +56,7 @@ import (
 	"github.com/bernardoforcillo/authlayer/token"
 )
 
-// The three closed values [Verification.Purpose] takes — see that field's
+// The four closed values [Verification.Purpose] takes — see that field's
 // doc and [Store]'s sentinel-error doc for why the closed set lives here,
 // in the service layer, rather than on the Store port.
 const (
@@ -74,6 +74,18 @@ const (
 	// VerifyEmail refuses it with [ErrVerificationPurpose] rather than
 	// silently accepting it and burning the token for nothing.
 	PurposePasswordReset = "password_reset"
+	// PurposeMagicLink marks a Verification minted by
+	// [Service.RequestMagicLink] for a passwordless sign-in. Not redeemable
+	// through [Service.VerifyEmail] — [Service.RedeemMagicLink] owns this
+	// purpose's redemption, and VerifyEmail refuses it with
+	// [ErrVerificationPurpose] without burning it, the same stance it takes
+	// on PurposePasswordReset.
+	//
+	// This is the only purpose whose redemption issues a SESSION, which is
+	// why it is swept by every credential-rotation and remediation path
+	// that already sweeps the other two redeemable-by-mail purposes — see
+	// [Service.ChangePassword]'s doc, "The sweep matrix".
+	PurposeMagicLink = "magic_link"
 )
 
 // defaultVerificationTTL is the default for [WithVerificationTTL]: how long
@@ -90,6 +102,13 @@ const defaultVerificationTTL = 24 * time.Hour
 // address" attestation), and a short window is the conventional stance this
 // class of flow takes elsewhere.
 const defaultPasswordResetTTL = time.Hour
+
+// defaultMagicLinkTTL is the default for [WithMagicLinkTTL]: how long a
+// "magic_link" [Verification] stays redeemable. Shorter still than
+// defaultPasswordResetTTL's hour, because redeeming one does not merely
+// let its holder SET a credential — it IS the credential: [Service.RedeemMagicLink]
+// exchanges it directly for a session, with no password step in between.
+const defaultMagicLinkTTL = 15 * time.Minute
 
 // Sentinel errors returned by Service, layered on top of the ones [Store]
 // already defines (ErrUserNotFound and friends propagate through verbatim
@@ -262,10 +281,12 @@ type config struct {
 	signingKey [][]byte
 	accessTTL  time.Duration
 	refreshTTL time.Duration
-	// verificationTTL and passwordResetTTL are the two [Verification]
-	// lifetimes — see [WithVerificationTTL] and [WithPasswordResetTTL].
+	// verificationTTL, passwordResetTTL and magicLinkTTL are the three
+	// [Verification] lifetimes — see [WithVerificationTTL],
+	// [WithPasswordResetTTL] and [WithMagicLinkTTL].
 	verificationTTL  time.Duration
 	passwordResetTTL time.Duration
+	magicLinkTTL     time.Duration
 	clock            func() time.Time
 	idGen            func() string
 	limiter          RateLimiter
@@ -273,9 +294,21 @@ type config struct {
 	// additionally consults — see [WithPasswordResetRateLimiter]'s doc for
 	// why it is a second, independent config slot rather than reusing
 	// limiter (which stays IP-keyed everywhere it is used).
-	resetLimiter         RateLimiter
-	claimsExtender       func(UserBase) map[string]any
-	requireVerifiedEmail bool
+	resetLimiter RateLimiter
+	// magicLinkLimiter is the address-keyed [RateLimiter]
+	// [Service.RequestMagicLink] additionally consults — a third,
+	// independent slot for the same reason resetLimiter is a second one:
+	// limiter stays IP-keyed everywhere it is used, and a deployment may
+	// want a tighter bucket on magic links than on password resets (a
+	// magic link is a login, not a credential-set form). See
+	// [WithMagicLinkRateLimiter].
+	magicLinkLimiter RateLimiter
+	// magicLinkProvisioning is [WithMagicLinkProvisioning]: whether
+	// [Service.RequestMagicLink] creates an account for an address it does
+	// not recognise. Defaults to false.
+	magicLinkProvisioning bool
+	claimsExtender        func(UserBase) map[string]any
+	requireVerifiedEmail  bool
 	// identityStore is the OPTIONAL external-identity port — see
 	// [WithIdentityStore]. nil means no external sign-in is configured, and
 	// every entry point needing it fails with [ErrOAuthNotConfigured]
@@ -298,6 +331,7 @@ func defaultConfig() config {
 		refreshTTL:       30 * 24 * time.Hour,
 		verificationTTL:  defaultVerificationTTL,
 		passwordResetTTL: defaultPasswordResetTTL,
+		magicLinkTTL:     defaultMagicLinkTTL,
 		clock:            func() time.Time { return time.Now().UTC() },
 		idGen:            uid.NewV7,
 	}
@@ -449,6 +483,66 @@ func WithPasswordResetTTL(d time.Duration) Option {
 	}
 }
 
+// WithMagicLinkTTL sets how long a "magic_link" [Verification] minted by
+// [Service.RequestMagicLink] stays redeemable: ExpiresAt is stamped as
+// CreatedAt+d. The default is fifteen minutes — shorter than
+// [WithPasswordResetTTL]'s hour, and far shorter than
+// [WithVerificationTTL]'s day, because this token is not a step towards a
+// credential, it IS one: [Service.RedeemMagicLink] exchanges it for a live
+// session with nothing else asked of its holder. d <= 0 is ignored,
+// leaving the default (or a prior option) in place.
+//
+// This is the whole of the window in which a link sitting unread in a
+// mailbox is a working login, so it is the one knob that bounds the
+// "mailbox compromised later" case. It is not the only control: the link
+// is single-use ([Service.RedeemMagicLink] burns it), re-issuing invalidates
+// the previous one ([Service.RequestMagicLink]), and every credential
+// rotation sweeps it (see [Service.ChangePassword]'s doc, "The sweep
+// matrix"). Lengthening it past the default trades directly against all
+// three; the cost of a short window is only that a user who opens the mail
+// late must ask for another link, since an expired token is
+// [ErrVerificationExpired] and is never burned by the attempt.
+func WithMagicLinkTTL(d time.Duration) Option {
+	return func(c *config) {
+		if d > 0 {
+			c.magicLinkTTL = d
+		}
+	}
+}
+
+// WithMagicLinkProvisioning controls whether [Service.RequestMagicLink]
+// CREATES an account for an address it does not recognise, rather than
+// silently minting nothing. The default is false: magic links sign existing
+// accounts in and register nobody.
+//
+// # What enabling this exposes, stated plainly
+//
+// With it on, anyone who can receive mail at an address can bring an
+// account for that address into existence, unauthenticated, by asking for a
+// link and clicking it. That is exactly the exposure an open
+// [Service.SignUp] endpoint already has — which is why a deployment that
+// already offers open self-service registration gives up nothing new here —
+// but it is a real change for a deployment that does not, and it is not
+// free. [WithMagicLinkRateLimiter] is the control, and it gates
+// provisioning itself, not merely the minting that follows it: a denial
+// from that limiter creates no account. [WithRateLimiter]'s IP-keyed limit
+// applies first and bounds the same thing per source.
+//
+// The account created holds no password credential at all
+// (PasswordHash "", so [Service.Login] can never authenticate it — see
+// [UserBase]'s doc) and an unset EmailVerifiedAt: ASKING for a link proves
+// nothing about the address, and only [Service.RedeemMagicLink] — which
+// requires actually receiving the mail — stamps it.
+//
+// One consequence worth planning for: a probe of an unregistered address
+// leaves a real, permanent row behind. Unlike the verifications a magic
+// link also creates, that row never expires and [Store.PurgeExpired] does
+// not remove it, so a deployment enabling this should expect its users
+// table to accumulate addresses nobody ever signed in with.
+func WithMagicLinkProvisioning(enabled bool) Option {
+	return func(c *config) { c.magicLinkProvisioning = enabled }
+}
+
 // WithClock sets the clock Service stamps CreatedAt/UpdatedAt/ExpiresAt
 // and checks expiry against. The default is time.Now().UTC(). A nil clock
 // is ignored.
@@ -564,6 +658,46 @@ func WithRateLimiter(l RateLimiter) Option {
 // how many timing samples an attacker can collect.
 func WithPasswordResetRateLimiter(l RateLimiter) Option {
 	return func(c *config) { c.resetLimiter = l }
+}
+
+// WithMagicLinkRateLimiter wires a third, independent [RateLimiter] that
+// [Service.RequestMagicLink] consults, keyed by the NORMALIZED email
+// address rather than by IP — see [NormalizeEmail]. The default is nil,
+// meaning RequestMagicLink imposes no address-keyed limit at all;
+// [WithRateLimiter]'s IP-keyed limit, if configured, still applies on its
+// own. It is deliberately NOT the same slot as
+// [WithPasswordResetRateLimiter]: the two flows have different costs and a
+// deployment may want different buckets for them.
+//
+// A denial from this limiter is never surfaced as [ErrRateLimited] the way
+// WithRateLimiter's IP-keyed denial is — see [Service.RequestMagicLink]'s
+// doc, "The enumeration property", point 2, for why: an address-keyed rate
+// limit that surfaced as a distinguishable error would itself become the
+// existence oracle that method's whole design exists to close.
+//
+// This limiter is the control for three separate things, and only the
+// first is about enumeration:
+//
+//   - It bounds how many timing samples an attacker can collect against
+//     ONE address, which is the resource [Service.RequestMagicLink]'s
+//     residual timing channel needs (the same argument
+//     [WithPasswordResetRateLimiter]'s doc makes for its own flow).
+//   - It bounds GRIEFING. RequestMagicLink invalidates an address's earlier
+//     "magic_link" token every time a new one is minted, so anyone who
+//     merely knows an address can kill a victim's genuine, unclicked link
+//     at will by looping requests. That is inherent to the re-issue
+//     contract [Store.DeleteVerificationsByUserAndPurpose] documents, not
+//     a bug this method can avoid while honouring it.
+//   - With [WithMagicLinkProvisioning] enabled, it bounds ACCOUNT
+//     CREATION: a denial from this limiter provisions nothing, so this is
+//     the control that keeps "anyone who can receive mail can create an
+//     account" from also meaning "anyone at all can create unlimited
+//     accounts". See WithMagicLinkProvisioning's own doc.
+//
+// This package configures no default here, for the reason [WithRateLimiter]'s
+// own default is nil: the right bucket size is an operator decision.
+func WithMagicLinkRateLimiter(l RateLimiter) Option {
+	return func(c *config) { c.magicLinkLimiter = l }
 }
 
 // WithRequireVerifiedEmail controls whether [Service.Login] refuses an
@@ -1134,13 +1268,15 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 //
 // This helper performs no credential check, no rate-limit check, no
 // email-verification check and no linking-policy check. Every one of those
-// belongs to whoever calls it, and the two callers run different sets:
+// belongs to whoever calls it, and the three callers run different sets:
 // [Service.Login] proves possession of a password and honours
 // [WithRequireVerifiedEmail]; [Service.SignInWith] proves nothing itself and
-// stands instead on a provider's assertion plus the [Linking] policy. A
-// third caller would mint a live session for whoever u names with no check
-// at all, so any future one must be read as the assertion "I have already
-// decided this user is authenticated".
+// stands instead on a provider's assertion plus the [Linking] policy;
+// [Service.RedeemMagicLink] proves nothing itself either, standing on a
+// verification it has already claimed and burned. A FOURTH caller would
+// mint a live session for whoever u names with no check at all, so any
+// future one must be read as the assertion "I have already decided this
+// user is authenticated".
 //
 // It exists because there must be exactly ONE minting path. Two would drift,
 // and the drift would not be a compile error: a scrub, a claim, or the
@@ -1155,6 +1291,14 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 // extender runs, and [github.com/bernardoforcillo/authlayer/token.Issue]
 // runs BEFORE [Store.CreateSession], so a misconfigured signing key fails
 // without leaving an orphaned session row behind.
+//
+// u is taken BY VALUE and its PasswordHash cleared here, so no caller can
+// leak a credential digest through the returned record or into a
+// [WithClaimsExtender] callback by forgetting to scrub first.
+//
+// ip and userAgent are recorded on the [Session] as audit fields and are
+// not validated here; a caller that requires them non-empty checks that
+// itself, as [Service.Login] does with [ErrMissingIP].
 func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent string) (LoginResult, error) {
 	var zero LoginResult
 
@@ -1199,8 +1343,8 @@ func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent str
 		UserID:    u.ID,
 		TokenHash: refreshHash,
 		// FamilyID: this session is the root of its own rotation chain —
-		// nothing to inherit from at login — so it names itself. A
-		// successor minted by a future refresh carries this same value
+		// nothing to inherit from at a fresh sign-in — so it names itself.
+		// A successor minted by a future refresh carries this same value
 		// forward (see auth.go's package doc, "Sessions, families, and
 		// rotation").
 		FamilyID:  sessionID,
@@ -1872,14 +2016,24 @@ func (s *Service) Refresh(ctx context.Context, refreshPlain string) (LoginResult
 //
 // Two things, and both are deliberate.
 //
-// First, VERIFICATIONS. Logout sweeps none: a pending "password_reset" or
-// "email_change" [Verification] survives it untouched and stays redeemable
-// for the rest of its own TTL. This is a per-device, routine action — a
-// browser signing itself out — and sweeping here would break a legitimate
-// flow with no attacker in it: request an email change on a desktop, log
-// out of that desktop, click the link that arrives on a phone.
+// First, VERIFICATIONS. Logout sweeps NONE — not "password_reset", not
+// "email_change", and not "magic_link". Every one of them survives this
+// call untouched and stays redeemable for the rest of its own TTL. That
+// includes a pending magic link, which is a working SIGN-IN for whoever
+// holds it: logging one device out does not invalidate it, and clicking it
+// afterwards signs in again.
+//
+// This is deliberate, and it is the whole bottom half of
+// [Service.ChangePassword]'s doc, "The sweep matrix". Logout is a
+// per-device, routine action — a browser signing itself out — and sweeping
+// here would break a legitimate flow with no attacker in it: request an
+// email change (or a magic link) on a desktop, log out of that desktop,
+// click the link that arrives on a phone. That flow is the ordinary case;
+// a user signing out of one browser is not telling this package the
+// account is compromised.
+//
 // [Service.LogoutAll] is the unambiguous "something is wrong" control and
-// it DOES sweep both purposes; [Service.ChangePassword] and
+// it DOES sweep all three purposes; [Service.ChangePassword] and
 // [Service.ResetPassword] sweep them too. A caller that wants a single
 // device's logout to invalidate those tokens must call LogoutAll instead —
 // this method will not do it for them.
@@ -1943,8 +2097,9 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 // LogoutAll revokes every session belonging to userID, across every
 // family — every device and browser this user is currently signed in on,
 // bounded by "What this does not revoke" below — and invalidates every
-// outstanding "password_reset" and "email_change" [Verification] for that
-// account. A user with neither is not an error.
+// outstanding "password_reset", "email_change" and "magic_link"
+// [Verification] for that account. A user with none of them is not an
+// error.
 //
 // The revocation is implemented as one [Store.DeleteSessionsByFamily] call
 // per DISTINCT family among the user's sessions, rather than one
@@ -1953,8 +2108,8 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 // family's rotated-but-unexpired predecessors (see auth.go's package doc
 // for why those rows are retained rather than deleted at rotation time),
 // not merely whichever rows happened to still exist at the instant the
-// list was read. The sweep is two [Store.DeleteVerificationsByUserAndPurpose]
-// calls, one per purpose, both fail-closed, and both run AFTER the
+// list was read. The sweep is three [Store.DeleteVerificationsByUserAndPurpose]
+// calls, one per purpose, all fail-closed, and all run AFTER the
 // revocation: see the section below.
 //
 // # Why this sweeps verifications, and why Logout and RevokeSession do not
@@ -1962,8 +2117,9 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 // "Sign out everywhere" is an unambiguous security action — the control a
 // user reaches for on spotting an intruder — not routine navigation. Like
 // [Service.ChangePassword] and [Service.ResetPassword], it must therefore
-// leave nothing armed that can quietly undo it. Two verification purposes
-// can:
+// leave nothing armed that can quietly undo it. Three verification purposes
+// can — see [Service.ChangePassword]'s doc, "The sweep matrix", for the
+// whole table:
 //
 // A still-live "password_reset" token grants a full credential rotation to
 // whoever holds it, for the remainder of [WithPasswordResetTTL]'s window.
@@ -1978,10 +2134,19 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 // leaked, or armed by the user themselves and then regretted, is exactly
 // what this sweep is for.
 //
-// [Service.Logout] and [Service.RevokeSession] deliberately sweep NOTHING.
+// A still-live "magic_link" token is the most direct of the three: it is
+// not a step towards a credential, it IS one, and
+// [Service.RedeemMagicLink] exchanges it for a live session with nothing
+// else asked. Leaving one armed would mean the very call that removed
+// every session an intruder had also left them a way to make a new one,
+// for the remainder of [WithMagicLinkTTL]'s window.
+//
+// [Service.Logout] and [Service.RevokeSession] deliberately sweep NOTHING,
+// for any of the three purposes.
 // They are per-device and routine — a browser signing itself out, a device
 // dropped from a "your devices" listing — and sweeping there would break a
-// legitimate flow with no attacker in it: request an email change on a
+// legitimate flow with no attacker in it: request an email change or a
+// magic link on a
 // desktop, log out of that desktop, click the link that arrives on a phone.
 // Each of those methods says so in its own doc.
 //
@@ -1990,9 +2155,11 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 // and destroying it would strand a user who signed out everywhere before
 // confirming their address, since this package exposes no resend path.
 //
-// Both sweeps carry the SAME guarantee, and it is SEQUENTIAL ONLY: nothing
-// orders either against a concurrently-running [Service.RequestPasswordReset]
-// or [Service.RequestEmailChange] whose own [Store.CreateVerification] has
+// All three sweeps carry the SAME guarantee, and it is SEQUENTIAL ONLY:
+// nothing
+// orders any of them against a concurrently-running [Service.RequestPasswordReset],
+// [Service.RequestEmailChange] or [Service.RequestMagicLink] whose own
+// [Store.CreateVerification] has
 // not yet committed — see [Service.ChangePassword]'s doc, point 6, for the
 // deterministic demonstration and for why closing that window would need a
 // transaction [Store] does not offer.
@@ -2040,16 +2207,20 @@ func (s *Service) LogoutAll(ctx context.Context, userID string) error {
 		}
 	}
 
-	// Then close BOTH token side doors — see the method doc's "Why this
-	// sweeps verifications, and why Logout and RevokeSession do not". The
-	// revocation runs FIRST, deliberately: it is what this caller actually
-	// asked for, so a sweep failure still leaves every session gone and an
-	// error telling the caller to retry, rather than leaving the intruder
-	// the live sessions this call exists to cut.
+	// Then close ALL THREE token side doors — see the method doc's "Why
+	// this sweeps verifications, and why Logout and RevokeSession do not",
+	// and [Service.ChangePassword]'s "The sweep matrix". The revocation
+	// runs FIRST, deliberately: it is what this caller actually asked for,
+	// so a sweep failure still leaves every session gone and an error
+	// telling the caller to retry, rather than leaving the intruder the
+	// live sessions this call exists to cut.
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposePasswordReset); err != nil {
 		return err
 	}
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeEmailChange); err != nil {
+		return err
+	}
+	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeMagicLink); err != nil {
 		return err
 	}
 	return nil
@@ -2136,14 +2307,20 @@ func (s *Service) ListSessions(ctx context.Context, userID string) ([]Session, e
 // Two things, and both are deliberate.
 //
 // First, VERIFICATIONS. Like [Service.Logout] and unlike
-// [Service.LogoutAll], this method sweeps none: a pending "password_reset"
-// or "email_change" [Verification] survives it and stays redeemable for the
-// rest of its own TTL. Dropping one device from a listing is routine, not a
+// [Service.LogoutAll], this method sweeps NONE: a pending "password_reset",
+// "email_change" or "magic_link" [Verification] survives it and stays
+// redeemable for the rest of its own TTL — the magic link included, so the
+// device dropped from the listing is not the only way back in, and a link
+// already delivered still signs its holder in.
+//
+// Dropping one device from a listing is routine, not a
 // declaration that the account is compromised, and sweeping here would
 // break a legitimate flow with no attacker in it — request an email change
-// on a desktop, drop that desktop from the device list, click the link that
-// arrives on a phone. [Service.LogoutAll] is the control that means "sign
-// out everywhere, something is wrong", and it sweeps both purposes.
+// (or a magic link) on a desktop, drop that desktop from the device list,
+// click the link that arrives on a phone. [Service.LogoutAll] is the
+// control that means "sign out everywhere, something is wrong", and it
+// sweeps all three purposes. See [Service.ChangePassword]'s doc, "The
+// sweep matrix", for the whole table this row belongs to.
 //
 // Second, ACCESS TOKENS. "Sign this device out" is a claim about [Session]
 // rows, which is to say about the family's REFRESH tokens: they are gone,
@@ -2263,11 +2440,11 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //  4. next is validated against the configured [password.Rules];
 //     [ErrWeakPassword] on failure.
 //  5. next is hashed and persisted via [Store.UpdateUserPassword].
-//  6. Every outstanding "password_reset" AND "email_change" [Verification]
-//     for this account is invalidated, via two
+//  6. Every outstanding "password_reset", "email_change" AND "magic_link"
+//     [Verification] for this account is invalidated, via three
 //     [Store.DeleteVerificationsByUserAndPurpose] calls — one per purpose,
-//     both fail-closed. See "Why both purposes, and what the sweep does
-//     not cover" below.
+//     all fail-closed. See "The sweep matrix" and "Why these purposes, and
+//     what the sweep does not cover" below.
 //  7. Every session NOT sharing currentSessionID's family is revoked via
 //     [Store.DeleteSessionsByFamily], one call per distinct OTHER family —
 //     the same "list, then delete per distinct family" shape
@@ -2275,11 +2452,45 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //     in another family is swept too, not just the currently-live session
 //     in that family.
 //
-// # Why both purposes, and what the sweep does not cover
+// # The sweep matrix
+//
+// This table is the whole of this package's doctrine on which actions
+// destroy which pending [Verification] tokens. It is stated here, in full,
+// because the last time it existed only as an assumption spread across five
+// method docs, it was filled in for two of its three columns and the third
+// was a full account takeover:
+//
+//	Remediation       | password_reset | email_change | magic_link
+//	------------------|----------------|--------------|---------------------
+//	ChangePassword    | swept          | swept        | swept
+//	ResetPassword     | swept          | swept        | swept
+//	LogoutAll         | swept          | swept        | swept
+//	Logout            | not swept      | not swept    | not swept
+//	RevokeSession     | not swept      | not swept    | not swept
+//	RedeemMagicLink   | —              | —            | burns its own token
+//
+// The top three rows are the REMEDIATION actions: each is something a user
+// does because they believe, or have just been told, that the account is at
+// risk. Each therefore leaves nothing armed that can quietly undo it, and
+// each sweeps fail-closed — a sweep that errors is returned to the caller,
+// never swallowed.
+//
+// The bottom two rows are ROUTINE, per-device actions, and their emptiness
+// is deliberate, not an omission — see [Service.Logout] and
+// [Service.RevokeSession], which each say so in their own docs. Sweeping
+// there would break a legitimate flow with no attacker in it: request a
+// link (or an email change) on a laptop, sign that laptop out, click the
+// link that arrives on a phone.
+//
+// "signup" appears in no column: it grants nothing over the credential or
+// the address, and destroying it would strand a user who remediated before
+// confirming their address, since this package exposes no resend path.
+//
+// # Why these purposes, and what the sweep does not cover
 //
 // A password change is the one action a user takes when they suspect
 // compromise, so it must leave nothing armed that can quietly undo it.
-// Two verification purposes can:
+// Three verification purposes can:
 //
 // A still-valid reset link — one whose [Service.RequestPasswordReset] call
 // ran and returned BEFORE this call started — would otherwise stay
@@ -2306,9 +2517,20 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // the credential — but purpose-scoping was never a reason to leave a
 // credential-rotation bypass armed.
 //
-// Both sweeps carry the SAME guarantee, and it is SEQUENTIAL ONLY: nothing
+// A still-valid "magic_link" token is the third door, and it is the most
+// direct of the three: it does not let its holder SET a credential, it IS
+// one. [Service.RedeemMagicLink] exchanges it for a live session with
+// nothing else asked, so a link left armed hands the account back the
+// moment this rotation finishes, for the remainder of [WithMagicLinkTTL]'s
+// window. That window is the shortest of the three by default (fifteen
+// minutes), which narrows the exposure but does not remove it: the user
+// changing their password because they suspect a compromised mailbox is
+// exactly the user whose pending link is already in the wrong hands.
+//
+// All three sweeps carry the SAME guarantee, and it is SEQUENTIAL ONLY: nothing
 // orders either against a concurrently-running [Service.RequestPasswordReset]
-// or [Service.RequestEmailChange] call. If that other call's own
+// or [Service.RequestEmailChange] or [Service.RequestMagicLink] call. If
+// that other call's own
 // [Store.CreateVerification] has not yet committed at the instant the sweep
 // runs, the sweep finds nothing, the concurrent mint proceeds moments
 // later, and the resulting token survives — demonstrated deterministically
@@ -2351,13 +2573,19 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 		return err
 	}
 
-	// Close BOTH token side doors — see the method doc's point 6. The
-	// email_change sweep is not a tidier variant of the reset one; it is
-	// the stronger of the two doors.
+	// Close ALL THREE token side doors — see the method doc's point 6 and
+	// "The sweep matrix". The email_change sweep is not a tidier variant of
+	// the reset one, and the magic_link sweep is not a tidier variant of
+	// either: each is a separate door, and shipping the fix for one of them
+	// only is precisely the defect this matrix exists to prevent
+	// recurring.
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposePasswordReset); err != nil {
 		return err
 	}
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeEmailChange); err != nil {
+		return err
+	}
+	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeMagicLink); err != nil {
 		return err
 	}
 
@@ -2707,10 +2935,13 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 // AFTER the token is irrevocably burned is a write already known to hold
 // valid input.
 //
-// After [Store.UpdateUserPassword] succeeds, two
-// [Store.DeleteVerificationsByUserAndPurpose] calls — one per purpose, both
-// fail-closed — invalidate every OTHER outstanding "password_reset" token
-// AND every outstanding "email_change" token for the same user.
+// After [Store.UpdateUserPassword] succeeds, three
+// [Store.DeleteVerificationsByUserAndPurpose] calls — one per purpose, all
+// fail-closed — invalidate every OTHER outstanding "password_reset" token,
+// every outstanding "email_change" token, AND every outstanding
+// "magic_link" token for the same user. See [Service.ChangePassword]'s
+// doc, "The sweep matrix", for the whole table these three rows belong
+// to.
 //
 // The reset sweep: the token THIS call redeemed is already gone via the
 // claim above, but a second, still-live token from an earlier
@@ -2790,6 +3021,16 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 // scope the verification sweeps have.
 //
 // These are the same two side doors [Service.ChangePassword] closes for its
+// The magic_link sweep closes the most direct door of the three. A magic
+// link is not a step towards a credential, it IS one:
+// [Service.RedeemMagicLink] exchanges it for a live session with nothing
+// else asked of its holder. This method has just revoked every session the
+// account had, precisely because whoever forced the reset may be holding
+// one; a pending link left armed hands a fresh session straight back for
+// the remainder of [WithMagicLinkTTL]'s window, and the mailbox it is
+// sitting in is a plausible part of what went wrong in the first place.
+//
+// These are the same three side doors [Service.ChangePassword] closes for its
 // own, differently-triggered path, with the identical SEQUENTIAL-ONLY scope
 // that method's doc discloses: nothing orders either sweep against a
 // [Service.RequestPasswordReset] or [Service.RequestEmailChange] call whose
@@ -2908,13 +3149,17 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 		return err
 	}
 
-	// Close BOTH token side doors — see the method doc above. The
-	// email_change sweep is not a tidier variant of the reset one; it is
-	// the stronger of the two doors.
+	// Close ALL THREE token side doors — see the method doc above and
+	// [Service.ChangePassword]'s "The sweep matrix". Each is a separate
+	// door; sweeping a subset is the shape of the defect this matrix
+	// exists to prevent recurring.
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposePasswordReset); err != nil {
 		return err
 	}
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposeEmailChange); err != nil {
+		return err
+	}
+	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposeMagicLink); err != nil {
 		return err
 	}
 
