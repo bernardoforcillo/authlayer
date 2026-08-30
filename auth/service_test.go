@@ -1817,6 +1817,21 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 			}
 			return u, res.User.ID
 		},
+		"RedeemMagicLink": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
+			// Signed up WITH a password on purpose: step 2 below asserts the
+			// Store's own copy still holds a live digest, which is what makes
+			// an empty returned value meaningful.
+			u := mustSignUp(t, svc, "scrub-magic@example.com", validPassword)
+			tok, ok, err := svc.RequestMagicLink(ctx, "scrub-magic@example.com", "1.2.3.4")
+			if err != nil || !ok {
+				t.Fatalf("RequestMagicLink: ok=%v err=%v", ok, err)
+			}
+			res, err := svc.RedeemMagicLink(ctx, tok, "1.2.3.4", "agent")
+			if err != nil {
+				t.Fatalf("RedeemMagicLink: %v", err)
+			}
+			return res.User, u.ID
+		},
 	}
 
 	// Step 1: no user-returning method may be absent from the table above.
@@ -1902,9 +1917,19 @@ func TestClaimsExtenderNeverSeesPasswordHash(t *testing.T) {
 	if _, err := svc.Refresh(ctx, login.RefreshToken); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
+	// The third minting path: RedeemMagicLink reaches the extender through
+	// the same shared mintSession tail Login does, so it is held to the
+	// same promise.
+	magicTok, ok, err := svc.RequestMagicLink(ctx, "extender-scrub@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestMagicLink: ok=%v err=%v", ok, err)
+	}
+	if _, err := svc.RedeemMagicLink(ctx, magicTok, "1.2.3.4", "agent"); err != nil {
+		t.Fatalf("RedeemMagicLink: %v", err)
+	}
 
-	if len(seen) != 2 {
-		t.Fatalf("claims extender ran %d time(s), want 2 (one Login, one Refresh)", len(seen))
+	if len(seen) != 3 {
+		t.Fatalf("claims extender ran %d time(s), want 3 (one Login, one Refresh, one RedeemMagicLink)", len(seen))
 	}
 	for i, h := range seen {
 		if h != "" {

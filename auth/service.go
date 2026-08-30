@@ -1181,6 +1181,36 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 		return zero, ErrEmailNotVerified
 	}
 
+	return s.mintSession(ctx, u, ip, userAgent)
+}
+
+// mintSession issues one brand-new session for the already-authenticated u
+// and returns the [LoginResult] the caller hands back: a fresh refresh
+// token, a signed access token, and a scrubbed copy of u. It is the tail
+// [Service.Login] and [Service.RedeemMagicLink] SHARE, extracted rather
+// than duplicated — two independent minting paths is how one of them
+// quietly stops clearing PasswordHash, or stops rooting its own family, or
+// starts issuing the access token after the Session row exists.
+//
+// It authenticates nothing. Every caller must have decided, on its own
+// terms, that u is entitled to a session BEFORE calling this: Login through
+// the password check, RedeemMagicLink through the claimed verification.
+// The one thing it will not do is trust u as given — u is taken by value
+// and its PasswordHash cleared here, so no caller can leak a credential
+// digest through the returned record or into a [WithClaimsExtender]
+// callback by forgetting to scrub first.
+//
+// [Service.Refresh] deliberately does NOT use this: it mints a SUCCESSOR
+// (inheriting a FamilyID, through [Store.CreateSuccessorSession]'s atomic
+// check-and-insert), which is a different operation from starting a new
+// chain, not a variation on it.
+//
+// ip and userAgent are recorded on the [Session] as audit fields and are
+// not validated here; a caller that requires them non-empty checks that
+// itself, as Login does with [ErrMissingIP].
+func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent string) (LoginResult, error) {
+	var zero LoginResult
+
 	now := s.cfg.clock()
 	sessionID := s.cfg.idGen()
 	refreshPlain, refreshHash, err := token.GenerateOpaque()
@@ -1204,9 +1234,9 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 	if s.cfg.claimsExtender != nil {
 		extra = s.cfg.claimsExtender(u)
 	}
-	// Issued BEFORE CreateSession, deliberately — see "Order of checks"
-	// point 6 above: a bad signing key must fail before any Session row
-	// exists to be orphaned.
+	// Issued BEFORE CreateSession, deliberately — see [Service.Login]'s
+	// "Order of checks" point 6: a bad signing key must fail before any
+	// Session row exists to be orphaned.
 	accessToken, err := token.Issue(token.Claims{
 		Subject:   u.ID,
 		SessionID: sessionID,
@@ -1222,8 +1252,8 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 		UserID:    u.ID,
 		TokenHash: refreshHash,
 		// FamilyID: this session is the root of its own rotation chain —
-		// nothing to inherit from at login — so it names itself. A
-		// successor minted by a future refresh carries this same value
+		// nothing to inherit from at a fresh sign-in — so it names itself.
+		// A successor minted by a future refresh carries this same value
 		// forward (see auth.go's package doc, "Sessions, families, and
 		// rotation").
 		FamilyID:  sessionID,
