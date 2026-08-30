@@ -110,8 +110,8 @@ func NewInviteStore() *InviteStore {
 // person rather than a spelling. Without it "erin@example.com" and
 // "Erin@Example.com" are two different pairs, both writes succeed, and the
 // container holds two live tokens for one human — see [invite.EmailInvite],
-// "Addresses are normalized". This store did not normalize at all until
-// v0.2.0, and neither did store/drops.
+// "Addresses are normalized". Through v0.1.0 this store did not normalize at
+// all, and neither did store/drops.
 //
 // The hash is checked first, so an invite that collides on both reports the
 // collision that matters to the redemption path.

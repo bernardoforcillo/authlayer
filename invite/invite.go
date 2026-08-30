@@ -306,7 +306,8 @@ var (
 type Store interface {
 	// CreateEmailInvite persists an already-stamped invite and returns what
 	// was stored. It stamps nothing of its own and drops nothing it was
-	// given.
+	// given; the one field it may change is Email, and only by normalizing
+	// it.
 	//
 	// inv.Email is normalized (see [NormalizeEmail]) before the uniqueness
 	// check and the write, so the caller need not normalize it first, though

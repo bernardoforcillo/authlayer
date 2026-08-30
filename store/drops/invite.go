@@ -104,7 +104,10 @@ func WithInviteTextLibraryIDs() InviteOption {
 type InviteSchema struct {
 	// EmailInvites is the one-time email invitation table. See
 	// [invite.EmailInvite] — the token is a bearer credential; the email
-	// column is a delivery hint, not an authorization check.
+	// column is a delivery hint, not an authorization check, and holds only
+	// normalized addresses ([invite.NormalizeEmail]), which is what makes the
+	// (container_id, email) constraint below a constraint on a person rather
+	// than on a spelling.
 	EmailInvites *pg.Table
 	// Links is the reusable invitation-link table.
 	Links *pg.Table
@@ -264,9 +267,9 @@ func (st *InviteStore) DeleteEmailInvite(ctx context.Context, id string) error {
 // nothing for a lower(email) comparison to catch, and the constraint's index
 // stays usable.
 //
-// Rows written before v0.2.0 may hold a non-normalized address and are NOT
-// matched by this. See the v0.2.0 changelog entry for the one-time migration
-// that folds them.
+// Rows written by v0.1.0, which normalized nothing, may hold a non-normalized
+// address and are NOT matched by this. See the changelog entry for the
+// one-time migration that folds them.
 func (st *InviteStore) DeleteEmailInvitesFor(ctx context.Context, containerID, email string) error {
 	_, err := st.db.Delete(st.s.EmailInvites).
 		Where(st.s.emailInvites.eq("container_id", containerID), st.s.emailInvites.eq("email", invite.NormalizeEmail(email))).

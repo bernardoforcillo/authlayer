@@ -54,6 +54,8 @@ Every uniqueness constraint its ports describe.
     `EmailInvite.TokenHash` (also `memory.ErrTokenHashTaken` — same column
     meaning, same failure), `(ContainerID, Email)` as
     `memory.ErrInviteEmailTaken`, and `Link.Code` as `memory.ErrLinkCodeTaken`.
+    Addresses are normalized on both sides, so that pair constraint bites on a
+    person rather than on a spelling.
   </Card>
 </Columns>
 

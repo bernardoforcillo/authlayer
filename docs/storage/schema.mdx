@@ -262,7 +262,7 @@ None of the three constraints here carries the inline `unique` flag on its
 column — like the `token_hash` columns above, each is registered as a named
 one-column constraint that `CreateSchema` emits as an `ALTER TABLE`. All three
 are
-[MUSTs on any backend](/storage/overview#the-seven-invitation-musts), and all three
+[MUSTs on any backend](/storage/overview#the-eight-invitation-musts), and all three
 bound *who gets in*:
 
 - **`token_hash`** — what makes one emailed token pay out once.
@@ -274,8 +274,13 @@ bound *who gets in*:
   person invited to two containers is two legitimate rows.
 </Warning>
 
-Note that this constraint is **byte-exact on the address**, because `invite`
-[does not normalize](/invitations/email-invites#addresses-are-stored-verbatim).
+The comparison is byte-exact, and that is correct because the column holds only
+normalized values: `CreateEmailInvite` and `DeleteEmailInvitesFor` both apply
+`invite.NormalizeEmail` (trim, lowercase) first, so the constraint is on a
+person rather than on a spelling and the index stays usable — no `lower(email)`
+needed. See [addresses are normalized](/invitations/email-invites#addresses-are-normalized).
+Rows written by **v0.1.0**, which normalized nothing, may hold non-normalized
+addresses; the changelog carries the one-time migration.
 
 {/* verify:stdout "organizations\n  id PK\n  owner_id\n  created_at\n  updated_at\n  name\n  slug UNIQUE\n  indexes: 0\norganization_members\n  container_id\n  user_id\n  role_key\n  joined_at\n  PRIMARY KEY [container_id user_id]\n  indexes: 0\norganization_roles\n  id PK\n  container_id\n  key\n  name\n  permissions\n  created_at\n  UNIQUE [container_id key] as organization_roles_container_key\n  indexes: 0\nusers\n  id PK\n  email UNIQUE\n  email_verified_at NULL\n  password_hash\n  created_at\n  updated_at\n  UNIQUE [email] as users_email_key\n  indexes: 0\nsessions\n  id PK\n  user_id\n  token_hash\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  user_agent\n  ip\n  UNIQUE [token_hash] as sessions_token_hash\n  indexes: 1\nverifications\n  id PK\n  user_id\n  token_hash\n  purpose\n  email\n  expires_at\n  created_at\n  UNIQUE [token_hash] as verifications_token_hash\n  indexes: 1\norganization_invites\n  id PK\n  container_id\n  email\n  role_key\n  token_hash\n  invited_by\n  expires_at\n  created_at\n  UNIQUE [container_id email] as organization_invites_container_email\n  UNIQUE [token_hash] as organization_invites_token_hash\n  indexes: 0\norganization_invite_links\n  id PK\n  container_id\n  code\n  role_key\n  created_by\n  max_uses\n  use_count\n  expires_at NULL\n  revoked_at NULL\n  created_at\n  UNIQUE [code] as organization_invite_links_code\n  indexes: 0" */}
 

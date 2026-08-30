@@ -266,6 +266,117 @@ once a 1.0 is cut. Until then, minor versions may break API.
   three constraints back out of `pg_constraint`.
 ### Fixed
 
+- **`invite` performed no email normalization at all**, while `auth` passed
+  every address through `auth.NormalizeEmail` (trim, lowercase) on both sides
+  of every read and write. The `(ContainerID, Email)` uniqueness `invite.Store`
+  states as a **MUST** was therefore byte-exact, so
+  `erin@example.com` and `Erin@Example.com` were two *different* pairs: both
+  invitations were written, both tokens were live, and the sweep
+  `InviteByEmail` performs first (`DeleteEmailInvitesFor`) matched only the
+  spelling it was handed. "Re-inviting an address replaces rather than
+  duplicates" — which the port states as a MUST — silently did not hold across
+  casing, and the consequence is the one that constraint exists to prevent:
+  an admin revoking the row they recognise on a pending-invitations screen
+  leaves the other one redeemable, at the invited role, with nothing anywhere
+  reporting that it is still out there. No concurrency required.
+
+  Two further consequences. The readme's recipient-binding advice — compare
+  `PreviewInvite`'s address against the accepting user's own verified address
+  — did not work as written: `Preview.Email` came back verbatim while
+  `auth.UserBase.Email` was normalized, so a raw `==` **refused a legitimate
+  recipient** invited as `Bob@Example.com`. That failed closed, so it was not a
+  hole, but it was wrong. And `PreviewInvite` and `ListInvites` handed the
+  address back exactly as it went in, so a management screen showed two rows
+  nobody would read as duplicates.
+
+  Normalization now goes where `auth` put it — in the service **and** in every
+  backend, with the obligation written on the port:
+
+  - `invite.NormalizeEmail` is new and exported, byte for byte
+    `auth.NormalizeEmail`. Both are now wrappers over one unexported
+    implementation (`internal/emailnorm`) so they cannot drift. They are two
+    functions rather than one because `invite` deliberately takes **no
+    dependency on `auth`** — that is a security argument in `invite`'s own
+    package doc (it stores no users, so it cannot check a recipient), not an
+    accident, and importing `auth` to reach a two-line string function would
+    have falsified it.
+  - `invite.EmailInvite` gains an **"Addresses are normalized"** MUST: a Store
+    must apply it to every address it writes or matches. That makes it the
+    fourth obligation stated on a record type rather than a method, and
+    `invite.Store`'s count goes from seven MUSTs to eight.
+    `CreateEmailInvite` normalizes before the uniqueness check and the write
+    and returns the normalized record; `DeleteEmailInvitesFor` normalizes
+    before it matches.
+  - `Service.InviteByEmail` normalizes before either store call, so an
+    application going through the service is covered whatever its backend
+    does. The obligation stays on the port because a Store is reachable
+    directly and the constraint it guards lives there — the same
+    belt-and-braces `auth` has always had.
+  - `store/memory` and `store/drops` both comply. `store/drops` keeps a plain
+    equality predicate on `email`: the column now holds only normalized
+    values, so the `UNIQUE (container_id, email)` index stays usable and no
+    `lower(email)` functional index is needed. **No schema change** —
+    `CreateSchema`'s DDL is byte-identical.
+  - `invitetest` grows three checks —
+    `CreateEmailInvite/NormalizesTheAddress`,
+    `CreateEmailInvite/ContainerEmailPairIsUniqueAcrossSpelling` and
+    `DeleteEmailInvitesFor/NormalizesTheAddress` — bringing it to 46, eight of
+    them still races. Two new negative controls, one per side of the
+    obligation, assert each check actually bites: a store that writes
+    addresses verbatim, and one that sweeps byte-exactly.
+
+  **Migrating a v0.1.0 database.** This changes what gets stored, and rows
+  written by v0.1.0 may hold a non-normalized address that a normalized lookup
+  will no longer match. The symptom is not data loss: those rows stay listable
+  and their tokens stay redeemable, and revoking by id still works. What breaks
+  is replacement — re-inviting `Erin@Example.com` now writes
+  `erin@example.com`, which does not match the legacy row, so the legacy
+  invitation survives alongside the new one and you are back in exactly the
+  state this fix removes. `store/memory` needs nothing; it starts empty. For
+  `store/drops`, run this once against your invitations table (named
+  `organization_invites` by default — use whatever you passed to
+  `WithInviteNames`):
+
+  ```sql
+  -- 1. Look before you delete. Every group returned is a set of rows this
+  --    defect created: two or more live invitations for one person.
+  SELECT container_id, lower(btrim(email)) AS normalized,
+         count(*), array_agg(email), array_agg(id)
+  FROM organization_invites
+  GROUP BY 1, 2
+  HAVING count(*) > 1;
+
+  -- 2. Keep the newest invitation per (container, normalized address) and
+  --    drop the rest. This DELETES live invitations: their emailed tokens
+  --    stop working, so re-invite anyone you drop. Skip this step and step 3
+  --    will fail on UNIQUE (container_id, email), which is the constraint
+  --    doing its job.
+  DELETE FROM organization_invites a
+  USING organization_invites b
+  WHERE a.container_id = b.container_id
+    AND lower(btrim(a.email)) = lower(btrim(b.email))
+    AND (a.created_at, a.id) < (b.created_at, b.id);
+
+  -- 3. Fold what is left. Tokens are unaffected — only the email column
+  --    changes, and acceptance looks up by token_hash.
+  UPDATE organization_invites
+  SET email = lower(btrim(email))
+  WHERE email <> lower(btrim(email));
+  ```
+
+  Run steps 2 and 3 in one transaction. If step 1 returns no rows and step 3
+  reports `UPDATE 0`, you were never affected and there is nothing to do — the
+  migration is only needed by a deployment that actually received mixed-case
+  or padded addresses. The `auth` tables are untouched: they have always been
+  normalized. Invite **links** are untouched too; they carry no address.
+
+  One caveat, for ASCII-only correctness: PostgreSQL's `lower()` is
+  locale-dependent and `btrim()` with no second argument strips spaces only,
+  while Go's `strings.ToLower`/`strings.TrimSpace` are Unicode-aware. The two
+  agree on every ASCII address. If your table holds addresses with non-ASCII
+  local parts or exotic whitespace, verify the fold in a transaction and roll
+  back before committing.
+
 - **Four readme snippets that did not compile.** The RBAC quick start — the
   first snippet anyone copies — declared `ok` and never read it (`declared and
   not used`); the `Context` snippet redeclared both `userID` and `orgID` with

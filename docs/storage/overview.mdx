@@ -135,7 +135,7 @@ satisfies every method obligation above and skips these is still wrong.
 
 </AccordionGroup>
 
-## The seven invitation MUSTs
+## The eight invitation MUSTs
 
 All about the same thing: bounding **who gets in**.
 
@@ -147,7 +147,7 @@ claims first and grants second precisely so it is the only thing that has to
 hold. And `CreateEmailInvite` and `CreateLink` must refuse a write that would
 break a uniqueness constraint, **atomically with performing it**.
 
-**Three are on the record types**, because they constrain the shape of the table
+**Four are on the record types**, because they constrain the shape of the table
 rather than the behaviour of one call:
 
 <Columns cols={2}>
@@ -165,6 +165,12 @@ rather than the behaviour of one call:
     duplicate when two calls race. The same person invited to two containers is
     two legitimate rows.
   </Card>
+  <Card title="EmailInvite.Email is normalized" icon="wand-magic-sparkles">
+    `invite.NormalizeEmail` on every address a store writes or matches — the
+    write in `CreateEmailInvite`, the argument to `DeleteEmailInvitesFor`.
+    Without it the pair above is byte-exact, so two casings of one address are
+    two live tokens for one person.
+  </Card>
 </Columns>
 
 ## They are executable, not just prose
@@ -175,7 +181,7 @@ backend author can check their work:
 {/* verify:skip test-function bodies needing a *testing.T; both are compiled and run by the project's own suite — store/memory runs each in store/memory/auth_test.go and invite_test.go, and store/drops runs each in its integration lane */}
 ```go
 authtest.RunStoreContract(t, newStore)   // 52 checks, 6 of them races
-invitetest.RunStoreContract(t, newStore) // 43 checks, 8 of them races
+invitetest.RunStoreContract(t, newStore) // 46 checks, 8 of them races
 ```
 
 See [Writing your own backend](/storage/custom-backends).

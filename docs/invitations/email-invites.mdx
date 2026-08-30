@@ -59,10 +59,11 @@ only the hash is stored: true
   The scope being invited into.
 </ResponseField>
 <ResponseField name="Email" type="string">
-  Stored **exactly as you passed it** — this package does not normalize
-  addresses. A delivery hint and an audit record, never an authorization test.
+  Always **normalized** — trimmed and lowercased by `invite.NormalizeEmail`,
+  the same rule `auth` applies to a user's address. A delivery hint and an
+  audit record, never an authorization test.
   See [bearer semantics](/invitations/security#an-email-invite-is-a-bearer-credential)
-  and [normalization is yours](#addresses-are-stored-verbatim).
+  and [addresses are normalized](#addresses-are-normalized).
 </ResponseField>
 <ResponseField name="RoleKey" type="string">
   The role granted on acceptance.
@@ -102,8 +103,9 @@ carry fields of your own devising that are not meant for an anonymous reader.
 <Tip>
 `Preview.Email` is also how you **bind an invitation to its recipient** if your
 application needs that: compare it against the authenticated user's own verified
-address before calling `AcceptInvite` — after normalizing both, since
-[this package stores addresses verbatim](#addresses-are-stored-verbatim).
+address before calling `AcceptInvite`. A plain `==` is correct — both sides are
+[normalized by the same rule](#addresses-are-normalized), so a recipient invited
+as `Bob@Example.com` is admitted rather than refused for the spelling.
 </Tip>
 
 ## Accepting
@@ -191,23 +193,19 @@ pending-invitations screen shows one row — and revoking the visible one leaves
 the other redeemable. It is a constraint on the **pair**: the same person
 invited to two containers is two legitimate rows.
 
-## Addresses are stored verbatim
+## Addresses are normalized
 
-<Warning>
-`invite` performs **no normalization at all**. Unlike
-[`auth`](/authentication/overview), which passes every address through
-`auth.NormalizeEmail` (trim, lowercase) on every read and write, this package
-stores and matches the exact string you hand it.
-
-So `(ContainerID, Email)` uniqueness — and therefore "re-inviting replaces" — is
-**byte-exact**. Two casings of one address are two rows, both live, and revoking
-the one your screen shows leaves the other redeemable.
-</Warning>
+Every address goes through `invite.NormalizeEmail` — trim, lowercase — on its
+way in: `InviteByEmail` applies it before it touches the store, and a compliant
+backend applies it again before it writes or matches. So `(ContainerID, Email)`
+uniqueness, and therefore "re-inviting replaces", is a constraint on a
+**person**, not on a spelling.
 
 {/* verify:main */}
 ```go
 _, lowerTok, _ := isvc.InviteByEmail(owner, "erin@example.com", org.RoleMember)
-_, upperTok, _ := isvc.InviteByEmail(owner, "Erin@Example.com", org.RoleMember)
+inv2, upperTok, _ := isvc.InviteByEmail(owner, "  Erin@Example.COM\t", org.RoleMember)
+fmt.Println("stored as:", inv2.Email)
 
 open := 0
 for _, t := range []string{lowerTok, upperTok} {
@@ -219,36 +217,45 @@ fmt.Println("live invitations for one human:", open)
 ```
 
 ```
-live invitations for one human: 2
+stored as: erin@example.com
+live invitations for one human: 1
 ```
 
-Two consequences to handle in your own code:
+<Warning>
+`invite` normalized nothing through **v0.1.0**: two casings of one address were
+two rows, both live, and revoking the one your screen showed left the other
+redeemable. Invitation rows written by that version may hold non-normalized
+addresses a normalized lookup will not match — see the
+[changelog](https://github.com/bernardoforcillo/authlayer/blob/main/changelog.md)
+for the one-time SQL migration.
+</Warning>
+
+Two things follow for your own code:
 
 <Columns cols={2}>
-  <Card title="Normalize before you call" icon="wand-magic-sparkles">
-    Lowercase and trim the address yourself — `auth.NormalizeEmail` is exported
-    and is exactly what the authentication half applies — so re-inviting really
-    does replace.
+  <Card title="Call it however your form spelled it" icon="wand-magic-sparkles">
+    You do not have to lowercase before calling. `auth.NormalizeEmail` and
+    `invite.NormalizeEmail` are the same rule and both are exported, but the
+    library no longer needs you to reach for either on this path.
   </Card>
-  <Card title="Normalize before you compare" icon="code-compare">
-    `Preview.Email` comes back exactly as it went in, while
-    `auth.UserBase.Email` is always normalized. A raw `==` between the two
-    refuses a legitimate recipient invited as `Bob@Example.com`.
+  <Card title="Compare with a plain ==" icon="code-compare">
+    `Preview.Email` and `auth.UserBase.Email` are both normalized, so binding an
+    invitation to its recipient is an equality test. No recipient is refused for
+    having been invited as `Bob@Example.com`.
   </Card>
 </Columns>
 
 {/* verify:main */}
 ```go
-// The comparison that actually works, when binding an invitation to its
-// recipient. auth.NormalizeEmail is trim + lowercase.
+// Binding an invitation to its recipient: both sides are already normalized.
 p, _ = isvc.PreviewInvite(context.Background(), upperTok)
-fmt.Println("raw compare:       ", p.Email == "erin@example.com")
-fmt.Println("normalized compare:", auth.NormalizeEmail(p.Email) == "erin@example.com")
+fmt.Println("preview address: ", p.Email)
+fmt.Println("plain == works:  ", p.Email == auth.NormalizeEmail("Erin@Example.com"))
 ```
 
 ```
-raw compare:        false
-normalized compare: true
+preview address:  erin@example.com
+plain == works:   true
 ```
 
 ## Listing and revoking
@@ -271,14 +278,13 @@ fmt.Println("revoke again:", errors.Is(
 ```
 
 ```
-pending: [Erin@Example.com dana@example.com erin@example.com]
+pending: [dana@example.com erin@example.com]
 revoke: <nil>
 revoke again: true
 ```
 
-Note the two rows for Erin — that is the
-[verbatim-address behaviour](#addresses-are-stored-verbatim) showing up on a
-management screen. `ListInvites` returns the container's rows in **no specified
+One row for Erin, not two — both spellings resolved to the same pending
+invitation. `ListInvites` returns the container's rows in **no specified
 order**; sort before you render.
 
 <Note>
@@ -305,7 +311,7 @@ fmt.Println("purged:", err, removed)
 purged: <nil> 0
 ```
 
-{/* verify:stdout "<nil> bob@example.com admin true\nexpires in about a week: true\nonly the hash is stored: true\n<nil> admin bob@example.com valid: true container: true\naccepted: <nil> Acme\nthe token is spent: true\nan unknown token: true\nre-accept: <nil> Acme\nbob is still an admin: true\nthe first token is dead: true\nthe second works: <nil>\nlive invitations for one human: 2\nraw compare:        false\nnormalized compare: true\npending: [Erin@Example.com dana@example.com erin@example.com]\nrevoke: <nil>\nrevoke again: true\npurged: <nil> 0" */}
+{/* verify:stdout "<nil> bob@example.com admin true\nexpires in about a week: true\nonly the hash is stored: true\n<nil> admin bob@example.com valid: true container: true\naccepted: <nil> Acme\nthe token is spent: true\nan unknown token: true\nre-accept: <nil> Acme\nbob is still an admin: true\nthe first token is dead: true\nthe second works: <nil>\nstored as: erin@example.com\nlive invitations for one human: 1\npreview address:  erin@example.com\nplain == works:   true\npending: [dana@example.com erin@example.com]\nrevoke: <nil>\nrevoke again: true\npurged: <nil> 0" */}
 
 ## Next
 

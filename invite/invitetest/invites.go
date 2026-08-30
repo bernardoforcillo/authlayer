@@ -39,6 +39,10 @@ func emailInviteChecks() []check {
 // nothing it was given. RoleKey in particular is what a redeemer is admitted
 // AT, so a store that silently loses it admits at the zero role rather than
 // the invited one.
+//
+// The fixture's address is already normalized, so the one field a store IS
+// allowed to change comes back identical here; whether it normalizes at all
+// is "CreateEmailInvite/NormalizesTheAddress".
 func checkCreateEmailInviteRoundTrip(t tb, st invite.Store) {
 	t.Helper()
 	ctx := context.Background()

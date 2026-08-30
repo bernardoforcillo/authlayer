@@ -96,7 +96,15 @@ backend author it was optional.
 
 ## The invite contract
 
-Built the same way, placed the same way.
+Built the same way, placed the same way. Beyond the three uniqueness
+constraints, it also asserts `invite.EmailInvite`'s **address normalization**:
+`CreateEmailInvite` must apply `invite.NormalizeEmail` before the uniqueness
+check and the write, and `DeleteEmailInvitesFor` must apply it before it
+matches. Skip it and the `(container_id, email)` constraint becomes byte-exact,
+so two casings of one address are two live tokens for one person — the checks
+are `CreateEmailInvite/NormalizesTheAddress`,
+`DeleteEmailInvitesFor/NormalizesTheAddress` and
+`CreateEmailInvite/ContainerEmailPairIsUniqueAcrossSpelling`.
 
 {/* verify:skip a test function needing a *testing.T; the identical call is compiled and run by store/memory/invite_test.go and by store/drops' integration lane */}
 ```go
@@ -114,7 +122,7 @@ Ids and container ids are UUIDv7, and addresses, token hashes and codes are
 unique per call unless a check is deliberately forcing a collision. Warm your
 pool to `invitetest.RaceGoroutines` connections, for the same reason as above.
 
-### Eight of the forty-three checks are races
+### Eight of the forty-six checks are races
 
 `ConsumeLink`'s single winner against a `MaxUses: 1` link; its ceiling against a
 `MaxUses: 4` one; the lost update its increment must not have on an unlimited
@@ -166,10 +174,10 @@ that asserts nothing cannot slip in green.
     covers it.
   </Card>
   <Card title="invitetest" icon="vials">
-    **Thirty-two** non-compliant stores — one whose `ConsumeLink` decides under
+    **Thirty-four** non-compliant stores — one whose `ConsumeLink` decides under
     one lock and increments under a second, one that lets two links share a
     code, one that reads `MaxUses: 0` as exhausted rather than unlimited, one
-    that reads a nil `ExpiresAt` as a zero time — paired into **forty-four**
+    that stores an invited address verbatim — paired into **forty-seven**
     cases. A further test fails if a check is ever added without a control.
   </Card>
 </Columns>
