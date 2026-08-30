@@ -95,7 +95,10 @@ atomicity rules out. `JoinViaLink` re-reads the link afterwards to tell them
 apart.
 </Note>
 
-## `auth` — eighteen
+## `auth` — twenty-four
+
+Eighteen belong to the password-and-session core. The six for
+[external identities](/oauth/overview) follow in their own table below.
 
 | Error | Meaning | Suggested status |
 |---|---|---|
@@ -113,7 +116,7 @@ apart.
 | `ErrVerificationExpired` | The verification's `ExpiresAt` has passed — checked **before** the claim, so the token is not burned | 410 |
 | `ErrWeakPassword` | Fails the configured `password.Rules`; wraps the failed rule names | 400 |
 | `ErrVerificationPurpose` | Right token, wrong flow — a `password_reset` token at `VerifyEmail`, say | 400 |
-| `ErrEmailRequired` | `RequestEmailChange` was given an address that is empty once normalized | 400 |
+| `ErrEmailRequired` | An address that is empty once normalized — `RequestEmailChange`'s new address, or a `SignInWith` whose provider returned none and whose `FallbackEmail` is blank too | 400 |
 | `ErrRateLimited` | The IP-keyed `RateLimiter` refused. **Never** returned for the address-keyed reset limiter | 429 |
 | `ErrMissingIP` | `Login` or `RequestPasswordReset` was called with an empty ip — a wiring bug, not caller input | 500 |
 | `ErrStoreContract` | A `Store` returned a value its own contract forbids, where continuing would silently degrade a security control | 500 |
@@ -137,6 +140,30 @@ a reported replay), `Logout` (of a superseded token) and `RevokeSession`.
 `SignUp` is the one method that reports a duplicate address **without an error
 at all**. See
 [Sign-up and the enumeration property](/authentication/sign-up).
+</Note>
+
+## `auth` — external identities
+
+The remaining six, raised by `SignInWith`, `LinkIdentity`, `UnlinkIdentity` and
+`ListIdentities`, or by the `IdentityStore` beneath them.
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrIdentityNotFound` | No identity for that `(provider, subject)` pair, id, or `(user, provider)` pair. From `UnlinkIdentity` it means there was **nothing to unlink** | 404 |
+| `ErrIdentityLinked` | That `(provider, subject)` pair is already linked to a **different** user. An existing link is never re-pointed | 409 |
+| `ErrLinkRequiresVerification` | The address matches an existing local account and the [linking policy](/oauth/linking) refused the implicit link. Not a dead end — `LinkIdentity` is the remedy | 409 |
+| `ErrLastCredential` | Unlinking would leave the account with no identity **and** no password — a permanent lockout, so nothing is removed | 422 |
+| `ErrProviderSubjectRequired` | An `ExternalIdentity` arrived with a blank or whitespace-only `Provider` or `Subject`. Refused by **both** entry points before any store is touched | 400 |
+| `ErrOAuthNotConfigured` | An external-identity method was called on a `Service` built without `WithIdentityStore` — a wiring bug, not caller input | 500 |
+
+<Note>
+`ErrUserNotFound` **wins over** `ErrIdentityLinked` when both would apply:
+`LinkIdentity` reads the account before it looks the pair up, so a link is never
+written pointing at a user that does not exist.
+
+`ListIdentities` on an unknown user id returns an **empty list, not**
+`ErrUserNotFound` — which is what keeps it from answering "does this account
+exist?" for a caller who should not be asking.
 </Note>
 
 ## `token` — six

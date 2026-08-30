@@ -49,8 +49,10 @@ type WorkspaceMember struct {
 <Warning>
 Against [`store/drops`](/storage/postgres), field types are restricted:
 `string`, `time.Time`, `[]byte`, `int` or `int32` — or a named type over
-`string`, `int` or `int32`. Anything else, a pointer included, **panics at
-construction** with the column named. Nullable columns are not supported yet.
+`string`, `int` or `int32`. `*time.Time` is accepted too and is the one nullable
+shape — it drops the `NOT NULL`, and a nil pointer is written as the SQL `NULL`
+keyword. Anything else, **any other pointer included**, panics at construction
+with the column and the type named.
 
 A field with no `drop:` tag (or `drop:"-"`) is not persisted. Your container
 type must tag `id`, `owner_id`, `created_at` and `updated_at`, and your member

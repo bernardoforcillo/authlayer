@@ -198,6 +198,14 @@ document each method's contract, and they are the reference.
 plus the sentinels, and the engine's own tests exercise it through
 `store/memory`.
 
+Neither does the optional `auth.IdentityStore`. Its
+[three MUSTs](/storage/overview#the-three-identity-musts) are covered by the two
+shipped backends' own tests — including a 200-round concurrency test with a
+deliberately split-lock control in `store/memory`, and a live one against real
+PostgreSQL in `store/drops` — rather than by an exported suite. A third-party
+identity backend has `go doc ./auth IdentityStore` and those tests to work
+from.
+
 ## Next
 
 <Columns cols={2}>

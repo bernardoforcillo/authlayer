@@ -4,7 +4,7 @@ description: "The PostgreSQL backend — the wiring in full with both stdlib imp
 ---
 
 `store/drops` declares **`package dropsstore`**, and it is the production
-backend: three stores over their own tables, generic over your container and
+backend: four stores over their own tables, generic over your container and
 member types, deriving columns from `drop:` struct tags.
 
 ## The wiring, in full
@@ -67,44 +67,50 @@ db := pg.New(stdlib.New(sqlDB))
 scopeStore := dropsstore.New[org.Organization, org.Member](db)
 authStore := dropsstore.NewAuthStore(db)
 inviteStore := dropsstore.NewInviteStore(db)
+identityStore := dropsstore.NewIdentityStore(db) // optional: external identities
 
 orgSvc := org.New(org.NewAccess(nil), scopeStore)
-authSvc := auth.New(authStore)
+authSvc := auth.New(authStore, auth.WithIdentityStore(identityStore))
 inviteSvc := invite.New(orgSvc.Service, inviteStore)
-fmt.Println("three services, three stores:",
-	orgSvc != nil, authSvc != nil, inviteSvc != nil)
+fmt.Println("three services, four stores:",
+	orgSvc != nil, authSvc != nil, inviteSvc != nil, identityStore != nil)
 
 _ = newOrgService // the function above; calling it needs a live database
 ```
 
 ```
 open: <nil>
-three services, three stores: true true true
+three services, four stores: true true true true
 ```
 
-## Three stores, three sets of tables
+## Four stores, four sets of tables
 
 | Constructor | Port | Default tables |
 |---|---|---|
 | `New[C, M](db, opts...)` | `scope.Store` | `organizations`, `organization_members`, `organization_roles` |
 | `NewAuthStore(db, opts...)` | `auth.Store` | `users`, `sessions`, `verifications` |
 | `NewInviteStore(db, opts...)` | `invite.Store` | `organization_invites`, `organization_invite_links` |
+| `NewIdentityStore(db, opts...)` | `auth.IdentityStore` — [optional](/oauth/overview) | `identities` |
 
 Each has its own `CreateSchema` and its own `Schema()`. **No foreign keys are
 declared** — not to a users table from the RBAC side, which authlayer does not
-own, and not between the three auth tables either.
+own, not between the three auth tables, and not from `identities` to `users`
+either. That last one is also forced: the auth store may be an entirely
+different backend.
 
 {/* verify:main */}
 ```go
 fmt.Println(dropsstore.NewSchema[org.Organization, org.Member]().Containers.Name())
 fmt.Println(dropsstore.NewAuthSchema().Users.Name())
 fmt.Println(dropsstore.NewInviteSchema().Links.Name())
+fmt.Println(dropsstore.NewIdentitySchema().Identities.Name())
 ```
 
 ```
 organizations
 users
 organization_invite_links
+identities
 ```
 
 ## Renaming tables
@@ -126,19 +132,23 @@ fmt.Println("renamed:", teams.Schema().Containers.Name())
 renamed: teams
 ```
 
-`WithAuthNames(AuthNames{...})` and `WithInviteNames(InviteNames{...})` do the
-same for the other two — reach for the first if `users` is already taken in your
-database.
+`WithAuthNames(AuthNames{...})`, `WithInviteNames(InviteNames{...})` and
+`WithIdentityNames(IdentityNames{...})` do the same for the other three — reach
+for the first if `users` is already taken in your database.
 
 ## Column derivation
 
 Columns come from the `drop:` tags on your types.
 
 <Warning>
-Field types are restricted to `string`, `time.Time`, `[]byte`, `int` or `int32`
-— or a named type over `string`, `int` or `int32`. Anything else, **a pointer
-included**, panics at construction with the column named. Nullable columns are
-not supported yet.
+Field types are restricted to `string`, `time.Time`, `*time.Time`, `[]byte`,
+`int` or `int32` — or a named type over `string`, `int` or `int32`. Anything
+else, **any other pointer included**, panics at construction with the column and
+the type named.
+
+`*time.Time` is the one nullable shape: it drops the `NOT NULL` and a nil
+pointer is written as the SQL `NULL` keyword rather than a parameter. It is what
+`email_verified_at`, `rotated_at` and `last_used_at` are.
 
 A field with no `drop:` tag (or `drop:"-"`) is not persisted. Your container
 type must tag `id`, `owner_id`, `created_at` and `updated_at`, and your member
@@ -185,6 +195,12 @@ override `WithIDGenerator`, you need the matching option on each store, and
 | `New` | `WithTextLibraryIDs()` | `WithTextUserIDs()` |
 | `NewInviteStore` | `WithInviteTextLibraryIDs()` | `WithInviteTextUserIDs()` |
 | `NewAuthStore` | `WithAuthTextLibraryIDs()` — moves **all five** columns | none, deliberately |
+| `NewIdentityStore` | `WithIdentityTextLibraryIDs()` — moves **both** columns | none, deliberately |
+
+Pass `WithIdentityTextLibraryIDs()` **alongside** `WithAuthTextLibraryIDs()`:
+`identities.user_id` references `users.id`, so leaving one `uuid` while the other
+went `text` fixes nothing and fails the first sign-in with the very error the
+option was added to remove.
 
 {/* verify:main */}
 ```go
@@ -212,9 +228,9 @@ AUTHLAYER_TEST_DSN='postgres://user:pass@host/scratch?sslmode=disable' go test -
 
 <Warning>
 **This lane is destructive and wants the database to itself.** It `DROP`s the
-auth, RBAC and invite tables in the target database on the way in and rebuilds
-them, so point `AUTHLAYER_TEST_DSN` at a scratch database, never at anything you
-care about.
+auth, RBAC, invite and identity tables in the target database on the way in and
+rebuilds them, so point `AUTHLAYER_TEST_DSN` at a scratch database, never at
+anything you care about.
 
 It also expects **exclusive** use of it: two copies running at once — or
 anything else writing those tables — will fail each other in ways that look like
@@ -222,7 +238,7 @@ product bugs (`relation ... does not exist` mid-run, timing measurements
 polluted by the other client's writes).
 </Warning>
 
-{/* verify:stdout "open: <nil>\nthree services, three stores: true true true\norganizations\nusers\norganization_invite_links\nrenamed: teams\noptions compose: true" */}
+{/* verify:stdout "open: <nil>\nthree services, four stores: true true true true\norganizations\nusers\norganization_invite_links\nidentities\nrenamed: teams\noptions compose: true" */}
 
 ## Next
 

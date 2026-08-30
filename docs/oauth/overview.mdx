@@ -1,0 +1,181 @@
+---
+title: "External identities"
+sidebarTitle: "Overview"
+description: "Sign in with Google, GitHub or a corporate IdP — what authlayer owns, what it deliberately refuses to store, and the optional port that turns it on."
+---
+
+`auth` can sign a user in from an external provider's assertion and owns the
+`identities` table that ties that external account to a local one. It is four
+methods on the `auth.Service` you already have, plus one optional port.
+
+<Warning>
+**authlayer stores no provider access token and no provider refresh token, and
+it is not an API client.** It never redirects a browser, never exchanges an
+authorization code, never calls a provider's API, and never refreshes a
+provider grant.
+
+Your application runs the OAuth/OIDC dance with whatever client library it
+likes — `golang.org/x/oauth2`, a vendor SDK, hand-written HTTP — validates the
+response, and hands the result here as an `auth.ExternalIdentity`. That is why
+there is no OAuth client in the [dependency budget](/reference/packages).
+</Warning>
+
+## What a row holds
+
+Seven columns, and no more: `id`, `user_id`, `provider`, `subject`, `email`,
+`created_at`, `last_used_at`. There is **no token column**, so a dump of that
+table holds nothing to replay against a provider on someone's behalf. If your
+product needs to call a provider's API for a user, those tokens are yours to
+store, in your own table, under your own rotation policy.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault") // the HS256 floor, RFC 7518 §3.2
+
+svc := auth.New(memory.NewAuthStore(),
+	auth.WithIdentityStore(memory.NewIdentityStore()), // dropsstore.NewIdentityStore(db)
+	auth.WithJWT([][]byte{key}, 15*time.Minute))
+
+ctx := context.Background()
+res, err := svc.SignInWith(ctx, auth.SignInRequest{
+	Identity: auth.ExternalIdentity{
+		Provider:      "google",
+		Subject:       "109371829301827364501", // the provider's `sub` — opaque
+		Email:         "dana@example.com",
+		EmailVerified: true,
+	},
+	IP:        "203.0.113.9",
+	UserAgent: "Mozilla/5.0",
+})
+fmt.Println(err, res.Created, res.User.Email, res.AccessToken != "")
+```
+
+```
+<nil> true dana@example.com true
+```
+
+Nothing here knew Dana before that call. It **provisioned** an account with no
+password, stamped `EmailVerifiedAt` because the provider asserted the address
+verified, wrote one identity row, and minted the same session a password
+`Login` would — see [Signing in](/oauth/sign-in) for the two rungs that decided
+that.
+
+{/* verify:main */}
+```go
+rows, err := svc.ListIdentities(ctx, res.User.ID)
+fmt.Println(err, len(rows))
+
+i := rows[0]
+fmt.Println(i.Provider, i.Subject, i.Email, i.LastUsedAt != nil)
+```
+
+```
+<nil> 1
+google 109371829301827364501 dana@example.com true
+```
+
+<Note>
+`Identity.Email` is what the **provider** asserted, normalized, at the moment
+the link was made. It is an audit and display field: it may legitimately differ
+from `UserBase.Email` — someone changed their address at the provider — and it
+is **never an authentication input once the link exists**. Nothing copies it
+onto the account, and nothing rewrites it from a later assertion.
+
+`LastUsedAt` is `nil` when the link has never signed anyone in. The sign-in
+paths stamp it at creation for exactly that reason, so `nil` records a fact
+rather than which code path wrote the row.
+</Note>
+
+## The port is optional, and separate on purpose
+
+`auth.IdentityStore` is **not** part of `auth.Store`. That interface shipped in
+`v0.1.0`, and adding a nineteenth method to it would break every third-party
+backend the day after — so identities follow the per-concern split `invite.Store`
+already uses.
+
+An application that offers no external sign-in wires nothing and creates no
+table. All four methods then answer `ErrOAuthNotConfigured` rather than
+dereferencing nil:
+
+{/* verify:main */}
+```go
+plain := auth.New(memory.NewAuthStore()) // no WithIdentityStore
+_, err = plain.SignInWith(ctx, auth.SignInRequest{})
+fmt.Println(errors.Is(err, auth.ErrOAuthNotConfigured))
+```
+
+```
+true
+```
+
+## The four methods
+
+<ResponseField name="SignInWith(ctx, req SignInRequest) (SignInResult, error)" type="method">
+  Resolve the provider's assertion to an account — provisioning one if the
+  address is new — and mint a session. Takes a **struct**, not positional
+  arguments. See [Signing in](/oauth/sign-in).
+</ResponseField>
+
+<ResponseField name="LinkIdentity(ctx, userID string, ext ExternalIdentity) (Identity, error)" type="method">
+  Attach an external account to a local one **deliberately**, after your
+  application has authenticated the user some other way. Mints no session, and
+  is **not** gated by the linking policy. See
+  [The linking policy](/oauth/linking).
+</ResponseField>
+
+<ResponseField name="UnlinkIdentity(ctx, userID, provider string) error" type="method">
+  Remove every identity that user holds at that provider — unless doing so
+  would leave the account with no way in at all. See
+  [Connected accounts](/oauth/connected-accounts).
+</ResponseField>
+
+<ResponseField name="ListIdentities(ctx, userID string) ([]Identity, error)" type="method">
+  That user's identities and nobody else's. A connected-accounts screen.
+</ResponseField>
+
+## The runnable tour
+
+One program in the module covers this whole section against `store/memory`,
+with no database:
+
+```sh
+go run ./examples/oauth
+```
+
+It provisions an account from a fake provider, signs the same subject in again,
+changes the provider's reported address and shows the link surviving it,
+refuses an unverified assertion claiming an existing account, links that same
+assertion explicitly after a password login, and refuses to remove an account's
+last credential.
+
+{/* verify:stdout "<nil> true dana@example.com true\n<nil> 1\ngoogle 109371829301827364501 dana@example.com true\ntrue" */}
+
+## Where to go next
+
+<Columns cols={2}>
+  <Card title="Signing in" icon="right-to-bracket" href="/oauth/sign-in">
+    The two-rung ladder, and why the subject rung comes first.
+  </Card>
+  <Card title="The linking policy" icon="link" href="/oauth/linking">
+    Three modes, the takeover each guards, and the explicit link.
+  </Card>
+  <Card title="Connected accounts" icon="list-check" href="/oauth/connected-accounts">
+    Listing, unlinking, and the last-credential refusal.
+  </Card>
+  <Card title="The schema" icon="table" href="/storage/schema">
+    The `identities` table, and its two load-bearing constraints.
+  </Card>
+</Columns>

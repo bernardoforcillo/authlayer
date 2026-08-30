@@ -10,6 +10,162 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **External identities — "sign in with Google/GitHub/…"** (`authlayer/auth`).
+  Four new methods on the existing `auth.Service` — `SignInWith`,
+  `LinkIdentity`, `UnlinkIdentity`, `ListIdentities` — over a new `Identity`
+  record and the `ExternalIdentity` / `SignInRequest` / `SignInResult` types.
+  authlayer owns the `identities` table, the resolution ladder and the session
+  issue; the application runs the OAuth/OIDC dance.
+
+  **The boundary is the feature.** authlayer stores **no** provider access
+  token and **no** provider refresh token, exchanges no authorization code,
+  and is not an API client. An identity row is `(provider, subject, email)`
+  plus `created_at` and `last_used_at`, and there is no token column to leak:
+  a dump of that table cannot be replayed against a provider on a user's
+  behalf. No new module requirement — no `x/oauth2`, no vendor SDK.
+
+  `SignInWith` resolves in two rungs, in this order. `(provider, subject)`
+  first: a hit **is** the account, so changing an address at the provider
+  never re-routes an existing link — and, the security half, an attacker who
+  can make a provider assert a victim's address cannot re-route an identity
+  they already control onto the victim's account. Only on a miss does the
+  address decide, from `Identity.Email` or `SignInRequest.FallbackEmail`,
+  provisioning a password-less account when nobody holds it and applying the
+  linking policy when somebody does. A `FallbackEmail` is never credited with
+  the provider's `EmailVerified`, since that flag is a claim about the address
+  the provider actually returned.
+
+  `WithLinking` governs that **implicit** link and nothing else.
+  `LinkVerified` — the default, and deliberately `Linking`'s zero value, so a
+  caller who configures nothing gets the safe policy — requires the provider
+  to have asserted the address verified **and** the local account to be
+  verified already, because each half alone is forgeable by exactly the route
+  the other closes. `LinkNever` refuses every implicit link. `LinkAlways` is
+  documented as unsafe for any provider you do not fully control: it is the
+  "an email match is authentication" behaviour that hands an account to
+  anyone who can make a provider assert its address. An unknown mode
+  **panics** at construction rather than falling back to a policy nobody
+  chose.
+
+  `LinkIdentity` is **not** gated by that policy, on purpose: it is the
+  documented remedy for `ErrLinkRequiresVerification`, performed after the
+  application has authenticated the user some other way, and a policy that
+  blocked the remedy would make the error a dead end — under `LinkNever`, no
+  identity could ever be linked at all. `UnlinkIdentity` refuses to remove an
+  account's last way in (`ErrLastCredential`), and the check and the delete
+  are one atomic step inside the store rather than a read-then-write in the
+  service, because a split there is a permanent, silent lockout with both
+  callers told they succeeded.
+
+  Two consequences are stated rather than smoothed over. An account
+  provisioned by an external sign-in holds **no password at all** — `Login`
+  refuses it and `ChangePassword` cannot help, since it needs a current
+  password — so `RequestPasswordReset` → `ResetPassword` is its only route to
+  a first one, pinned end to end by test. And one window is not closed: the
+  linking decision reads the user and then writes the identity, and `Store`
+  and `IdentityStore` may be different backends with no transaction spanning
+  them, so a concurrent `UpdateUserEmail` can leave a link decided on an
+  `EmailVerifiedAt` the account no longer has.
+
+- **`auth.IdentityStore` is a separate, OPTIONAL port**, wired with
+  `auth.WithIdentityStore` — five methods: `CreateIdentity`,
+  `FindIdentityByProviderSubject`, `ListIdentitiesByUser`, `TouchIdentity`,
+  `DeleteIdentityIfNotLast`.
+
+  It was deliberately **not** added to `auth.Store`. That interface shipped in
+  `v0.1.0`; adding a nineteenth method to it would break every third-party
+  backend that already implements it, the day after the release that invited
+  them to. This project already had the pattern — `invite.Store` is its own
+  port, and `NewAuthStore` / `NewInviteStore` are separate constructors — so
+  identities follow it. An application offering no external sign-in wires
+  nothing, creates no table, and gets `ErrOAuthNotConfigured` from all four
+  service methods rather than a nil dereference.
+
+  Three **MUST**s, each naming what breaks without it. `(Provider, Subject)`
+  is unique across every row, or one external account maps to two local users
+  and a sign-in resolving that subject lands on whichever row the backend
+  returns first. `CreateIdentity` decides the conflict from the write attempt
+  itself, never from a separate read a concurrent link could race.
+  `DeleteIdentityIfNotLast` makes its reachability check and its delete one
+  atomic step — the read-then-write shape this project has shipped and closed
+  four times elsewhere, and the reason `userHasPassword` is a parameter rather
+  than a lookup (the identity store owns `identities` and must never be handed
+  the credential table; the value can only go stale in the fail-closed
+  direction, since no `Service` method removes a password).
+
+- **`store/memory` and `store/drops` both implement it.**
+  `memory.NewIdentityStore()` holds one mutex across every method body and
+  enforces both uniqueness rules its port declares.
+  `dropsstore.NewIdentityStore(db)` owns one table:
+
+  ```
+  identities  id PK (uuid by default), user_id, provider, subject, email,
+              created_at, last_used_at NULL,
+              UNIQUE (provider, subject), INDEX (user_id)
+  ```
+
+  **`UNIQUE (provider, subject)`** is what makes `ErrIdentityLinked` a
+  guarantee rather than advice, and what fails the loser of two concurrent
+  first sign-ins for the same new external account. It is composite, so
+  `CREATE TABLE` cannot carry it; `CreateSchema` emits it as a guarded
+  `ALTER TABLE`, the idiom the invite schema already uses. **`INDEX (user_id)`**
+  serves `ListIdentitiesByUser` and the locking `SELECT` inside every unlink,
+  and a live `EXPLAIN` test proves the planner picks it, with a control that
+  drops the index and requires the plan to degrade.
+
+  `DeleteIdentityIfNotLast` is a transaction there, not a single conditional
+  `DELETE`: a statement is atomic with respect to the rows it *writes*, but
+  this decision is about the sibling rows an `EXISTS` subquery reads, and
+  under `READ COMMITTED` that subquery neither locks what it reads nor sees a
+  concurrent uncommitted delete — so both callers would delete. A per-user
+  advisory transaction lock plus `SELECT … FOR UPDATE` is what makes it
+  serial, and `TestDeleteIdentityIfNotLastIsAtomicUnderConcurrencyLive` is
+  the live test that guards it.
+  `WithIdentityNames` renames the table, and `WithIdentityTextLibraryIDs()`
+  retypes both id columns for a non-UUID `auth.WithIDGenerator` — it must be
+  passed alongside `WithAuthTextLibraryIDs()`, since `identities.user_id`
+  references `users.id`.
+
+- **Six new sentinels** in `authlayer/auth`, bringing that package to
+  twenty-four: `ErrIdentityNotFound`, `ErrIdentityLinked`,
+  `ErrLinkRequiresVerification`, `ErrLastCredential`,
+  `ErrProviderSubjectRequired` and `ErrOAuthNotConfigured`. Two orderings are
+  part of the contract rather than incidental: `ErrUserNotFound` wins over
+  `ErrIdentityLinked` in `LinkIdentity`, because the account is read before
+  the pair is looked up and no row may be left pointing at a user that does
+  not exist; and `ErrProviderSubjectRequired` is raised by **both** entry
+  points before any store is touched, because a blank subject is not a value
+  that misses — it is a key every account at that provider would collide on.
+  `ListIdentities` on an unknown user id returns an **empty list**, not
+  `ErrUserNotFound`, so it cannot answer "does this account exist?".
+
+- **`examples/oauth` — a runnable tour of all of it.** Database-free, over
+  `store/memory`, with a fake provider struct standing in for the OAuth
+  client. It demonstrates rather than describes: a first sign-in provisioning
+  an account (`Created: true`); the same `(provider, subject)` signing the
+  same user in; the provider changing its reported address and the link not
+  moving; an unverified assertion claiming an existing verified account being
+  refused with `ErrLinkRequiresVerification`, writing no identity row and
+  issuing no session; the same assertion linked explicitly afterwards on a
+  `LinkNever` service, proving the policy does not gate the remedy;
+  `UnlinkIdentity` refusing an account's last credential; and an
+  OAuth-provisioned account reaching its first password through the reset
+  flow. It runs in the readme's `Checks` block and in CI alongside the other
+  three.
+
+- **Documentation: a readme `## OAuth` section and four docs-site pages.**
+  The readme section leads with the boundary, then the ladder, the three
+  linking modes, `ErrLastCredential` and the no-password consequence; every
+  fenced `go` block in it is extracted programmatically, compiled, run, and
+  diffed against the values it claims. The docs site gains an **External
+  identities** group — overview, signing in, the linking policy, connected
+  accounts — grouped as a feature domain of its own rather than folded into
+  Authentication, because it carries a separate optional port, its own table
+  and its own error family. Every Go sample on those pages is compiled, run
+  and its stdout pinned by `go run ./docs/_verify`. `storage/schema` now
+  prints the `identities` table from `NewIdentitySchema` itself, so its
+  columns and constraints cannot drift from the code.
+
 - **`examples/reset` — a runnable tour of the password lifecycle.**
   `RequestPasswordReset`, `ResetPassword` and `RequestEmailChange` appeared in
   zero fenced `go` blocks and in neither example, so a newcomer implementing
@@ -399,6 +555,19 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `ulid.ULID`. The module is now named in the snippet and the adapter is
   written out. This one is not covered by the extraction above — authlayer
   does not depend on that module and a doc example is not a reason to start.
+
+- **"Nullable columns are not supported yet" was never true of `*time.Time`.**
+  The readme's `store/drops` section, `docs/storage/postgres` and
+  `docs/authorization/custom-scopes` all said pointers panic at construction
+  and that nullable columns are unsupported. `store/drops`' own panic message
+  lists `*time.Time (nullable)` among the supported types, `colSet.add` types
+  such a column without `NOT NULL`, and `bind` renders a nil one as the SQL
+  `NULL` keyword — which is exactly how `users.email_verified_at`,
+  `sessions.rotated_at` and now `identities.last_used_at` work, all three of
+  them printed as `NULL` columns on the schema page of the same site. All
+  three places now say what the code does: `*time.Time` is accepted and is the
+  one nullable shape; any *other* pointer panics, with the column and the type
+  named.
 
 ## [0.1.0] - 2026-08-29
 

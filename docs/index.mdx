@@ -16,8 +16,8 @@ string:
   </Card>
   <Card title="Authentication" icon="key" href="/authentication/overview">
     Users, password credentials, revocable server-side sessions with
-    refresh-token rotation and reuse detection, email verification, and the
-    password lifecycle.
+    refresh-token rotation and reuse detection, email verification, the password
+    lifecycle, and [external identities](/oauth/overview).
   </Card>
 </Columns>
 
@@ -52,10 +52,13 @@ your application authlayer replaces:
     `UserBase.ID`. That is what keeps authlayer's migrations from ever owning
     a column your product's shape decides.
   </Accordion>
-  <Accordion title="It has no OAuth in this release" icon="right-to-bracket">
-    Social and enterprise identity providers are not shipped. The rest of the
-    authentication core — password credentials, email verification, revocable
-    sessions with refresh rotation — is.
+  <Accordion title="It does not run the OAuth dance, or store a provider's tokens" icon="right-to-bracket">
+    [External identities](/oauth/overview) are shipped — "sign in with
+    Google/GitHub/…", linked to a local account. But authlayer never redirects a
+    browser, never exchanges an authorization code, and is not an API client:
+    you run the dance and hand over the result. An identity row holds
+    `(provider, subject, email)` and two timestamps, with **no token column** of
+    any kind.
   </Accordion>
 </AccordionGroup>
 
@@ -94,6 +97,6 @@ The UUIDv7 generator behind every id authlayer mints is written out in
     Scopes, statements, roles, and the two enforcement points.
   </Card>
   <Card title="Storage" icon="database" href="/storage/overview">
-    The three `Store` ports, the shipped backends, and the schema.
+    The four `Store` ports, the shipped backends, and the schema.
   </Card>
 </Columns>

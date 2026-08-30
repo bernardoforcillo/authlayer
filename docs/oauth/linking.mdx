@@ -1,0 +1,269 @@
+---
+title: "The linking policy"
+description: "An email match is not authentication. The three Linking modes, the takeover each one guards, and why LinkIdentity — the documented remedy — is not gated by any of them."
+---
+
+`Linking` governs one decision: rung 2's **implicit** link, where an unknown
+`(provider, subject)` arrives with an address that already belongs to a local
+account.
+
+<Warning>
+**An email match is not authentication.** Under a naive "the addresses match, so
+sign them in", anyone who can make any configured provider assert
+`victim@example.com` owns that account without ever learning the password — by
+registering that address at a provider that does not verify it, or by exploiting
+a provider that lets an address be re-assigned.
+</Warning>
+
+## The three modes
+
+| Mode | Links to an existing account when | |
+|---|---|---|
+| `LinkVerified` | the provider asserted the address verified **and** the local account's own email is already verified | **default**, and `Linking`'s zero value |
+| `LinkNever` | never | every link must be made explicitly |
+| `LinkAlways` | always, on an address match alone | **unsafe** for a provider you do not control |
+
+`LinkVerified` being the **zero value** is load-bearing: a caller who never
+calls `WithLinking` gets the safe policy rather than a permissive one. An int
+enum whose zero value was `LinkAlways` would hand the takeover above to every
+application that forgot to configure a policy. A test pins `LinkVerified == 0`
+for that reason.
+
+### Why `LinkVerified` needs both halves
+
+Each one alone is forgeable by exactly the route the other closes.
+
+<Columns cols={2}>
+  <Card title="Without the provider's half" icon="user-secret">
+    Anyone who can register a victim's address at a provider that does not
+    verify addresses signs in as the victim, having never learned the password.
+  </Card>
+  <Card title="Without the local half" icon="hourglass">
+    An attacker signs up locally with an address they do not own and waits. When
+    the real owner arrives through a provider that genuinely verified it, their
+    identity is attached to the **attacker's** account — one the attacker still
+    holds the password to.
+  </Card>
+</Columns>
+
+<Note>
+`LinkAlways` is exactly the "an email match is authentication" behaviour above.
+Its only legitimate use is a single first-party identity provider that **you**
+operate, whose verification semantics you know, and which no third party can
+make assert an arbitrary address.
+
+A provider that does not report verification status at all must be mapped to
+`EmailVerified: false`. Defaulting an unknown to `true` hands account takeover
+to anyone who can make that provider assert a victim's address.
+</Note>
+
+`WithLinking` **panics** on a mode outside those three, at construction rather
+than at the first sign-in. A linking mode is a security decision made once, by a
+human reading the option's doc; a `Service` holding a value no branch handles is
+either an unexplainable denial or — far worse — a fallback that links more
+freely than anyone chose.
+
+## The refusal
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault")
+store := memory.NewAuthStore()
+ids := memory.NewIdentityStore()
+svc := auth.New(store,
+	auth.WithIdentityStore(ids), // no WithLinking: LinkVerified is the zero value
+	auth.WithJWT([][]byte{key}, 15*time.Minute))
+ctx := context.Background()
+
+// Gil holds a real, verified, password-backed account here.
+signup, err := svc.SignUp(ctx, "gil@example.com", "Correct-Horse-Battery-9!")
+if err == nil {
+	_, err = svc.VerifyEmail(ctx, signup.VerifyToken)
+}
+fmt.Println("verified local account:", err)
+```
+
+```
+verified local account: <nil>
+```
+
+{/* verify:main */}
+```go
+// An unknown GitHub subject now asserts Gil's address — and GitHub does not
+// claim to have verified it. This is the attack, and it is refused.
+unverified := auth.ExternalIdentity{
+	Provider: "github", Subject: "2002", Email: "gil@example.com", // EmailVerified: false
+}
+_, err = svc.SignInWith(ctx, auth.SignInRequest{Identity: unverified})
+fmt.Println(errors.Is(err, auth.ErrLinkRequiresVerification))
+
+rows, _ := svc.ListIdentities(ctx, signup.User.ID)
+sessions, _ := svc.ListSessions(ctx, signup.User.ID)
+fmt.Println(len(rows), len(sessions))
+```
+
+```
+true
+0 0
+```
+
+The refusal is total: no identity row is written, and no session is issued.
+
+## The remedy, which the policy does not gate
+
+`ErrLinkRequiresVerification` is a "not like this", not a dead end. The account
+exists and the user may well own it — so your application authenticates them by
+some **other** means (a password login, or a [reset](/authentication/passwords)
+if they have no password) and links deliberately.
+
+{/* verify:main */}
+```go
+id, err := svc.LinkIdentity(ctx, signup.User.ID, unverified)
+fmt.Println(err, id.Provider, id.LastUsedAt == nil)
+
+// Re-linking the same pair to the same user returns the stored row unchanged,
+// so a retried request is a no-op.
+same, err := svc.LinkIdentity(ctx, signup.User.ID, unverified)
+fmt.Println(err, same.ID == id.ID)
+```
+
+```
+<nil> github true
+<nil> true
+```
+
+<Warning>
+**`LinkIdentity` is not gated by the `Linking` policy, on purpose.** The policy
+governs the *implicit* link inside `SignInWith`, where it is the only thing
+standing between a provider's assertion and somebody else's account. Here the
+trust basis is different in kind: the application has already authenticated the
+user, and is attaching an identity to the account that user just proved they
+hold.
+
+So `LinkNever` does **not** disable this method, and `LinkVerified` does not
+require either side to be verified here. If the policy that produced the refusal
+also blocked the remedy, the error would have no answer — and under `LinkNever`,
+which produces it most often, no identity could ever be linked at all.
+</Warning>
+
+`Identity.LastUsedAt` is `nil` above because no sign-in happened, and that is
+the whole point of stamping it at creation on the sign-in paths: `nil` means
+"this link has never signed the user in", not "some code path forgot".
+
+## The policy is not a wall
+
+With both sides verified, `LinkVerified` links implicitly and signs the existing
+account in — `Created` is false, because the account was already there:
+
+{/* verify:main */}
+```go
+hana, err := svc.SignUp(ctx, "hana@example.com", "Correct-Horse-Battery-8!")
+if err == nil {
+	_, err = svc.VerifyEmail(ctx, hana.VerifyToken)
+}
+bothVerified := auth.ExternalIdentity{
+	Provider: "google", Subject: "3003", Email: "hana@example.com", EmailVerified: true,
+}
+linked, err := svc.SignInWith(ctx, auth.SignInRequest{Identity: bothVerified})
+fmt.Println(err, linked.Created, linked.User.ID == hana.User.ID)
+```
+
+```
+<nil> false true
+```
+
+Linking certifies nothing about the local address: `EmailVerifiedAt` is left
+exactly as it was, on **every** policy — `LinkAlways` included.
+
+## `LinkNever`, and the same remedy under it
+
+{/* verify:main */}
+```go
+strict := auth.New(store,
+	auth.WithIdentityStore(ids), // the same two stores
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithLinking(auth.LinkNever))
+
+another := bothVerified
+another.Subject = "4004" // an unknown pair, so rung 2 is what decides
+
+_, err = strict.SignInWith(ctx, auth.SignInRequest{Identity: another})
+fmt.Println(errors.Is(err, auth.ErrLinkRequiresVerification))
+
+// ... and the explicit link goes through on the very same Service.
+_, err = strict.LinkIdentity(ctx, hana.User.ID, another)
+fmt.Println(err)
+```
+
+```
+true
+<nil>
+```
+
+The first line is `LinkNever` refusing a link **both** sides had verified. The
+second is the same `Service` performing it explicitly.
+
+## What `LinkIdentity` refuses
+
+{/* verify:main */}
+```go
+// Gil's github pair, pointed at Hana. An existing link is never re-pointed.
+_, err = svc.LinkIdentity(ctx, hana.User.ID, unverified)
+fmt.Println(errors.Is(err, auth.ErrIdentityLinked))
+
+// And the user is read FIRST, so a missing account wins over a taken pair.
+_, err = svc.LinkIdentity(ctx, "no-such-user", unverified)
+fmt.Println(errors.Is(err, auth.ErrUserNotFound), errors.Is(err, auth.ErrIdentityLinked))
+```
+
+```
+true
+true false
+```
+
+- **`ErrIdentityLinked`** — the pair belongs to a different user, and nothing is
+  written. Re-pointing would let anyone able to authenticate as themselves claim
+  a subject that then signs in as the victim, which is the same end state as
+  forging the victim's password.
+- **`ErrUserNotFound`** — the account is read before the pair is looked up, so
+  it wins when both would apply, and no row is ever left pointing at a user that
+  does not exist (occupying a pair nobody can then use, and failing every
+  sign-in that resolves it).
+- **`ErrProviderSubjectRequired`** — a blank or whitespace-only `Provider` or
+  `Subject`, refused before even the account is read. See
+  [Signing in](/oauth/sign-in).
+
+<Note>
+Two concurrent links of the same pair can both pass the lookup; the loser is
+failed by `UNIQUE (provider, subject)` with `ErrIdentityLinked`, which is
+propagated rather than retried — a retry would attach an external account
+somebody else just claimed. A user deleted between the read and the write is the
+residual window, and it leaves the same dangling row `SignInWith` fails closed
+on.
+</Note>
+
+{/* verify:stdout "verified local account: <nil>\ntrue\n0 0\n<nil> github true\n<nil> true\n<nil> false true\ntrue\n<nil>\ntrue\ntrue false" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Connected accounts" icon="list-check" href="/oauth/connected-accounts">
+    Listing, unlinking, and the last-credential refusal.
+  </Card>
+  <Card title="Options" icon="sliders" href="/reference/options">
+    `WithIdentityStore` and `WithLinking`, with their defaults.
+  </Card>
+</Columns>

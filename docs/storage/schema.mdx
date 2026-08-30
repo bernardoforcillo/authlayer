@@ -1,16 +1,17 @@
 ---
 title: "The schema"
-description: "Eight tables across three independent stores, printed from the code that defines them — and which constraint or index is load-bearing rather than decorative."
+description: "Nine tables across four independent stores, printed from the code that defines them — and which constraint or index is load-bearing rather than decorative."
 ---
 
-Three stores own eight tables between them, and none of them declares a foreign
-key — not to a users table from the RBAC side, which authlayer does not own, and
-not between the three auth tables either.
+Four stores own nine tables between them, and none of them declares a foreign
+key — not to a users table from the RBAC side, which authlayer does not own, not
+between the three auth tables, and not from `identities` to `users` (that one is
+also forced: the auth store may be an entirely different backend).
 
 <Note>
 The column lists below are **printed by a program the documentation gate runs**,
-straight out of `dropsstore.NewSchema`, `NewAuthSchema` and `NewInviteSchema`.
-They cannot drift from the code.
+straight out of `dropsstore.NewSchema`, `NewAuthSchema`, `NewInviteSchema` and
+`NewIdentitySchema`. They cannot drift from the code.
 </Note>
 
 {/* verify:import */}
@@ -282,7 +283,63 @@ needed. See [addresses are normalized](/invitations/email-invites#addresses-are-
 Rows written by **v0.1.0**, which normalized nothing, may hold non-normalized
 addresses; the changelog carries the one-time migration.
 
-{/* verify:stdout "organizations\n  id PK\n  owner_id\n  created_at\n  updated_at\n  name\n  slug UNIQUE\n  indexes: 0\norganization_members\n  container_id\n  user_id\n  role_key\n  joined_at\n  PRIMARY KEY [container_id user_id]\n  indexes: 0\norganization_roles\n  id PK\n  container_id\n  key\n  name\n  permissions\n  created_at\n  UNIQUE [container_id key] as organization_roles_container_key\n  indexes: 0\nusers\n  id PK\n  email UNIQUE\n  email_verified_at NULL\n  password_hash\n  created_at\n  updated_at\n  UNIQUE [email] as users_email_key\n  indexes: 0\nsessions\n  id PK\n  user_id\n  token_hash\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  user_agent\n  ip\n  UNIQUE [token_hash] as sessions_token_hash\n  indexes: 1\nverifications\n  id PK\n  user_id\n  token_hash\n  purpose\n  email\n  expires_at\n  created_at\n  UNIQUE [token_hash] as verifications_token_hash\n  indexes: 1\norganization_invites\n  id PK\n  container_id\n  email\n  role_key\n  token_hash\n  invited_by\n  expires_at\n  created_at\n  UNIQUE [container_id email] as organization_invites_container_email\n  UNIQUE [token_hash] as organization_invites_token_hash\n  indexes: 0\norganization_invite_links\n  id PK\n  container_id\n  code\n  role_key\n  created_by\n  max_uses\n  use_count\n  expires_at NULL\n  revoked_at NULL\n  created_at\n  UNIQUE [code] as organization_invite_links_code\n  indexes: 0" */}
+{/* verify:stdout "organizations\n  id PK\n  owner_id\n  created_at\n  updated_at\n  name\n  slug UNIQUE\n  indexes: 0\norganization_members\n  container_id\n  user_id\n  role_key\n  joined_at\n  PRIMARY KEY [container_id user_id]\n  indexes: 0\norganization_roles\n  id PK\n  container_id\n  key\n  name\n  permissions\n  created_at\n  UNIQUE [container_id key] as organization_roles_container_key\n  indexes: 0\nusers\n  id PK\n  email UNIQUE\n  email_verified_at NULL\n  password_hash\n  created_at\n  updated_at\n  UNIQUE [email] as users_email_key\n  indexes: 0\nsessions\n  id PK\n  user_id\n  token_hash\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  user_agent\n  ip\n  UNIQUE [token_hash] as sessions_token_hash\n  indexes: 1\nverifications\n  id PK\n  user_id\n  token_hash\n  purpose\n  email\n  expires_at\n  created_at\n  UNIQUE [token_hash] as verifications_token_hash\n  indexes: 1\norganization_invites\n  id PK\n  container_id\n  email\n  role_key\n  token_hash\n  invited_by\n  expires_at\n  created_at\n  UNIQUE [container_id email] as organization_invites_container_email\n  UNIQUE [token_hash] as organization_invites_token_hash\n  indexes: 0\norganization_invite_links\n  id PK\n  container_id\n  code\n  role_key\n  created_by\n  max_uses\n  use_count\n  expires_at NULL\n  revoked_at NULL\n  created_at\n  UNIQUE [code] as organization_invite_links_code\n  indexes: 0\nidentities\n  id PK\n  user_id\n  provider\n  subject\n  email\n  created_at\n  last_used_at NULL\n  UNIQUE [provider subject] as identities_provider_subject\n  indexes: 1" */}
+
+## The identity table
+
+{/* verify:main */}
+```go
+id := dropsstore.NewIdentitySchema()
+describe(id.Identities)
+```
+
+```
+identities
+  id PK
+  user_id
+  provider
+  subject
+  email
+  created_at
+  last_used_at NULL
+  UNIQUE [provider subject] as identities_provider_subject
+  indexes: 1
+```
+
+`last_used_at` is the only nullable column here, and `nil` is a fact an
+application acts on: the link exists but has
+[never signed anyone in](/oauth/overview). There is **no token column**, and
+that is the point — this table is the physical form of the boundary
+[External identities](/oauth/overview) opens with.
+
+### Both of these are load-bearing
+
+<Columns cols={2}>
+  <Card title="UNIQUE (provider, subject)" icon="fingerprint">
+    What makes `auth.ErrIdentityLinked` a guarantee rather than advice. Without
+    it two rows can name one external account against two **different** users,
+    and the [sign-in ladder's](/oauth/sign-in) first rung becomes a coin flip
+    over row order. It is also what fails the loser of two concurrent first
+    sign-ins for the same new external account.
+  </Card>
+  <Card title="INDEX (user_id)" icon="layer-group">
+    `ListIdentitiesByUser` — every connected-accounts screen — and the locking
+    `SELECT` inside every unlink both filter on `user_id` alone. Without it both
+    scan a table that grows with the whole deployment rather than with one user,
+    and the unlink pays that **while holding a transaction open**.
+  </Card>
+</Columns>
+
+<Note>
+The constraint is composite, so `CREATE TABLE` cannot carry it at all: it is
+registered through `AddUnique` and emitted as a guarded `ALTER TABLE`, the same
+idiom the invitation schema uses for its own composite constraint.
+
+That the planner actually **picks** the index is proven live rather than
+assumed. `TestIdentityStoreListIdentitiesByUserUsesTheIndexLive` asserts an
+index scan, with a control that drops the index and requires the plan to
+degrade — an index the planner ignores is not an index.
+</Note>
 
 ## Column types
 

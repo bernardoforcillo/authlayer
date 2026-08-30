@@ -62,9 +62,11 @@ and why `BOB@example.com` cannot become a second account.
     `DisplayName` field of yours lives in your own table, keyed by
     `UserBase.ID`.
   </Accordion>
-  <Accordion title="No OAuth in this release" icon="right-to-bracket">
-    Social and enterprise identity providers are not shipped. Password
-    credentials, email verification and revocable sessions are.
+  <Accordion title="No OAuth dance, and no provider tokens" icon="right-to-bracket">
+    [External identities](/oauth/overview) are shipped, through an optional
+    second port — but authlayer never exchanges an authorization code and is not
+    an API client. It stores `(provider, subject, email)` and two timestamps,
+    and **no** provider access or refresh token.
   </Accordion>
 </AccordionGroup>
 
@@ -108,8 +110,10 @@ redeems it with no authentication at all. See
   `ID`, `Email` (always normalized, unique), `EmailVerifiedAt *time.Time`,
   `PasswordHash`, `CreatedAt`, `UpdatedAt`. An **empty** `PasswordHash` is a
   real, supported state — an account with no password credential — not a
-  zero-value accident. `PasswordHash` carries `json:"-"`, and every `Service`
-  method additionally clears it on the value it hands back.
+  zero-value accident; it is what
+  [an externally-provisioned account](/oauth/connected-accounts) holds.
+  `PasswordHash` carries `json:"-"`, and every `Service` method additionally
+  clears it on the value it hands back.
 </ResponseField>
 
 <ResponseField name="Session" type="struct">

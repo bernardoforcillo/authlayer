@@ -1,0 +1,237 @@
+---
+title: "Connected accounts"
+description: "Listing a user's identities, removing one, and the two edges that follow: the refusal to delete an account's last way in, and an account provisioned with no password at all."
+---
+
+`ListIdentities` and `UnlinkIdentity` are what a "connected accounts" screen is
+built from. Both are scoped to one user, and both have an edge worth
+understanding before you render a "Disconnect" button.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault")
+svc := auth.New(memory.NewAuthStore(),
+	auth.WithIdentityStore(memory.NewIdentityStore()),
+	auth.WithJWT([][]byte{key}, 15*time.Minute))
+ctx := context.Background()
+
+// Ida arrives from Google and is provisioned: one identity, no password.
+res, err := svc.SignInWith(ctx, auth.SignInRequest{
+	Identity: auth.ExternalIdentity{
+		Provider: "google", Subject: "5005",
+		Email: "ida@example.com", EmailVerified: true,
+	},
+})
+fmt.Println(err, res.Created)
+```
+
+```
+<nil> true
+```
+
+## The last credential
+
+{/* verify:main */}
+```go
+err = svc.UnlinkIdentity(ctx, res.User.ID, "google")
+fmt.Println(errors.Is(err, auth.ErrLastCredential))
+
+rows, _ := svc.ListIdentities(ctx, res.User.ID)
+fmt.Println(len(rows)) // the row survives — nothing was deleted
+```
+
+```
+true
+1
+```
+
+<Warning>
+Removing that identity would leave an account **nothing in this package can
+authenticate**: `Login` refuses an empty `PasswordHash`, and `SignInWith` would
+have no link to resolve. The lockout would be permanent and silent, so the
+removal is refused and **nothing** is deleted.
+</Warning>
+
+`UnlinkIdentity` removes **every** row for `(userID, provider)` — nothing in the
+data model forbids two identities at one provider, and "unlink this provider"
+means all of them. The reachability test is on what would **remain**, not on the
+user's total row count: a password-less user whose only two identities are both
+at provider `P` is refused, even though the table holds two rows for them.
+
+"There was nothing to unlink here" is a different answer, and a connected-accounts
+screen acts on it differently:
+
+{/* verify:main */}
+```go
+err = svc.UnlinkIdentity(ctx, res.User.ID, "github") // never linked
+fmt.Println(errors.Is(err, auth.ErrIdentityNotFound))
+
+// An unknown user id lists empty rather than erroring, so this is not an
+// account-existence oracle.
+none, err := svc.ListIdentities(ctx, "no-such-user")
+fmt.Println(err, len(none))
+```
+
+```
+true
+<nil> 0
+```
+
+<Note>
+A store failure **is** an error and is returned as-is. An empty list is a
+statement your application acts on, so an outage must not be able to produce
+one. Whether "none" arrives as an empty or a nil slice is deliberately
+unspecified — `store/memory` returns an empty non-nil slice and `store/drops`
+returns nil — so use `len`, never a nil comparison. Order is unspecified too;
+sort if you depend on one.
+</Note>
+
+## Why the decision lives in the store
+
+The check ("does another way in survive?") and the delete are **one atomic step**
+inside `IdentityStore.DeleteIdentityIfNotLast` — not a read-then-write in the
+service.
+
+<Warning>
+A user with exactly two identities and no password unlinks both at once — two
+clicks, two tabs, a retried request. A "list the identities, decide, then
+delete" service method has each call read the list, see a sibling, conclude the
+account stays reachable, and delete. **Both deletes succeed**, the account has no
+identity and no password, and nothing can sign that user in again. Both requests
+returned success.
+
+This project has shipped that exact read-then-write shape four times elsewhere
+and closed it four times; this method is shaped to make it unreachable rather
+than to be gotten right by whoever calls it.
+</Warning>
+
+The two shipped backends satisfy it differently, and both are covered by the
+port's "one statement, one transaction, or one acquisition of the mutex":
+
+<Columns cols={2}>
+  <Card title="store/memory" icon="microchip">
+    One `sync.Mutex` acquisition spans the scan, the decision and the delete —
+    the same discipline every other method in that package uses.
+  </Card>
+  <Card title="store/drops" icon="database">
+    A transaction: a per-user advisory lock, then
+    `SELECT … FOR UPDATE` over the user's rows, then the `DELETE`.
+  </Card>
+</Columns>
+
+A single conditional `DELETE` **cannot** do it, and the statement that looks
+right is worth naming so nobody re-derives it: a statement is atomic with
+respect to the rows it *writes*, but this decision is about the **other** rows —
+the siblings an `EXISTS` subquery reads — and under `READ COMMITTED` that
+subquery neither locks what it reads nor sees a concurrent uncommitted delete.
+Both callers see the sibling, both delete. Adding `FOR UPDATE` to the subquery
+trades that silent lockout for a lock-order inversion and a deadlock at the
+moment a user removes a credential, which is not a fix.
+
+## Why the store is told about the password
+
+`DeleteIdentityIfNotLast` takes a `userHasPassword bool`. It reads like a
+layering mistake — the store deciding a question it has to be *told* the answer
+to — and it is not: an `IdentityStore` owns `identities` and nothing else.
+`users` belongs to `auth.Store`, which may be a different backend entirely, and
+giving the identity backend the ability to read a password hash would mean
+handing it the credential table.
+
+The service reads the account **fresh** on every call and passes the answer
+down. What makes that safe rather than merely necessary is the direction the
+value can go stale in:
+
+| Transition | Consequence |
+|---|---|
+| `false` → `true` (the user acquires a password mid-call) | Refuses a delete that would in fact have been safe. Fail-closed, self-correcting on retry. |
+| `true` → `false` (the user **loses** their password mid-call) | Would allow the delete that locks them out — and **no `Service` method can produce it**. |
+
+Both password writers (`ChangePassword`, `ResetPassword`) store a freshly
+hashed, non-empty value, and this package offers no "remove my password" and no
+account deletion at all.
+
+<Warning>
+**The one way to reach the dangerous transition** is for an application to call
+`Store.UpdateUserPassword` with an empty hash itself, going around `Service`.
+Such an application has removed a credential this package has no idea about; it
+must not concurrently unlink identities, and if it grows a "remove my password"
+feature, that feature owes the same last-credential check this method makes.
+</Warning>
+
+## An account provisioned here has no password
+
+Not a scrubbed one — an empty column, which is a supported state. Every
+`Service` method clears `PasswordHash` on the record it hands back, so the
+difference is invisible from the outside; what is visible is that no password
+works, including the empty string:
+
+{/* verify:main */}
+```go
+_, err = svc.Login(ctx, "ida@example.com", "", "203.0.113.9", "web")
+fmt.Println(errors.Is(err, auth.ErrInvalidCredentials))
+```
+
+```
+true
+```
+
+`ChangePassword` cannot help either: it requires the **current** password, and
+there is none to present. The only route to a first password is
+`RequestPasswordReset` → `ResetPassword`, which needs no current password and
+whose redemption is itself proof of control of the address the link was
+delivered to:
+
+{/* verify:main */}
+```go
+tok, ok, err := svc.RequestPasswordReset(ctx, "ida@example.com", "203.0.113.9")
+if err == nil && ok {
+	err = svc.ResetPassword(ctx, tok, "First-Password-Ever-4!")
+}
+login, loginErr := svc.Login(ctx, "ida@example.com", "First-Password-Ever-4!", "203.0.113.9", "web")
+fmt.Println(err, loginErr, login.User.ID == res.User.ID)
+
+// And now the unlink refused above goes through: the account stays reachable.
+fmt.Println(svc.UnlinkIdentity(ctx, res.User.ID, "google"))
+```
+
+```
+<nil> <nil> true
+<nil>
+```
+
+`TestOAuthProvisionedUserGetsAPasswordThroughTheResetFlow` pins that arc end to
+end, because a regression there would strand every externally-provisioned
+account on its provider forever, with no way in if that provider is lost.
+
+<Note>
+A dedicated "set your first password" method would be better API than routing
+people through a reset. It is **additive** and can land later without cost, and
+it is deliberately not in this release. See
+[the password lifecycle](/authentication/passwords) for the flow as it stands.
+</Note>
+
+{/* verify:stdout "<nil> true\ntrue\n1\ntrue\n<nil> 0\ntrue\n<nil> <nil> true\n<nil>" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="The schema" icon="table" href="/storage/schema">
+    The `identities` table, its `UNIQUE (provider, subject)`, and its index.
+  </Card>
+  <Card title="Errors" icon="triangle-exclamation" href="/reference/errors">
+    Every sentinel, and a suggested status.
+  </Card>
+</Columns>

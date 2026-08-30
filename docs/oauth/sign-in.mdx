@@ -1,0 +1,281 @@
+---
+title: "Signing in"
+description: "SignInWith's two-rung resolution ladder — why the subject rung comes first, what provisioning does, and the three ways it deliberately differs from Login."
+---
+
+`SignInWith` is the only method in `auth` that can create an account without a
+password. It takes a `SignInRequest` struct and returns a `SignInResult`:
+`Created`, the `User`, and the same access and refresh tokens a password
+`Login` mints.
+
+## The ladder
+
+Two rungs, tried strictly in this order.
+
+<Steps>
+  <Step title="(provider, subject)">
+    A hit **is** the account. Its user is signed in, `LastUsedAt` is stamped,
+    `Created` is false — and **no address is consulted at all**.
+  </Step>
+  <Step title="On a miss, the address decides">
+    `Identity.Email`, or `SignInRequest.FallbackEmail` when the provider
+    returned none, normalized either way. No local account at that address →
+    **provision** one, with an empty `PasswordHash`. A local account exists →
+    link to it only if the [linking policy](/oauth/linking) allows.
+  </Step>
+</Steps>
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault")
+svc := auth.New(memory.NewAuthStore(),
+	auth.WithIdentityStore(memory.NewIdentityStore()),
+	auth.WithJWT([][]byte{key}, 15*time.Minute))
+ctx := context.Background()
+
+google := auth.ExternalIdentity{
+	Provider: "google", Subject: "1001",
+	Email: "erin@example.com", EmailVerified: true,
+}
+first, err := svc.SignInWith(ctx, auth.SignInRequest{Identity: google})
+fmt.Println(err, first.Created, first.User.Email)
+```
+
+```
+<nil> true erin@example.com
+```
+
+## Why the subject rung comes first
+
+Reversing it is a vulnerability, and it costs the same number of queries either
+way.
+
+The subject is the provider's own stable, opaque identifier for the external
+account. The email is a mutable **attribute** of that account. Resolving by
+subject first means someone who changes their address at the provider still
+lands on the same local account rather than being silently split into a second
+one:
+
+{/* verify:main */}
+```go
+moved := google
+moved.Email = "erin@newmail.example" // she changed it at Google; the sub did not change
+
+again, err := svc.SignInWith(ctx, auth.SignInRequest{Identity: moved})
+fmt.Println(err, again.Created, again.User.ID == first.User.ID, again.User.Email)
+```
+
+```
+<nil> false true erin@example.com
+```
+
+That is the usability half. The security half is the same fact from the other
+side.
+
+<Warning>
+If the address were consulted first, an established link would resolve to
+whichever local account the provider's **current** email field happens to name.
+An attacker who can make a provider assert a victim's address would then
+re-route an identity they already control onto the victim's account.
+
+With the subject first, an already-linked identity never consults the address
+at all: **nothing a provider says about email can move an existing link.**
+</Warning>
+
+Neither `Identity.Email` nor `UserBase.Email` is rewritten from a later
+assertion, as the run above shows. Both record what was true at link time;
+treat a divergence as information, never as authority.
+
+## Provisioning
+
+On a miss at both rungs, `SignInWith` creates the account:
+
+- `PasswordHash` is left **empty** — a real, supported state, not a
+  zero-value accident. Such an account has [no password at
+  all](/oauth/connected-accounts);
+- `EmailVerifiedAt` is stamped **only** if the provider asserted the address
+  verified;
+- `Created` is `true`.
+
+Unlike `SignUpResult.Created`, this one is safe to branch on in a public
+handler: reaching it takes a provider's assertion about a specific external
+account, which an anonymous prober does not have, so it is not the enumeration
+oracle [sign-up's would be](/authentication/sign-up).
+
+## When the provider returns no address
+
+GitHub with a private address is the usual case. `FallbackEmail` is your own
+value — collected from the user, or already known — and it is used **only** to
+resolve or provision a local account.
+
+{/* verify:main */}
+```go
+// Neither address present: nothing is written.
+_, err = svc.SignInWith(ctx, auth.SignInRequest{
+	Identity: auth.ExternalIdentity{Provider: "github", Subject: "2002"},
+})
+fmt.Println(errors.Is(err, auth.ErrEmailRequired))
+
+// With a fallback, the account is provisioned — but NOT as verified, even
+// though the assertion carries EmailVerified: true.
+withFallback, err := svc.SignInWith(ctx, auth.SignInRequest{
+	Identity:      auth.ExternalIdentity{Provider: "github", Subject: "2002", EmailVerified: true},
+	FallbackEmail: "frank@example.com",
+})
+fmt.Println(err, withFallback.Created, withFallback.User.EmailVerifiedAt == nil)
+```
+
+```
+true
+<nil> true true
+```
+
+`ErrEmailRequired` is not fussiness: `users.email` is unique, so provisioning on
+an empty address would create the one row every later address-less sign-in then
+collides with.
+
+<Note>
+**A `FallbackEmail` is never credited with `EmailVerified`.** That flag is the
+provider's claim about the address *the provider returned*; when it returned
+none, the claim is about nothing. Letting it certify an address your
+application supplied would let a verification of some entirely different
+address stand in for this one.
+</Note>
+
+## A blank provider or subject is refused first
+
+{/* verify:main */}
+```go
+_, err = svc.SignInWith(ctx, auth.SignInRequest{
+	Identity: auth.ExternalIdentity{Provider: "google", Subject: "   ", Email: "x@example.com"},
+})
+fmt.Println(errors.Is(err, auth.ErrProviderSubjectRequired))
+```
+
+```
+true
+```
+
+Both entry points — `SignInWith` and `LinkIdentity` — enforce this **before any
+store is touched**, and a whitespace-only value is rejected rather than quietly
+folded to empty (provider and subject are matched byte-for-byte everywhere, so
+storing a trimmed value would create a link the caller's own input could never
+resolve).
+
+A blank subject is not a harmless empty string. It is a key every account at
+that provider would collide on: the first such call links a row that any later
+blank-subject sign-in at the same provider resolves to — one caller signed in as
+another — and the only thing in the way is the uniqueness constraint, which
+downgrades that takeover to a baffling conflict. Both are the wrong answer to a
+malformed request, so it is refused as one.
+
+## Three deliberate differences from `Login`
+
+| | `Login` | `SignInWith` |
+|---|---|---|
+| `WithRateLimiter` (IP-keyed) | consulted | **not consulted** |
+| empty `ip` | `ErrMissingIP` | accepted — `IP` is an audit field here |
+| `WithRequireVerifiedEmail` | enforced | **not enforced** |
+
+Neither limiter reaches this path: `WithPasswordResetRateLimiter` is
+address-keyed and belongs to `RequestPasswordReset` alone.
+
+The first two travel together: `Login`'s blank-`ip` refusal exists so that
+every caller omitting one does not share a single rate-limit bucket, and with
+no limiter on this path there is no bucket to share. Rate limiting external
+sign-in is yours to do at the transport, where the dance already lives.
+
+The third needs its own argument.
+
+<AccordionGroup>
+<Accordion title="Why WithRequireVerifiedEmail does not apply here" icon="scale-balanced">
+In a password login the address **is** the claim: it is the identifier the user
+asserts they hold, and an unverified one proves nothing about whether they hold
+it. Here the account is identified by `(provider, subject)`, which the provider
+actually authenticated. The address is corroborating detail, not the claim being
+made.
+
+Both rungs it could apply to are already covered, and more strictly. On the
+**link** rung, `LinkVerified` already requires the local account to be verified —
+strictly stronger, since it demands the provider's half as well; and
+`LinkAlways` is a deliberate opt-out of exactly that check, so re-imposing half
+of it through a second option would make a policy the caller chose mean
+something they did not choose. On the **provisioning** rung the address lookup
+*missed*: no other account holds that address, so there is nobody to take over
+from.
+</Accordion>
+
+<Accordion title="What that leaves, stated plainly" icon="triangle-exclamation">
+An application that sets `WithRequireVerifiedEmail(true)` can still end up with
+an active, **unverified** account — provisioned here when the provider reports
+the address unverified. Such an account holds no password, so it can never reach
+`Login`'s check at all.
+
+The remedy available today is to configure only providers that report
+verification status honestly, and to map a provider that does not report it to
+`false`. `TestSignInWithIgnoresRequireVerifiedEmail` pins both halves so this
+cannot drift into an accident.
+</Accordion>
+</AccordionGroup>
+
+## Fail closed
+
+Every store error is returned as-is and no session is minted. In particular a
+failed `(provider, subject)` lookup is **not** read as "no such identity" —
+folding it into a miss would demote every sign-in to rung 2 for the duration of
+an outage, letting the address decide accounts an existing link already decided.
+An identity row naming a user that no longer exists fails with
+`ErrUserNotFound` rather than provisioning a replacement.
+
+`TouchIdentity` runs **before** the session is minted, for the same reason: a
+use this package cannot record is one it does not perform.
+
+## What is not atomic, stated rather than smoothed over
+
+Rung 1's lookup and rung 2's write are two steps, and two sign-ins for the same
+new external account can both pass the lookup. That window is closed where it
+can be — by `UNIQUE (provider, subject)`, which fails the loser with
+`ErrIdentityLinked`, and by `users.email`'s uniqueness, which fails a concurrent
+provisioning with `ErrEmailTaken`. Both are propagated rather than retried into
+a link: "it exists now, so link to it" would skip the policy for precisely the
+caller who lost the race. A retry from your application re-enters the ladder at
+the top, which is the right outcome either way.
+
+<Warning>
+**One window is not closed.** The linking decision reads the local account and
+then writes the identity, and `auth.Store` and `auth.IdentityStore` may be
+different backends with **no transaction spanning them** — that is the point of
+the split port.
+
+A concurrent `UpdateUserEmail` landing in between can therefore leave a link
+decided on an `EmailVerifiedAt` the account no longer has. The decision was
+correct as of the read, the address changed under it rather than the
+authorization being forged, and closing it would require a transaction the port
+deliberately does not offer.
+</Warning>
+
+{/* verify:stdout "<nil> true erin@example.com\n<nil> false true erin@example.com\ntrue\n<nil> true true\ntrue" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="The linking policy" icon="link" href="/oauth/linking">
+    What rung 2 does when the address already belongs to someone.
+  </Card>
+  <Card title="Connected accounts" icon="list-check" href="/oauth/connected-accounts">
+    Listing, unlinking, and the account with no password.
+  </Card>
+</Columns>
