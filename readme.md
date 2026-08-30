@@ -541,6 +541,31 @@ All of them are written on the port as requirements with their consequences
 spelled out, because they constrain any third-party backend as much as the
 two shipped ones — see [Authentication](#enumeration-safe-sign-up).
 
+`invite.Store` carries seven **MUST**s of its own, and they are all about the
+same thing: bounding *who gets in*. **Four are on methods.** `ConsumeLink`
+must make its check and its increment one atomic step, or a `MaxUses: 1` link
+admits everyone who clicks it at once. `DeleteEmailInvite` must be
+rows-affected gated, because that gate — not any check above it — is what
+makes one emailed token pay out once; `AcceptInvite` claims first and grants
+second precisely so it is the only thing that has to hold. And
+`CreateEmailInvite` and `CreateLink` must refuse a write that would break a
+uniqueness constraint, atomically with performing it.
+
+**Three more are on the record types**, because they constrain the shape of
+the table rather than the behaviour of one call: `EmailInvite.TokenHash`,
+`Link.Code`, and `EmailInvite`'s `(ContainerID, Email)` pair — `UNIQUE`
+constraints in a SQL backend. The first two defeat the single-winner
+properties above *with no atomicity defect at all*: two rows sharing a `Code`
+means two concurrent redeemers resolve **different** rows through
+`FindLinkByCode` and each atomically wins `ConsumeLink` on the row it picked,
+so the limit bounds nothing while every individual consume behaves perfectly.
+`TokenHash` is the same story for an emailed token and `DeleteEmailInvite`.
+The third is what makes re-inviting an address replace rather than duplicate
+when two such calls race — without it a container holds two live tokens where
+its pending-invitations screen shows one row, and revoking the visible one
+leaves the other redeemable. It is a constraint on the *pair*: the same person
+invited to two containers is two legitimate rows.
+
 ### `store/memory`
 
 An in-process, generic store backed by maps. Zero dependencies, concurrency
@@ -552,15 +577,29 @@ and `auth.Store` counterparts. The auth one enforces every uniqueness
 constraint its port describes — one account per normalized email, no id
 collision on any `Create*`, and the `token_hash` uniqueness `auth.Store`
 requires of a backend on both `Session` and `Verification`, reported as
-`memory.ErrTokenHashTaken`. It used to defer that last one to `store/drops`,
-the way the invite store still defers `TokenHash` and `Code`; that left a
-caller who developed here and deployed there meeting the constraint for the
-first time in production, so it went away. A hash collision gets a
-backend-level error rather than a port sentinel because `auth.Store`
-classifies only `ErrIDTaken` on the `Create*` methods — `store/drops` answers
-the same case with the driver's own unique violation. It satisfies every
-atomicity MUST the port states by holding one mutex for each method's entire
-body, so no check-then-write can be split by a concurrent call.
+`memory.ErrTokenHashTaken`. The invite one enforces all three of its port's:
+`EmailInvite.TokenHash` (also `memory.ErrTokenHashTaken` — same column
+meaning, same failure), `(ContainerID, Email)` as
+`memory.ErrInviteEmailTaken`, and `Link.Code` as `memory.ErrLinkCodeTaken`.
+
+Both used to defer those to `store/drops`, which has always had them as
+`UNIQUE` constraints; that left a caller who developed here and deployed there
+meeting the constraint for the first time in production, so it went away.
+A collision gets a backend-level error rather than a port sentinel because
+`auth.Store` classifies only `ErrIDTaken` on the `Create*` methods and
+`invite.Store` classifies no conflict-on-create at all — `store/drops` answers
+the same cases with the driver's own unique violation. Both stores satisfy
+every atomicity MUST their ports state by holding one mutex for each method's
+entire body, so no check-then-write can be split by a concurrent call.
+
+One divergence from `store/drops` remains, in the invite store, and is
+recorded rather than closed: `store/drops` types an invite's and a link's `id`
+as a `PRIMARY KEY`, so re-using one is a unique violation there, while
+`memory.InviteStore` keys its maps by ID and a create under an id already
+present overwrites the row. `invite.Store` documents no id-collision contract
+and `authlayer/invite` has no sentinel for one (unlike `auth.ErrIDTaken`), so
+nothing in the backend is entitled to invent one; the service mints a fresh
+UUIDv7 for every record, so the case does not arise in practice.
 
 ### `store/drops`
 
@@ -755,6 +794,74 @@ writes non-atomically, one whose `DeleteSessionsByFamily` snapshots the family
 before it waits — paired into nineteen defect/check cases, each asserted to
 **fail** the check that covers it. A contract suite that passes everything is
 worthless, and that is not visible without controls.
+
+### Writing your own `invite.Store`
+
+`invite.Store`'s seven **MUST**s — four on methods, three on the record types
+— are listed in [Storage](#storage) above, along with what each one costs when
+it is violated. They ship as an executable suite too, built the same way and
+placed the same way:
+
+```go
+import "github.com/bernardoforcillo/authlayer/invite/invitetest"
+
+func TestMyStoreSatisfiesTheInviteContract(t *testing.T) {
+    invitetest.RunStoreContract(t, func(t *testing.T) invite.Store {
+        return myStoreWithEmptyTables(t)   // called once per check
+    })
+}
+```
+
+The factory must hand back a store with **no** email invites and no links in
+it — several checks assert counts over the whole table — and may register
+teardown with `t.Cleanup` or call `t.Skip`. Ids and container ids are UUIDv7,
+and addresses, token hashes and codes are unique per call unless a check is
+deliberately forcing a collision, so the suite runs unchanged against a backend
+that types its id columns as `uuid`. If your store opens connections on demand,
+raise your pool limits and warm it to `invitetest.RaceGoroutines` connections
+first: goroutines that trickle in across a connection-setup window never
+actually contend, which silently weakens every race in the suite.
+
+Eight of the forty-three checks are races, because the obligations behind them
+are unreachable sequentially: `ConsumeLink`'s single winner against a
+`MaxUses: 1` link, its ceiling against a `MaxUses: 4` one, and the lost update
+its increment must not have on an unlimited one; `DeleteEmailInvite`'s
+at-most-one-nil claim; each of the three uniqueness constraints under
+concurrent creates; and a `DeleteEmailInvitesFor` racing the
+`CreateEmailInvite` that re-invites the same address. That last one asserts a
+*linearizability* property rather than a timing guess — the end state it
+rejects (the create reporting success while the container ends up holding no
+invitation for the address) is one no serial order of the two calls can
+produce.
+
+Points the port leaves unspecified are deliberately not asserted: list order,
+empty-slice-versus-nil, and — for every one of the three uniqueness checks —
+*which error* a rejected duplicate comes back as, since `invite.Store`
+classifies no conflict-on-create at all and the two shipped backends answer
+differently on purpose. Each of those checks requires only that the write
+failed and that the original row survived it.
+
+One thing it does **not** do, stated here rather than left to be discovered:
+`ConsumeLink`'s MUST names the two acceptable shapes (one `UPDATE ... WHERE`
+whose rows-affected count *is* `ok`, or one critical section spanning the check
+and the write), and which shape your backend used is invisible to a caller. The
+suite asserts the consequences. Two of them — one winner against `MaxUses: 1`,
+exactly four against `MaxUses: 4` — catch a grossly non-atomic implementation
+every time and a subtly non-atomic one only sometimes: `store/memory` measured
+a deliberately split-lock `ConsumeLink` passing that race 20 times out of 20,
+even at 2000 goroutines. The third is the deterministic one. Against an
+*unlimited* link every caller wins on any implementation, but a read-then-write
+loses increments — N callers each read the same `UseCount` and each write
+`read+1` — so the stored count comes back far below N whatever the timing. Run
+all three; none of them proves the mechanism.
+
+The suite's own tests include thirty-two deliberately non-compliant stores —
+one whose `ConsumeLink` decides under one lock and increments under a second,
+one that lets two links share a code, one that reads `MaxUses: 0` as exhausted
+rather than unlimited, one that reads a nil `ExpiresAt` as a zero time —
+paired into forty-four defect/check cases, each asserted to **fail** the check
+that covers it. A further test fails if a check is ever added without a control,
+so a check that asserts nothing cannot slip in green.
 
 ## Custom scopes
 
@@ -1729,7 +1836,9 @@ rules and `Verify` returns a bool, so there is nothing to compare with
 | [`org`](org/) | Organization RBAC — `scope` with the type parameters fixed and the names spelled "organization". |
 | [`team`](team/) | Team RBAC nested inside `org` via `scope.WithParent` — the worked example of [nesting](#nested-scopes). |
 | [`invite`](invite/) | [Invitations](#invitations) — email tokens and reusable links admitting a user with no standing yet, via `scope.Service.GrantMembership`. |
+| [`invite/invitetest`](invite/invitetest/) | `invite.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-invitestore) and run it. Test-only; imports `testing`. |
 | [`auth`](auth/) | [Authentication](#authentication) — `Service`, its `Store` port, and the user/session/verification records. Sign-up, login, email verification, refresh rotation, and the password lifecycle. |
+| [`auth/authtest`](auth/authtest/) | `auth.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-authstore) and run it. Test-only; imports `testing`. |
 | [`token`](token/) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled, [single-algorithm](#the-jwt-and-why-hand-rolling-it-is-defensible) HS256 JWT. Standard library only. |
 | [`password`](password/) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` for a strength policy. The only package that pulls in `golang.org/x/crypto`. |
 | [`store/memory`](store/memory/) | In-memory `scope.Store`, `invite.Store` and `auth.Store` for dev, tests, and examples. |
