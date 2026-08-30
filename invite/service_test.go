@@ -1289,7 +1289,7 @@ func TestAcceptInviteSecondPresentationOfTheSameTokenIsRefused(t *testing.T) {
 // test is kept anyway because it exercises real contention at low cost and
 // is a second, independent line of evidence — but it is not what this
 // invariant's regression protection depends on. This is the same class of
-// caveat store/memory's own TestConsumeLinkConcurrencyExactlyOneWinner
+// caveat store/memory's own TestInviteStoreSatisfiesTheStoreContract
 // documents for a different mutation: a green run here is evidence the
 // happy path works, and a red run is unambiguous proof of the bug, but a
 // lone green run under a SUSPECTED regression is not proof the regression is
@@ -1698,8 +1698,9 @@ func TestJoinViaLinkRecheckInviterOnAcceptRefusesADemotedCreator(t *testing.T) {
 //
 // n distinct, previously-unseen users hit a MaxUses:1 link at once. With the
 // ordering this test is written against — consume first, grant second — the
-// atomic ConsumeLink (already proven in store/memory's own
-// TestConsumeLinkConcurrencyExactlyOneWinner) admits at most one winner
+// atomic ConsumeLink (already exercised by invitetest's
+// ConsumeLink/ConcurrentCallersAdmitExactlyOneWinner, which both backends
+// run) admits at most one winner
 // through to GrantMembership, so at most one of the n candidates can ever
 // become a real member.
 //

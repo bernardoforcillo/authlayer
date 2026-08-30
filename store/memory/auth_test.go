@@ -1056,8 +1056,8 @@ func oneWinner(successes, errs int) bool {
 // The suite's MarkRotated check pins the same observable contract the local
 // copy did: N goroutines started ahead of time and blocked on a channel so
 // they all enter MarkRotated at effectively the same instant once it closes
-// (the same construction as store/memory/invite_test.go's
-// TestConsumeLinkConcurrencyExactlyOneWinner), exactly one observing
+// (the same construction authlayer/invite/invitetest's ConsumeLink races
+// use), exactly one observing
 // ok=true, the rest ok=false with no error, and a final RotatedAt equal to
 // the shared instant every goroutine raced with.
 //
@@ -1078,13 +1078,14 @@ func oneWinner(successes, errs int) bool {
 //   - Naive window (nothing inserted between the unlocked read and the
 //     second Lock): 70 runs total (20 + 50, in two separate invocations), 3
 //     failures — a 3/70 (~4%) catch rate. Not flaky-clean the way
-//     TestConsumeLinkConcurrencyExactlyOneWinner's doc reports for
-//     ConsumeLink (0 failures in 20 runs, even at 2000 goroutines), but
+//     store/memory/invite_test.go's
+//     TestInviteStoreSatisfiesTheStoreContract doc reports for ConsumeLink
+//     (0 failures in 20 runs, even at 2000 goroutines), but
 //     still far too unreliable to trust as a regression net: a CI run that
 //     happens to land in the ~96% of green runs certifies a broken
 //     implementation as correct. The failures that did occur reported 2 and
 //     3 successful callers, consistent with the sub-microsecond window
-//     TestConsumeLinkConcurrencyExactlyOneWinner's doc describes — most
+//     TestInviteStoreSatisfiesTheStoreContract's doc describes — most
 //     interleavings still resolve before a second goroutine's Lock() call
 //     can land in the gap, they just do so less consistently here than in
 //     ConsumeLink's simpler map lookup. An independent reviewer reproduced
@@ -1147,7 +1148,7 @@ func oneWinner(successes, errs int) bool {
 // experiment — this test pins the contract and catches a grossly broken
 // implementation reliably (100% once the window is widened) and a subtly
 // broken one occasionally (~1-4% at the naive window), per the same caveats
-// TestConsumeLinkConcurrencyExactlyOneWinner's doc states.
+// TestInviteStoreSatisfiesTheStoreContract's doc states.
 //
 // It is also a logical (check-then-act) race, not a memory race: every
 // individual map read and write in the broken variant is still separately
