@@ -82,7 +82,7 @@ duplicate branch's mint is purely **additive**, so nobody can destroy a victim's
 emailed link by "signing up" as them.
 </Note>
 
-## The caller's obligation
+## What the caller must do
 
 <Warning>
 A public sign-up handler must emit a **fixed response regardless of outcome** —
@@ -120,7 +120,7 @@ respond 202 Accepted, same body, either way
 ## Two `Store` obligations are load-bearing here
 
 This is a **joint** property, not one `SignUp` can guarantee alone. Both are
-documented as requirements on the [port](/storage/ports):
+documented as requirements on the [port](/storage/overview):
 
 <Columns cols={2}>
   <Card title="CreateUser decides ErrEmailTaken from the write" icon="pen">

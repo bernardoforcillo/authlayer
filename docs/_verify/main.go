@@ -204,6 +204,15 @@ func main() {
 		failures++
 	}
 
+	linkProblems, err := checkLinks(*root)
+	if err != nil {
+		fail(err)
+	}
+	for _, p := range linkProblems {
+		fmt.Println("link:", p)
+		failures++
+	}
+
 	fmt.Printf("%d programs, %d failed, %d Go blocks not executed, %d unmarked\n",
 		len(results), failures, len(skipped), unmarked)
 	if failures > 0 {
@@ -287,6 +296,126 @@ func checkNavigation(root string) ([]string, error) {
 	}
 	sort.Strings(problems)
 	return problems, nil
+}
+
+var (
+	linkRe    = regexp.MustCompile(`\]\((/[^)\s]*)\)`)
+	hrefRe    = regexp.MustCompile(`href="(/[^"]*)"`)
+	headingRe = regexp.MustCompile(`^#{1,6}\s+(.+?)\s*$`)
+	slugDrop  = regexp.MustCompile(`[^a-z0-9\s-]`)
+	slugSpace = regexp.MustCompile(`[\s-]+`)
+)
+
+// checkLinks resolves every absolute internal link and href in the docs tree
+// against the pages on disk, and every #anchor against that page's headings.
+// A broken one renders as a live link to a 404, which no build step catches.
+func checkLinks(root string) ([]string, error) {
+	pages := map[string]map[string]bool{} // slug -> set of heading anchors
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if path != root && (strings.HasPrefix(d.Name(), "_") || strings.HasPrefix(d.Name(), ".")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".mdx") {
+			return nil
+		}
+		raw, rerr := os.ReadFile(path) //nolint:gosec // paths come from the docs tree
+		if rerr != nil {
+			return rerr
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return rerr
+		}
+		anchors := map[string]bool{}
+		inFence := false
+		for _, line := range strings.Split(string(raw), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "```") {
+				inFence = !inFence
+				continue
+			}
+			if inFence {
+				continue
+			}
+			if m := headingRe.FindStringSubmatch(line); m != nil {
+				for _, s := range slugs(m[1]) {
+					anchors[s] = true
+				}
+			}
+		}
+		pages["/"+strings.TrimSuffix(filepath.ToSlash(rel), ".mdx")] = anchors
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	pages["/index"] = pages["/index"]
+	pages["/"] = pages["/index"]
+
+	var problems []string
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if path != root && (strings.HasPrefix(d.Name(), "_") || strings.HasPrefix(d.Name(), ".")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".mdx") {
+			return nil
+		}
+		raw, rerr := os.ReadFile(path) //nolint:gosec // paths come from the docs tree
+		if rerr != nil {
+			return rerr
+		}
+		rel, _ := filepath.Rel(root, path)
+		from := filepath.ToSlash(rel)
+		var targets []string
+		for _, m := range linkRe.FindAllStringSubmatch(string(raw), -1) {
+			targets = append(targets, m[1])
+		}
+		for _, m := range hrefRe.FindAllStringSubmatch(string(raw), -1) {
+			targets = append(targets, m[1])
+		}
+		for _, t := range targets {
+			page, anchor, _ := strings.Cut(t, "#")
+			anchors, ok := pages[page]
+			if !ok {
+				problems = append(problems, from+" -> "+t+" (no such page)")
+				continue
+			}
+			if anchor != "" && !anchors[anchor] {
+				problems = append(problems, from+" -> "+t+" (no such heading)")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(problems)
+	return problems, nil
+}
+
+// slugs renders the anchor forms a heading may plausibly take. Mintlify's exact
+// slugifier is not documented, so both the "drop the apostrophe" and the
+// "treat it as a separator" conventions are accepted.
+func slugs(heading string) []string {
+	h := strings.ToLower(heading)
+	for _, pair := range [][2]string{{"`", ""}, {"*", ""}, {"_", ""}} {
+		h = strings.ReplaceAll(h, pair[0], pair[1])
+	}
+	dropped := slugSpace.ReplaceAllString(strings.TrimSpace(slugDrop.ReplaceAllString(h, "")), "-")
+	spaced := slugSpace.ReplaceAllString(
+		strings.TrimSpace(slugDrop.ReplaceAllString(h, " ")), "-")
+	return []string{strings.Trim(dropped, "-"), strings.Trim(spaced, "-")}
 }
 
 // inlineStdout reads the optional stdout="..." attribute off a program marker.

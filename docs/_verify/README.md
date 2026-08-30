@@ -30,3 +30,16 @@ exhaustive answer.
 
 A page's `import`/`decl`/`main` blocks are assembled in source order into one
 program, so its snippets continue each other exactly as a reader reads them.
+
+It also reconciles `docs.json` with the tree in three directions, all of which
+Mintlify's JSON Schema leaves unchecked and all of which render as a live link
+to a 404:
+
+- every page the navigation references exists on disk;
+- every page on disk is reachable from the navigation;
+- every absolute internal link and `href` resolves to a page, and every
+  `#anchor` to a heading on it.
+
+Mintlify does not document its heading slugifier, so anchor matching accepts
+both the "drop the apostrophe" and the "treat it as a separator" conventions.
+Headings linked to by anchor avoid punctuation for that reason.

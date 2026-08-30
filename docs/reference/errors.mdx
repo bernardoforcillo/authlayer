@@ -1,0 +1,195 @@
+---
+title: "Errors"
+description: "Every sentinel authlayer defines, what it means, and a suggested HTTP status. Compare with errors.Is, never by string."
+---
+
+<Warning>
+Compare with `errors.Is`, never by string. `org` re-exports `scope`'s errors as
+**aliases** — `org.ErrOrgNotFound` *is* `scope.ErrContainerNotFound` — so either
+name matches the same value.
+</Warning>
+
+{/* verify:import */}
+```go
+import (
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/scope"
+	"github.com/bernardoforcillo/authlayer/team"
+)
+```
+
+{/* verify:main */}
+```go
+fmt.Println(org.ErrOrgNotFound == scope.ErrContainerNotFound)
+fmt.Println(org.ErrOrgMissing == scope.ErrScopeMissing)
+fmt.Println(org.ErrSlugTaken == scope.ErrConflict)
+fmt.Println(team.ErrTeamNotFound == scope.ErrContainerNotFound)
+```
+
+```
+true
+true
+true
+true
+```
+
+{/* verify:stdout "true\ntrue\ntrue\ntrue" */}
+
+## `scope` — fifteen
+
+`org`'s name is given in parentheses where it differs.
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrContainerNotFound` (`ErrOrgNotFound`) | No such container | 404 |
+| `ErrRoleNotFound` | No default or custom role with that key | 404 |
+| `ErrForbidden` | Member, but the role does not grant it | 403 |
+| `ErrNotMember` | No membership in this container | 403 |
+| `ErrOwnerOnly` | Reserved to the owner; no grant substitutes | 403 |
+| `ErrPrivilegeEscalation` | Cannot grant what you do not hold | 403 |
+| `ErrAlreadyMember` | That user is already a member | 409 |
+| `ErrRoleKeyTaken` | Key collides with a default or existing role | 409 |
+| `ErrConflict` (`ErrSlugTaken`) | Unique constraint on one of your own fields | 409 |
+| `ErrRoleInUse` | Role still assigned to members | 422 |
+| `ErrDefaultRole` | Default roles cannot be modified at runtime | 422 |
+| `ErrLastOwner` | Would remove or demote the owner | 422 |
+| `ErrNotParentMember` | [Nested scope](/authorization/nested-scopes): `AddMember` target has no standing in the parent | 422 |
+| `ErrSubjectMissing` | No subject on the context — a wiring bug | 500 |
+| `ErrScopeMissing` (`ErrOrgMissing`) | No container on the context — a wiring bug | 500 |
+
+<Tip>
+`Can` already folds `ErrForbidden` and `ErrNotMember` into a plain `false`. A
+non-nil error from `Can` means the question could not be **answered**, which is
+not a denial.
+</Tip>
+
+## `invite` — seven
+
+Not exported by `scope`, and not aliased anywhere.
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrInviteNotFound` | No email invite with that id or token hash | 404 |
+| `ErrLinkNotFound` | No link with that id or code | 404 |
+| `ErrInviteExpired` | The invite's `ExpiresAt` has passed | 410 |
+| `ErrLinkRevoked` | The link's `RevokedAt` is set | 410 |
+| `ErrLinkExpired` | The link's `ExpiresAt` has passed | 410 |
+| `ErrLinkExhausted` | `UseCount` has reached `MaxUses` | 410 |
+| `ErrInvalidMaxUses` | `CreateLink` was passed a negative `maxUses` | 400 |
+
+The first two are raised by the `Store` on any lookup or delete that matches no
+row — **and also by the service layer, deliberately**: `RevokeInvite` and
+`RevokeLink` report them for an id that exists in *another* container, so a
+cross-tenant id is indistinguishable from a missing one. `ErrInvalidMaxUses` is
+a plain argument error, raised before any store is touched.
+
+<Note>
+The middle four describe *why a redemption did not happen* rather than a lookup
+miss, and only the service layer raises them. `Store.ConsumeLink` folds all
+three of its own reasons into a single `ok=false` — the check and the increment
+must be one atomic step, and asking that step to also report which of three
+conditions applied would require a second read, which is exactly the race
+atomicity rules out. `JoinViaLink` re-reads the link afterwards to tell them
+apart.
+</Note>
+
+## `auth` — eighteen
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrUserNotFound` | No user with that id or email | 404 |
+| `ErrSessionNotFound` | No session with that id or token hash | 404 |
+| `ErrVerificationNotFound` | No verification with that id or token hash | 404 |
+| `ErrInvalidCredentials` | `Login` failed — unknown address, no password credential, or wrong password, deliberately indistinguishable | 401 |
+| `ErrTokenInvalid` | The refresh token is unknown or its session has expired. The family is **not** revoked | 401 |
+| `ErrTokenReuse` | A rotated-away refresh token was presented again — see the note below | 401 |
+| `ErrSessionRevoked` | `Refresh` won the rotation, but the family was revoked before the successor could be persisted | 401 |
+| `ErrEmailNotVerified` | `WithRequireVerifiedEmail` is on and the address is unconfirmed — checked only **after** the password verifies | 403 |
+| `ErrEmailTaken` | Another user already holds this normalized address | 409 |
+| `ErrIDTaken` | A `Create*` was given an id that already identifies a row of that kind | 409 |
+| `ErrEmailMismatch` | `MarkEmailVerified` was asked to certify an address that is not the user's current one | 409 |
+| `ErrVerificationExpired` | The verification's `ExpiresAt` has passed — checked **before** the claim, so the token is not burned | 410 |
+| `ErrWeakPassword` | Fails the configured `password.Rules`; wraps the failed rule names | 400 |
+| `ErrVerificationPurpose` | Right token, wrong flow — a `password_reset` token at `VerifyEmail`, say | 400 |
+| `ErrEmailRequired` | `RequestEmailChange` was given an address that is empty once normalized | 400 |
+| `ErrRateLimited` | The IP-keyed `RateLimiter` refused. **Never** returned for the address-keyed reset limiter | 429 |
+| `ErrMissingIP` | `Login` or `RequestPasswordReset` was called with an empty ip — a wiring bug, not caller input | 500 |
+| `ErrStoreContract` | A `Store` returned a value its own contract forbids, where continuing would silently degrade a security control | 500 |
+
+<Warning>
+**`ErrTokenReuse` must be checked *before* testing whether an error wraps
+anything else.**
+
+Returned **alone** it means the family is already revoked. It comes wrapped
+around a second error in exactly two cases — the family revocation itself
+failing, and `ErrStoreContract` — and in both, a replay was detected while the
+family **may still be live**. Either way the alarm is never lost to the failure
+of the response to it.
+</Warning>
+
+Every `ErrStoreContract` trigger today is one condition — a `Session` handed
+back with no `FamilyID`, leaving nothing to revoke — reached from `Refresh` (on
+a reported replay), `Logout` (of a superseded token) and `RevokeSession`.
+
+<Note>
+`SignUp` is the one method that reports a duplicate address **without an error
+at all**. See
+[Sign-up and the enumeration property](/authentication/sign-up).
+</Note>
+
+## `token` — six
+
+The first four are what a caller gets from `Parse` for a bad token. The last two
+report a bad **key or TTL** rather than a bad token — but only `ErrInvalidTTL`
+is confined to `Issue`.
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrMalformedToken` | Not a valid JWS compact serialization — wrong segment count, non-canonical base64, or a segment that is not JSON | 401 |
+| `ErrUnsupportedAlgorithm` | The header's `alg` is not exactly `"HS256"`. Returned **before** any signature is verified | 401 |
+| `ErrInvalidSignature` | No key in the list produced a matching signature | 401 |
+| `ErrExpiredToken` | The signature verified but `exp` is not in the future — checked **after** verification, so it cannot probe for a valid signature on forged claims | 401 |
+| `ErrKeyTooShort` | An HMAC key under 32 bytes was passed to `Issue`, or appears anywhere in `Parse`'s key list | 500 |
+| `ErrInvalidTTL` | `Issue` was given a zero or negative ttl | 500 |
+
+`Parse` checks every key's length **before** it looks at the token at all and
+refuses the whole call if any one of them is short — so a misconfigured
+`Service` surfaces `ErrKeyTooShort` on the request path, not only at startup.
+`auth.Service.VerifyAccessToken` hands these back **unwrapped**, so you can tell
+an expired token from a forged one.
+
+## `password` — none
+
+`Validate` returns the **names** of the failed rules (`min_length`, `upper`,
+`lower`, `digit`, `special`) and `Verify` returns a bool, so there is nothing to
+compare with `errors.Is`. The service wraps a validation failure as
+`auth.ErrWeakPassword`.
+
+## Backend-level errors
+
+Two cases are deliberately **not** normalized into a port sentinel, because the
+port classifies no such condition and the two shipped backends answer
+differently on purpose:
+
+| Case | `store/memory` | `store/drops` |
+|---|---|---|
+| duplicate `token_hash` (session, verification, invite) | `memory.ErrTokenHashTaken` | the driver's unique violation |
+| duplicate `(container_id, email)` invite | `memory.ErrInviteEmailTaken` | the driver's unique violation |
+| duplicate link `code` | `memory.ErrLinkCodeTaken` | the driver's unique violation |
+
+Match on your backend's own error if you need to distinguish these. `store/drops`
+also surfaces `SQLSTATE 22P02` verbatim when a non-UUID id meets a `uuid` column
+— see [Ids](/concepts/ids).
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Options" icon="sliders" href="/reference/options">
+    Every option on every service, with its default.
+  </Card>
+  <Card title="Packages" icon="cubes" href="/reference/packages">
+    What each package is, and what it pulls in.
+  </Card>
+</Columns>

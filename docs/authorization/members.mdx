@@ -11,7 +11,7 @@ Every call on this page reads the acting subject and the active scope from the
 | `CreateOrganization(ctx, name, slug)` | subject only | caller becomes owner; **no permission check** — gate it upstream |
 | `AddMember(ctx, userID, roleKey)` | `member:create` + escalation guard | `ErrAlreadyMember` on a duplicate |
 | `ChangeMemberRole(ctx, userID, roleKey)` | `member:update` + escalation guard | owner cannot be demoted under `LastOwnerLocked` |
-| `RemoveMember(ctx, userID)` | `member:delete` + escalation guard **on the target's role** | see [what that does and does not stop](#the-guard-runs-on-the-target-s-role) |
+| `RemoveMember(ctx, userID)` | `member:delete` + escalation guard **on the target's role** | see [what that does and does not stop](#the-guard-runs-on-the-target-role) |
 | `LeaveContainer(ctx)` | membership only | owner cannot leave under `LastOwnerLocked` |
 | `ListMembers(ctx)` | membership only | non-members get `ErrNotMember`, not an empty list |
 | `TransferOwnership(ctx, userID)` | **owner only** | target must already be a member |
@@ -68,7 +68,7 @@ promote carol, who is not a member: true
 members: 2
 ```
 
-## The guard runs on the target's role
+## The guard runs on the target role
 
 `RemoveMember` resolves the **target's** role and refuses if it grants anything
 the actor lacks. That is what stops a mid-level administrator from evicting

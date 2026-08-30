@@ -89,6 +89,15 @@
           "storage/schema",
           "storage/custom-backends"
         ]
+      },
+      {
+        "group": "Reference",
+        "icon": "book",
+        "pages": [
+          "reference/packages",
+          "reference/errors",
+          "reference/options"
+        ]
       }
     ],
     "global": {
