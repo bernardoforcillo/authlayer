@@ -25,6 +25,18 @@
           "get-started/installation",
           "get-started/quickstart"
         ]
+      },
+      {
+        "group": "Concepts",
+        "icon": "diagram-project",
+        "pages": [
+          "concepts/scopes",
+          "concepts/statements",
+          "concepts/roles",
+          "concepts/decisions",
+          "concepts/context",
+          "concepts/ids"
+        ]
       }
     ],
     "global": {

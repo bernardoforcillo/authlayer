@@ -1,0 +1,129 @@
+---
+title: "Roles"
+description: "Three code-defined default roles seeded in every container, plus per-container custom roles defined at runtime. One role per member, never a stack."
+---
+
+A role is a named bundle of grants over the
+[permission surface](/concepts/statements). A membership holds **exactly one**
+role key — there is no stacking, no union of roles, no additive grants. A
+member's effective permissions are always exactly one role's, which is what
+keeps them auditable.
+
+Roles come from two places.
+
+## Default roles
+
+Three roles are defined in **code**, are identical in every container, and are
+seeded by `NewAccess`. They are derived from the merged statement surface, so
+they grow automatically as your application declares more resources.
+
+| Key | Grants | Notes |
+|---|---|---|
+| `owner` | everything | `IsFull`, so it bypasses fine-grained checks and the escalation guard |
+| `admin` | everything except `<container>:delete` | **not** full, so the escalation guard still applies to it |
+| `member` | nothing | standing only: can list members and roles, change nothing |
+
+They are reserved. A custom role may not reuse a default key
+(`ErrRoleKeyTaken`), and none of the three can be updated or deleted at runtime
+(`ErrDefaultRole`).
+
+<Note>
+`admin` being deliberately short of full permission is load-bearing in two
+places far from here. It is why an admin is still subject to the
+[privilege-escalation guard](/authorization/privilege-escalation), and it is
+why a plain admin inherits nothing in a [nested scope](/authorization/nested-scopes)
+by default.
+</Note>
+
+## Custom roles
+
+Custom roles are **per-container**, defined at runtime, and persisted as
+encoded grants. A custom role in one container is invisible to every other, so
+two tenants can each define an `editor` that means something different.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{
+	"project": {"create", "read", "update", "delete"},
+}), memory.New[org.Organization, org.Member]())
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+alice := org.WithOrg(ctx, acme.ID)
+
+editor, err := svc.CreateRole(alice, "editor", "Editor", map[string][]access.Action{
+	"project": {"create", "update"},
+})
+fmt.Println(err, editor.Key, editor.Name, editor.IsDefault)
+fmt.Println(editor.Permissions.Allows("project", "create"))
+fmt.Println(editor.Permissions.Allows("project", "delete"))
+```
+
+```
+<nil> editor Editor false
+true
+false
+```
+
+Full lifecycle — update, delete, list, and the rules each one enforces — is on
+[Custom roles](/authorization/custom-roles).
+
+## Resolving a key to a permission set
+
+Every check resolves a member's role key the same way: a **code-defined role
+first** if the registry knows it, otherwise a **custom role** loaded from the
+store and decoded. Neither found is `ErrRoleNotFound`.
+
+There is a third source that trips people up. `access.Access.NewRole` registers
+a role in **code** at startup — a `viewer` role, say — and such a role is
+assignable and resolves normally, but it is **not** in the store, so it does
+not appear in `ListRoles`:
+
+{/* verify:main */}
+```go
+roles, _ := svc.ListRoles(alice)
+for _, r := range roles {
+	fmt.Println(r.Key, r.IsDefault)
+}
+```
+
+```
+owner true
+admin true
+member true
+editor false
+```
+
+<Warning>
+`ListRoles` returns the three defaults followed by the container's **stored**
+custom roles. It is not the full set of assignable role keys: a role registered
+in code with `access.Access.NewRole` is assignable but invisible here. Use
+`scope.Service.RolePermissions(ctx, containerID, roleKey)` to resolve a
+specific key — that is the same ladder every check walks, and approximating it
+from `ListRoles` would silently treat such a role as nonexistent.
+</Warning>
+
+{/* verify:stdout "<nil> editor Editor false\ntrue\nfalse\nowner true\nadmin true\nmember true\neditor false" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="How a decision is made" icon="scale-balanced" href="/concepts/decisions">
+    The five-step ladder from a role key to an allow or a deny.
+  </Card>
+  <Card title="Custom roles" icon="pen-to-square" href="/authorization/custom-roles">
+    Create, update, delete, and the rules on each.
+  </Card>
+</Columns>
