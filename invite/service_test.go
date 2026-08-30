@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/auth"
 	"github.com/bernardoforcillo/authlayer/invite"
 	"github.com/bernardoforcillo/authlayer/org"
 	"github.com/bernardoforcillo/authlayer/scope"
@@ -211,6 +213,86 @@ func TestInviteByEmailReplacesPendingInvite(t *testing.T) {
 	}
 	if len(invites) != 1 {
 		t.Fatalf("len(invites) = %d, want exactly 1 surviving row for alice", len(invites))
+	}
+}
+
+// TestInviteByEmailReplacesAPendingInviteSpelledDifferently is the
+// security-relevant half of TestInviteByEmailReplacesPendingInvite: "a
+// re-invite REPLACES" has to hold across casing and surrounding whitespace,
+// not merely across an identical string.
+//
+// Before [invite.NormalizeEmail] existed, it did not. erin@example.com and
+// Erin@Example.com were two different (ContainerID, Email) pairs, so the
+// sweep [invite.Service.InviteByEmail] performs first matched neither the
+// other's row and the (ContainerID, Email) constraint saw no conflict: the
+// container ended up holding TWO live, redeemable invitations for one human.
+// A pending-invitations screen shows both, an admin revoking the one they
+// recognise leaves the other redeemable at the invited role, and nothing
+// anywhere reports that it is still out there.
+//
+// The assertion that carries the security weight is the last one: exactly one
+// row, and the first token dead. Do not weaken it to "the second token
+// works" — that passes with the defect fully present.
+func TestInviteByEmailReplacesAPendingInviteSpelledDifferently(t *testing.T) {
+	f := newFixture(t)
+
+	_, lower, err := f.isvc.InviteByEmail(f.ctx("owner"), "erin@example.com", org.RoleMember)
+	if err != nil {
+		t.Fatalf("first invite: %v", err)
+	}
+	inv, upper, err := f.isvc.InviteByEmail(f.ctx("owner"), "  Erin@Example.COM\t", org.RoleAdmin)
+	if err != nil {
+		t.Fatalf("re-invite under a different spelling: %v", err)
+	}
+
+	// The security consequence first, so a regression reports what actually
+	// went wrong rather than the cosmetic mismatch that precedes it.
+	invites, err := f.ist.ListEmailInvites(context.Background(), f.cID)
+	if err != nil {
+		t.Fatalf("ListEmailInvites: %v", err)
+	}
+	if len(invites) != 1 {
+		addresses := make([]string, 0, len(invites))
+		for _, i := range invites {
+			addresses = append(addresses, i.Email)
+		}
+		sort.Strings(addresses)
+		t.Fatalf("the container holds %d live invitation(s) %v for ONE person, want exactly 1. Two spellings of one address are two redeemable tokens: an admin revoking the row they recognise leaves the other live, at the invited role, with nothing reporting that it is still out there", len(invites), addresses)
+	}
+
+	if _, err := f.isvc.PreviewInvite(context.Background(), lower); !errors.Is(err, invite.ErrInviteNotFound) {
+		t.Fatalf("preview of the first token err = %v, want ErrInviteNotFound — re-inviting the same person under a different spelling must REPLACE the pending invitation, not leave a second one redeemable", err)
+	}
+	p, err := f.isvc.PreviewInvite(context.Background(), upper)
+	if err != nil {
+		t.Fatalf("preview of the second token: %v", err)
+	}
+	if !p.Valid || p.RoleKey != org.RoleAdmin {
+		t.Fatalf("preview = %+v, want a valid admin-role invite", p)
+	}
+
+	if inv.Email != "erin@example.com" {
+		t.Errorf("stored Email = %q, want the normalized %q — InviteByEmail must apply invite.NormalizeEmail before it writes", inv.Email, "erin@example.com")
+	}
+	if p.Email != "erin@example.com" {
+		t.Errorf("Preview.Email = %q, want the normalized %q — a caller binding the invitation to its recipient compares this against a normalized auth.UserBase.Email", p.Email, "erin@example.com")
+	}
+}
+
+// TestNormalizeEmailMatchesAuth pins that invite and auth fold addresses
+// identically. The two are separate exported functions — invite takes no
+// dependency on auth, deliberately — so nothing but this test and their
+// shared internal implementation stops them drifting, and an application
+// that compares an invited address against a verified account address is
+// relying on them agreeing exactly.
+func TestNormalizeEmailMatchesAuth(t *testing.T) {
+	for _, in := range []string{
+		"", "   ", "bob@example.com", "Bob@Example.com", "  BOB@EXAMPLE.COM \t",
+		"\tCarol.Smith+Tag@Example.COM\n", "bo b@example.com",
+	} {
+		if got, want := invite.NormalizeEmail(in), auth.NormalizeEmail(in); got != want {
+			t.Errorf("invite.NormalizeEmail(%q) = %q, auth.NormalizeEmail(%q) = %q — the two must agree byte for byte", in, got, in, want)
+		}
 	}
 }
 

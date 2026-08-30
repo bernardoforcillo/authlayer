@@ -1,0 +1,210 @@
+---
+title: "Writing your own backend"
+description: "The two strict ports ship their contract as an executable suite, races included — because prose and two in-tree implementations are not something a third party can test against."
+---
+
+`auth.Store` and `invite.Store` carry obligations that, when violated, reopen a
+specific security hole rather than merely narrowing a race. Until these suites
+existed those obligations were enforced by prose and by the two backends this
+repository happens to ship; a third-party author had no way to check their work.
+
+Both suites are ordinary Go tests. Write one per backend.
+
+## The auth contract
+
+<Note>
+`auth/authtest` imports `testing`, so it belongs in a `_test.go` file.
+</Note>
+
+{/* verify:skip a test function needing a *testing.T; the identical call is compiled and run by store/memory/auth_test.go and by store/drops' integration lane */}
+```go
+import "github.com/bernardoforcillo/authlayer/auth/authtest"
+
+func TestMyStoreSatisfiesTheAuthContract(t *testing.T) {
+	authtest.RunStoreContract(t, func(t *testing.T) auth.Store {
+		return myStoreWithEmptyTables(t) // called once per check
+	})
+}
+```
+
+The factory must hand back a store with **no** users, sessions or verifications
+in it — several checks assert counts over the whole table — and may register
+teardown with `t.Cleanup` or call `t.Skip`. Ids are UUIDv7 and every address is
+unique per call, so the suite runs unchanged against a backend that types its id
+columns as `uuid`.
+
+<Warning>
+If your store opens connections on demand, raise your pool limits and warm it to
+`authtest.RaceGoroutines` connections first. Goroutines that trickle in across a
+connection-setup window never actually contend, which **silently weakens every
+race in the suite**.
+</Warning>
+
+### Six of the fifty-two checks are races
+
+Because the obligations behind them are unreachable sequentially:
+
+| Race | What it rejects |
+|---|---|
+| `MarkRotated`'s single winner | two successful rotations of one refresh token |
+| `CreateUser`'s one-address-one-account atomicity | two accounts sharing one address |
+| `UpdateUserEmail`'s, the same | the same, through the other door |
+| `MarkEmailVerified` racing the `UpdateUserEmail` that moves the address | an address certified that nobody proved control of |
+| `CreateSuccessorSession` racing family revocation | a revoked family left with one live, rotating session |
+| concurrent revocations of one family | survivors |
+
+The middle two assert a **linearizability** property rather than a timing guess:
+the end state they reject is one no serial order of the two calls can produce.
+
+### Two things the suite does not do
+
+<AccordionGroup>
+
+<Accordion title="It does not check whether CreateUser read first" icon="eye-slash">
+`CreateUser`'s MUST is that `ErrEmailTaken` comes from the **same attempt that
+performs the write**, so a condition denying writes but not reads cannot make a
+duplicate address answer faster than a new one.
+
+Whether your backend consulted a separate read first is **invisible to a
+caller** — the port itself permits an in-process map to check first, precisely
+because its write cannot fail on its own. The suite asserts the observable
+consequence (two concurrent creates of one address, one winner); the
+read-authorization half is for review, not test.
+</Accordion>
+
+<Accordion title="It cannot force DeleteSessionsByFamily's lock-order inversion" icon="lock">
+That serialization MUST is asserted only through its consequence: concurrent
+calls on one family must all succeed and leave no survivors.
+
+Forcing the inversion needs backend-specific SQL on a second connection, which
+no port-level suite can write. `store/drops` carries that test itself.
+</Accordion>
+
+</AccordionGroup>
+
+<Note>
+Token-hash uniqueness is **in** that suite, not an extra alongside it.
+`Session.TokenHash` and `Verification.TokenHash` carry their MUST on the record
+type, and a backend that satisfies every method obligation and skips these is
+still wrong.
+
+It was briefly a second entry point, `RunTokenHashUniquenessContract`, because
+`store/memory` declined the obligation. That backend now enforces it and the
+entry point is gone — shipping the check as opt-in told the next in-memory
+backend author it was optional.
+</Note>
+
+## The invite contract
+
+Built the same way, placed the same way. Beyond the three uniqueness
+constraints, it also asserts `invite.EmailInvite`'s **address normalization**:
+`CreateEmailInvite` must apply `invite.NormalizeEmail` before the uniqueness
+check and the write, and `DeleteEmailInvitesFor` must apply it before it
+matches. Skip it and the `(container_id, email)` constraint becomes byte-exact,
+so two casings of one address are two live tokens for one person — the checks
+are `CreateEmailInvite/NormalizesTheAddress`,
+`DeleteEmailInvitesFor/NormalizesTheAddress` and
+`CreateEmailInvite/ContainerEmailPairIsUniqueAcrossSpelling`.
+
+{/* verify:skip a test function needing a *testing.T; the identical call is compiled and run by store/memory/invite_test.go and by store/drops' integration lane */}
+```go
+import "github.com/bernardoforcillo/authlayer/invite/invitetest"
+
+func TestMyStoreSatisfiesTheInviteContract(t *testing.T) {
+	invitetest.RunStoreContract(t, func(t *testing.T) invite.Store {
+		return myStoreWithEmptyTables(t) // called once per check
+	})
+}
+```
+
+The factory must hand back a store with **no** email invites and no links in it.
+Ids and container ids are UUIDv7, and addresses, token hashes and codes are
+unique per call unless a check is deliberately forcing a collision. Warm your
+pool to `invitetest.RaceGoroutines` connections, for the same reason as above.
+
+### Eight of the forty-six checks are races
+
+`ConsumeLink`'s single winner against a `MaxUses: 1` link; its ceiling against a
+`MaxUses: 4` one; the lost update its increment must not have on an unlimited
+one; `DeleteEmailInvite`'s at-most-one-nil claim; each of the three uniqueness
+constraints under concurrent creates; and a `DeleteEmailInvitesFor` racing the
+`CreateEmailInvite` that re-invites the same address.
+
+That last one is another **linearizability** assertion: the end state it rejects
+— the create reporting success while the container ends up holding no invitation
+for the address — is one no serial order of the two calls can produce.
+
+<Warning>
+**None of the three `ConsumeLink` races proves the mechanism.** `ConsumeLink`'s
+MUST names two acceptable shapes (one `UPDATE ... WHERE` whose rows-affected
+count *is* `ok`, or one critical section spanning the check and the write), and
+which shape your backend used is invisible to a caller.
+
+Two of the three — one winner against `MaxUses: 1`, exactly four against
+`MaxUses: 4` — catch a grossly non-atomic implementation every time and a subtly
+non-atomic one only **sometimes**: `store/memory` measured a deliberately
+split-lock `ConsumeLink` passing that race 20 times out of 20, even at 2000
+goroutines.
+
+The third is the deterministic one. Against an *unlimited* link every caller
+wins on any implementation, but a read-then-write **loses increments** — N
+callers each read the same `UseCount` and each write `read+1` — so the stored
+count comes back far below N whatever the timing. Run all three.
+</Warning>
+
+### What it deliberately does not assert
+
+Points the port leaves unspecified: list order, empty-slice-versus-nil, and —
+for every one of the three uniqueness checks — **which error** a rejected
+duplicate comes back as, since `invite.Store` classifies no conflict-on-create
+at all and the two shipped backends answer differently on purpose. Each of those
+checks requires only that the write failed and that the original row survived it.
+
+## A contract suite that passes everything is worthless
+
+Both suites are themselves tested against deliberately broken stores, so a check
+that asserts nothing cannot slip in green.
+
+<Columns cols={2}>
+  <Card title="authtest" icon="vial">
+    **Fifteen** non-compliant stores — one whose `MarkRotated` lets every caller
+    win, one whose `CreateUser` checks then writes non-atomically, one whose
+    `DeleteSessionsByFamily` snapshots the family before it waits — paired into
+    **nineteen** defect/check cases, each asserted to **fail** the check that
+    covers it.
+  </Card>
+  <Card title="invitetest" icon="vials">
+    **Thirty-four** non-compliant stores — one whose `ConsumeLink` decides under
+    one lock and increments under a second, one that lets two links share a
+    code, one that reads `MaxUses: 0` as exhausted rather than unlimited, one
+    that stores an invited address verbatim — paired into **forty-seven**
+    cases. A further test fails if a check is ever added without a control.
+  </Card>
+</Columns>
+
+## What a backend still owes beyond the suites
+
+<Note>
+The sentinel discipline. A store must return `ErrNotMember` rather than a
+generic not-found, `ErrUserNotFound` rather than `sql.ErrNoRows`, and so on —
+the engine branches on those, and no contract suite can tell you that your
+`SELECT` returned the wrong error *type* for a case it never exercises.
+
+`go doc ./scope Store`, `go doc ./auth Store` and `go doc ./invite Store`
+document each method's contract, and they are the reference.
+</Note>
+
+`scope.Store` has no suite of its own. Its obligations are ordinary persistence
+plus the sentinels, and the engine's own tests exercise it through
+`store/memory`.
+
+## Next
+
+<Columns cols={2}>
+  <Card title="The Store ports" icon="plug" href="/storage/overview">
+    Every MUST, and what each one costs when violated.
+  </Card>
+  <Card title="store/memory" icon="microchip" href="/storage/memory">
+    The reference implementation both suites run against.
+  </Card>
+</Columns>

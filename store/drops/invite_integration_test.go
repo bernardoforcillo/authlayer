@@ -90,7 +90,8 @@ func dropInviteTables(t *testing.T, db *pg.DB, st *dropsstore.InviteStore) {
 // obligation of invite.Store, including the ConsumeLink single-winner race
 // and the DeleteEmailInvite claim this file used to reimplement, and the
 // three uniqueness constraints this backend has always enforced and
-// store/memory now does too.
+// store/memory now does too, and the address normalization neither of them
+// did before.
 //
 // A fake driver has no lock contention or wire round trips to interleave, so
 // it cannot demonstrate atomicity; only a real server's row lock can. That is

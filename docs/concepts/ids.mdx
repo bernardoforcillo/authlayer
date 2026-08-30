@@ -1,0 +1,135 @@
+---
+title: "Ids"
+description: "Every id authlayer mints is a UUIDv7, and its column is a PostgreSQL uuid by default. Overriding the generator needs the matching column option."
+---
+
+Every id authlayer mints for itself — a container's `id`, a custom role's `id`,
+a user, a session, a verification, an invite, a link — is a **UUIDv7** drawn
+from `crypto/rand`. The generator is `internal/uid`, written out per RFC 9562
+rather than depended on, which is what keeps the module at three requirements.
+
+User ids are in that list: authlayer's [authentication half](/authentication/overview)
+mints them too.
+
+## Overriding the generator
+
+`scope.WithIDGenerator` (and `org`'s / `team`'s aliases) and
+`auth.WithIDGenerator` replace the id source. Against a `Store` of your own,
+the only requirement is that ids are unique and stable.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"sync/atomic"
+
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+var n atomic.Int64
+seq := func() string { return "org-" + strconv.FormatInt(n.Add(1), 10) }
+
+svc := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member](),
+	org.WithIDGenerator(seq))
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, err := svc.CreateOrganization(ctx, "Acme", "acme")
+fmt.Println(acme.ID, err)
+```
+
+```
+org-1 <nil>
+```
+
+{/* verify:stdout "org-1 <nil>" */}
+
+## Against `store/drops`, the column type has to move with it
+
+<Warning>
+`store/memory` accepts any string, so a service developed and tested entirely
+against the in-memory store passes every test and **breaks on deployment**. The
+first `CreateOrganization` or `SignUp` fails at the store, on the first write,
+with `SQLSTATE 22P02` (`invalid_text_representation`).
+</Warning>
+
+Every id column is a PostgreSQL `uuid` **by default** — right for the UUIDv7
+generator authlayer ships, wrong for any other. Two *independent* options
+retype columns, because they answer two independent questions:
+
+| Option | Retypes | Reach for it when |
+|---|---|---|
+| `WithTextLibraryIDs()` | `id`, `container_id`, `parent_id` | You overrode `WithIDGenerator` with something a `uuid` column will not hold. |
+| `WithTextUserIDs()` | `user_id`, `owner_id` (and `invited_by`, `created_by` via `WithInviteTextUserIDs()`) | You use only the RBAC half, against an existing user table whose ids are not UUIDs. |
+
+They compose, and a deployment minting non-UUID ids for **both** wants both:
+
+{/* verify:skip needs a live PostgreSQL database and a *pg.DB — the store constructors it calls open no connection, but the surrounding wiring on /storage/postgres does */}
+```go
+newID := func() string { return ulid.Make().String() } // illustrative; ulid is not a dependency
+
+scopeSt := dropsstore.New[org.Organization, org.Member](db,
+	dropsstore.WithTextLibraryIDs(), dropsstore.WithTextUserIDs())
+inviteSt := dropsstore.NewInviteStore(db,
+	dropsstore.WithInviteTextLibraryIDs(), dropsstore.WithInviteTextUserIDs())
+authSt := dropsstore.NewAuthStore(db, dropsstore.WithAuthTextLibraryIDs())
+
+orgSvc := org.New(ac, scopeSt, org.WithIDGenerator(newID))
+authSvc := auth.New(authSt, auth.WithIDGenerator(newID))
+```
+
+<Note>
+`WithTextUserIDs()` on its own does **nothing** for `WithIDGenerator`.
+`New[...](db, WithTextUserIDs())` with a ULID generator still fails on the
+first write, because the container's own `id` column is still `uuid`. The two
+options are separate on purpose; a deployment that overrides the generator
+needs the *library* one.
+</Note>
+
+## The auth store is different, and deliberately so
+
+`dropsstore.NewAuthStore` has **no text-user-id option at all**. It owns the
+`users` table its `user_id` columns point at, so a `user_id` typed differently
+from `users.id` could never be self-consistent.
+
+What it has instead is `WithAuthTextLibraryIDs()`, one option that moves **all
+five** id columns together — `users.id`, `sessions.id`, `verifications.id`, and
+the two `user_id` columns referencing the first. A hatch that moved only the
+first three would fix `SignUp` and then break `Login`.
+
+## Choose before the tables exist
+
+`CreateSchema` emits the right `CREATE TABLE` either way and stays idempotent,
+but — like everything else it does — it only ever *adds* what is missing. It
+will not retype a table that already exists. Pick before the tables are
+created, or retype the columns in your own migration.
+
+## All three directions are pinned by test
+
+Not asserted from prose:
+
+- `TestNonUUIDIDGeneratorIsAcceptedByTheMemoryStore` in `auth` — the memory
+  store takes any string.
+- `TestNonUUIDIDGeneratorFailsAgainstDropsLive` and
+  `TestNonUUIDIDGeneratorFailsAgainstTheScopeStoreLive` in `store/drops`'
+  integration lane — the `22P02` on each half.
+- `TestTextLibraryIDsRoundTripANonUUIDGeneratorLive` in the same lane — a ULID
+  generator driven through a full sign-up/verify/login/refresh arc and a full
+  organization/member/custom-role arc against live PostgreSQL, with the options
+  on.
+
+## Next
+
+<Columns cols={2}>
+  <Card title="The PostgreSQL store" icon="database" href="/storage/postgres">
+    The wiring, the options, and what `CreateSchema` will and will not do.
+  </Card>
+  <Card title="The schema" icon="table" href="/storage/schema">
+    Every table, and which constraint is load-bearing.
+  </Card>
+</Columns>

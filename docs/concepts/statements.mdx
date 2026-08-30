@@ -1,0 +1,154 @@
+---
+title: "Statements and permissions"
+description: "The permission surface is declared in code as resource → actions. Nothing outside it is grantable, and grants are persisted by name, not by bit index."
+---
+
+`access.Statements` is the **permission surface**: the complete set of things
+that *can* be granted anywhere in your application. You declare it once, at
+startup, in code.
+
+{/* verify:import */}
+```go
+import (
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/org"
+)
+```
+
+{/* verify:main */}
+```go
+ac := org.NewAccess(map[string][]access.Action{
+	"project": {"create", "read", "update", "delete"},
+	"billing": {"read", "update"},
+})
+```
+
+Nothing outside that surface is grantable, so a typo **denies** rather than
+silently allowing.
+
+## The control statements you get for free
+
+`org.NewAccess` merges your statements with the control statements the engine
+enforces on its own operations. `scope.NewAccess(containerResource, …)` does
+the same for a scope of your own, substituting your container resource name.
+
+| Resource | Actions | Checked by |
+|---|---|---|
+| `organization` | `update`, `delete` | your handlers — declared, not enforced |
+| `member` | `create`, `update`, `delete` | `AddMember`, `ChangeMemberRole`, `RemoveMember` |
+| `role` | `create`, `update`, `delete` | `CreateRole`, `UpdateRole`, `DeleteRole` |
+| `invite` | `create`, `read`, `delete` | the [`invite`](/invitations/overview) package's own mint/list/revoke calls — the engine itself checks none of it |
+
+`organization:update` and `organization:delete` are declared so your own
+"rename the org" and "delete the org" handlers have something to check with
+`Authorize`, and so that `admin` can be defined as *everything except deleting
+the container*.
+
+## Permission
+
+An `access.Permission` is an immutable set of grants over those statements,
+held as a bitset — a check is a bit test, not a map lookup or a string scan.
+
+{/* verify:main */}
+```go
+viewer, err := ac.Permission(map[string][]access.Action{
+	"project": {"read"},
+	"billing": {"read"},
+})
+fmt.Println(err)
+fmt.Println(viewer.Allows("project", "read"))          // one pair
+fmt.Println(viewer.Allows("project", "read", "update")) // AND across actions
+fmt.Println(viewer.Allows("project", "publish"))        // undeclared -> false
+fmt.Println(viewer.IsFull())
+fmt.Println(string(viewer.Encode()))
+```
+
+```
+<nil>
+true
+false
+false
+false
+billing:read
+project:read
+```
+
+<Note>
+`Allows` is an **AND** across the actions you pass. It reports `false` for any
+pair the statements never declared, which is what makes a typo a denial. And a
+call naming **no** actions denies — there is nothing to authorize.
+</Note>
+
+`SubsetOf(other)` is the comparison behind the
+[privilege-escalation guard](/authorization/privilege-escalation), and
+`IsFull()` reports whether a permission grants every declared pair — which is
+what makes a holder *elevated* in [a decision](/concepts/decisions).
+
+## Encoding is by name, not by bit index
+
+This is the property that lets your permission surface evolve without
+corrupting roles already stored in a database.
+
+`Encode` writes newline-separated `resource:action` tokens, and `Access.Decode`
+re-resolves those names against the statements in force **at decode time**.
+
+<Columns cols={2}>
+  <Card title="Add a resource" icon="plus">
+    Every stored role keeps its exact meaning. New bit indices do not shift
+    what an old grant meant, because an old grant never referred to an index.
+  </Card>
+  <Card title="Remove a resource" icon="minus">
+    That capability is dropped from stored roles on decode. Everything else in
+    the same role is untouched.
+  </Card>
+</Columns>
+
+## Where an invalid grant fails, and how loudly
+
+A grant that names an undeclared `(resource, action)` pair never silently
+disappears. *Where* it fails depends on where it came from:
+
+<Columns cols={2}>
+  <Card title="Access.NewRole panics" icon="triangle-exclamation">
+    A mis-declared **code-defined** role is a startup programming bug, and a
+    startup bug should be loud.
+  </Card>
+  <Card title="Access.Permission returns an error" icon="circle-exclamation">
+    Runtime and database-sourced grants must be **validated**, not trusted, so
+    the caller gets an error to handle.
+  </Card>
+</Columns>
+
+## Using `access` on its own
+
+The engine has no dependencies beyond the standard library and knows nothing
+about organizations, databases or HTTP. If you want only the permission algebra:
+
+{/* verify:main */}
+```go
+st := access.NewStatements(map[string][]access.Action{"doc": {"read", "write"}})
+pure := access.New(st)
+pure.NewRole("viewer", map[string][]access.Action{"doc": {"read"}})
+
+role, ok := pure.Role("viewer")
+fmt.Println(ok, role.Permissions.Allows("doc", "read"), role.Permissions.Allows("doc", "write"))
+```
+
+```
+true true false
+```
+
+{/* verify:stdout "<nil>\ntrue\nfalse\nfalse\nfalse\nbilling:read\nproject:read\ntrue true false" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Roles" icon="user-tag" href="/concepts/roles">
+    How grants get bundled and assigned.
+  </Card>
+  <Card title="Checking permissions" icon="scale-balanced" href="/authorization/checking-permissions">
+    `Can`, `Authorize`, `HasPermission`, and when each one is right.
+  </Card>
+</Columns>

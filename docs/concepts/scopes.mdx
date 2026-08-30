@@ -1,0 +1,154 @@
+---
+title: "Scopes"
+description: "A scope is an authorization boundary with an owner and members. The engine is generic over your container type; org is the ready-made instance."
+---
+
+A **scope** is an authorization boundary — an organization, a team, a project,
+a workspace. It has an owner, a set of members, and exactly one role per
+member.
+
+The engine that implements this is `scope`, and it is generic over two types:
+the **container** (the boundary itself) and the **member** (a membership row).
+`org` fixes both, so most callers never write a type parameter:
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member]())
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, err := svc.CreateOrganization(ctx, "Acme", "acme") // alice becomes owner
+fmt.Println(acme.Name, acme.OwnerID, err)
+```
+
+```
+Acme alice <nil>
+```
+
+## The rules that hold in every scope
+
+<Columns cols={2}>
+  <Card title="One role per member" icon="user-tag">
+    No stacking. A member's effective permissions are always exactly one
+    role's, which is what keeps them auditable. See [Roles](/concepts/roles).
+  </Card>
+  <Card title="The owner can always recover it" icon="crown">
+    With `Policy.OwnerBypass` on — the default — the owner gets full
+    permissions regardless of the role key on their membership, so a
+    mis-configured container is never a dead end. See [Policy](/authorization/policy).
+  </Card>
+  <Card title="Nobody grants more than they hold" icon="ban">
+    The privilege-escalation guard applies to adding members, changing roles,
+    removing members, and minting custom roles. See
+    [Privilege escalation](/authorization/privilege-escalation).
+  </Card>
+  <Card title="Nothing is cached" icon="rotate">
+    Every check hits the store for the container, the membership, and — for a
+    custom role — the role record. A permission change takes effect
+    immediately and there is no invalidation to get wrong.
+  </Card>
+</Columns>
+
+## Scopes carry no users
+
+<Note>
+The authorization half — `scope`, `org`, `team`, `invite` — stores **no users**
+and declares **no foreign key** to yours. A user id is a value it carries,
+never one it validates against a schema of its own.
+</Note>
+
+That is what makes it adoptable on top of an existing system: you can put
+`org` over a user table you already have, with ids of any shape, and change
+nothing about how your accounts work. [`auth`](/authentication/overview) is the
+separate half that *does* own a `users` table, and you can use one without the
+other.
+
+Where user ids come from and what column type they land in is
+[Ids](/concepts/ids).
+
+## Your own container type
+
+`org.Organization` and `org.Member` are ordinary structs embedding
+`scope.ContainerBase` and `scope.MemberBase`. When you need a different
+boundary, or extra fields on a membership, you declare your own and call
+`scope.New` directly:
+
+{/* verify:decl */}
+```go
+type Project struct {
+	scope.ContainerBase        // id, owner_id, created_at, updated_at
+	Name string `drop:"name"`
+}
+
+type ProjectMember struct {
+	scope.MemberBase           // container_id, user_id, role_key, joined_at
+	InvitedBy string `drop:"invited_by"`
+}
+```
+
+The engine reads and stamps the base fields and leaves yours alone. Full worked
+example: [Custom scopes](/authorization/custom-scopes).
+
+{/* verify:import */}
+```go
+import (
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/scope"
+)
+```
+
+{/* verify:main */}
+```go
+ac := scope.NewAccess("project", map[string][]access.Action{
+	"task": {"create", "read"},
+})
+projects := scope.New[Project, ProjectMember](
+	ac, memory.New[Project, ProjectMember]())
+
+bob := scope.WithSubject(context.Background(), "bob")
+p, err := projects.CreateContainer(bob, Project{Name: "Apollo"})
+fmt.Println(p.Name, p.OwnerID, err)
+```
+
+```
+Apollo bob <nil>
+```
+
+{/* verify:stdout "Acme alice <nil>\nApollo bob <nil>" */}
+
+## Nesting
+
+A scope can sit **inside** another, so that standing in the parent confers
+standing in the child. `team` is the worked example — teams nested one level
+inside `org`. Nesting changes three things (`CreateContainer` gains a
+permission check against the parent, `AddMember` gains a parent-membership
+requirement, and every check may climb a rung), and it has one documented gap
+around row-level filtering. All of it is on
+[Nested scopes](/authorization/nested-scopes).
+
+## Where to go next
+
+<Columns cols={2}>
+  <Card title="Statements and permissions" icon="list-check" href="/concepts/statements">
+    Declaring what is grantable at all.
+  </Card>
+  <Card title="Roles" icon="user-tag" href="/concepts/roles">
+    The three defaults, and per-container custom roles.
+  </Card>
+  <Card title="How a decision is made" icon="scale-balanced" href="/concepts/decisions">
+    The five-step ladder every check walks.
+  </Card>
+  <Card title="Context" icon="share-nodes" href="/concepts/context">
+    How the subject and the active scope reach a check.
+  </Card>
+</Columns>

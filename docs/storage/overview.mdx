@@ -1,0 +1,204 @@
+---
+title: "Storage"
+description: "Three independent Store ports, two shipped backends, and one discipline: a store is pure persistence that never authorizes anything."
+---
+
+authlayer has **three** persistence ports, and they are independent. You can
+implement one and not the others, and the two shipped backends implement all
+three.
+
+| Port | Holds | Methods |
+|---|---|---|
+| `scope.Store[C, M]` | containers, members, custom roles, a transaction | composed from `ContainerStore`, `MemberStore`, `RoleStore` |
+| `invite.Store` | email invitations and links | 13 |
+| `auth.Store` | users, sessions, verifications | 18 |
+
+<Columns cols={2}>
+  <Card title="store/memory" icon="microchip" href="/storage/memory">
+    In-process, map-backed, zero dependencies. The reference implementation of
+    every contract — for development, tests and examples.
+  </Card>
+  <Card title="store/drops" icon="database" href="/storage/postgres">
+    PostgreSQL, generic over your container and member types, deriving columns
+    from `drop:` tags. The production backend.
+  </Card>
+</Columns>
+
+## A store is pure persistence
+
+<Note>
+The engine stamps ids, owners and timestamps, resolves roles, and runs **every**
+authorization check before calling in. The store never authorizes anything and
+never interprets permission bytes.
+</Note>
+
+What it *does* owe the engine is the right **sentinel error** when a lookup
+finds nothing — `ErrNotMember` rather than a generic not-found — because the
+engine branches on those. Each method's contract is documented on the
+interface; `go doc ./scope Store` is the reference.
+
+`scope.Store` is composed from three smaller interfaces, so a backend or a
+decorator — caching, metrics, multi-tenant routing — can override a slice of it
+by embedding the rest.
+
+<Tip>
+If you need fewer round trips, wrap the **`Store`**, not the `Service`. A
+decorator over the port keeps every authorization rule intact while changing
+where the bytes come from. authlayer caches nothing itself, on purpose: a
+permission change takes effect immediately and there is no invalidation to get
+wrong.
+</Tip>
+
+## `WithTx` is only used in one place
+
+`scope.Store.WithTx(ctx, fn)` runs `fn` inside a single transaction, passing a
+tx-scoped `Store` that `fn` must use for its writes. The engine uses it for
+`CreateContainer`, where the container, the owner's membership and the
+`ContainerCreated` hook must commit together or not at all.
+
+A backend without real transactions may approximate it — `store/memory`
+snapshots and restores under a mutex — but a production backend should use the
+database's.
+
+<Warning>
+There is **no cross-store transaction anywhere**. Invitation acceptance spans
+`invite.Store` and `scope.Store`, which may not even share a database, and
+`auth`, `scope` and `invite` declare no foreign keys between their tables. That
+constraint is what shapes
+[claim-first-admit-second](/invitations/security#claim-first-admit-second) and
+what leaves the
+[verification sweeps sequential-only](/authentication/passwords#both-sweeps-are-sequential-only).
+</Warning>
+
+## The strictest port
+
+`auth.Store` carries **seven MUSTs across its eighteen methods**, and they are
+not all the same kind of obligation.
+
+<AccordionGroup>
+
+<Accordion title="Four demand atomicity" icon="lock">
+`MarkRotated`, `CreateSuccessorSession`, `MarkEmailVerified`, `UpdateUserEmail`.
+
+Splitting any of them into a read and a later write **reopens a security hole**
+rather than merely narrowing a race: two successful rotations of one token; a
+successor resurrecting a family that was revoked mid-rotation; an address
+certified that nobody proved control of; two accounts sharing one address.
+
+That last one has nothing above it to catch it — `RequestEmailChange`
+[deliberately does not pre-check the new address](/authentication/email-verification#the-uniqueness-check-happens-at-redemption-not-before),
+so `UpdateUserEmail` at redemption is the only enforcement point there is.
+</Accordion>
+
+<Accordion title="Two are what SignUp's enumeration safety leans on" icon="eye-slash">
+`CreateUser` must decide `ErrEmailTaken` from the **same attempt that performs
+the write**, and `FindUserByEmail` must **read its own writes**.
+
+Either one violated turns a single `SignUp` call into an "is this address
+registered?" oracle from inside the store, where no amount of care in `SignUp`
+itself can see it.
+</Accordion>
+
+<Accordion title="One demands the opposite: an extra read, and serialization" icon="arrows-rotate">
+`DeleteSessionsByFamily` carries two MUSTs that apply to any backend whose
+`CreateSuccessorSession` holds a row-level lock on the predecessor for a
+transaction's duration — the shape `store/drops` uses.
+
+A single autocommit `DELETE FROM sessions WHERE family_id = $1` is **not
+sufficient** there: its snapshot is taken *before* it waits for that lock, so
+once unblocked it deletes only what existed at the earlier instant and misses
+the successor committed while it waited — leaving a revoked family with one
+live, fully rotating session.
+
+Such a backend must re-snapshot **after** the wait (a `SELECT ... FOR UPDATE`
+over the family's rows, then the `DELETE`, in one transaction), and must
+**additionally serialize** concurrent calls on the same family, because that
+locking `SELECT` has no ordering guarantee and two callers can deadlock each
+other. A per-family advisory transaction lock taken before the `SELECT` is
+sufficient; an `ORDER BY` on the `SELECT` is **not**, since the `DELETE` that
+follows has no ordering of its own.
+
+A backend whose `CreateSuccessorSession` takes no such lock —
+`store/memory`, whose single mutex spans both methods' whole bodies — has no gap
+to close and owes neither.
+</Accordion>
+
+<Accordion title="Two more sit on the record types, not on a method" icon="fingerprint">
+`Session.TokenHash` and `Verification.TokenHash` each carry a **uniqueness**
+MUST — a `UNIQUE` constraint in a SQL backend.
+
+`MarkRotated`'s single-winner contract breaks without it **with no atomicity
+defect at all**: two rows sharing a hash lets two concurrent callers each
+correctly, atomically win the row they happened to pick. A backend that
+satisfies every method obligation above and skips these is still wrong.
+</Accordion>
+
+</AccordionGroup>
+
+## The eight invitation MUSTs
+
+All about the same thing: bounding **who gets in**.
+
+**Four are on methods.** `ConsumeLink` must make its check and its increment one
+atomic step, or a `MaxUses: 1` link admits everyone who clicks it at once.
+`DeleteEmailInvite` must be **rows-affected gated**, because that gate — not any
+check above it — is what makes one emailed token pay out once; `AcceptInvite`
+claims first and grants second precisely so it is the only thing that has to
+hold. And `CreateEmailInvite` and `CreateLink` must refuse a write that would
+break a uniqueness constraint, **atomically with performing it**.
+
+**Four are on the record types**, because they constrain the shape of the table
+rather than the behaviour of one call:
+
+<Columns cols={2}>
+  <Card title="EmailInvite.TokenHash" icon="fingerprint">
+    Unique. Two rows sharing a hash defeats the single-winner property with no
+    atomicity defect at all.
+  </Card>
+  <Card title="Link.Code" icon="link">
+    Unique. Two concurrent redeemers resolve **different** rows and each wins
+    the one it picked — the limit bounds nothing while every individual consume
+    behaves perfectly.
+  </Card>
+  <Card title="(ContainerID, Email)" icon="table-columns">
+    Unique **as a pair**. What makes re-inviting an address replace rather than
+    duplicate when two calls race. The same person invited to two containers is
+    two legitimate rows.
+  </Card>
+  <Card title="EmailInvite.Email is normalized" icon="wand-magic-sparkles">
+    `invite.NormalizeEmail` on every address a store writes or matches — the
+    write in `CreateEmailInvite`, the argument to `DeleteEmailInvitesFor`.
+    Without it the pair above is byte-exact, so two casings of one address are
+    two live tokens for one person.
+  </Card>
+</Columns>
+
+## They are executable, not just prose
+
+Both strict ports ship their contract as a runnable suite, so a third-party
+backend author can check their work:
+
+{/* verify:skip test-function bodies needing a *testing.T; both are compiled and run by the project's own suite — store/memory runs each in store/memory/auth_test.go and invite_test.go, and store/drops runs each in its integration lane */}
+```go
+authtest.RunStoreContract(t, newStore)   // 52 checks, 6 of them races
+invitetest.RunStoreContract(t, newStore) // 46 checks, 8 of them races
+```
+
+See [Writing your own backend](/storage/custom-backends).
+
+## Next
+
+<Columns cols={2}>
+  <Card title="store/memory" icon="microchip" href="/storage/memory">
+    The development backend, and the one divergence it still has.
+  </Card>
+  <Card title="store/drops" icon="database" href="/storage/postgres">
+    The production wiring, in full, imports included.
+  </Card>
+  <Card title="The schema" icon="table" href="/storage/schema">
+    Eight tables, and which constraint is load-bearing.
+  </Card>
+  <Card title="Custom backends" icon="plug" href="/storage/custom-backends">
+    Running the two contract suites.
+  </Card>
+</Columns>

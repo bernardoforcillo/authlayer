@@ -1,0 +1,231 @@
+---
+title: "Nested scopes"
+description: "A scope inside another, so standing in the parent can confer standing in the child — what the zero-config default gives you, and the three things nesting changes."
+---
+
+A scope can sit **inside** another: a team inside an organization, a project
+inside a team. `team` is the worked example, teams nested one level inside
+`org`.
+
+<Note>
+Read [Scopes](/concepts/scopes) and [Custom scopes](/authorization/custom-scopes)
+first. Nesting is an addition to the engine you already know, not a different
+one.
+</Note>
+
+## The minimum wiring
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/scope"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+	"github.com/bernardoforcillo/authlayer/team"
+)
+```
+
+{/* verify:main */}
+```go
+orgSvc := org.New(
+	org.NewAccess(team.ParentStatements()), // declares team:create on the ORG
+	memory.New[org.Organization, org.Member]())
+
+teamSvc := team.New(
+	team.NewAccess(nil),
+	memory.New[team.Team, team.Member](),
+	orgSvc) // the parent
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := orgSvc.CreateOrganization(ctx, "Acme", "acme") // alice is owner
+
+alice := org.WithOrg(ctx, acme.ID) // CreateTeam reads the ORGANIZATION
+platform, err := teamSvc.CreateTeam(alice, "Platform")
+fmt.Println("alice owns the org, so she creates the team:", err, platform.Name)
+```
+
+```
+alice owns the org, so she creates the team: <nil> Platform
+```
+
+`team.ParentStatements()` declares `team:create` on the **organization's**
+surface, so an organization role — not only the owner — can be granted the
+right to create a team.
+
+<Warning>
+Skipping that merge is **not** a startup error. `CreateTeam` still works for the
+org owner, since ownership always bypasses the check; every other member is
+refused with nothing in the error to say why. `team.New` cannot catch the
+omission for you — a `scope.ParentScope` exposes only `Standing`, not the
+parent's `Access`, so this package has no way to inspect what the organization
+declared.
+</Warning>
+
+## Bits never cross a scope boundary
+
+An `access.Permission` is a bitset over **one** package's `Statements`, so a
+parent's bits mean nothing in a child's statement space. Inheritance therefore
+never projects bits — only **grant names**, which the child recompiles against
+its own `Access`.
+
+## The zero-config default confers standing on nobody but the elevated
+
+Under `org.NewAccess`'s default roles, that is the **owner alone**, via
+ownership. The built-in `admin` role is deliberately short of full permission
+(it excludes `organization:delete`, so the escalation guard still applies to
+it), so a plain admin inherits **nothing** in a team by default.
+
+{/* verify:main */}
+```go
+_, _ = orgSvc.AddMember(alice, "bob", org.RoleAdmin)
+
+bobInTeam := team.WithTeam(team.WithSubject(context.Background(), "bob"), platform.ID)
+err = teamSvc.Authorize(bobInTeam, team.ResourceMember, team.ActionCreate)
+fmt.Println("org admin in the team, no projection:", errors.Is(err, scope.ErrNotMember))
+```
+
+```
+org admin in the team, no projection: true
+```
+
+<Tip>
+`Authorize` rather than `Can` here on purpose: `Can` folds `ErrNotMember` into a
+plain `false`, so it would tell you bob is refused without telling you he has no
+standing at all. See [Checking permissions](/authorization/checking-permissions).
+</Tip>
+
+## Projecting standing from the parent
+
+To extend administration to whoever can manage teams — what most applications
+actually want — **both** halves are required:
+
+<Steps>
+  <Step title="Declare the capability on the parent's own surface" icon="list-check">
+    `team:update`, say. This is separate from, and in addition to,
+    `team.ParentStatements()`'s `team:create`. Without it the projection has
+    nothing to find and confers standing on nobody — silently, since an
+    undeclared pair just reads as "not granted".
+  </Step>
+  <Step title="Install the projection" icon="arrow-down">
+    `scope.WithParent(parent, scope.InheritWhen(resource, actions...))` on the
+    child. `InheritWhen` confers **elevation** in the child on anyone whose
+    parent standing allows every named action.
+  </Step>
+</Steps>
+
+{/* verify:main */}
+```go
+statements := team.ParentStatements()
+statements[team.ResourceTeam] = append(statements[team.ResourceTeam], team.ActionUpdate)
+
+orgSvc2 := org.New(org.NewAccess(statements), memory.New[org.Organization, org.Member]())
+teamSvc2 := team.New(team.NewAccess(nil), memory.New[team.Team, team.Member](), orgSvc2,
+	scope.WithParent(orgSvc2, scope.InheritWhen(team.ResourceTeam, team.ActionUpdate)))
+
+ctx2 := org.WithSubject(context.Background(), "alice")
+acme2, _ := orgSvc2.CreateOrganization(ctx2, "Acme", "acme")
+alice2 := org.WithOrg(ctx2, acme2.ID)
+_, _ = orgSvc2.AddMember(alice2, "bob", org.RoleAdmin)
+
+plat2, _ := teamSvc2.CreateTeam(alice2, "Platform")
+
+bob2 := team.WithTeam(team.WithSubject(context.Background(), "bob"), plat2.ID)
+ok, err := teamSvc2.Can(bob2, team.ResourceMember, team.ActionCreate)
+fmt.Println("org admin now administers every team:", ok, err)
+```
+
+```
+org admin now administers every team: true <nil>
+```
+
+`org.NewAccess` grants every declared pair but `organization:delete` to
+`admin`, so an admin picks up `team:update` automatically once it is declared.
+
+## Three things nesting changes
+
+<AccordionGroup>
+  <Accordion title="CreateContainer starts checking the parent" icon="plus">
+    On a parented scope, `CreateContainer` (and `team.CreateTeam`) performs a
+    permission check against the parent — `<containerResource>:create`, or
+    elevated parent standing — **before creating anything**. The unparented
+    form performs no check at all. Expect that difference the first time you
+    wire `WithParent`.
+
+    This is also why `CreateTeam` reads `org.WithOrg` from the context while
+    every other team call reads `team.WithTeam`: the two set the same
+    underlying key, and `CreateTeam` is operating in the *parent*.
+  </Accordion>
+  <Accordion title="AddMember requires standing in the parent" icon="user-plus">
+    `Policy.MembersFromParent` is on by default, so adding a user to a team
+    refuses a non-member of the organization with `ErrNotParentMember` — rather
+    than the team quietly acquiring members the organization has never heard of.
+
+    Clearing it is a legitimate model (a project with outside collaborators),
+    but then the parent's roster is no longer a superset of the child's.
+  </Accordion>
+  <Accordion title="Every check may climb a rung" icon="stairs">
+    A nested check consults the **parent's store before it ever looks at the
+    child's own membership**. So a parent-store outage denies every non-owner
+    check in every nested container beneath it — even a subject whose own
+    membership would otherwise have sufficed. Failing closed beats guessing,
+    but it is worth knowing before it surprises you in an incident.
+
+    Each level a check climbs costs one more store round trip.
+  </Accordion>
+</AccordionGroup>
+
+{/* verify:main */}
+```go
+fmt.Println("adding a non-member of the org to a team:",
+	errors.Is(func() error {
+		_, e := teamSvc2.AddMember(
+			team.WithTeam(alice2, plat2.ID), "stranger", team.RoleMember)
+		return e
+	}(), scope.ErrNotParentMember))
+```
+
+```
+adding a non-member of the org to a team: true
+```
+
+## Row-level filtering does not follow the parent
+
+<Warning>
+`PermissionGuard` and `ContainersWith` resolve **membership-based standing
+only**. They do not walk the parent rung. An organization admin who administers
+a team purely through the projection above — holding no membership row of their
+own in that team — gets no rows from a guard built over it, even though `Can`
+says yes for the same container.
+
+That is a [known gap](/authorization/query-filtering#nested-scopes-diverge), not
+a deliberate rule.
+</Warning>
+
+## Parent chains must be acyclic
+
+Two `*Service` values cannot form a cycle by construction — a parent has to
+already exist before it can be named as one. But `ParentScope` is an exported
+single-method interface, so a custom implementation with a field wired up after
+construction can still build one.
+
+The engine does **not** detect it. Configuring a cycle recurses until the
+goroutine's stack overflows: a fail-stop crash in your own wiring, rather than
+anything a request can trigger.
+
+{/* verify:stdout "alice owns the org, so she creates the team: <nil> Platform\norg admin in the team, no projection: true\norg admin now administers every team: true <nil>\nadding a non-member of the org to a team: true" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Policy" icon="sliders" href="/authorization/policy">
+    `MembersFromParent` and the rest.
+  </Card>
+  <Card title="Invitation security" icon="lock" href="/invitations/security">
+    Why a team invitation to someone not yet in the organization burns the
+    token.
+  </Card>
+</Columns>

@@ -1,0 +1,130 @@
+---
+title: "Packages"
+description: "What each package is, what it pulls in, and where its documentation lives. Every exported symbol carries a doc comment; go doc is the reference."
+---
+
+Module path: `github.com/bernardoforcillo/authlayer`. Requires **Go 1.26+**.
+Current release **v0.1.0**.
+
+## The packages
+
+| Package | What it is | Pulls in |
+|---|---|---|
+| [`access`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/access) | The pure access-control engine — statements, permissions, roles | standard library |
+| [`scope`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/scope) | The generic RBAC engine: `Service`, `Store` port, policy, hooks, context helpers, guard | `drops` |
+| [`org`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/org) | Organization RBAC — `scope` with the type parameters fixed and the names spelled "organization" | `drops` |
+| [`team`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/team) | Team RBAC nested inside `org` via `scope.WithParent` — the worked example of [nesting](/authorization/nested-scopes) | `drops` |
+| [`invite`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/invite) | [Invitations](/invitations/overview) — email tokens and reusable links | `drops` |
+| [`invite/invitetest`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/invite/invitetest) | `invite.Store`'s contract as an executable suite. **Test-only**; imports `testing` | `drops` |
+| [`auth`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/auth) | [Authentication](/authentication/overview) — `Service`, its `Store` port, and the user/session/verification records | `x/crypto` |
+| [`auth/authtest`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/auth/authtest) | `auth.Store`'s contract as an executable suite. **Test-only**; imports `testing` | `x/crypto` |
+| [`token`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/token) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled, [single-algorithm](/authentication/access-tokens#why-hand-rolling-this-jwt-is-defensible) HS256 JWT | standard library |
+| [`password`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/password) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` | `x/crypto` — the **only** package that does |
+| [`store/memory`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/store/memory) | In-memory `scope.Store`, `invite.Store` and `auth.Store` | — |
+| [`store/drops`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/store/drops) | PostgreSQL stores — declares **`package dropsstore`** | `drops`, `pgx/v5` |
+
+Three runnable, database-free tours ship alongside them:
+
+```sh
+go run ./examples/basic   # organization RBAC
+go run ./examples/auth    # auth + org + invite, sign-up through log-out
+go run ./examples/reset   # the password lifecycle
+```
+
+<Note>
+`internal/uid` is not importable. It is the RFC 9562 UUIDv7 generator authlayer
+uses for every id it mints — containers, roles, users, sessions, verifications,
+invites, links — written out rather than depended on so the module stays at
+three requirements.
+</Note>
+
+## The dependency budget
+
+Three, and which one you pay depends on what you import:
+
+| Requirement | Why |
+|---|---|
+| `github.com/bernardoforcillo/drops` | the RBAC engine and its PostgreSQL toolkit |
+| `github.com/jackc/pgx/v5` | the PostgreSQL driver, used only by `store/drops` |
+| `golang.org/x/crypto` | bcrypt, used only by `password` |
+
+`access` and `token` are standard-library only. `password` — and therefore
+`auth` — adds `x/crypto` and nothing else.
+
+## Which package answers which question
+
+<Columns cols={2}>
+  <Card title="May this user do X?" icon="scale-balanced" href="/authorization/checking-permissions">
+    `scope` / `org` / `team` — `Can`, `Authorize`, `HasPermission`.
+  </Card>
+  <Card title="Which rows may this user see?" icon="filter" href="/authorization/query-filtering">
+    `scope`'s `MembershipGuard` and `PermissionGuard`, over drops.
+  </Card>
+  <Card title="Who is this user?" icon="user" href="/authentication/overview">
+    `auth` — sign-up, login, sessions, verification, the password lifecycle.
+  </Card>
+  <Card title="How do I let someone in?" icon="envelope-open-text" href="/invitations/overview">
+    `invite` — email tokens and reusable links.
+  </Card>
+</Columns>
+
+## `go doc` is the reference
+
+Every exported symbol carries a doc comment, and several of them carry reasoning
+this site only summarizes:
+
+```sh
+go doc ./scope          # the engine, and the Store port's contract
+go doc ./auth           # sessions, families, rotation, and what revocation does not revoke
+go doc ./auth Store     # the seven MUSTs, each with the failure it prevents
+go doc ./invite Store   # the four method MUSTs and four record-type ones
+go doc ./token          # why hand-rolling this JWT is safe here, and only here
+go doc ./password       # why Dummy exists and why its result is ignored on purpose
+```
+
+## The project's own gate
+
+Every command below runs in CI on each push and pull request:
+
+```sh
+gofmt -l .                      # must print nothing
+go vet ./... && go vet -tags integration ./...
+go test ./... -count=1          # database-free
+golangci-lint run ./...         # v2 required; the config is .golangci.yml
+go run ./examples/basic && go run ./examples/auth && go run ./examples/reset
+```
+
+CI adds two the hand gate does not: the unit tests under `-race`, and the live
+PostgreSQL lane against a `postgres:17-alpine` service container. The Go version
+comes from `go.mod`'s own directive, so it cannot drift from the module.
+
+<Note>
+`.golangci.yml` is a v2 config and runs clean at zero issues. It lints the
+`integration`-tagged files too, which is otherwise about 3.5k lines of the suite
+no static check would see. Every exclusion in it carries the reason it is there.
+</Note>
+
+## Not in this release
+
+<Warning>
+**OAuth.** Social and enterprise identity providers, and the table linking them
+to a user, are not shipped. The rest of the authentication core — password
+credentials, email verification, revocable server-side sessions with
+refresh-token rotation — is, and is documented under
+[Authentication](/authentication/overview).
+</Warning>
+
+## License
+
+MIT.
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Errors" icon="triangle-exclamation" href="/reference/errors">
+    Every sentinel, and a suggested status.
+  </Card>
+  <Card title="Options" icon="sliders" href="/reference/options">
+    Every option, with its default.
+  </Card>
+</Columns>

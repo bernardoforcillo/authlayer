@@ -21,7 +21,12 @@ import (
 // It enforces all three uniqueness constraints [invite.Store] states on the
 // record types: EmailInvite.TokenHash, EmailInvite's (ContainerID, Email)
 // pair, and Link.Code. Each check happens under the same acquisition of mu as
-// the write it guards, so two concurrent creates can never both pass it.
+// the write it guards, so two concurrent creates can never both pass it. It
+// also applies [invite.NormalizeEmail] on both sides of every address —
+// [InviteStore.CreateEmailInvite] before the pair check and the write,
+// [InviteStore.DeleteEmailInvitesFor] before it matches — which is the fourth
+// record-type obligation, and what makes the pair constraint a constraint on
+// a person rather than on a spelling.
 //
 // It did NOT always. All three were deferred to store/drops — which has
 // enforced them as UNIQUE constraints from the start (token_hash and code
@@ -92,19 +97,28 @@ func NewInviteStore() *InviteStore {
 	}
 }
 
-// CreateEmailInvite stores the invite under its ID and returns it unchanged,
-// or returns [ErrTokenHashTaken] if another invite already holds
-// inv.TokenHash, or [ErrInviteEmailTaken] if the (ContainerID, Email) pair
-// already has a pending invite. Both checks and the write happen under one
-// acquisition of mu, so two concurrent calls contending for a hash or a pair
-// cannot both pass: the second to reach the lock sees the first's row already
-// present.
+// CreateEmailInvite normalizes inv.Email (see [invite.NormalizeEmail]),
+// stores the invite under its ID and returns what was stored — carrying the
+// normalized address, not the spelling passed in — or returns
+// [ErrTokenHashTaken] if another invite already holds inv.TokenHash, or
+// [ErrInviteEmailTaken] if the (ContainerID, Email) pair already has a
+// pending invite. Both checks and the write happen under one acquisition of
+// mu, so two concurrent calls contending for a hash or a pair cannot both
+// pass: the second to reach the lock sees the first's row already present.
+//
+// Normalizing BEFORE the pair check is what makes that check constrain a
+// person rather than a spelling. Without it "erin@example.com" and
+// "Erin@Example.com" are two different pairs, both writes succeed, and the
+// container holds two live tokens for one human — see [invite.EmailInvite],
+// "Addresses are normalized". Through v0.1.0 this store did not normalize at
+// all, and neither did store/drops.
 //
 // The hash is checked first, so an invite that collides on both reports the
 // collision that matters to the redemption path.
 func (s *InviteStore) CreateEmailInvite(_ context.Context, inv invite.EmailInvite) (invite.EmailInvite, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	inv.Email = invite.NormalizeEmail(inv.Email)
 	if s.inviteHashTaken(inv.TokenHash) {
 		return invite.EmailInvite{}, ErrTokenHashTaken
 	}
@@ -128,7 +142,8 @@ func (s *InviteStore) inviteHashTaken(tokenHash string) bool {
 }
 
 // pendingInviteFor reports whether (containerID, email) already has a pending
-// invite. Callers hold mu.
+// invite. Callers hold mu, and pass an already-normalized email — every
+// stored Email is normalized, so a raw one would silently miss.
 func (s *InviteStore) pendingInviteFor(containerID, email string) bool {
 	for _, inv := range s.emailInvites {
 		if inv.ContainerID == containerID && inv.Email == email {
@@ -192,11 +207,18 @@ func (s *InviteStore) DeleteEmailInvite(_ context.Context, id string) error {
 	return nil
 }
 
-// DeleteEmailInvitesFor removes every invite for (containerID, email).
-// Deleting zero rows is not an error.
+// DeleteEmailInvitesFor normalizes email (see [invite.NormalizeEmail]) and
+// removes every invite for that (containerID, address). Deleting zero rows is
+// not an error.
+//
+// The normalization is the read-side half of the obligation
+// [InviteStore.CreateEmailInvite] carries on the write side: stored addresses
+// are canonical, so the one matched against them has to be, or the sweep an
+// ordinary re-invite performs first misses the very row it exists to clear.
 func (s *InviteStore) DeleteEmailInvitesFor(_ context.Context, containerID, email string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	email = invite.NormalizeEmail(email)
 	for id, inv := range s.emailInvites {
 		if inv.ContainerID == containerID && inv.Email == email {
 			delete(s.emailInvites, id)

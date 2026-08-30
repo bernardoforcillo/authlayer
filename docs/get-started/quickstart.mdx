@@ -1,0 +1,220 @@
+---
+title: "Quickstart"
+description: "Two complete programs — organization RBAC, and sign-up through a verified access token — that run with no database."
+---
+
+Both programs below are complete files. Paste either into `main.go` in a module
+that has `go get github.com/bernardoforcillo/authlayer`, and run it. Neither
+needs a database: `store/memory` is an in-process, map-backed store that ships
+with the library and is the reference implementation of every `Store` contract.
+
+<Tabs>
+
+<Tab title="Authorization">
+
+Declare a permission surface, create an organization, add members, and ask
+whether one of them may do something.
+
+{/* verify:program stdout="alice created Acme\nbob may add members: true\nbob may delete the org: false\ncarol may create projects (as editor): true\ncarol may delete projects: false\nbob minting a role beyond his own powers: blocked" */}
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+
+func main() {
+	// 1. Declare your application's permission surface. org.NewAccess merges
+	//    it with the control statements the engine enforces on its own
+	//    operations (organization, member, role, invite).
+	ac := org.NewAccess(map[string][]access.Action{
+		"project": {"create", "read", "update", "delete"},
+	})
+	svc := org.New(ac, memory.New[org.Organization, org.Member]())
+
+	// 2. The acting subject travels on the context, never as an argument.
+	ctx := org.WithSubject(context.Background(), "alice")
+	acme, err := svc.CreateOrganization(ctx, "Acme", "acme") // alice is owner
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("alice created", acme.Name)
+
+	// From here on the active scope is on the context too.
+	alice := org.WithOrg(ctx, acme.ID)
+	if _, err := svc.AddMember(alice, "bob", org.RoleAdmin); err != nil {
+		panic(err)
+	}
+	if _, err := svc.AddMember(alice, "carol", org.RoleMember); err != nil {
+		panic(err)
+	}
+
+	// 3. Check permissions. admin grants everything but deleting the org.
+	bob := org.WithOrg(org.WithSubject(context.Background(), "bob"), acme.ID)
+	addMembers, _ := svc.Can(bob, org.ResourceMember, org.ActionCreate)
+	deleteOrg, _ := svc.Can(bob, org.ResourceOrganization, org.ActionDelete)
+	fmt.Println("bob may add members:", addMembers)
+	fmt.Println("bob may delete the org:", deleteOrg)
+
+	// 4. Custom roles are per-organization and defined at runtime.
+	if _, err := svc.CreateRole(alice, "editor", "Editor", map[string][]access.Action{
+		"project": {"create", "update"},
+	}); err != nil {
+		panic(err)
+	}
+	if err := svc.ChangeMemberRole(alice, "carol", "editor"); err != nil {
+		panic(err)
+	}
+
+	carol := org.WithOrg(org.WithSubject(context.Background(), "carol"), acme.ID)
+	create, _ := svc.Can(carol, "project", "create")
+	del, _ := svc.Can(carol, "project", "delete")
+	fmt.Println("carol may create projects (as editor):", create)
+	fmt.Println("carol may delete projects:", del)
+
+	// 5. The privilege-escalation guard. bob is an admin, so he cannot mint
+	//    a role carrying a power he does not hold himself.
+	_, err = svc.CreateRole(bob, "superadmin", "Super", map[string][]access.Action{
+		org.ResourceOrganization: {org.ActionDelete},
+	})
+	if errors.Is(err, org.ErrPrivilegeEscalation) {
+		fmt.Println("bob minting a role beyond his own powers: blocked")
+	}
+}
+```
+
+</Tab>
+
+<Tab title="Authentication">
+
+Sign up, confirm the address, log in, and verify the access token a request
+handler would receive.
+
+{/* verify:program stdout="created=true email=\"bob@example.com\"\nlogin before verification: ErrEmailNotVerified\naccess token verifies, sub is the user id: true\nrefresh rotated to a new token: true\nreplaying the old refresh token: ErrTokenReuse\nlive sessions after family revocation: 0" */}
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+
+func main() {
+	ctx := context.Background()
+
+	// 32 bytes is the HS256 floor RFC 7518 section 3.2 sets, and both Issue
+	// and Parse refuse anything shorter. Read yours from a secret manager.
+	key := []byte("32-bytes-or-more-from-your-vault")
+
+	svc := auth.New(memory.NewAuthStore(),
+		auth.WithJWT([][]byte{key}, 15*time.Minute), // access-token TTL
+		auth.WithRefreshTTL(30*24*time.Hour),        // session lifetime
+		auth.WithRequireVerifiedEmail(true))
+
+	// 1. Sign up. The address is normalized (trimmed, lowercased) on every
+	//    read and write, so the capitals and the space below vanish.
+	res, err := svc.SignUp(ctx, "  Bob@Example.com ", "Correct-Horse-Battery-7")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("created=%v email=%q\n", res.Created, res.User.Email)
+	// Deliver res.VerifyToken by email yourself: authlayer owns no transport.
+
+	// 2. WithRequireVerifiedEmail(true) means Login refuses until the address
+	//    is confirmed — and that check runs only after the password verifies.
+	_, err = svc.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+	if errors.Is(err, auth.ErrEmailNotVerified) {
+		fmt.Println("login before verification: ErrEmailNotVerified")
+	}
+	if _, err := svc.VerifyEmail(ctx, res.VerifyToken); err != nil {
+		panic(err)
+	}
+
+	// 3. Log in. ip must be non-empty: a blank one would put every caller
+	//    that omits it into one shared rate-limit bucket.
+	login, err := svc.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+	if err != nil {
+		panic(err)
+	}
+
+	// 4. What a request handler does per request: verify the bearer token
+	//    locally, with no store round trip.
+	claims, err := svc.VerifyAccessToken(login.AccessToken)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("access token verifies, sub is the user id:", claims.Subject == login.User.ID)
+
+	// 5. Refreshing rotates. The presented token is superseded, and a
+	//    successor is minted in the same family.
+	next, err := svc.Refresh(ctx, login.RefreshToken)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("refresh rotated to a new token:", next.RefreshToken != login.RefreshToken)
+
+	// 6. Presenting a rotated-away token is a replay. authlayer cannot tell
+	//    a thief from a client retrying a raced request, so it treats every
+	//    replay as compromise and revokes the whole session family.
+	if _, err := svc.Refresh(ctx, login.RefreshToken); errors.Is(err, auth.ErrTokenReuse) {
+		fmt.Println("replaying the old refresh token: ErrTokenReuse")
+	}
+	live, err := svc.ListSessions(ctx, login.User.ID)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("live sessions after family revocation:", len(live))
+}
+```
+
+</Tab>
+
+</Tabs>
+
+<Warning>
+The access token verified at step 4 above **still verifies** after step 6 has
+revoked every session behind it. Verification is signature and expiry and
+nothing else, so a revoked session's access token keeps working up to the
+access TTL — 15 minutes with the default here. That bound applies to every
+"signs out every device" sentence in this documentation without exception; see
+[What "revocable" actually means](/authentication/sessions).
+</Warning>
+
+## What to read next
+
+<Columns cols={2}>
+  <Card title="Scopes" icon="diagram-project" href="/concepts/scopes">
+    What a scope is, and why the engine is generic over your container type.
+  </Card>
+  <Card title="Statements and permissions" icon="list-check" href="/concepts/statements">
+    The permission surface, and why grants are persisted by name.
+  </Card>
+  <Card title="Sessions" icon="clock-rotate-left" href="/authentication/sessions">
+    The access/refresh split, and exactly what revocation revokes.
+  </Card>
+  <Card title="Storage" icon="database" href="/storage/overview">
+    Swap `store/memory` for PostgreSQL.
+  </Card>
+</Columns>
+
+## Runnable tours in the module
+
+Three examples ship with authlayer and go further than this page. They are
+executed by the project's own gate, so they cannot drift:
+
+```sh
+go run ./examples/basic   # organization RBAC
+go run ./examples/auth    # auth + org + invite, sign-up through log-out
+go run ./examples/reset   # the password lifecycle
+```

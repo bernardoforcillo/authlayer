@@ -1,0 +1,223 @@
+---
+title: "Invitation links"
+description: "A reusable code with a use limit and an optional expiry, stored in the clear because its whole purpose is to be shown again."
+---
+
+A `Link` is the opposite of an [email invite](/invitations/email-invites) in one
+respect that decides everything else about it: **its whole purpose is to be
+shown again**, on a "manage invite links" screen. So `Code` is stored in the
+clear — hashing it would make redisplay impossible.
+
+<Warning>
+A link's security therefore comes from `MaxUses`, `ExpiresAt` and revocation
+rather than from secrecy of storage. That is why `Store.ConsumeLink` must weigh
+all three **atomically** before admitting anyone, and why
+[`ListLinks` redacts the code](/invitations/security#listlinks-redaction) from
+readers who could not have minted it.
+</Warning>
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/invite"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member]())
+isvc := invite.New(svc.Service, memory.NewInviteStore())
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+
+link, code, err := isvc.CreateLink(owner, org.RoleMember, 2, nil) // 2 uses, no expiry
+fmt.Println(err, link.RoleKey, link.MaxUses, link.UseCount, link.ExpiresAt == nil)
+fmt.Println("the code IS the stored value:", link.Code == code)
+```
+
+```
+<nil> member 2 0 true
+the code IS the stored value: true
+```
+
+## The record
+
+<ResponseField name="Code" type="string">
+  The plaintext, stored as-is so it can be redisplayed. Redacted from
+  `ListLinks` for readers who could not have minted it.
+</ResponseField>
+<ResponseField name="MaxUses" type="int">
+  **0 means unlimited.** A negative value is `ErrInvalidMaxUses`, raised before
+  any store is touched.
+</ResponseField>
+<ResponseField name="UseCount" type="int">
+  Incremented atomically by `Store.ConsumeLink`, in the same step that checks
+  the limit.
+</ResponseField>
+<ResponseField name="ExpiresAt" type="*time.Time">
+  **nil means never.** Unlike an email invite's, a link's expiry is per-link and
+  set at `CreateLink` — `WithInviteExpiry` does not apply to links.
+</ResponseField>
+<ResponseField name="RevokedAt" type="*time.Time">
+  nil means not revoked. `RevokeLink` stamps it rather than deleting the row.
+</ResponseField>
+<ResponseField name="CreatedBy" type="string">
+  The minting actor, and the standing `RecheckInviterOnAccept` re-tests.
+</ResponseField>
+
+## Joining, and the use limit
+
+{/* verify:main */}
+```go
+join := func(user string) error {
+	_, err := isvc.JoinViaLink(org.WithSubject(context.Background(), user), code)
+	return err
+}
+
+fmt.Println("bob:  ", join("bob"))
+fmt.Println("carol:", join("carol"))
+fmt.Println("dana: ", errors.Is(join("dana"), invite.ErrLinkExhausted))
+
+members, _ := svc.ListMembers(owner)
+fmt.Println("members:", len(members)) // alice, bob, carol
+```
+
+```
+bob:   <nil>
+carol: <nil>
+dana:  true
+members: 3
+```
+
+## An existing member costs nothing
+
+{/* verify:main */}
+```go
+unlimited, freeCode, _ := isvc.CreateLink(owner, org.RoleMember, 0, nil) // 0 = unlimited
+fmt.Println("unlimited:", unlimited.MaxUses)
+
+bob := org.WithSubject(context.Background(), "bob")
+_, err = isvc.JoinViaLink(bob, freeCode) // bob is already a member
+fmt.Println("member re-clicks:", err)
+
+links, _ := isvc.ListLinks(owner)
+for _, l := range links {
+	if l.ID == unlimited.ID {
+		fmt.Println("uses consumed:", l.UseCount)
+	}
+}
+```
+
+```
+unlimited: 0
+member re-clicks: <nil>
+uses consumed: 0
+```
+
+<Note>
+If the ctx subject already has standing in the link's container, `JoinViaLink`
+returns the container immediately and consumes **nothing** — no use taken, no
+redundant membership write. That check runs *before* the escalation recheck and
+the use count, so a member re-clicking an old link never costs it anything.
+
+That is the asymmetry with `AcceptInvite`, which
+[folds a duplicate into success **after** consuming the token](/invitations/email-invites#an-existing-member-is-folded-into-success).
+</Note>
+
+## Expiry and revocation
+
+{/* verify:main */}
+```go
+past := time.Now().UTC().Add(-time.Hour)
+_, deadCode, _ := isvc.CreateLink(owner, org.RoleMember, 0, &past)
+fmt.Println("expired:", errors.Is(join("erin"), invite.ErrLinkExhausted) ||
+	errors.Is(func() error {
+		_, e := isvc.JoinViaLink(org.WithSubject(context.Background(), "erin"), deadCode)
+		return e
+	}(), invite.ErrLinkExpired))
+
+live, liveCode, _ := isvc.CreateLink(owner, org.RoleMember, 0, nil)
+fmt.Println("revoke:", isvc.RevokeLink(owner, live.ID))
+_, err = isvc.JoinViaLink(org.WithSubject(context.Background(), "frank"), liveCode)
+fmt.Println("revoked:", errors.Is(err, invite.ErrLinkRevoked))
+
+fmt.Println("unknown code:", errors.Is(
+	func() error {
+		_, e := isvc.JoinViaLink(org.WithSubject(context.Background(), "gina"), "nope")
+		return e
+	}(), invite.ErrLinkNotFound))
+```
+
+```
+expired: true
+revoke: <nil>
+revoked: true
+unknown code: true
+```
+
+<Note>
+`Store.ConsumeLink` folds revoked, expired and exhausted into a single
+`ok=false` — the check and the increment must be **one atomic step**, and asking
+that step to also report which of three conditions applied would require a
+second, separate read, which is exactly the race atomicity rules out.
+
+`JoinViaLink` re-reads the link afterwards to tell them apart, which is where
+`ErrLinkRevoked`, `ErrLinkExpired` and `ErrLinkExhausted` come from.
+</Note>
+
+## Previewing
+
+{/* verify:main */}
+```go
+p, err := isvc.PreviewLink(context.Background(), liveCode)
+fmt.Println(err, p.RoleKey, "email:", p.Email == "", "valid:", p.Valid)
+```
+
+```
+<nil> member email: true valid: false
+```
+
+`Preview.Email` is empty for a link — a link admits whoever presents the code
+rather than one named recipient — and `Valid` is `false` here because that link
+was revoked above. Previewing consumes nothing and needs no authentication.
+
+{/* verify:stdout "<nil> member 2 0 true\nthe code IS the stored value: true\nbob:   <nil>\ncarol: <nil>\ndana:  true\nmembers: 3\nunlimited: 0\nmember re-clicks: <nil>\nuses consumed: 0\nexpired: true\nrevoke: <nil>\nrevoked: true\nunknown code: true\n<nil> member email: true valid: false" */}
+
+## The backend obligations behind all of this
+
+Three of `invite.Store`'s eight **MUST**s are what make a link's limit mean
+anything:
+
+<Columns cols={2}>
+  <Card title="ConsumeLink is one atomic step" icon="lock">
+    Or a `MaxUses: 1` link admits everyone who clicks it at once.
+  </Card>
+  <Card title="Link.Code is unique" icon="fingerprint">
+    Two rows sharing a code means two concurrent redeemers resolve **different**
+    rows and each atomically wins the one it picked — the limit bounds nothing
+    while every individual consume behaves perfectly.
+  </Card>
+</Columns>
+
+Both are asserted by
+[`invitetest.RunStoreContract`](/storage/custom-backends#the-invite-contract).
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Invitation security" icon="lock" href="/invitations/security">
+    Code redaction, claim ordering, and the inviter recheck.
+  </Card>
+  <Card title="Email invitations" icon="envelope" href="/invitations/email-invites">
+    The one-time form, and how it differs.
+  </Card>
+</Columns>

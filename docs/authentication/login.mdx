@@ -1,0 +1,173 @@
+---
+title: "Login"
+description: "What Login checks and in what order, why ip is mandatory, and why three different failures come back as one indistinguishable error."
+---
+
+`Login(ctx, email, password, ip, userAgent)` returns a `LoginResult`: the
+account, a fresh access token, and the plaintext of the refresh token that now
+names the caller's live session.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault")
+svc := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithRefreshTTL(30*24*time.Hour),
+	auth.WithRequireVerifiedEmail(true))
+
+ctx := context.Background()
+res, _ := svc.SignUp(ctx, "bob@example.com", "Correct-Horse-Battery-7")
+_, _ = svc.VerifyEmail(ctx, res.VerifyToken)
+
+login, err := svc.Login(ctx,
+	"bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+fmt.Println(err, login.User.ID != "", login.AccessToken != "", login.RefreshToken != "")
+fmt.Println("password hash is scrubbed:", login.User.PasswordHash == "")
+```
+
+```
+<nil> true true true
+password hash is scrubbed: true
+```
+
+<Note>
+`Login` and `Refresh` both return a **`LoginResult`** rather than one returning
+a named struct and the other a positional tuple whose two same-typed token
+strings a caller can transpose without the compiler noticing.
+</Note>
+
+## The order of checks
+
+<Steps>
+  <Step title="ip must be non-empty" icon="network-wired">
+    `ErrMissingIP`, before anything else. A blank ip would put every caller
+    that omits it into a single shared rate-limit bucket, so it is refused
+    rather than tolerated as "unknown". This is a wiring bug, not caller input
+    — suggest a **500**.
+  </Step>
+  <Step title="The IP-keyed rate limiter" icon="gauge">
+    If wired. `false` is `ErrRateLimited`; an **error** from the limiter
+    propagates and the call is refused — an authentication decision that cannot
+    be made must deny. See [Rate limiting](/authentication/rate-limiting).
+  </Step>
+  <Step title="Look the address up, normalized" icon="magnifying-glass">
+    On a miss, `Hasher.Dummy` is called and the result is
+    `ErrInvalidCredentials`.
+  </Step>
+  <Step title="No password credential, or a wrong password" icon="key">
+    Both `ErrInvalidCredentials`. An account with an **empty** `PasswordHash`
+    is a real, supported state, and it also spends `Dummy`.
+  </Step>
+  <Step title="The verified-email requirement" icon="envelope-circle-check">
+    Only if `WithRequireVerifiedEmail(true)`, and only **after** the password
+    verifies — so `ErrEmailNotVerified` is never an oracle for an unauthenticated
+    caller.
+  </Step>
+  <Step title="Issue the access token, then persist the session" icon="ticket">
+    In that order, deliberately: a bad signing key must fail before any
+    `Session` row exists to be orphaned. A `Service` built without `WithJWT`
+    fails here with `token.ErrKeyTooShort`.
+  </Step>
+</Steps>
+
+## Three failures, one error
+
+{/* verify:main */}
+```go
+_, err = svc.Login(ctx, "nobody@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+fmt.Println("unknown address: ", errors.Is(err, auth.ErrInvalidCredentials))
+
+_, err = svc.Login(ctx, "bob@example.com", "wrong-password", "203.0.113.9", "curl/8")
+fmt.Println("wrong password:  ", errors.Is(err, auth.ErrInvalidCredentials))
+
+_, err = svc.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "", "curl/8")
+fmt.Println("empty ip:        ", errors.Is(err, auth.ErrMissingIP))
+```
+
+```
+unknown address:  true
+wrong password:   true
+empty ip:         true
+```
+
+Unknown address, no password credential, and wrong password are **deliberately
+indistinguishable**. Do not unwrap them in a handler and do not log them
+differently in a response.
+
+<Warning>
+`Hasher.Dummy` is what makes that indistinguishability hold in *time* as well as
+in *shape*. It runs a real bcrypt comparison against a fixed throwaway hash and
+discards the outcome, so the no-such-account path spends work of the same order
+as a real verify.
+
+Deleting it because "the result is discarded, so this does nothing" is exactly
+backwards: discarding the result is the point, and removing the call silently
+reinstates an account-enumeration timing oracle.
+</Warning>
+
+## The unverified-email case
+
+{/* verify:main */}
+```go
+other, _ := svc.SignUp(ctx, "carol@example.com", "Correct-Horse-Battery-7")
+fmt.Println("carol signed up:", other.Created)
+
+_, err = svc.Login(ctx, "carol@example.com", "Correct-Horse-Battery-7", "198.51.100.7", "curl/8")
+fmt.Println("unverified:", errors.Is(err, auth.ErrEmailNotVerified))
+
+// A WRONG password for the same unverified account is still
+// ErrInvalidCredentials — the verification check never runs.
+_, err = svc.Login(ctx, "carol@example.com", "nope", "198.51.100.7", "curl/8")
+fmt.Println("unverified + wrong password:", errors.Is(err, auth.ErrInvalidCredentials))
+```
+
+```
+carol signed up: true
+unverified: true
+unverified + wrong password: true
+```
+
+<Warning>
+authlayer exposes **no verification-resend path**. Under
+`WithRequireVerifiedEmail(true)`, the way back in for an account whose signup
+mail was lost is a completed
+[password reset](/authentication/passwords#a-completed-reset-also-verifies-the-address),
+which stamps `EmailVerifiedAt` when it is not already set.
+</Warning>
+
+## What a login creates
+
+One `Session` row, whose `FamilyID` is its own `ID`: this session is the root of
+its own rotation chain, and every successor a
+[refresh](/authentication/refresh-rotation) mints carries that value forward.
+
+`UserAgent` and `IP` are copied onto the row as **audit and display fields
+only**. They are never a security check, and `Refresh` copies them into every
+successor — so a thief who rotates a stolen token wears the victim's
+fingerprint. See [Sessions](/authentication/sessions#listsessions-is-not-a-device-list).
+
+{/* verify:stdout "<nil> true true true\npassword hash is scrubbed: true\nunknown address:  true\nwrong password:   true\nempty ip:         true\ncarol signed up: true\nunverified: true\nunverified + wrong password: true" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Verifying an access token" icon="ticket" href="/authentication/access-tokens">
+    What a request handler does with `login.AccessToken`.
+  </Card>
+  <Card title="Refresh rotation" icon="rotate" href="/authentication/refresh-rotation">
+    What to do with `login.RefreshToken`.
+  </Card>
+</Columns>

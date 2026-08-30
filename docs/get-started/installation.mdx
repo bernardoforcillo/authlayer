@@ -1,0 +1,140 @@
+---
+title: "Installation"
+description: "Add the module, and learn the three import paths you cannot guess from the identifier they introduce."
+---
+
+```sh
+go get github.com/bernardoforcillo/authlayer
+```
+
+Requires **Go 1.26+**. The current release is **v0.1.0**, and the module path is
+`github.com/bernardoforcillo/authlayer`.
+
+## The import set
+
+Most packages import under the name you would guess. Three do not, and they are
+the ones that cost people time.
+
+{/* verify:import */}
+```go
+import (
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/invite"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/scope"
+	"github.com/bernardoforcillo/authlayer/team"
+	"github.com/bernardoforcillo/authlayer/token"
+
+	// memory.New, memory.NewInviteStore, memory.NewAuthStore
+	"github.com/bernardoforcillo/authlayer/store/memory"
+
+	// the package name is dropsstore, not drops
+	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
+)
+```
+
+Two of those are not guessable from the identifier they introduce: `memory`
+lives at `store/memory`, and `store/drops` declares `package dropsstore`.
+
+A smoke test that every one of them links — this compiles and runs with no
+database and no configuration:
+
+{/* verify:main */}
+```go
+fmt.Println(
+	access.Action("read"),
+	scope.RoleOwner,
+	org.ResourceOrganization,
+	team.ResourceTeam,
+	auth.PurposeSignup,
+	invite.ErrInviteNotFound != nil,
+	token.HashOpaque("") != "",
+	memory.NewAuthStore() != nil,
+	dropsstore.NewInviteSchema() != nil,
+)
+```
+
+{/* verify:stdout "read owner organization team signup true true true true" */}
+
+```
+read owner organization team signup true true true true
+```
+
+## The two packages both called `stdlib`
+
+<Warning>
+Only the PostgreSQL store needs these, and they are the trap. **Two different
+packages are both called `stdlib`**, and only one can hold the identifier.
+
+- `drops/stdlib` is used **by name** — `stdlib.New(sqlDB)` wraps a `*sql.DB` as
+  a drops driver.
+- `pgx/v5/stdlib` is **blank-imported** purely for its `init`, which is what
+  makes `sql.Open("pgx", dsn)` resolve at all.
+
+Neither is optional.
+</Warning>
+
+{/* verify:skip an import list; the complete wiring these imports belong to is compiled and run on /storage/postgres */}
+```go
+import (
+	"database/sql"
+
+	"github.com/bernardoforcillo/drops/pg"     // pg.New, pg.Guard, pg.AnyOf
+	"github.com/bernardoforcillo/drops/stdlib" // used BY NAME: stdlib.New(sqlDB)
+	_ "github.com/jackc/pgx/v5/stdlib"         // BLANK: registers the "pgx" driver
+)
+```
+
+[The PostgreSQL store page](/storage/postgres) writes the whole wiring out with
+both imports in place rather than leaving you to work it out.
+
+Two more packages exist and are test-only, so they carry `testing` and belong in
+a `_test.go` file: `auth/authtest` and `invite/invitetest`, the executable
+contract suites for the two strictest ports. See
+[Writing your own backend](/storage/custom-backends).
+
+## Which packages you actually need
+
+<Tabs>
+  <Tab title="Authorization only">
+    `access`, `scope`, `org` (or `team`), plus a store. Nothing about users
+    changes — the RBAC half stores no users and carries a user id as an opaque
+    value, never validating it against a schema of its own. It pulls in
+    `drops`.
+  </Tab>
+  <Tab title="Authentication only">
+    `auth`, plus a store. `token` and `password` come along underneath; you
+    rarely import them directly, though `token`'s sentinel errors are exactly
+    what `VerifyAccessToken` hands back. `password` is the only package that
+    pulls in `golang.org/x/crypto`, for bcrypt.
+  </Tab>
+  <Tab title="Both, plus invitations">
+    All of the above plus `invite`. The three services share no store and no
+    types; the only thing connecting them is the user id `auth` mints. See
+    [Wiring auth, org and invite](/authentication/wiring).
+  </Tab>
+</Tabs>
+
+## Verify the install
+
+Three runnable, database-free tours ship in the module:
+
+```sh
+go run ./examples/basic   # organization RBAC
+go run ./examples/auth    # auth + org + invite, sign-up through log-out
+go run ./examples/reset   # the password lifecycle
+```
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/get-started/quickstart">
+    Two complete programs you can paste and run.
+  </Card>
+  <Card title="Storage" icon="database" href="/storage/overview">
+    Pick a backend: in-memory for development, PostgreSQL for production.
+  </Card>
+</Columns>

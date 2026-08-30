@@ -1,0 +1,316 @@
+---
+title: "Invitation security"
+description: "Why ListLinks redacts a code, why both flows claim before they admit, what a bearer credential does and does not bind, and what rechecking the inviter costs."
+---
+
+Both acceptance paths end at `scope.Service.GrantMembership`, which performs
+**no actor check of its own** — not `member:create`, not the escalation guard.
+Four mechanisms are what keep that safe. Each has a cost, and each cost is
+stated here.
+
+## `ListLinks` redaction
+
+<Warning>
+This is the security core of the package.
+
+`invite:read` sits on the
+[control-statement surface](/concepts/statements#the-control-statements-you-get-for-free)
+every `NewAccess` builds, so the built-in `admin` role acquires it
+automatically — and `admin` is deliberately **not** `IsFull`, so it is subject
+to the escalation guard everywhere else in the codebase.
+
+Without redaction that guard would be worthless here. A non-elevated admin
+lists the links, reads the owner's `Code` in clear, leaves the container, and
+rejoins at the owner role through `JoinViaLink` — which admits via
+`GrantMembership`, a call that runs no escalation check because the whole point
+of a link is to admit someone who has no standing yet. **Two calls, full
+escalation**, and every fine-grained check elsewhere never touched.
+</Warning>
+
+So a `Code` survives in `ListLinks`' result only when **both halves of the mint
+test** hold for the reader, because minting takes two things:
+
+<Steps>
+  <Step title="The capability" icon="key">
+    The reader must hold `invite:create` — the same permission `CreateLink`
+    requires, resolved once for the whole list. A reader granted `invite:read`
+    *without* `invite:create` could not have minted any link here, so they see
+    **no `Code` at all**, whatever the roles involved.
+  </Step>
+  <Step title="The standing" icon="ruler-vertical">
+    The reader must be elevated, **or** the link's role must resolve to a
+    permission set that is a `SubsetOf` their own **current** standing. That is
+    the same test applied when the link was created, reapplied here because a
+    role's grants — or the reader's own standing — can change afterwards.
+  </Step>
+</Steps>
+
+The two are independent: the first bounds *whether* this principal mints at all,
+the second bounds *how high*.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/invite"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/scope"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member]())
+isvc := invite.New(svc.Service, memory.NewInviteStore())
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+
+// The owner mints a link that admits at the OWNER role.
+_, ownerCode, _ := isvc.CreateLink(owner, org.RoleOwner, 0, nil)
+
+// An auditor can read invitations but not create them.
+_, _ = svc.CreateRole(owner, "auditor", "Auditor", map[string][]access.Action{
+	scope.ResourceInvite: {scope.ActionRead},
+})
+_, _ = svc.AddMember(owner, "erin", "auditor")
+_, _ = svc.AddMember(owner, "bob", org.RoleAdmin)
+
+show := func(who string) {
+	c := org.WithOrg(org.WithSubject(context.Background(), who), acme.ID)
+	links, err := isvc.ListLinks(c)
+	if err != nil {
+		fmt.Println(who, "->", err)
+		return
+	}
+	for _, l := range links {
+		fmt.Printf("%-6s sees code: %-5v (role %s)\n", who, l.Code != "", l.RoleKey)
+	}
+}
+show("alice") // owner: elevated
+show("bob")   // admin: has invite:create, but admin is NOT a superset of owner
+show("erin")  // auditor: invite:read only
+```
+
+```
+alice  sees code: true  (role owner)
+bob    sees code: false (role owner)
+erin   sees code: false (role owner)
+```
+
+Every **other** field stays populated, so a management screen can still list a
+link and let its owner revoke it — even one whose code it cannot show back.
+
+{/* verify:main */}
+```go
+c := org.WithOrg(org.WithSubject(context.Background(), "bob"), acme.ID)
+links, _ := isvc.ListLinks(c)
+fmt.Println("bob can still revoke it:", links[0].ID != "" && isvc.RevokeLink(c, links[0].ID) == nil)
+fmt.Println("but the code he never saw still works for a holder:",
+	func() bool {
+		_, e := isvc.JoinViaLink(org.WithSubject(context.Background(), "zoe"), ownerCode)
+		return errors.Is(e, invite.ErrLinkRevoked)
+	}())
+```
+
+```
+bob can still revoke it: true
+but the code he never saw still works for a holder: true
+```
+
+## Claim first, admit second
+
+Acceptance spans two stores that may not share a database — the invitation lives
+in `invite.Store`, the membership in `scope.Store` — so **there is no
+cross-store transaction**. Both paths therefore claim the credential atomically
+FIRST and admit SECOND.
+
+<Columns cols={2}>
+  <Card title="AcceptInvite" icon="envelope">
+    Deletes the invite through the rows-affected-gated
+    `Store.DeleteEmailInvite`. Of any two callers racing to delete the same id —
+    including the same token presented twice — **at most one** ever sees a nil
+    error, and only that caller proceeds to `GrantMembership`.
+  </Card>
+  <Card title="JoinViaLink" icon="link">
+    Consumes a use through the atomic `Store.ConsumeLink`, which folds the
+    revoked/expired/exhausted check and the increment into one step a concurrent
+    caller cannot split.
+  </Card>
+</Columns>
+
+<Warning>
+A failure **after** the claim burns the credential and admits no one —
+under-admission, the safe direction — at the cost that accepting is **not safe
+to retry** with the same token. The invitee has to be re-invited, or, for a link
+with uses left, try again.
+</Warning>
+
+The reverse order — admit first, claim second — was an earlier version of
+`AcceptInvite`, and it was a **Critical** finding, not a style preference: while
+the invite row still existed, the token stayed redeemable by *anyone* holding
+it, not merely by the original caller retrying. Two distinct subjects were
+demonstrably admitted from a single invitation.
+
+<Note>
+Do not "tidy" that ordering back during a later refactor. A one-time credential
+must never pay out more than once.
+</Note>
+
+## On a nested scope, admit to the parent first
+
+The post-claim failure that actually happens is not a store outage — it is
+`scope.ErrNotParentMember`.
+
+Under the default `Policy.MembersFromParent`, `GrantMembership` refuses anyone
+who does not **already** hold standing in the parent of a
+[nested scope](/authorization/nested-scopes), deterministically and every time.
+Since the credential is claimed first, that **burns it**: a team invitation sent
+to someone not yet in the organization fails, the token is spent, and
+re-presenting it gives `ErrInviteNotFound`.
+
+<Warning>
+Nothing in `invite` checks parent standing before the claim. Add the invitee to
+the parent organization — directly, or via a parent-scope invitation they accept
+first — before they accept the child's; or clear `MembersFromParent` for that
+scope if the child is meant to hold members the parent has never heard of.
+
+It fails closed. Nobody is over-admitted; the invitation is simply gone.
+</Warning>
+
+## An email invite is a bearer credential
+
+<Warning>
+`AcceptInvite` admits **whoever presents the token**, at the invited role. It
+never compares the accepting subject to `EmailInvite.Email`.
+
+"One-time" bounds how many times the token pays out, **not who it pays out
+to** — so a forwarded or intercepted invitation email admits whoever clicks it.
+</Warning>
+
+That is not something `invite` can check for you: it stores no users and takes
+no dependency on [`auth`](/authentication/overview) — `scope` carries a user id
+as an opaque value and nothing else — so `Email` is a delivery hint and an audit
+record rather than an authorization test.
+
+If your application needs the invitation bound to its recipient, enforce it
+yourself before calling `AcceptInvite`. `PreviewInvite` reads the invited
+address out of a token **without consuming it**:
+
+{/* verify:main */}
+```go
+_, token, _ := isvc.InviteByEmail(owner, "carol@example.com", org.RoleMember)
+
+p, err := isvc.PreviewInvite(context.Background(), token)
+fmt.Println("preview:", err, p.Email, p.Valid)
+// Compare p.Email against the authenticated user's own VERIFIED address —
+// auth.UserBase.EmailVerifiedAt. A plain == is correct: both sides are the
+// output of the same trim-and-lowercase rule.
+```
+
+```
+preview: <nil> carol@example.com true
+```
+
+See [addresses are normalized](/invitations/email-invites#addresses-are-normalized)
+for why that comparison needs no normalization step of your own. It did through
+**v0.1.0**, when `invite` stored addresses verbatim and a raw `==` refused a
+legitimate recipient invited as `Carol@Example.com`.
+
+## Rechecking the inviter
+
+`WithRecheckInviterOnAccept(b)`, **on by default**.
+
+The escalation guard already ran once, at mint time, against the inviter's
+standing *as of that moment*. Nothing about a stored token or link updates
+afterwards — so without a recheck, a credential keeps paying out at the power
+level its inviter held when they minted it, even after that inviter is demoted
+or leaves the container entirely.
+
+Enabled, the guard reruns against the inviter's **current** standing before
+either path admits anyone — and **before the claim**, so a refusal spends
+nothing.
+
+{/* verify:main */}
+```go
+// bob (admin) mints an invitation, then is demoted to a plain member.
+bobCtx := org.WithOrg(org.WithSubject(context.Background(), "bob"), acme.ID)
+_, bobToken, err := isvc.InviteByEmail(bobCtx, "dana@example.com", org.RoleAdmin)
+fmt.Println("bob mints while admin:", err)
+
+_ = svc.ChangeMemberRole(owner, "bob", org.RoleMember)
+
+dana := org.WithSubject(context.Background(), "dana")
+_, err = isvc.AcceptInvite(dana, bobToken)
+fmt.Println("after demotion:", errors.Is(err, scope.ErrPrivilegeEscalation))
+
+// The refusal ran BEFORE the claim, so the row is still there — but a
+// preview now reports it as not currently acceptable.
+p, err = isvc.PreviewInvite(context.Background(), bobToken)
+fmt.Println("the row survives:", err == nil, "acceptable right now:", p.Valid)
+
+// Restore bob's standing and the very same token works: it was never spent.
+_ = svc.ChangeMemberRole(owner, "bob", org.RoleAdmin)
+joined, err := isvc.AcceptInvite(dana, bobToken)
+fmt.Println("after re-promotion:", err, joined.Name)
+```
+
+```
+bob mints while admin: <nil>
+after demotion: true
+the row survives: true acceptable right now: false
+after re-promotion: <nil> Acme
+```
+
+<Note>
+`Preview.Valid` folds the inviter recheck in too, so a "you've been invited"
+page cannot tell an unauthenticated visitor their invitation is good when
+acceptance would immediately refuse it. A `nil` error with `Valid: false` means
+the invitation exists but is not currently acceptable; `ErrInviteNotFound` means
+it is gone.
+</Note>
+
+An inviter who has since **left** the container fails with `scope.ErrNotMember`
+instead.
+
+<Warning>
+The cost is durability. A pending invitation now dies the moment its inviter's
+own standing can no longer support it — including simply leaving the container.
+
+Turn it off with `invite.WithRecheckInviterOnAccept(false)` if your application
+wants "who invited me" to be provenance rather than an ongoing authorization the
+inviter must keep backing.
+</Warning>
+
+{/* verify:stdout "alice  sees code: true  (role owner)\nbob    sees code: false (role owner)\nerin   sees code: false (role owner)\nbob can still revoke it: true\nbut the code he never saw still works for a holder: true\npreview: <nil> carol@example.com true\nbob mints while admin: <nil>\nafter demotion: true\nthe row survives: true acceptable right now: false\nafter re-promotion: <nil> Acme" */}
+
+## `PurgeExpired` is for a cron
+
+<Warning>
+`Service.PurgeExpired(ctx, before)` deletes every expired invite and link across
+**every container the `Store` holds**, and returns how many rows were removed.
+It performs **no authorization check** and reads neither a subject nor a
+container from the context — there is no ctx container to check against, since
+one call spans them all.
+
+Call it only from a trusted context. An unauthenticated caller who could trigger
+it at will gets a cross-tenant denial-of-service knob, even though it cannot
+itself grant access.
+</Warning>
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Privilege escalation" icon="ban" href="/authorization/privilege-escalation">
+    The guard this page keeps reaching for.
+  </Card>
+  <Card title="Writing your own backend" icon="plug" href="/storage/custom-backends">
+    The eight `invite.Store` MUSTs, as an executable suite.
+  </Card>
+</Columns>

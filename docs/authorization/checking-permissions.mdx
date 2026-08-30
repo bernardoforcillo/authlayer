@@ -1,0 +1,160 @@
+---
+title: "Checking permissions"
+description: "Can, Authorize and HasPermission — three call shapes for the same decision, and which of them is safe to put behind an end-user endpoint."
+---
+
+All three read the [permission surface](/concepts/statements) you declared and
+walk the same [decision ladder](/concepts/decisions). They differ in what they
+return and in where the actor comes from.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{
+	"project": {"create", "read", "update", "delete"},
+	"billing": {"read", "update"},
+}), memory.New[org.Organization, org.Member]())
+
+alice := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(alice, "Acme", "acme")
+ctx := org.WithOrg(alice, acme.ID)
+_, _ = svc.AddMember(ctx, "carol", org.RoleMember)
+```
+
+## `Can` — the boolean form
+
+Folds "forbidden" and "not a member" into a plain `false`.
+
+{/* verify:main */}
+```go
+ok, err := svc.Can(ctx, "project", org.ActionDelete)
+fmt.Println("owner may delete projects:", ok, err)
+```
+
+```
+owner may delete projects: true <nil>
+```
+
+<Warning>
+A non-nil error from `Can` means the question could not be **answered** — a
+missing subject, a missing scope, a store failure. That is *not* a denial.
+Check `err` before you look at the bool.
+</Warning>
+
+## `Authorize` — the error form
+
+Distinguishes 403-denied from 403-not-a-member from 404, which is what a
+handler needs to shape a response.
+
+{/* verify:main */}
+```go
+carol := org.WithOrg(org.WithSubject(context.Background(), "carol"), acme.ID)
+err = svc.Authorize(carol, "project", org.ActionCreate, org.ActionUpdate)
+fmt.Println("carol (member role):", errors.Is(err, org.ErrForbidden))
+
+dave := org.WithOrg(org.WithSubject(context.Background(), "dave"), acme.ID)
+err = svc.Authorize(dave, "project", org.ActionCreate)
+fmt.Println("dave (no membership):", errors.Is(err, org.ErrNotMember))
+```
+
+```
+carol (member role): true
+dave (no membership): true
+```
+
+## `HasPermission` — out of band
+
+Asks about a user who is **not** the context subject, and takes the container
+id as an argument too.
+
+{/* verify:main */}
+```go
+ok, err = svc.HasPermission(ctx, acme.ID, "carol", map[string][]access.Action{
+	"project": {"create"},
+	"billing": {"read"},
+})
+fmt.Println("carol has both:", ok, err)
+```
+
+```
+carol has both: false <nil>
+```
+
+<Warning>
+`HasPermission` reads **nothing** from the context and performs **no check that
+the caller may ask**. Keep it out of end-user-facing paths — it is for
+administrative and internal callers who have already been authorized by
+something else. An empty request map returns `true` for any member.
+</Warning>
+
+The same caveat applies to `Standing(ctx, containerID, userID)`, which resolves
+a user's permission set and elevation directly, and to
+[`ContainersWith`](/authorization/query-filtering#hoisting-the-container-set).
+
+## Two rules that catch people
+
+<Columns cols={2}>
+  <Card title="Multiple actions are an AND" icon="ampersand">
+    `Authorize(ctx, "project", "create", "update")` requires **both**. There is
+    no OR form; call twice and combine the answers yourself.
+  </Card>
+  <Card title="Zero actions denies" icon="circle-xmark">
+    Including for an owner, and for any full-permission role. There is nothing
+    to authorize, so there is nothing to allow.
+  </Card>
+</Columns>
+
+{/* verify:main */}
+```go
+none, _ := svc.Can(ctx, "project")
+fmt.Println("owner, zero actions:", none)
+```
+
+```
+owner, zero actions: false
+```
+
+## Mapping outcomes to HTTP
+
+authlayer owns no transport, so it never chooses a status code. These are the
+suggestions the [error reference](/reference/errors) carries:
+
+| Sentinel | Suggested status |
+|---|---|
+| `ErrOrgNotFound` (`scope.ErrContainerNotFound`) | 404 |
+| `ErrRoleNotFound` | 404 |
+| `ErrForbidden` | 403 |
+| `ErrNotMember` | 403 |
+| `ErrOwnerOnly` | 403 |
+| `ErrSubjectMissing`, `ErrOrgMissing` | 500 — a wiring bug, not caller input |
+
+<Tip>
+Compare with `errors.Is`, never by string. `org` re-exports these as
+**aliases**, so `org.ErrOrgNotFound` *is* `scope.ErrContainerNotFound` and
+either name matches.
+</Tip>
+
+{/* verify:stdout "owner may delete projects: true <nil>\ncarol (member role): true\ndave (no membership): true\ncarol has both: false <nil>\nowner, zero actions: false" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Managing members" icon="users" href="/authorization/members">
+    What each membership call requires.
+  </Card>
+  <Card title="Query-level filtering" icon="database" href="/authorization/query-filtering">
+    The other enforcement point — which rows, not which action.
+  </Card>
+</Columns>

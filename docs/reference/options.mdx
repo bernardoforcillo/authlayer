@@ -1,0 +1,190 @@
+---
+title: "Options"
+description: "Every option on every service and store, with its default — and the rule that governs all of them: options apply at construction and never after."
+---
+
+<Note>
+Options apply at construction and **never afterwards**, so every `Service` is
+immutable once built. That is true of `scope.Option`, `auth.Option` and
+`invite.Option` alike.
+</Note>
+
+## `scope` / `org` / `team`
+
+`org` and `team` re-export these under their own names, so `org.WithPolicy` *is*
+`scope.WithPolicy`.
+
+<ResponseField name="WithPolicy(p Policy)" type="Option">
+  Replace the authorization policy. **Replaces wholesale — it does not merge**,
+  and the zero `Policy` is not the defaults. See
+  [Policy](/authorization/policy).
+</ResponseField>
+
+<ResponseField name="WithHooks(h ...Hook)" type="Option">
+  Append lifecycle hooks. **Accumulates** across calls, unlike `WithPolicy`. See
+  [Hooks and events](/authorization/hooks).
+</ResponseField>
+
+<ResponseField name="WithClock(fn func() time.Time)" type="Option" default="time.Now().UTC()">
+  Timestamp source. Inject a fixed clock for deterministic tests.
+</ResponseField>
+
+<ResponseField name="WithIDGenerator(fn func() string)" type="Option" default="UUIDv7 from crypto/rand">
+  Id source for containers and custom roles. A non-UUID generator needs
+  `dropsstore.WithTextLibraryIDs()` — see [Ids](/concepts/ids).
+</ResponseField>
+
+<ResponseField name="WithParent(p ParentScope, inherit Inheritance)" type="Option">
+  [Nest](/authorization/nested-scopes) this scope inside another, resolving
+  standing through `p` and projecting it with `inherit`. `team.New` wires this
+  for you.
+</ResponseField>
+
+<ResponseField name="WithContainerResource(res string)" type="Option">
+  Name this scope's own container resource, so a nested `CreateContainer` knows
+  which `<res>:create` to check for in the parent. `team.New` wires this too.
+</ResponseField>
+
+### `Policy`
+
+| Field | Default | Effect |
+|---|---|---|
+| `Escalation` | `EscalationStrict` | `EscalationOff` disables the guard entirely. `EscalationAllowEqual` currently behaves **exactly** like `Strict`. |
+| `LastOwnerLocked` | `true` | Owner cannot be removed, demoted, or leave. Ownership still moves via `TransferOwnership`. |
+| `MembersFromParent` | `true` | In a nested scope, `AddMember` refuses a user with no standing in the parent. No effect without `WithParent`. |
+| `OwnerBypass` | `true` | Owner gets full permissions regardless of their role key, so a mis-configured container is always recoverable. |
+
+## `auth`
+
+<ResponseField name="WithJWT(keys [][]byte, ttl time.Duration)" type="Option" default="no keys, 15 min">
+  The HS256 signing keys and the access-token TTL. `Issue` always signs with
+  `keys[0]`; `Parse` tries every key, which is how a signing key rotates. Every
+  key must be **at least 32 bytes**. Without this option, `Login` and
+  `VerifyAccessToken` fail closed with `token.ErrKeyTooShort`.
+</ResponseField>
+
+<ResponseField name="WithRefreshTTL(d time.Duration)" type="Option" default="30 days">
+  Session lifetime.
+</ResponseField>
+
+<ResponseField name="WithVerificationTTL(d time.Duration)" type="Option" default="24 hours">
+  Lifetime of `signup` **and** `email_change` tokens. Shortening it shortens how
+  long an `email_change` token stays armed, which is
+  [the strongest of the three](/authentication/email-verification).
+</ResponseField>
+
+<ResponseField name="WithPasswordResetTTL(d time.Duration)" type="Option" default="1 hour">
+  Lifetime of `password_reset` tokens. Short on purpose: a reset link grants a
+  full credential change, not an "I own this address" attestation.
+</ResponseField>
+
+<ResponseField name="WithRequireVerifiedEmail(require bool)" type="Option" default="false">
+  When on, `Login` refuses an unconfirmed address with `ErrEmailNotVerified` —
+  checked **only after** the password verifies. There is no resend path; a
+  completed reset is the way out.
+</ResponseField>
+
+<ResponseField name="WithHasher(h password.Hasher)" type="Option" default="password.Bcrypt(0)">
+  Bcrypt at the library's own default cost. A `nil` hasher is ignored.
+</ResponseField>
+
+<ResponseField name="WithRules(r password.Rules)" type="Option" default="password.DefaultRules()">
+  12 characters, upper, lower, digit, and one character that is neither a
+  letter, a digit, nor whitespace.
+</ResponseField>
+
+<ResponseField name="WithRateLimiter(l RateLimiter)" type="Option" default="none">
+  IP-keyed. Consulted by `Login` **and** `RequestPasswordReset`. Fails closed:
+  an error from the limiter refuses the call.
+</ResponseField>
+
+<ResponseField name="WithPasswordResetRateLimiter(l RateLimiter)" type="Option" default="none">
+  Address-keyed, `RequestPasswordReset` only. A denial returns the same
+  `("", false, nil)` an unknown address gets — **not** `ErrRateLimited`. See
+  [Rate limiting](/authentication/rate-limiting).
+</ResponseField>
+
+<ResponseField name="WithClaimsExtender(f func(UserBase) map[string]any)" type="Option" default="none">
+  Application claims, nested under one `"ext"` object **structurally** — so an
+  extender cannot shadow a reserved claim.
+</ResponseField>
+
+<ResponseField name="WithClock(now func() time.Time)" type="Option" default="time.Now().UTC()">
+  Timestamp source.
+</ResponseField>
+
+<ResponseField name="WithIDGenerator(gen func() string)" type="Option" default="UUIDv7">
+  Id source for users, sessions and verifications. A non-UUID generator needs
+  `dropsstore.WithAuthTextLibraryIDs()`.
+</ResponseField>
+
+<Tip>
+Every TTL option **ignores a non-positive duration** and keeps its default,
+rather than minting a token that has already expired.
+</Tip>
+
+## `invite`
+
+An `invite.Service` and the `scope.Service` it wraps are configured
+independently; `invite` does **not** read `Policy`.
+
+<ResponseField name="WithRecheckInviterOnAccept(b bool)" type="Option" default="true">
+  Re-check the inviter's **current** standing before admitting anyone, and
+  before the claim — so a refusal spends nothing. The cost is durability: a
+  pending invitation dies the moment its inviter's standing can no longer
+  support it, including simply leaving the container.
+</ResponseField>
+
+<ResponseField name="WithInviteExpiry(d time.Duration)" type="Option" default="7 days">
+  How long a freshly minted **email invite** stays acceptable. Links take their
+  expiry per-link, at `CreateLink`, and this option does not apply to them.
+</ResponseField>
+
+<ResponseField name="WithNotifier(n Notifier)" type="Option" default="nil — sends nothing">
+  Deliver each minted invitation. Called once, synchronously, immediately after
+  the invite is persisted; a `Notify` error propagates to `InviteByEmail`'s
+  caller with the row already stored and its token unrecoverable.
+</ResponseField>
+
+<ResponseField name="WithTokens(gen func() string)" type="Option" default="crypto/rand">
+  Override the token and code generator. **Tests only** — `gen` is the entire
+  source of unguessability for every credential the service mints.
+</ResponseField>
+
+## `store/drops`
+
+Three separate option types, one per store, because the three stores are
+independent.
+
+| Option | Type | Effect |
+|---|---|---|
+| `WithNames(Names{...})` | `Option` | Rename the three RBAC tables |
+| `WithTextLibraryIDs()` | `Option` | Retype `id`, `container_id`, `parent_id` as text |
+| `WithTextUserIDs()` | `Option` | Retype `user_id`, `owner_id` as text |
+| `WithInviteNames(InviteNames{...})` | `InviteOption` | Rename the two invitation tables |
+| `WithInviteTextLibraryIDs()` | `InviteOption` | Retype the invitation `id` and `container_id` |
+| `WithInviteTextUserIDs()` | `InviteOption` | Retype `invited_by`, `created_by` |
+| `WithAuthNames(AuthNames{...})` | `AuthOption` | Rename `users`, `sessions`, `verifications` |
+| `WithAuthTextLibraryIDs()` | `AuthOption` | Retype **all five** auth id columns together |
+
+<Warning>
+The library-ids and user-ids options answer **independent** questions and do not
+substitute for each other. `New[...](db, WithTextUserIDs())` with a ULID
+generator still fails on the first write, because the container's own `id`
+column is still `uuid`. See [Ids](/concepts/ids).
+
+The auth store has **no** text-*user*-id option at all: it owns the `users`
+table its `user_id` columns point at, so a `user_id` typed differently from
+`users.id` could never be self-consistent.
+</Warning>
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Errors" icon="triangle-exclamation" href="/reference/errors">
+    Every sentinel, and a suggested status.
+  </Card>
+  <Card title="Packages" icon="cubes" href="/reference/packages">
+    What each package is, and what it pulls in.
+  </Card>
+</Columns>

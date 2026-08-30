@@ -6,13 +6,15 @@
 // matter most about it are the ones that bound WHO GETS IN: [invite.Store.ConsumeLink]'s
 // single-winner atomicity (a naive read-then-increment lets N callers each
 // claim a MaxUses:1 link), [invite.Store.DeleteEmailInvite]'s rows-affected
-// gate (which is how one emailed token pays out at most once), and the three
+// gate (which is how one emailed token pays out at most once), the three
 // uniqueness constraints that keep a lookup by token hash, by code, or by
-// invited address resolving to exactly one row. Until this package existed
-// none of them had an exported check, so a third-party backend author had
-// nothing to test their work against, and the two backends this repository
-// ships disagreed about all three uniqueness constraints without any test
-// able to notice.
+// invited address resolving to exactly one row, and the address
+// normalization that makes the last of those a constraint on a PERSON rather
+// than on a spelling. Until this package existed none of them had an
+// exported check, so a third-party backend author had nothing to test their
+// work against, the two backends this repository ships disagreed about all
+// three uniqueness constraints without any test able to notice, and neither
+// of them normalized an address at all.
 //
 // # Using it
 //
@@ -96,15 +98,21 @@
 // increment but one, whatever the timing, because the writes overwrite each
 // other rather than merely racing. None of the three proves the mechanism.
 //
-// # The three uniqueness constraints
+// # The four record-type obligations
 //
 // [invite.EmailInvite.TokenHash], [invite.Link.Code] and the
 // (ContainerID, Email) pair each carry a uniqueness MUST on the record type
-// rather than on a method. They are part of [RunStoreContract] like every
+// rather than on a method, and [invite.EmailInvite] carries a fourth beside
+// them: every address a Store writes or matches is the output of
+// [invite.NormalizeEmail]. They are part of [RunStoreContract] like every
 // other obligation — the checks are "CreateEmailInvite/TokenHashIsUnique",
 // "CreateLink/CodeIsUnique" and
 // "CreateEmailInvite/ContainerEmailPairIsUnique", after the write paths that
-// have to enforce them, plus a concurrent form of each.
+// have to enforce them, plus a concurrent form of each; normalization is
+// "CreateEmailInvite/NormalizesTheAddress" and
+// "DeleteEmailInvitesFor/NormalizesTheAddress", one per side, with
+// "CreateEmailInvite/ContainerEmailPairIsUniqueAcrossSpelling" for the
+// consequence the two of them together buy.
 //
 // They are not niceties a backend may decline. The first two defeat
 // ConsumeLink's and DeleteEmailInvite's single-winner properties with no
@@ -118,18 +126,30 @@
 // pending-invitations screen — and the revocation performed from it —
 // complete.
 //
-// store/memory did not enforce any of the three when this package was
-// written, and its own doc said so; folding them in would have failed one of
-// this repository's own backends. That was the wrong way round, exactly as
-// it was for auth, and the backend changed instead. Shipping them as an
-// opt-in extra would have told the next in-memory backend author they were
-// optional, and would have let a caller develop against store/memory and
-// meet the constraint for the first time in production against store/drops.
+// The fourth is what makes the third mean anything. Without normalization
+// the pair constraint is byte-exact: "erin@example.com" and
+// "Erin@Example.com" are two different pairs, so both writes succeed, both
+// tokens are live, and the sweep the re-invite performs first matches only
+// the spelling it was handed. That is the same incomplete
+// pending-invitations screen and the same surviving token, reached with no
+// concurrency at all — which is why it is checked here rather than left to
+// the caller to remember.
+//
+// store/memory did not enforce any of the three uniqueness constraints when
+// this package was written, and its own doc said so; neither backend
+// normalized addresses, and the documentation site pinned that as executed
+// output. Folding either in would have failed one of this repository's own
+// backends. That was the wrong way round, exactly as it was for auth, and
+// the backends changed instead. Shipping them as an opt-in extra would have
+// told the next in-memory backend author they were optional, and would have
+// let a caller develop against store/memory and meet the constraint for the
+// first time in production against store/drops.
 package invitetest
 
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -200,7 +220,8 @@ func storeContractChecks() []check {
 // suite deliberately does not assert. It must not return nil.
 //
 // This is the only entry point: every obligation [invite.Store] states is in
-// here, the three uniqueness MUSTs included.
+// here, the three uniqueness MUSTs and the address-normalization MUST
+// included.
 func RunStoreContract(t *testing.T, newStore func(t *testing.T) invite.Store) {
 	t.Helper()
 	runChecks(t, storeContractChecks(), newStore)
@@ -234,6 +255,13 @@ func newID() string { return uid.NewV7() }
 // they mean to. The unique part is a UUID, whose hyphens and hex digits are
 // all legal in a local part.
 func newEmail() string { return "invitetest-" + uid.NewV7() + "@example.test" }
+
+// mixedCase returns email with its case flipped and surrounding whitespace
+// added — a variant [invite.NormalizeEmail] collapses back to email, and
+// therefore one that must resolve to the same row on every path that writes
+// or matches an address. It is authtest's helper of the same name, for the
+// same obligation on the other half of the library.
+func mixedCase(email string) string { return "  " + strings.ToUpper(email) + "\t" }
 
 // newHash returns a token hash no other call will produce. The suite never
 // hashes anything — the port stores an already-computed hash and the

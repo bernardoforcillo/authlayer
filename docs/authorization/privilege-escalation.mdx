@@ -1,0 +1,166 @@
+---
+title: "The privilege-escalation guard"
+description: "Delegated administration must not be a ladder. The guard, where it applies, who is exempt, and the equal-power case it deliberately allows."
+---
+
+Handing someone `member:create` should let them build a team, not let them
+build themselves a promotion. The guard is one comparison —
+`granted.SubsetOf(actor)` — applied at every point where an actor's action
+could increase somebody's power, their own included.
+
+## Where it applies
+
+Unless the actor is [elevated](/concepts/decisions#what-elevated-buys-and-what-it-does-not),
+they may not:
+
+<Columns cols={2}>
+  <Card title="AddMember" icon="user-plus">
+    Add a member at a role more powerful than their own.
+  </Card>
+  <Card title="ChangeMemberRole" icon="user-pen">
+    Move a member *to* such a role.
+  </Card>
+  <Card title="RemoveMember" icon="user-minus">
+    Remove a member more powerful than themselves — the guard runs on the
+    **target's** role here, not the actor's intent.
+  </Card>
+  <Card title="CreateRole / UpdateRole" icon="pen-to-square">
+    Mint or widen a custom role granting powers they lack.
+  </Card>
+</Columns>
+
+A violation is `ErrPrivilegeEscalation` (`scope.ErrPrivilegeEscalation`;
+`org` re-exports the same value).
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{
+	"project": {"create", "read", "update", "delete"},
+}), memory.New[org.Organization, org.Member]())
+
+alice := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(alice, "Acme", "acme")
+ctx := org.WithOrg(alice, acme.ID)
+_, _ = svc.AddMember(ctx, "bob", org.RoleAdmin)
+
+bob := org.WithOrg(org.WithSubject(context.Background(), "bob"), acme.ID)
+
+// bob is an admin: admin is everything EXCEPT organization:delete.
+_, err := svc.CreateRole(bob, "superadmin", "Super", map[string][]access.Action{
+	org.ResourceOrganization: {org.ActionDelete},
+})
+fmt.Println("admin mints a role that can delete the org:",
+	errors.Is(err, org.ErrPrivilegeEscalation))
+
+// The same bound applies to promoting somebody else.
+_, _ = svc.AddMember(ctx, "carol", org.RoleMember)
+fmt.Println("admin promotes carol to owner:",
+	errors.Is(svc.ChangeMemberRole(bob, "carol", org.RoleOwner),
+		org.ErrPrivilegeEscalation))
+```
+
+```
+admin mints a role that can delete the org: true
+admin promotes carol to owner: true
+```
+
+<Note>
+The built-in `admin` role is deliberately kept short of full permission — it
+excludes `<container>:delete`. That is not cosmetic: it is precisely what keeps
+`admin` subject to this guard, since a full permission set would make every
+comparison trivially pass.
+</Note>
+
+## Who is exempt
+
+The owner (under `Policy.OwnerBypass`, the default) and anyone holding a role
+whose permission set `IsFull`. For them every grant set is trivially a subset,
+so the guard never fires.
+
+{/* verify:main */}
+```go
+_, err = svc.CreateRole(ctx, "superadmin", "Super", map[string][]access.Action{
+	org.ResourceOrganization: {org.ActionDelete},
+})
+fmt.Println("the owner mints the same role:", err)
+```
+
+```
+the owner mints the same role: <nil>
+```
+
+## Equal power passes
+
+<Warning>
+`SubsetOf` is a **non-strict** subset: a set is a subset of itself. So an actor
+may grant, assign, or remove at exactly their own level. Two `admin`s can
+remove each other; an `admin` can promote someone to `admin`.
+
+The guard bounds *climbing*, not *peer action*. If your application needs
+strict seniority between two people at the same level, model it as two roles
+with different grants — there is no policy switch that adds strictness.
+</Warning>
+
+{/* verify:main */}
+```go
+_, _ = svc.AddMember(ctx, "dana", org.RoleMember)
+fmt.Println("admin promotes dana to admin (equal level):",
+	svc.ChangeMemberRole(bob, "dana", org.RoleAdmin))
+```
+
+```
+admin promotes dana to admin (equal level): <nil>
+```
+
+`Policy.Escalation` has a third value, `EscalationAllowEqual`, which **today
+behaves exactly like `EscalationStrict`**. It is reserved for future
+strictly-less semantics and changes nothing if you set it.
+
+## Turning it off
+
+`Policy{Escalation: scope.EscalationOff}` disables the guard entirely — every
+one of the five call sites skips it. Reach for that only when your application
+enforces its own hierarchy above authlayer, because with it off a member
+holding `member:update` can promote themselves to owner's role key.
+
+See [Policy](/authorization/policy) for how to set it, and for the warning that
+`WithPolicy` replaces the policy wholesale rather than merging.
+
+{/* verify:stdout "admin mints a role that can delete the org: true\nadmin promotes carol to owner: true\nthe owner mints the same role: <nil>\nadmin promotes dana to admin (equal level): <nil>" */}
+
+## The one place it does not run
+
+`scope.Service.GrantMembership` — the call
+[invitations](/invitations/security) end at — performs **no actor check at
+all**, not even `member:create`, let alone this guard. That is deliberate: the
+person accepting an invitation has no standing yet to check, and every
+actor-facing rule already ran when the credential was minted.
+
+It also means `GrantMembership` is only as safe as whatever decided to call it.
+It must never be reachable except by presenting a credential minted for exactly
+that container and role — which is what `AcceptInvite`, `JoinViaLink` and
+`ListLinks`' code redaction exist to guarantee.
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Policy" icon="sliders" href="/authorization/policy">
+    The four tunable invariants, and why the zero value is not the defaults.
+  </Card>
+  <Card title="Invitation security" icon="lock" href="/invitations/security">
+    Why `ListLinks` redacts a link's code, and what it stops.
+  </Card>
+</Columns>

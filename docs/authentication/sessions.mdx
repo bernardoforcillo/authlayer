@@ -1,0 +1,232 @@
+---
+title: "Sessions, and what revocable actually means"
+description: "The refresh side is revocable instantly. The access side is revocable within one TTL. Read every 'signs out every device' sentence with that bound attached."
+---
+
+A login mints two credentials with very different properties:
+
+<Columns cols={2}>
+  <Card title="Access token" icon="ticket">
+    A short-lived HS256 JWT the server **never stores**. Verification is
+    signature and expiry only — no lookup. 15 minutes by default.
+  </Card>
+  <Card title="Refresh token" icon="rotate">
+    A 32-byte opaque bearer token whose **sha256** becomes a `Session` row. The
+    plaintext is never persisted, so a database leak cannot be replayed into a
+    session. 30 days by default.
+  </Card>
+</Columns>
+
+## Revoking a session does not invalidate an access token already issued for it
+
+<Warning>
+This is the single most important bound in this package, and it applies to
+**every** "signs out every device" sentence in this documentation without
+exception.
+
+A device holding an access token keeps working until that token expires — up to
+**15 minutes** with the default TTL — no matter what `Refresh`, `Logout`,
+`LogoutAll`, `RevokeSession`, `ChangePassword` or `ResetPassword` did to the
+session behind it.
+</Warning>
+
+Here it is, running. The verification below happens *after* reuse detection has
+revoked the entire family:
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault")
+svc := auth.New(memory.NewAuthStore(), auth.WithJWT([][]byte{key}, 15*time.Minute))
+
+ctx := context.Background()
+res, _ := svc.SignUp(ctx, "bob@example.com", "Correct-Horse-Battery-7")
+_, _ = svc.VerifyEmail(ctx, res.VerifyToken)
+login, _ := svc.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+
+next, _ := svc.Refresh(ctx, login.RefreshToken)
+_, err := svc.Refresh(ctx, login.RefreshToken) // a replay: revokes the family
+fmt.Println("replay detected:", errors.Is(err, auth.ErrTokenReuse))
+
+sessions, _ := svc.ListSessions(ctx, login.User.ID)
+fmt.Println("sessions remaining:", len(sessions))
+
+claims, err := svc.VerifyAccessToken(next.AccessToken)
+fmt.Println("its access token still verifies:", err == nil, claims.SessionID != "")
+```
+
+```
+replay detected: true
+sessions remaining: 0
+its access token still verifies: true true
+```
+
+Zero sessions, and a token that still parses. So **"revocable sessions" means
+the refresh side is revocable *instantly* and the access side is revocable
+*within one TTL*.**
+
+### The hook for closing the gap
+
+The `sid` claim (`token.Claims.SessionID`) is stamped by `Login` and `Refresh`
+with the id of the session that minted the token. An application that needs
+another device's access to stop being honoured sooner than the TTL must **look
+`sid` up in the `Store` on every request** — the same per-request read `Refresh`
+and `RevokeSession` already do — rather than trusting a parsed,
+still-unexpired JWT on its own.
+
+That is a real cost, a database round trip per request, for a real property.
+authlayer does not make the choice for you: it puts `sid` in the token so the
+choice exists. Shortening the access TTL through `WithJWT` **narrows** the
+window without closing it.
+
+## Revocation is per-family, not per-row
+
+Rotated-but-unexpired rows are kept **on purpose** — they are what makes replay
+detectable at all. So every revocation path takes the family wherever it can.
+
+<AccordionGroup>
+
+<Accordion title="Logout is idempotent, and asymmetric" icon="right-from-bracket">
+Presented a **current** token it removes that one session and leaves the
+family's tripwire rows alone. Presented a **superseded** one it revokes the
+whole family and still returns `nil` — the same signal `Refresh` treats as a
+replay, so the two paths agree about what it means. An unknown token is also
+`nil`.
+
+Deleting that superseded row instead was a complete bypass of reuse detection
+that needed no race: a thief who steals `R`, refreshes it into `S_a`, then calls
+`Logout(R)` removed the very row the victim's replay would have tripped over.
+The victim got a benign `ErrTokenInvalid`, the family was never revoked, and
+`S_a` rotated on indefinitely.
+</Accordion>
+
+<Accordion title="LogoutAll revokes every family a user has" icon="power-off">
+And it is the **only session path that also invalidates** the account's pending
+`password_reset` and `email_change` verifications. "Sign out of every device" is
+precisely what a user clicks on spotting an intruder; sweeping only on the two
+credential paths meant a takeover survived it. See
+[the password lifecycle](/authentication/passwords#the-two-sweeps).
+</Accordion>
+
+<Accordion title="RevokeSession takes an id and revokes that session's family" icon="trash">
+And only if the id belongs to the named user — another user's session is
+reported identically to a nonexistent one.
+
+A family is one login's rotation chain, which is what "sign this device out" has
+to revoke. Revoking the single row a user picked off a listing used to delete a
+superseded entry, return `nil`, and leave the device signed in.
+</Accordion>
+
+<Accordion title="Logout and RevokeSession sweep no verifications" icon="envelope">
+Deliberately. They are per-device and routine, and sweeping there would break a
+flow with no attacker in it: request an email change on a desktop, sign that
+desktop out, click the link that arrives on a phone. `LogoutAll` is the
+unambiguous "something is wrong" control.
+</Accordion>
+
+</AccordionGroup>
+
+{/* verify:main */}
+```go
+a, _ := svc.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "laptop")
+b, _ := svc.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "198.51.100.7", "phone")
+
+rotated, _ := svc.Refresh(ctx, a.RefreshToken) // laptop now has a successor
+
+// Logout of the CURRENT token removes one row and leaves the tripwire.
+fmt.Println("logout(current):", svc.Logout(ctx, rotated.RefreshToken))
+fmt.Println("logout again (unknown token):", svc.Logout(ctx, rotated.RefreshToken))
+
+rows, _ := svc.ListSessions(ctx, login.User.ID)
+fmt.Println("rows left:", len(rows), "— the laptop's rotated predecessor, plus the phone")
+
+// Logout of a SUPERSEDED token takes the whole family.
+fmt.Println("logout(superseded):", svc.Logout(ctx, a.RefreshToken))
+rows, _ = svc.ListSessions(ctx, login.User.ID)
+fmt.Println("rows left:", len(rows))
+
+fmt.Println("logout all:", svc.LogoutAll(ctx, login.User.ID))
+rows, _ = svc.ListSessions(ctx, login.User.ID)
+fmt.Println("rows left:", len(rows), "(phone was", b.RefreshToken != "", "before)")
+```
+
+```
+logout(current): <nil>
+logout again (unknown token): <nil>
+rows left: 2 — the laptop's rotated predecessor, plus the phone
+logout(superseded): <nil>
+rows left: 1
+logout all: <nil>
+rows left: 0 (phone was true before)
+```
+
+## `ListSessions` is not a device list
+
+<Warning>
+It returns rotation **history**. One device refreshing at the 15-minute default
+accumulates about **97 rows a day**, 96 of them superseded.
+
+Build a "your devices" screen by grouping on `FamilyID` — any row of a family
+revokes it — and treat `RotatedAt == nil` as the live one.
+</Warning>
+
+And a family is not a promise about *devices* either:
+
+<Warning>
+`Refresh` copies the predecessor's `UserAgent` and `IP` into every successor, so
+a thief who rotates a stolen token joins the victim's family **wearing the
+victim's fingerprint**. A listing grouped by `FamilyID` shows one device where
+two are in use.
+
+Revoking the family is still right — it signs the thief out too. But
+`UserAgent` and `IP` are audit and display fields, never a security check.
+</Warning>
+
+## Housekeeping
+
+`auth.Service.PurgeExpired(ctx, before)` sweeps expired sessions and
+verifications, a pass-through to the `Store` method of the same name. It is
+**housekeeping, not a security boundary** — an expired row is already refused by
+`Refresh`, `VerifyEmail` and `ResetPassword` without it — but this package does
+*require* it, since nothing else removes a retained predecessor row.
+
+<Warning>
+Like `invite`'s, it authorizes nothing and spans **every user the store holds**.
+Call it from a cron job or a superuser console, never a per-request handler. The
+cutoff is literal: a `before` in the future signs out live sessions.
+</Warning>
+
+{/* verify:main */}
+```go
+removed, err := svc.PurgeExpired(ctx, time.Now().UTC().Add(-24*time.Hour))
+fmt.Println("purge:", err, removed)
+```
+
+```
+purge: <nil> 0
+```
+
+{/* verify:stdout "replay detected: true\nsessions remaining: 0\nits access token still verifies: true true\nlogout(current): <nil>\nlogout again (unknown token): <nil>\nrows left: 2 — the laptop's rotated predecessor, plus the phone\nlogout(superseded): <nil>\nrows left: 1\nlogout all: <nil>\nrows left: 0 (phone was true before)\npurge: <nil> 0" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Refresh rotation" icon="rotate" href="/authentication/refresh-rotation">
+    How a family is built, and how a replay tears it down.
+  </Card>
+  <Card title="The password lifecycle" icon="lock" href="/authentication/passwords">
+    The two credential paths that also sweep verifications.
+  </Card>
+</Columns>

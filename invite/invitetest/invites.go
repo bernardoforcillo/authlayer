@@ -11,8 +11,10 @@ import (
 func emailInviteChecks() []check {
 	return []check{
 		{"CreateEmailInvite/RoundTrip", checkCreateEmailInviteRoundTrip},
+		{"CreateEmailInvite/NormalizesTheAddress", checkCreateEmailInviteNormalizes},
 		{"CreateEmailInvite/TokenHashIsUnique", checkEmailInviteTokenHashUnique},
 		{"CreateEmailInvite/ContainerEmailPairIsUnique", checkEmailInviteContainerEmailUnique},
+		{"CreateEmailInvite/ContainerEmailPairIsUniqueAcrossSpelling", checkEmailInvitePairUniqueAcrossSpelling},
 		{"CreateEmailInvite/OtherContainersMayInviteTheSameAddress", checkEmailInviteAddressIsNotGloballyUnique},
 		{"FindEmailInvite/UnknownIDReturnsErrInviteNotFound", checkFindEmailInviteNotFound},
 		{"FindEmailInviteByTokenHash/UnknownHashReturnsErrInviteNotFound", checkFindEmailInviteByTokenHashNotFound},
@@ -22,6 +24,7 @@ func emailInviteChecks() []check {
 		{"DeleteEmailInvite/RemovesExactlyOneRow", checkDeleteEmailInvite},
 		{"DeleteEmailInvite/UnknownIDReturnsErrInviteNotFound", checkDeleteEmailInviteNotFound},
 		{"DeleteEmailInvitesFor/RemovesOnlyThatPair", checkDeleteEmailInvitesFor},
+		{"DeleteEmailInvitesFor/NormalizesTheAddress", checkDeleteEmailInvitesForNormalizes},
 		{"DeleteEmailInvitesFor/ZeroRowsIsNotAnError", checkDeleteEmailInvitesForEmpty},
 	}
 }
@@ -36,6 +39,10 @@ func emailInviteChecks() []check {
 // nothing it was given. RoleKey in particular is what a redeemer is admitted
 // AT, so a store that silently loses it admits at the zero role rather than
 // the invited one.
+//
+// The fixture's address is already normalized, so the one field a store IS
+// allowed to change comes back identical here; whether it normalizes at all
+// is "CreateEmailInvite/NormalizesTheAddress".
 func checkCreateEmailInviteRoundTrip(t tb, st invite.Store) {
 	t.Helper()
 	ctx := context.Background()
@@ -79,6 +86,95 @@ func assertInviteEqual(t tb, what string, got, want invite.EmailInvite) {
 	}
 	wantTimeEqual(t, what+" ExpiresAt", got.ExpiresAt, want.ExpiresAt)
 	wantTimeEqual(t, what+" CreatedAt", got.CreatedAt, want.CreatedAt)
+}
+
+// checkCreateEmailInviteNormalizes asserts [invite.EmailInvite]'s
+// address-normalization MUST on the write path: an invite created from an
+// upper-cased, whitespace-padded address is stored — and returned — under
+// the normalized form, and every read path hands that form back.
+//
+// The returned record matters as much as the stored one.
+// [invite.Service.InviteByEmail] returns what CreateEmailInvite gave it, and
+// [invite.Service.PreviewInvite] and ListInvites return what the read paths
+// give them, so a store that normalizes on the way in but echoes the
+// caller's spelling back on the way out reintroduces the mismatch an
+// application hits when it compares an invited address against a verified
+// account address.
+func checkCreateEmailInviteNormalizes(t tb, st invite.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+	containerID := newID()
+	email := newEmail()
+	inv := newInvite(containerID, mixedCase(email), at)
+
+	created := mustCreateEmailInvite(t, st, inv)
+	if created.Email != email {
+		t.Fatalf("CreateEmailInvite(%q) returned Email %q, want the normalized %q — invite.EmailInvite's address-normalization MUST applies before the uniqueness check and the write, and the returned record is what was stored", inv.Email, created.Email, email)
+	}
+
+	byID, err := st.FindEmailInvite(ctx, inv.ID)
+	wantNoErr(t, "FindEmailInvite", err)
+	if byID.Email != email {
+		t.Fatalf("FindEmailInvite returned Email %q, want the normalized %q — the stored row still carries the raw spelling", byID.Email, email)
+	}
+
+	byHash, err := st.FindEmailInviteByTokenHash(ctx, inv.TokenHash)
+	wantNoErr(t, "FindEmailInviteByTokenHash", err)
+	if byHash.Email != email {
+		t.Fatalf("FindEmailInviteByTokenHash returned Email %q, want the normalized %q", byHash.Email, email)
+	}
+
+	list, err := st.ListEmailInvites(ctx, containerID)
+	wantNoErr(t, "ListEmailInvites", err)
+	if len(list) != 1 {
+		t.Fatalf("ListEmailInvites returned %d row(s), want 1", len(list))
+	}
+	if list[0].Email != email {
+		t.Fatalf("ListEmailInvites returned Email %q, want the normalized %q — a pending-invitations screen renders this value", list[0].Email, email)
+	}
+
+	// The normalized form is also what the sweep the re-invite performs will
+	// be handed, so it has to match the row that was just written.
+	wantNoErr(t, "DeleteEmailInvitesFor(the normalized address)", st.DeleteEmailInvitesFor(ctx, containerID, email))
+	if _, err := st.FindEmailInvite(ctx, inv.ID); !errors.Is(err, invite.ErrInviteNotFound) {
+		t.Fatalf("FindEmailInvite after sweeping the normalized address: error = %v, want ErrInviteNotFound — the row was written under a spelling the sweep cannot reach", err)
+	}
+}
+
+// checkEmailInvitePairUniqueAcrossSpelling is the (ContainerID, Email)
+// uniqueness MUST asked of a PERSON rather than of a byte string: a second
+// invite for the same address spelled differently must be refused exactly as
+// an identically-spelled one is.
+//
+// This is the security-relevant half of the normalization obligation, and it
+// is reachable with no concurrency at all. Without normalization,
+// "erin@example.com" and "Erin@Example.com" are two different pairs: both
+// writes succeed, both tokens are live, and the sweep
+// [invite.Service.InviteByEmail] performs first matches only the spelling it
+// was handed. The container ends up holding two redeemable invitations for
+// one human, and revoking the row an admin recognises on a
+// pending-invitations screen leaves the other one live at the invited role.
+//
+// The colliding row is given its own TokenHash, so it fails only on the
+// pair. What the refusal RETURNS is not asserted, for the reason the package
+// doc gives.
+func checkEmailInvitePairUniqueAcrossSpelling(t tb, st invite.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+	containerID := newID()
+	email := newEmail()
+	first := mustCreateEmailInvite(t, st, newInvite(containerID, email, at))
+
+	clash := newInvite(containerID, mixedCase(email), at)
+	if _, err := st.CreateEmailInvite(ctx, clash); err == nil {
+		t.Fatalf("CreateEmailInvite(%q) returned nil while %q already has a pending invite in this container — addresses are not normalized, so the (ContainerID, Email) constraint is byte-exact. Two casings of one address are two LIVE tokens for one person: revoking the row an admin recognises leaves the other redeemable, at the invited role, with nothing reporting that it is still out there", clash.Email, first.Email)
+	}
+
+	list, err := st.ListEmailInvites(ctx, containerID)
+	wantNoErr(t, "ListEmailInvites after the rejected duplicate", err)
+	wantSameIDs(t, "ListEmailInvites after the rejected duplicate", inviteIDs(list), []string{first.ID})
 }
 
 // checkEmailInviteTokenHashUnique asserts [invite.EmailInvite.TokenHash]'s
@@ -315,6 +411,45 @@ func checkDeleteEmailInvitesFor(t tb, st invite.Store) {
 
 	if _, err := st.FindEmailInvite(ctx, doomed.ID); !errors.Is(err, invite.ErrInviteNotFound) {
 		t.Fatalf("FindEmailInvite(the swept row) error = %v, want ErrInviteNotFound", err)
+	}
+	for _, survivor := range []invite.EmailInvite{otherAddress, otherContainer} {
+		if _, err := st.FindEmailInvite(ctx, survivor.ID); err != nil {
+			t.Fatalf("FindEmailInvite(%s, outside the swept pair) error = %v, want nil", survivor.ID, err)
+		}
+	}
+}
+
+// checkDeleteEmailInvitesForNormalizes asserts the read-side half of
+// [invite.EmailInvite]'s address-normalization MUST: the sweep matches on
+// the normalized address, so a mixed-case, whitespace-padded spelling
+// removes the row a normalized one wrote.
+//
+// This is what keeps the re-invite sequence correct for a caller that
+// reaches the Store directly with whatever its own form field produced. A
+// sweep that matched byte-exactly would leave the pending row behind and let
+// the CreateEmailInvite that follows it add a second one — or, against a
+// backend that normalizes on create, would refuse that create as a duplicate
+// and fail an invitation that should have replaced.
+//
+// A sibling in the same container and the same address in another container
+// are asserted to survive, so a store cannot pass by sweeping too widely —
+// "DeleteEmailInvitesFor/RemovesOnlyThatPair" makes the same demand of the
+// exact spelling.
+func checkDeleteEmailInvitesForNormalizes(t tb, st invite.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+	here, there := newID(), newID()
+	email := newEmail()
+
+	doomed := mustCreateEmailInvite(t, st, newInvite(here, email, at))
+	otherAddress := mustCreateEmailInvite(t, st, newInvite(here, newEmail(), at))
+	otherContainer := mustCreateEmailInvite(t, st, newInvite(there, email, at))
+
+	wantNoErr(t, "DeleteEmailInvitesFor(a case variant)", st.DeleteEmailInvitesFor(ctx, here, mixedCase(email)))
+
+	if _, err := st.FindEmailInvite(ctx, doomed.ID); !errors.Is(err, invite.ErrInviteNotFound) {
+		t.Fatalf("FindEmailInvite(%s) after sweeping %q: error = %v, want ErrInviteNotFound — the sweep must normalize its address argument, or a re-invite leaves the pending row behind and the container holds two live tokens for one person", doomed.ID, mixedCase(email), err)
 	}
 	for _, survivor := range []invite.EmailInvite{otherAddress, otherContainer} {
 		if _, err := st.FindEmailInvite(ctx, survivor.ID); err != nil {

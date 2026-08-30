@@ -1,0 +1,172 @@
+---
+title: "Custom roles"
+description: "Per-container roles defined at runtime — create, update, delete, list — and the four rules each call enforces."
+---
+
+Custom roles are **per-container**. A role called `editor` in one organization
+is invisible to every other, so two tenants can each define one that means
+something different. They are persisted as
+[encoded grants](/concepts/statements#encoding-is-by-name-not-by-bit-index),
+so a change to your permission surface never re-interprets a role saved
+earlier.
+
+`key` is what gets stored on memberships; `name` is a display label.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{
+	"project": {"create", "read", "update", "delete"},
+}), memory.New[org.Organization, org.Member]())
+
+alice := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(alice, "Acme", "acme")
+ctx := org.WithOrg(alice, acme.ID)
+
+editor, err := svc.CreateRole(ctx, "editor", "Editor", map[string][]access.Action{
+	"project": {"create", "update"},
+})
+fmt.Println("create:", err, editor.Key, editor.IsDefault)
+```
+
+```
+create: <nil> editor false
+```
+
+Creating a role requires `role:create` **and** clears the
+[escalation guard](/authorization/privilege-escalation): you cannot mint a role
+granting powers you do not hold.
+
+## Update replaces, it does not merge
+
+{/* verify:main */}
+```go
+_, _ = svc.AddMember(ctx, "carol", "editor")
+
+updated, err := svc.UpdateRole(ctx, "editor", "Editor", map[string][]access.Action{
+	"project": {"read"}, // create and update are GONE, not merged
+})
+fmt.Println("update:", err, updated.Permissions.Allows("project", "create"))
+
+carol := org.WithOrg(org.WithSubject(context.Background(), "carol"), acme.ID)
+can, _ := svc.Can(carol, "project", "create")
+fmt.Println("carol lost project:create immediately:", !can)
+```
+
+```
+update: <nil> false
+carol lost project:create immediately: true
+```
+
+<Warning>
+`UpdateRole` **replaces** the grant set wholesale, and takes effect immediately
+for every member holding the role. Permissions are resolved per check, never
+copied onto the membership, so there is no propagation delay and no cache to
+invalidate — and no partial update either. Send the complete grant set.
+</Warning>
+
+## Delete refuses a role that is still in use
+
+{/* verify:main */}
+```go
+fmt.Println("delete while carol holds it:",
+	errors.Is(svc.DeleteRole(ctx, "editor"), org.ErrRoleInUse))
+
+_ = svc.RemoveMember(ctx, "carol")
+fmt.Println("delete once nobody holds it:", svc.DeleteRole(ctx, "editor"))
+```
+
+```
+delete while carol holds it: true
+delete once nobody holds it: <nil>
+```
+
+That refusal is deliberate: cascading would silently strip every holder of
+their permissions, and a member left pointing at a role key that no longer
+resolves fails every check with `ErrRoleNotFound`.
+
+## Default roles are immutable
+
+{/* verify:main */}
+```go
+_, err = svc.UpdateRole(ctx, org.RoleAdmin, "Admin", nil)
+fmt.Println("update a default role:", errors.Is(err, org.ErrDefaultRole))
+
+_, err = svc.CreateRole(ctx, org.RoleMember, "Member", nil)
+fmt.Println("reuse a default key:", errors.Is(err, org.ErrRoleKeyTaken))
+```
+
+```
+update a default role: true
+reuse a default key: true
+```
+
+## Listing
+
+`ListRoles` returns the three defaults (`IsDefault: true`) followed by the
+container's custom roles, each carrying a **resolved** `access.Permission` —
+enough to drive a role editor without a second lookup.
+
+{/* verify:main */}
+```go
+_, _ = svc.CreateRole(ctx, "auditor", "Auditor", map[string][]access.Action{
+	"project": {"read"},
+})
+
+roles, _ := svc.ListRoles(ctx)
+for _, r := range roles {
+	fmt.Println(r.Key, r.Name, r.IsDefault, r.Permissions.IsFull())
+}
+```
+
+```
+owner owner true true
+admin admin true false
+member member true false
+auditor Auditor false false
+```
+
+<Warning>
+`ListRoles` is **not** the full set of assignable role keys. A role registered
+in code with `access.Access.NewRole` is assignable and resolves normally, but
+it lives in the process rather than in the store, so it never appears here. Use
+`svc.RolePermissions(ctx, containerID, roleKey)` to resolve a specific key —
+that is the same ladder every check walks.
+</Warning>
+
+For a default role, `Name` is the key itself: code-defined roles carry no
+separate display label.
+
+{/* verify:stdout "create: <nil> editor false\nupdate: <nil> false\ncarol lost project:create immediately: true\ndelete while carol holds it: true\ndelete once nobody holds it: <nil>\nupdate a default role: true\nreuse a default key: true\nowner owner true true\nadmin admin true false\nmember member true false\nauditor Auditor false false" */}
+
+## What each call requires
+
+| Call | Permission | Also |
+|---|---|---|
+| `CreateRole(ctx, key, name, grants)` | `role:create` | escalation guard; `ErrRoleKeyTaken` on a collision with a default or existing key |
+| `UpdateRole(ctx, key, name, grants)` | `role:update` | escalation guard; `ErrDefaultRole` on a default |
+| `DeleteRole(ctx, key)` | `role:delete` | `ErrRoleInUse` if members hold it; `ErrDefaultRole` on a default |
+| `ListRoles(ctx)` | membership only | non-members get `ErrNotMember` |
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Privilege escalation" icon="ban" href="/authorization/privilege-escalation">
+    Why `CreateRole` refuses grants you do not hold.
+  </Card>
+  <Card title="Managing members" icon="users" href="/authorization/members">
+    Assigning a role key to somebody.
+  </Card>
+</Columns>
