@@ -1,0 +1,59 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "authlayer",
+  "description": "Reusable authentication and authorization for Go — scope RBAC, invitations, and a revocable session core you import rather than deploy.",
+  "colors": {
+    "primary": "#4F46E5",
+    "light": "#A5B4FC",
+    "dark": "#3730A3"
+  },
+  "favicon": "/favicon.svg",
+  "icons": {
+    "library": "fontawesome"
+  },
+  "appearance": {
+    "default": "system"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get started",
+        "icon": "rocket",
+        "pages": [
+          "index",
+          "get-started/installation",
+          "get-started/quickstart"
+        ]
+      }
+    ],
+    "global": {
+      "anchors": [
+        {
+          "anchor": "GitHub",
+          "href": "https://github.com/bernardoforcillo/authlayer",
+          "icon": "github"
+        },
+        {
+          "anchor": "Go reference",
+          "href": "https://pkg.go.dev/github.com/bernardoforcillo/authlayer",
+          "icon": "book"
+        }
+      ]
+    }
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/bernardoforcillo/authlayer"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/bernardoforcillo/authlayer"
+    }
+  },
+  "seo": {
+    "indexing": "navigable"
+  }
+}
