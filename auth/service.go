@@ -1060,7 +1060,8 @@ func (s *Service) mintSignupVerification(ctx context.Context, userID, email stri
 //     as its own enumeration channel.
 //  6. Only once every check above has passed does this touch the Store
 //     with a write ([Store.CreateSession]) — and even that is ordered
-//     LAST, after [token.Issue] has already succeeded (see the body): a
+//     LAST, after [token.Issue] has already succeeded (see mintSession,
+//     the minting tail this method and [Service.SignInWith] share): a
 //     misconfigured signing key ([WithJWT] never called, or too short)
 //     fails before any Session row is persisted, rather than leaving an
 //     orphaned, unreachable-by-refresh-token row behind that
@@ -1110,6 +1111,43 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 		return zero, ErrEmailNotVerified
 	}
 
+	return s.mintSession(ctx, u, ip, userAgent)
+}
+
+// mintSession is the session-issuing tail shared by [Service.Login] and
+// [Service.SignInWith]: given a user whose identity the caller has ALREADY
+// established, it mints a root session — a fresh refresh token, its
+// [Session] row, and a matching access token — and returns the three things
+// a successful authentication hands back.
+//
+// # It authenticates nothing
+//
+// This helper performs no credential check, no rate-limit check, no
+// email-verification check and no linking-policy check. Every one of those
+// belongs to whoever calls it, and the two callers run different sets:
+// [Service.Login] proves possession of a password and honours
+// [WithRequireVerifiedEmail]; [Service.SignInWith] proves nothing itself and
+// stands instead on a provider's assertion plus the [Linking] policy. A
+// third caller would mint a live session for whoever u names with no check
+// at all, so any future one must be read as the assertion "I have already
+// decided this user is authenticated".
+//
+// It exists because there must be exactly ONE minting path. Two would drift,
+// and the drift would not be a compile error: a scrub, a claim, or the
+// family-id rule fixed in one and forgotten in the other surfaces as a live
+// credential digest inside a JWT claim, or as a session no revocation can
+// reach. [Service.Refresh] deliberately does NOT use it — a rotation
+// inherits its predecessor's FamilyID rather than starting a new chain,
+// which is the one thing this function hard-codes the other way.
+//
+// The order inside is load-bearing, and is the order [Service.Login]'s own
+// doc describes at point 6: PasswordHash is scrubbed BEFORE the claims
+// extender runs, and [github.com/bernardoforcillo/authlayer/token.Issue]
+// runs BEFORE [Store.CreateSession], so a misconfigured signing key fails
+// without leaving an orphaned session row behind.
+func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent string) (LoginResult, error) {
+	var zero LoginResult
+
 	now := s.cfg.clock()
 	sessionID := s.cfg.idGen()
 	refreshPlain, refreshHash, err := token.GenerateOpaque()
@@ -1133,9 +1171,9 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 	if s.cfg.claimsExtender != nil {
 		extra = s.cfg.claimsExtender(u)
 	}
-	// Issued BEFORE CreateSession, deliberately — see "Order of checks"
-	// point 6 above: a bad signing key must fail before any Session row
-	// exists to be orphaned.
+	// Issued BEFORE CreateSession, deliberately — see [Service.Login]'s
+	// "Order of checks" point 6: a bad signing key must fail before any
+	// Session row exists to be orphaned.
 	accessToken, err := token.Issue(token.Claims{
 		Subject:   u.ID,
 		SessionID: sessionID,

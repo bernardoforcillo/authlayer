@@ -1806,6 +1806,19 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 			}
 			return u, seeded.ID
 		},
+		// SignInWith is driven down its LINK rung, not its provisioning
+		// one, deliberately: an account this method PROVISIONS holds no
+		// password hash at all, so an empty return value would prove
+		// nothing about scrubbing — which is exactly what step 2's
+		// "the fixture is broken" guard below rejects.
+		"SignInWith": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
+			u := signUpVerified(t, svc, "scrub-signin@example.com", validPassword)
+			res, err := svc.SignInWith(ctx, signInReq(googleExt("scrub-signin@example.com", true)))
+			if err != nil {
+				t.Fatalf("SignInWith: %v", err)
+			}
+			return res.User, u.ID
+		},
 		"VerifyEmail": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
 			res, err := svc.SignUp(ctx, "scrub-verify@example.com", validPassword)
 			if err != nil {
@@ -1854,7 +1867,10 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 	// Step 2: every driver's value is scrubbed, and the Store's is not.
 	for name, drive := range drivers {
 		t.Run(name, func(t *testing.T) {
-			svc, store := newTestService(t)
+			// newOAuthService, not newTestService: identical wiring plus an
+			// IdentityStore, which the SignInWith driver needs and the rest
+			// never touch.
+			svc, store, _ := newOAuthService(t)
 			got, userID := drive(t, svc)
 			if got.PasswordHash != "" {
 				t.Fatalf("%s returned User.PasswordHash = %q, want empty — this is a live credential digest", name, got.PasswordHash)
