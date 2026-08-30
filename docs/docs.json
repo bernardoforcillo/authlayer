@@ -37,6 +37,21 @@
           "concepts/context",
           "concepts/ids"
         ]
+      },
+      {
+        "group": "Authorization",
+        "icon": "shield-halved",
+        "pages": [
+          "authorization/checking-permissions",
+          "authorization/members",
+          "authorization/custom-roles",
+          "authorization/privilege-escalation",
+          "authorization/policy",
+          "authorization/hooks",
+          "authorization/query-filtering",
+          "authorization/custom-scopes",
+          "authorization/nested-scopes"
+        ]
       }
     ],
     "global": {

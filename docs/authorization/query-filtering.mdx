@@ -1,0 +1,252 @@
+---
+title: "Query-level filtering"
+description: "An in-memory check answers 'may this user do X?'. A guard answers 'which rows may this user see?' — pushed into the SQL, so a SELECT cannot return another tenant's rows."
+---
+
+authlayer's second [enforcement point](/concepts/decisions#the-two-enforcement-points)
+is a drops `pg.Guard`: a predicate ANDed into every query against a table, so
+the database itself cannot return rows the subject has no standing over.
+
+Both guards read the subject from the **same context** the permission checks
+use, and a missing subject fails closed with `pg.ErrSubjectMissing`.
+
+<Note>
+This page needs the [PostgreSQL store](/storage/postgres) and a drops schema.
+Every SQL fragment shown below is rendered by a program the documentation gate
+runs — the guards themselves build their predicate without touching a database,
+so the rendering is real, not illustrative.
+</Note>
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+	"github.com/bernardoforcillo/drops"
+	"github.com/bernardoforcillo/drops/pg"
+)
+```
+
+{/* verify:decl */}
+```go
+// render is only a documentation helper: it turns a guard's predicate into the
+// SQL drops would AND into the query.
+func render(g pg.Guard, ctx context.Context) (string, []any, error) {
+	expr, err := g.Predicate(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	b := drops.NewBuilder()
+	b.Append(expr)
+	sql, args := b.SQL()
+	return sql, args, nil
+}
+```
+
+{/* verify:main */}
+```go
+members := pg.NewTable("organization_members")
+pg.Add(members, pg.Text("user_id").NotNull())
+pg.Add(members, pg.Text("container_id").NotNull())
+
+projects := pg.NewTable("projects")
+pg.Add(projects, pg.Text("id").NotNull())
+pg.Add(projects, pg.Text("organization_id").NotNull())
+```
+
+## `MembershipGuard` — coarse, and cheap
+
+It asks only whether the subject belongs to the container.
+
+{/* verify:main */}
+```go
+guard := org.MembershipGuard(members,
+	members.Col("user_id"), members.Col("container_id"),
+	projects.Col("organization_id"))
+
+alice := org.WithSubject(context.Background(), "alice")
+sql, args, err := render(guard, alice)
+fmt.Println(err)
+fmt.Println(sql)
+fmt.Println(args)
+```
+
+```
+<nil>
+"projects"."organization_id" IN (SELECT "container_id" FROM "organization_members" WHERE "user_id" = $1)
+[alice]
+```
+
+Mount it on a drops entity:
+
+{/* verify:skip needs a drops Entity bound to a live *pg.DB; the guard it mounts is the value rendered above */}
+```go
+projectEntity.AuthorizeWith(guard)
+```
+
+The drops store has a convenience form that fills in the junction table and its
+columns for you, so you name only the column on the table being guarded:
+
+{/* verify:skip needs a live PostgreSQL *pg.DB to construct the store; the guard it returns is the same pg.Guard rendered above */}
+```go
+st := dropsstore.New[org.Organization, org.Member](db)
+projectEntity.AuthorizeWith(st.MembershipGuard(projectsTbl.Col("organization_id")))
+```
+
+## `PermissionGuard` — per action
+
+Where `MembershipGuard` asks *"is the subject a member?"*, this asks *"may the
+subject do this?"* — the difference between showing every project in the user's
+organizations and showing only the ones they may delete.
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{
+	"project": {"create", "read", "update", "delete"},
+}), memory.New[org.Organization, org.Member]())
+
+acme, _ := svc.CreateOrganization(alice, "Acme", "acme") // alice is owner
+
+perm := svc.PermissionGuard(projects.Col("organization_id"), "project", org.ActionDelete)
+
+sql, args, err = render(perm, alice)
+fmt.Println(err)
+fmt.Println(sql)
+fmt.Println("binds acme's id:", len(args) == 1 && args[0] == acme.ID)
+```
+
+```
+<nil>
+("projects"."organization_id" IN ($1))
+binds acme's id: true
+```
+
+It resolves the container set through the same ladder `Can` uses, so the guard
+and an in-memory check agree for every container where the subject holds a
+membership whose role key resolves.
+
+## It fails closed, in every direction
+
+{/* verify:main */}
+```go
+// A subject with no qualifying containers renders a FALSE predicate —
+// no rows, never all rows.
+bob := org.WithSubject(context.Background(), "bob")
+sql, args, err = render(perm, bob)
+fmt.Println(err, sql, args)
+
+// A missing subject is an error, which aborts the query.
+_, _, err = render(perm, context.Background())
+fmt.Println("no subject:", errors.Is(err, pg.ErrSubjectMissing))
+```
+
+```
+<nil> (false) []
+no subject: true
+```
+
+<Warning>
+Where the guard and an in-memory check *could* diverge, the guard **denies**: an
+unresolvable role key, a missing container row, an owner with no membership row
+of their own. A store failure aborts the query rather than narrowing it to
+nothing.
+</Warning>
+
+## Nested scopes diverge
+
+<Warning>
+In a [nested scope](/authorization/nested-scopes), **neither `PermissionGuard`
+nor `ContainersWith` consults the parent.** They resolve membership-based
+standing only; they do not walk the parent rung that `Can` applies.
+
+An organization admin who can administer a team purely through inheritance —
+holding no membership row of their own in that team — gets no row here and no
+rows from a `PermissionGuard` built over it, even though `Can`, `Authorize` and
+`Standing` all admit them in that same container. `Can` says yes, the guard says
+no.
+
+That is a known gap, not a deliberate rule. Do not build a nested scope's
+row-level filtering on the assumption that it mirrors `Can`.
+</Warning>
+
+## What it costs
+
+<Columns cols={2}>
+  <Card title="One round trip per query" icon="server">
+    Plus one lookup per distinct `(container, role key)` pair naming a custom
+    role. A custom role belongs to one container, so the same key in two
+    containers is two lookups.
+  </Card>
+  <Card title="One bound parameter per container" icon="list-ol">
+    The rendered `IN` list binds one per qualifying container, so a subject in
+    very many containers is a reason to hoist.
+  </Card>
+</Columns>
+
+### Hoisting the container set
+
+`ContainersWith` is the same answer as a plain `[]string`, so a hot endpoint
+can compute it once:
+
+{/* verify:main */}
+```go
+ids, err := svc.ContainersWith(context.Background(), "alice", "project", org.ActionDelete)
+fmt.Println(err, len(ids) == 1 && ids[0] == acme.ID)
+```
+
+```
+<nil> true
+```
+
+<Warning>
+`ContainersWith` takes the user id as an **argument** rather than from the
+context, so — like `HasPermission` and `Standing` — it performs no check that
+the *caller* is entitled to ask, and its answer enumerates that user's
+memberships and how privileged they are in each. Do not expose it directly to
+end users. `PermissionGuard` is the safe form: it reads the subject from the
+context.
+</Warning>
+
+Note also that `ContainersWith` returns `nil` when you name **zero** actions,
+matching the "zero actions denies" rule everywhere else.
+
+## Composing guards
+
+`pg.AnyOf` and `pg.AllOf` combine them, so "rows I created, **or** rows in an
+organization where I may delete projects" is one expression:
+
+{/* verify:main */}
+```go
+pg.Add(projects, pg.Text("created_by").NotNull())
+
+combined := pg.AnyOf(
+	pg.OwnerGuard{Owner: projects.Col("created_by")},
+	svc.PermissionGuard(projects.Col("organization_id"), "project", org.ActionDelete),
+)
+sql, _, err = render(combined, alice)
+fmt.Println(err)
+fmt.Println(sql)
+```
+
+```
+<nil>
+(("projects"."created_by" = $1) OR ("projects"."organization_id" IN ($2)))
+```
+
+{/* verify:stdout "<nil>\n\"projects\".\"organization_id\" IN (SELECT \"container_id\" FROM \"organization_members\" WHERE \"user_id\" = $1)\n[alice]\n<nil>\n(\"projects\".\"organization_id\" IN ($1))\nbinds acme's id: true\n<nil> (false) []\nno subject: true\n<nil> true\n<nil>\n((\"projects\".\"created_by\" = $1) OR (\"projects\".\"organization_id\" IN ($2)))" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="The PostgreSQL store" icon="database" href="/storage/postgres">
+    Building the `*pg.DB` these guards are mounted against.
+  </Card>
+  <Card title="Nested scopes" icon="sitemap" href="/authorization/nested-scopes">
+    The gap described above, in context.
+  </Card>
+</Columns>

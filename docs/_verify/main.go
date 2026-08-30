@@ -355,6 +355,13 @@ func parse(path string) (page, error) {
 			mode, note = m[1], m[2]
 			continue
 		}
+		// A marker that does not parse would silently do nothing, which is
+		// worse than doing the wrong thing: the check it was meant to apply
+		// would just never run. Refuse it.
+		if strings.Contains(line, "verify:") && strings.Contains(line, "{/*") {
+			return page{}, fmt.Errorf("%s:%d: malformed verify marker: %s",
+				p.path, i+1, strings.TrimSpace(line))
+		}
 
 		f := fenceRe.FindStringSubmatch(line)
 		if f == nil {

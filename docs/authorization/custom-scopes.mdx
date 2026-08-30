@@ -1,0 +1,204 @@
+---
+title: "Custom scopes"
+description: "Reach past org when you need a different boundary — projects, workspaces — or extra fields on a membership. Embed the bases and use scope directly."
+---
+
+`org` fixes the container type to `Organization` and the member type to
+`Member`. When you need a different boundary, or extra fields on a membership,
+declare your own types and call `scope.New`.
+
+<Note>
+Read [Scopes](/concepts/scopes) first. This page assumes you know what a
+container, a member and the [decision ladder](/concepts/decisions) are.
+</Note>
+
+## Declare the types
+
+Embed `scope.ContainerBase` and `scope.MemberBase`. The engine reads and stamps
+the base fields and leaves yours alone; drops flattens the embedded struct when
+persisting.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/scope"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:decl */}
+```go
+type Workspace struct {
+	scope.ContainerBase        // id, owner_id, created_at, updated_at
+	Name string `drop:"name"`
+	Plan string `drop:"plan"`  // a field of your own
+}
+
+type WorkspaceMember struct {
+	scope.MemberBase           // container_id, user_id, role_key, joined_at
+	InvitedBy string `drop:"invited_by"` // a field of your own
+}
+```
+
+<Warning>
+Against [`store/drops`](/storage/postgres), field types are restricted:
+`string`, `time.Time`, `[]byte`, `int` or `int32` — or a named type over
+`string`, `int` or `int32`. Anything else, a pointer included, **panics at
+construction** with the column named. Nullable columns are not supported yet.
+
+A field with no `drop:` tag (or `drop:"-"`) is not persisted. Your container
+type must tag `id`, `owner_id`, `created_at` and `updated_at`, and your member
+type `container_id`, `user_id`, `role_key` and `joined_at` — embedding the two
+bases does that for you, and a type that misses one is rejected at construction
+rather than at the first query.
+</Warning>
+
+## Build the service
+
+`scope.NewAccess` takes the **container resource name** as its first argument —
+that is what the [control statements](/concepts/statements#the-control-statements-you-get-for-free)
+get named after, so `workspace:update` and `workspace:delete` appear on the
+surface instead of `organization:*`.
+
+{/* verify:main */}
+```go
+ac := scope.NewAccess("workspace", map[string][]access.Action{
+	"document": {"create", "read", "update", "delete"},
+})
+svc := scope.New[Workspace, WorkspaceMember](ac, memory.New[Workspace, WorkspaceMember]())
+
+ctx := scope.WithSubject(context.Background(), "alice")
+ws, err := svc.CreateContainer(ctx, Workspace{Name: "Apollo", Plan: "pro"})
+fmt.Println(err, ws.Name, ws.Plan, ws.OwnerID)
+```
+
+```
+<nil> Apollo pro alice
+```
+
+Your fields round-trip: the engine stamped `ID`, `OwnerID` and the timestamps,
+and left `Name` and `Plan` exactly as you passed them.
+
+## Everything else is the same engine
+
+The context helper is `scope.WithScope` rather than `org.WithOrg`, and
+`CreateContainer` rather than `CreateOrganization`. Beyond those two names,
+every call, rule and error is the one you already know.
+
+{/* verify:main */}
+```go
+inWS := scope.WithScope(ctx, ws.ID)
+_, _ = svc.AddMember(inWS, "bob", scope.RoleAdmin)
+
+_, err = svc.CreateRole(inWS, "editor", "Editor", map[string][]access.Action{
+	"document": {"create", "update"},
+})
+fmt.Println("custom role:", err)
+
+bob := scope.WithScope(scope.WithSubject(context.Background(), "bob"), ws.ID)
+canDelete, _ := svc.Can(bob, "workspace", scope.ActionDelete)
+canDoc, _ := svc.Can(bob, "document", scope.ActionCreate)
+fmt.Println("admin may delete the workspace:", canDelete)
+fmt.Println("admin may create documents:", canDoc)
+```
+
+```
+custom role: <nil>
+admin may delete the workspace: false
+admin may create documents: true
+```
+
+Member fields of your own are yours to populate on the value you hand back;
+the engine writes only the base fields it owns.
+
+{/* verify:main */}
+```go
+members, _ := svc.ListMembers(inWS)
+sort.Slice(members, func(i, j int) bool { return members[i].UserID < members[j].UserID })
+for _, m := range members {
+	fmt.Println(" ", m.UserID, m.RoleKey, "invitedBy="+m.InvitedBy)
+}
+```
+
+```
+  alice owner invitedBy=
+  bob admin invitedBy=
+```
+
+{/* verify:stdout "<nil> Apollo pro alice\ncustom role: <nil>\nadmin may delete the workspace: false\nadmin may create documents: true\n  alice owner invitedBy=\n  bob admin invitedBy=\nescalation guard applies: true" */}
+
+## `CreateContainer` performs no check — unless the scope is nested
+
+<Warning>
+On an **unparented** scope, `CreateContainer` runs no permission check at all:
+there is no container yet to check against, so gate it upstream exactly as you
+would `CreateOrganization`.
+
+On a **parented** scope it does check, against the parent
+(`<containerResource>:create`, or elevated parent standing). Expect that
+difference the first time you wire `WithParent` — see
+[Nested scopes](/authorization/nested-scopes).
+</Warning>
+
+`WithContainerResource(res)` names this scope's own container resource so a
+nested `CreateContainer` knows which `<res>:create` to look for in the parent.
+`team.New` wires it for you; a scope of your own nested by hand must pass it.
+
+## Persisting it
+
+`store/drops` is generic over the same two types and derives its columns from
+your `drop:` tags, so a new scope needs only a set of table names:
+
+{/* verify:skip needs a live PostgreSQL *pg.DB; the naming option it passes is covered on /storage/postgres */}
+```go
+st := dropsstore.New[Workspace, WorkspaceMember](db, dropsstore.WithNames(
+	dropsstore.Names{
+		Containers: "workspaces",
+		Members:    "workspace_members",
+		Roles:      "workspace_roles",
+	}))
+```
+
+`org`'s own source is short, and is the worked example of everything on this
+page.
+
+## If the parent matters
+
+If a scope's standing should be reachable **from** a parent container's
+standing — rather than a `ParentID` field being just another column you happen
+to store — do not roll it by hand. Embed `scope.NestedBase` and read
+[Nested scopes](/authorization/nested-scopes); `team` is the worked example.
+
+## The errors are the same values
+
+Nothing about a custom scope changes the sentinels. `scope.ErrForbidden`,
+`scope.ErrNotMember`, `scope.ErrPrivilegeEscalation` and the rest are the exact
+values `org` re-exports under organization-flavoured names — so handler code
+written against one works unchanged against the other.
+
+{/* verify:main */}
+```go
+_, err = svc.AddMember(bob, "carol", scope.RoleOwner) // admin promoting to owner
+fmt.Println("escalation guard applies:", errors.Is(err, scope.ErrPrivilegeEscalation))
+```
+
+```
+escalation guard applies: true
+```
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Nested scopes" icon="sitemap" href="/authorization/nested-scopes">
+    Putting a scope inside another one.
+  </Card>
+  <Card title="The PostgreSQL store" icon="database" href="/storage/postgres">
+    Table names, column derivation, and `CreateSchema`.
+  </Card>
+</Columns>

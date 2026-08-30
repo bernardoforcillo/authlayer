@@ -1,0 +1,154 @@
+---
+title: "Hooks and events"
+description: "Fire after a mutation is applied and before the call returns — for audit trails, webhooks, cache invalidation, or a transactional outbox."
+---
+
+A hook runs **after** a mutation is applied and **before** the call returns.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/scope"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+audit := scope.HookFunc(func(ctx context.Context, e scope.Event) error {
+	fmt.Printf("event kind=%d actor=%s target=%s role=%s\n",
+		e.Kind, e.ActorID, e.TargetID, e.RoleKey)
+	return nil
+})
+
+svc := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member](),
+	org.WithHooks(audit))
+
+alice := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(alice, "Acme", "acme")
+ctx := org.WithOrg(alice, acme.ID)
+_, _ = svc.AddMember(ctx, "bob", org.RoleAdmin)
+_ = svc.ChangeMemberRole(ctx, "bob", org.RoleMember)
+```
+
+```
+event kind=0 actor=alice target= role=
+event kind=1 actor=alice target=bob role=admin
+event kind=2 actor=alice target=bob role=member
+```
+
+## The event kinds
+
+| Kind | Emitted by | `TargetID` / `RoleKey` |
+|---|---|---|
+| `ContainerCreated` | `CreateOrganization` / `CreateContainer` | — (`ActorID` is the new owner) |
+| `MemberAdded` | `AddMember`, `GrantMembership` | added user / their role |
+| `MemberRoleChanged` | `ChangeMemberRole` | member / new role |
+| `MemberRemoved` | `RemoveMember`, `LeaveContainer` | removed user (equals `ActorID` on a leave) |
+| `RoleCreated` / `RoleUpdated` / `RoleDeleted` | the role calls | — / the role key |
+| `OwnershipTransferred` | `TransferOwnership` | incoming owner (`ActorID` is the outgoing one) |
+
+`Event.At` is stamped from the `Service` clock if the engine leaves it zero, so
+a hook can rely on it being set.
+
+## `GrantMembership` cannot name an actor
+
+<Warning>
+`ActorID` is the context subject for every operation that resolves one.
+`GrantMembership` is the exception: it reads nothing from the context and sets
+`ActorID` to the **admitted user**, the same value as `TargetID`.
+
+That is the only honest answer available. `GrantMembership` exists for
+[invitation acceptance](/invitations/overview), where the invitee is the one
+calling and the inviter who authorized it decided at mint time and is not
+present.
+</Warning>
+
+So an audit hook **cannot** distinguish an invitation-based admission from a
+self-add on the event alone, and the invitation's `InvitedBy` never reaches the
+hook. Record that attribution when the invitation is **minted**, from the
+invitation record itself, if you need it.
+
+## A hook that errors aborts the operation
+
+{/* verify:main */}
+```go
+boom := errors.New("audit sink is down")
+strict := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member](),
+	org.WithHooks(scope.HookFunc(func(context.Context, scope.Event) error {
+		return boom
+	})))
+
+_, err := strict.CreateOrganization(alice, "Beta", "beta")
+fmt.Println("CreateOrganization with a failing hook:", errors.Is(err, boom))
+
+list, _ := strict.ListRoles(org.WithOrg(alice, "beta"))
+fmt.Println("nothing was left behind:", len(list) == 0)
+```
+
+```
+CreateOrganization with a failing hook: true
+nothing was left behind: true
+```
+
+The two cases differ, and the difference matters:
+
+<Columns cols={2}>
+  <Card title="CreateOrganization rolls back" icon="rotate-left">
+    The container, the owner membership and the hook all commit together or not
+    at all — the whole operation runs inside `Store.WithTx`.
+  </Card>
+  <Card title="Every other operation does not" icon="triangle-exclamation">
+    The store change is **already committed** while the caller sees an error.
+    Keep non-retryable side effects out of hooks, and return `nil` for
+    best-effort work like logging.
+  </Card>
+</Columns>
+
+Hooks run in registration order, on the caller's goroutine. The first error
+stops the chain.
+
+{/* verify:stdout "event kind=0 actor=alice target= role=\nevent kind=1 actor=alice target=bob role=admin\nevent kind=2 actor=alice target=bob role=member\nCreateOrganization with a failing hook: true\nnothing was left behind: true" */}
+
+## Accumulating hooks
+
+`WithHooks` **appends** rather than replacing, and accumulates across calls —
+unlike `WithPolicy`, which replaces wholesale. Passing it twice registers both
+sets, in order.
+
+## Good uses
+
+<Columns cols={2}>
+  <Card title="Audit trail" icon="scroll">
+    Write the event and return `nil`. Never fail the mutation because the log
+    write failed.
+  </Card>
+  <Card title="Transactional outbox" icon="paper-plane">
+    On `CreateOrganization` only, the hook shares the transaction — so an
+    outbox row written there commits atomically with the container.
+  </Card>
+  <Card title="Cache invalidation" icon="broom">
+    authlayer caches nothing itself, but if you wrapped the `Store` in a cache,
+    this is where you drop keys.
+  </Card>
+  <Card title="Webhooks" icon="satellite-dish">
+    Enqueue, do not deliver. A synchronous HTTP call inside a hook puts a
+    third party's availability on your mutation path.
+  </Card>
+</Columns>
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Managing members" icon="users" href="/authorization/members">
+    The mutations these events describe.
+  </Card>
+  <Card title="Storage" icon="database" href="/storage/overview">
+    Where `WithTx` comes from, and what a backend owes it.
+  </Card>
+</Columns>
