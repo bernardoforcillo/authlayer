@@ -81,6 +81,51 @@ func (s duplicatePendingInvites) CreateEmailInvite(_ context.Context, inv invite
 	return inv, nil
 }
 
+// verbatimCreateEmail stores an invite's address exactly as it was handed
+// in — the shape this package's own backends had before
+// [invite.NormalizeEmail] existed. The uniqueness check underneath still
+// runs and still enforces the (ContainerID, Email) pair; it is just
+// enforcing it on a spelling rather than on a person, which is precisely
+// what lets one container end up holding two live tokens for one human.
+//
+// Its sweep still normalizes, so the only obligation it violates is the
+// write-side half. That keeps "this check failed" evidence about a store
+// that writes addresses verbatim and nothing else.
+type verbatimCreateEmail struct{ *refStore }
+
+func (s verbatimCreateEmail) CreateEmailInvite(_ context.Context, inv invite.EmailInvite) (invite.EmailInvite, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tokenHashTaken(inv.TokenHash) {
+		return invite.EmailInvite{}, errDuplicateTokenHash
+	}
+	if s.pairTaken(inv.ContainerID, inv.Email) {
+		return invite.EmailInvite{}, errDuplicatePair
+	}
+	s.emailInvites[inv.ID] = inv
+	return inv, nil
+}
+
+// verbatimSweepEmail is the other half: it normalizes on the way in, so
+// every stored address is canonical, but matches DeleteEmailInvitesFor's
+// argument byte-exactly. The sweep then misses the row it was meant to clear
+// whenever its caller spells the address differently from the canonical
+// form — which, against a store that does normalize on create, turns the
+// re-invite that follows it into a refused duplicate rather than a
+// replacement.
+type verbatimSweepEmail struct{ *refStore }
+
+func (s verbatimSweepEmail) DeleteEmailInvitesFor(_ context.Context, containerID, email string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, inv := range s.emailInvites {
+		if inv.ContainerID == containerID && inv.Email == email {
+			delete(s.emailInvites, id)
+		}
+	}
+	return nil
+}
+
 // globallyUniqueAddress enforces uniqueness on the ADDRESS alone rather than
 // on the (ContainerID, Email) pair — the over-broad reading of the same
 // constraint, which stops one person being invited to a second container.
@@ -910,6 +955,21 @@ func negativeControls() []negativeControl {
 			defect:   "DeleteEmailInvitesFor sweeps the container, ignoring the address",
 			check:    "DeleteEmailInvitesFor/RemovesOnlyThatPair",
 			newStore: func() invite.Store { return deleteEmailInvitesForIgnoresTheAddress{newRefStore()} },
+		},
+		{
+			defect:   "CreateEmailInvite stores the address verbatim",
+			check:    "CreateEmailInvite/NormalizesTheAddress",
+			newStore: func() invite.Store { return verbatimCreateEmail{newRefStore()} },
+		},
+		{
+			defect:   "CreateEmailInvite stores the address verbatim, so two casings are two live invitations",
+			check:    "CreateEmailInvite/ContainerEmailPairIsUniqueAcrossSpelling",
+			newStore: func() invite.Store { return verbatimCreateEmail{newRefStore()} },
+		},
+		{
+			defect:   "DeleteEmailInvitesFor matches the address byte-exactly",
+			check:    "DeleteEmailInvitesFor/NormalizesTheAddress",
+			newStore: func() invite.Store { return verbatimSweepEmail{newRefStore()} },
 		},
 		{
 			defect:   "DeleteEmailInvitesFor reports a sweep that matched nothing as an error",

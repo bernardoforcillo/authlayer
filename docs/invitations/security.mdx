@@ -210,16 +210,18 @@ _, token, _ := isvc.InviteByEmail(owner, "carol@example.com", org.RoleMember)
 p, err := isvc.PreviewInvite(context.Background(), token)
 fmt.Println("preview:", err, p.Email, p.Valid)
 // Compare p.Email against the authenticated user's own VERIFIED address —
-// auth.UserBase.EmailVerifiedAt — normalizing both first, since invite
-// stores addresses verbatim while auth normalizes them.
+// auth.UserBase.EmailVerifiedAt. A plain == is correct: both sides are the
+// output of the same trim-and-lowercase rule.
 ```
 
 ```
 preview: <nil> carol@example.com true
 ```
 
-See [addresses are stored verbatim](/invitations/email-invites#addresses-are-stored-verbatim)
-for why the normalization step is not optional.
+See [addresses are normalized](/invitations/email-invites#addresses-are-normalized)
+for why that comparison needs no normalization step of your own. It did through
+**v0.1.0**, when `invite` stored addresses verbatim and a raw `==` refused a
+legitimate recipient invited as `Carol@Example.com`.
 
 ## Rechecking the inviter
 
@@ -309,6 +311,6 @@ itself grant access.
     The guard this page keeps reaching for.
   </Card>
   <Card title="Writing your own backend" icon="plug" href="/storage/custom-backends">
-    The seven `invite.Store` MUSTs, as an executable suite.
+    The eight `invite.Store` MUSTs, as an executable suite.
   </Card>
 </Columns>

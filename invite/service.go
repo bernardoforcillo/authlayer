@@ -24,8 +24,18 @@ type Preview struct {
 	ContainerID string
 	// RoleKey is the role that will be granted on acceptance.
 	RoleKey string
-	// Email is the invited address. Empty for a link preview, which admits
-	// whoever presents the code rather than one named recipient.
+	// Email is the invited address, always normalized (see
+	// [NormalizeEmail]) because that is what was stored. Empty for a link
+	// preview, which admits whoever presents the code rather than one named
+	// recipient.
+	//
+	// An application binding an invitation to its recipient compares this
+	// against the accepting user's own VERIFIED address — see [EmailInvite],
+	// "The token is a bearer credential", for why that is the application's
+	// job and not this package's. Both sides of that comparison are
+	// normalized by the same rule (auth.NormalizeEmail is this package's
+	// NormalizeEmail), so a plain == is correct: a recipient invited as
+	// "Bob@Example.com" is not refused for it.
 	Email string
 	// Valid reports whether accepting right now would succeed: the token or
 	// code resolves to a record that is not expired, revoked, or exhausted.
@@ -344,6 +354,16 @@ func (s *Service[C, M, PC, PM]) recheckValid(ctx context.Context, containerID, i
 // so the old token stops resolving the instant the new one is minted, not
 // merely once it later expires.
 //
+// email is normalized ([NormalizeEmail] — trim, lowercase) before either
+// store call, and the stored record carries the normalized form, so
+// "replaces" holds across spelling as well as across an identical string:
+// re-inviting "Erin@Example.com" replaces the pending "erin@example.com"
+// rather than adding a second live token for the same person. A Store is
+// required to normalize too (see [EmailInvite], "Addresses are normalized");
+// this call does not rely on that, because it is what an application
+// actually goes through and the guarantee should not depend on which backend
+// is underneath.
+//
 // The invite always expires — [WithInviteExpiry] sets how long, seven days
 // by default. There is no "never" case for an email invite, unlike a link.
 //
@@ -370,7 +390,9 @@ func (s *Service[C, M, PC, PM]) InviteByEmail(ctx context.Context, email, roleKe
 		return EmailInvite{}, "", err
 	}
 
-	if err := s.st.DeleteEmailInvitesFor(ctx, containerID, email); err != nil {
+	normalized := NormalizeEmail(email)
+
+	if err := s.st.DeleteEmailInvitesFor(ctx, containerID, normalized); err != nil {
 		return EmailInvite{}, "", err
 	}
 
@@ -379,7 +401,7 @@ func (s *Service[C, M, PC, PM]) InviteByEmail(ctx context.Context, email, roleKe
 	stored, err := s.st.CreateEmailInvite(ctx, EmailInvite{
 		ID:          uid.NewV7(),
 		ContainerID: containerID,
-		Email:       email,
+		Email:       normalized,
 		RoleKey:     roleKey,
 		TokenHash:   hashToken(plain),
 		InvitedBy:   actor,

@@ -13,15 +13,17 @@
 // [github.com/bernardoforcillo/authlayer/invite/invitetest] is [Store]'s
 // contract as an executable suite —
 // invitetest.RunStoreContract(t, newStore) — covering every obligation
-// stated here, the three uniqueness MUSTs and [Store.ConsumeLink]'s
-// single-winner atomicity included. Both shipped backends run it; a
-// third-party one should too.
+// stated here, the three uniqueness MUSTs, the address-normalization MUST
+// and [Store.ConsumeLink]'s single-winner atomicity included. Both shipped
+// backends run it; a third-party one should too.
 package invite
 
 import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/bernardoforcillo/authlayer/internal/emailnorm"
 )
 
 // EmailInvite is a one-time invitation delivered by email.
@@ -46,7 +48,10 @@ import (
 // Email against the authenticated user's own verified address
 // (auth.UserBase.EmailVerifiedAt, if that is where the account lives), using
 // [Service.PreviewInvite] to read the invited address out of a token without
-// consuming it.
+// consuming it. A plain == is the right comparison there: both sides are
+// normalized by the same rule — see "Addresses are normalized" below and
+// [NormalizeEmail] — so a recipient invited as "Bob@Example.com" is admitted
+// rather than refused for the spelling.
 //
 // Only TokenHash is stored — never the plain token. The token is emailed once
 // and never redisplayed to anyone, including the inviter, so persisting just
@@ -79,15 +84,45 @@ import (
 // It is a constraint on the PAIR, not on the address: one person invited to
 // two different containers is two legitimate rows, and enforcing uniqueness on
 // Email alone would break the ordinary case.
+//
+// # Addresses are normalized
+//
+// An implementation MUST apply [NormalizeEmail] to every address it writes or
+// matches: CreateEmailInvite stores — and returns — the normalized form of
+// inv.Email, and [Store.DeleteEmailInvitesFor] normalizes its email argument
+// before matching. That is what makes the pair constraint above a constraint
+// on a PERSON rather than on a spelling.
+//
+// It is not a tidiness rule. Without it, uniqueness is byte-exact:
+// "erin@example.com" and "Erin@Example.com" are two DIFFERENT pairs, so both
+// writes succeed, both tokens are live, and the sweep a re-invite performs
+// first matches only the spelling it was handed. The container then holds two
+// redeemable invitations for one human, and revoking the one an admin
+// recognises on a pending-invitations screen leaves the other redeemable at
+// the invited role — the exact outcome the pair constraint exists to prevent,
+// reached with no concurrency at all. This package therefore normalizes on
+// the same both-sides discipline
+// [github.com/bernardoforcillo/authlayer/auth] applies to a user's address,
+// and for the same reason: an application must not have to remember which
+// half of this library folds case and which does not.
+//
+// [Service.InviteByEmail] normalizes too, before it calls either method, so
+// an application going through the service is covered whether or not its
+// backend complies. A Store is still required to do it: a Store is reachable
+// directly, and the constraint this guards lives there rather than in the
+// service.
 type EmailInvite struct {
 	// ID is the record's surrogate key, stamped by the service.
 	ID string `drop:"id"`
 	// ContainerID is the scope the invitee is admitted to on acceptance. It
 	// is half of the uniqueness obligation the type doc states; see there.
 	ContainerID string `drop:"container_id"`
-	// Email is the address the token was sent to. Delivery hint and audit
-	// record only — acceptance never checks it. See the type doc, which also
-	// states the (ContainerID, Email) uniqueness an implementation owes.
+	// Email is the address the token was sent to, always the output of
+	// [NormalizeEmail] — see that function's doc, and "Addresses are
+	// normalized" on the type. Delivery hint and audit record only:
+	// acceptance never checks it. The type doc also states the
+	// (ContainerID, Email) uniqueness an implementation owes, which the
+	// normalization is what makes meaningful.
 	Email string `drop:"email"`
 	// RoleKey is the role the invitee holds once admitted.
 	RoleKey string `drop:"role_key"`
@@ -171,6 +206,34 @@ type Link struct {
 	CreatedAt time.Time `drop:"created_at"`
 }
 
+// NormalizeEmail trims leading and trailing whitespace and lowercases s.
+//
+// Every path that writes or matches an [EmailInvite]'s address applies it:
+// [Service.InviteByEmail] before it touches the Store at all, and — per
+// [EmailInvite]'s "Addresses are normalized" — [Store.CreateEmailInvite] and
+// [Store.DeleteEmailInvitesFor] inside any compliant backend. So
+// "Erin@Example.com", " erin@example.com" and "erin@example.com" are one
+// invitation to one person, not three: none of them can slip past the
+// (ContainerID, Email) constraint by varying only case or surrounding
+// whitespace, and re-inviting any spelling replaces whichever of them is
+// pending.
+//
+// It is byte-for-byte
+// [github.com/bernardoforcillo/authlayer/auth.NormalizeEmail], and shares one
+// implementation with it so the two cannot drift. They are two functions
+// rather than one because this package takes no dependency on auth — see the
+// package doc, where that is a security argument and not an accident. Which
+// one an application calls does not matter; that is the point of them being
+// the same. Both are exported so a caller doing its own comparison — binding
+// an invitation to its recipient by checking [Preview.Email] against a
+// verified auth.UserBase.Email, say — folds case the same way this library
+// does. Since both sides of that comparison are now already normalized, such
+// a comparison is a plain ==; the functions are there for addresses that come
+// from somewhere else.
+func NormalizeEmail(s string) string {
+	return emailnorm.Normalize(s)
+}
+
 // Sentinel errors returned by an invite.Store implementation and consumed by
 // the service layer built on top. Compare with [errors.Is], never by string —
 // the messages are not part of the API.
@@ -231,10 +294,11 @@ var (
 // keys to read by.
 //
 // Four of its methods carry a normative MUST — CreateEmailInvite,
-// DeleteEmailInvite, CreateLink and ConsumeLink — and three more are stated
+// DeleteEmailInvite, CreateLink and ConsumeLink — and four more are stated
 // on the record types instead, because they constrain the shape of the table
-// rather than the behaviour of one call: [EmailInvite]'s TokenHash and its
-// (ContainerID, Email) pair, and [Link]'s Code. Every one of the seven is
+// rather than the behaviour of one call: [EmailInvite]'s TokenHash, its
+// (ContainerID, Email) pair and the normalized form its Email column may
+// hold, and [Link]'s Code. Every one of the eight is
 // exercised by
 // [github.com/bernardoforcillo/authlayer/invite/invitetest], which is this
 // interface's contract as runnable code; run it against a backend rather than
@@ -242,7 +306,17 @@ var (
 type Store interface {
 	// CreateEmailInvite persists an already-stamped invite and returns what
 	// was stored. It stamps nothing of its own and drops nothing it was
-	// given.
+	// given; the one field it may change is Email, and only by normalizing
+	// it.
+	//
+	// inv.Email is normalized (see [NormalizeEmail]) before the uniqueness
+	// check and the write, so the caller need not normalize it first, though
+	// doing so is harmless — [Service.InviteByEmail] does. The returned
+	// record carries the normalized form, not the spelling passed in: it is
+	// what was stored, and every read path returns it too. See
+	// [EmailInvite]'s "Addresses are normalized" for why a backend that
+	// skips this leaves two live invitations for one person behind a screen
+	// showing what looks like two unrelated rows.
 	//
 	// It MUST refuse a write that would break either uniqueness obligation
 	// [EmailInvite] states — a TokenHash another row already holds, or a
@@ -298,6 +372,13 @@ type Store interface {
 	// address. Deleting zero rows is not an error — the service calls it
 	// unconditionally, including for the first invitation an address ever
 	// gets.
+	//
+	// email is normalized (see [NormalizeEmail]) before anything is matched,
+	// the read-side half of the obligation CreateEmailInvite carries on the
+	// write side. A sweep that matched byte-exactly would leave a pending
+	// "Erin@Example.com" untouched while the re-invite it precedes writes
+	// "erin@example.com", which is precisely the duplicate the whole
+	// sequence exists to avoid.
 	//
 	// [EmailInvite]'s (ContainerID, Email) uniqueness means there is at most
 	// one such row to begin with; the method is still specified as a sweep,

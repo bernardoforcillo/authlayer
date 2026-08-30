@@ -101,8 +101,9 @@ package auth
 import (
 	"context"
 	"errors"
-	"strings"
 	"time"
+
+	"github.com/bernardoforcillo/authlayer/internal/emailnorm"
 )
 
 // UserBase carries the identity and credential fields authentication needs.
@@ -311,8 +312,16 @@ type Verification struct {
 // to the exact same row: none of them can create a duplicate account, and
 // none of them can slip past a uniqueness check by varying only case or
 // surrounding whitespace.
+//
+// [github.com/bernardoforcillo/authlayer/invite.NormalizeEmail] is the same
+// rule, applied by that package to an [invite.EmailInvite]'s address on the
+// same both-sides discipline. The two are deliberately identical and share
+// one implementation, because binding an invitation to its recipient means
+// comparing an address invite stored against an address auth stored; they
+// are two functions rather than one only because invite takes no dependency
+// on this package (see its own package doc for why).
 func NormalizeEmail(s string) string {
-	return strings.ToLower(strings.TrimSpace(s))
+	return emailnorm.Normalize(s)
 }
 
 // Sentinel errors returned by an auth.Store implementation and consumed by

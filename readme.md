@@ -584,7 +584,7 @@ All of them are written on the port as requirements with their consequences
 spelled out, because they constrain any third-party backend as much as the
 two shipped ones — see [Authentication](#enumeration-safe-sign-up).
 
-`invite.Store` carries seven **MUST**s of its own, and they are all about the
+`invite.Store` carries eight **MUST**s of its own, and they are all about the
 same thing: bounding *who gets in*. **Four are on methods.** `ConsumeLink`
 must make its check and its increment one atomic step, or a `MaxUses: 1` link
 admits everyone who clicks it at once. `DeleteEmailInvite` must be
@@ -594,10 +594,11 @@ second precisely so it is the only thing that has to hold. And
 `CreateEmailInvite` and `CreateLink` must refuse a write that would break a
 uniqueness constraint, atomically with performing it.
 
-**Three more are on the record types**, because they constrain the shape of
+**Four more are on the record types**, because they constrain the shape of
 the table rather than the behaviour of one call: `EmailInvite.TokenHash`,
 `Link.Code`, and `EmailInvite`'s `(ContainerID, Email)` pair — `UNIQUE`
-constraints in a SQL backend. The first two defeat the single-winner
+constraints in a SQL backend — plus the normalized form `EmailInvite.Email`
+may hold. The first two defeat the single-winner
 properties above *with no atomicity defect at all*: two rows sharing a `Code`
 means two concurrent redeemers resolve **different** rows through
 `FindLinkByCode` and each atomically wins `ConsumeLink` on the row it picked,
@@ -608,6 +609,22 @@ when two such calls race — without it a container holds two live tokens where
 its pending-invitations screen shows one row, and revoking the visible one
 leaves the other redeemable. It is a constraint on the *pair*: the same person
 invited to two containers is two legitimate rows.
+
+The fourth is what makes the third mean anything. A store must apply
+`invite.NormalizeEmail` (trim, lowercase — byte for byte `auth.NormalizeEmail`)
+to every address it writes or matches: `CreateEmailInvite` before the
+uniqueness check and the write, `DeleteEmailInvitesFor` before it matches.
+Without that the pair constraint is byte-exact, so `erin@example.com` and
+`Erin@Example.com` are two *different* pairs — both writes succeed, both tokens
+are live, and the sweep the re-invite performs first matches only the spelling
+it was handed. That is the same incomplete pending-invitations screen and the
+same surviving token as above, reached with no concurrency at all.
+`invite.Service.InviteByEmail` normalizes too, before either store call, so an
+application going through the service is covered whatever its backend does; the
+obligation is still on the port, because a store is reachable directly and the
+constraint it guards lives there. `invite` normalized nothing at all through
+v0.1.0 — see the changelog for the one-time data migration a database written
+by that version needs.
 
 ### `store/memory`
 
@@ -620,9 +637,10 @@ and `auth.Store` counterparts. The auth one enforces every uniqueness
 constraint its port describes — one account per normalized email, no id
 collision on any `Create*`, and the `token_hash` uniqueness `auth.Store`
 requires of a backend on both `Session` and `Verification`, reported as
-`memory.ErrTokenHashTaken`. The invite one enforces all three of its port's:
-`EmailInvite.TokenHash` (also `memory.ErrTokenHashTaken` — same column
-meaning, same failure), `(ContainerID, Email)` as
+`memory.ErrTokenHashTaken`. The invite one enforces all three of its port's uniqueness constraints, and
+normalizes addresses on both sides so the pair one bites on a person rather
+than on a spelling: `EmailInvite.TokenHash` (also `memory.ErrTokenHashTaken` —
+same column meaning, same failure), `(ContainerID, Email)` as
 `memory.ErrInviteEmailTaken`, and `Link.Code` as `memory.ErrLinkCodeTaken`.
 
 Both used to defer those to `store/drops`, which has always had them as
@@ -869,7 +887,7 @@ worthless, and that is not visible without controls.
 
 ### Writing your own `invite.Store`
 
-`invite.Store`'s seven **MUST**s — four on methods, three on the record types
+`invite.Store`'s eight **MUST**s — four on methods, four on the record types
 — are listed in [Storage](#storage) above, along with what each one costs when
 it is violated. They ship as an executable suite too, built the same way and
 placed the same way:
@@ -894,7 +912,7 @@ raise your pool limits and warm it to `invitetest.RaceGoroutines` connections
 first: goroutines that trickle in across a connection-setup window never
 actually contend, which silently weakens every race in the suite.
 
-Eight of the forty-three checks are races, because the obligations behind them
+Eight of the forty-six checks are races, because the obligations behind them
 are unreachable sequentially: `ConsumeLink`'s single winner against a
 `MaxUses: 1` link, its ceiling against a `MaxUses: 4` one, and the lost update
 its increment must not have on an unlimited one; `DeleteEmailInvite`'s
@@ -927,11 +945,11 @@ loses increments — N callers each read the same `UseCount` and each write
 `read+1` — so the stored count comes back far below N whatever the timing. Run
 all three; none of them proves the mechanism.
 
-The suite's own tests include thirty-two deliberately non-compliant stores —
+The suite's own tests include thirty-four deliberately non-compliant stores —
 one whose `ConsumeLink` decides under one lock and increments under a second,
 one that lets two links share a code, one that reads `MaxUses: 0` as exhausted
-rather than unlimited, one that reads a nil `ExpiresAt` as a zero time —
-paired into forty-four defect/check cases, each asserted to **fail** the check
+rather than unlimited, one that stores an invited address verbatim — paired
+into forty-seven defect/check cases, each asserted to **fail** the check
 that covers it. A further test fails if a check is ever added without a control,
 so a check that asserts nothing cannot slip in green.
 
@@ -1106,6 +1124,19 @@ from `MaxUses`, `ExpiresAt` and revocation rather than secrecy of storage,
 which is why `Store.ConsumeLink` must weigh all three atomically before
 admitting anyone.
 
+**Addresses are normalized.** `InviteByEmail` passes the address through
+`invite.NormalizeEmail` (trim, lowercase) before either store call, and a
+compliant backend applies it again on the write and on `DeleteEmailInvitesFor`'s
+argument. So `(ContainerID, Email)` uniqueness — and with it "re-inviting an
+address replaces rather than duplicates" — is a constraint on a *person*, not on
+a spelling: `erin@example.com` and `Erin@Example.com` are one pending
+invitation, and `EmailInvite.Email`, `Preview.Email` and `ListInvites` all hand
+back the normalized form. It is the same rule `auth` applies, deliberately, so a
+caller never has to remember which half of this library folds case. Through
+v0.1.0 `invite` normalized nothing, and two casings of one address were two
+live tokens where revoking the one an admin recognised left the other
+redeemable.
+
 **Delivery is your job.** `InviteByEmail` returns the plain token exactly
 once, alongside the stored record; authlayer knows no base URL and owns no
 transport, so turning that into an actual email — which link, which template,
@@ -1199,7 +1230,12 @@ application needs the invitation bound to its recipient, enforce it yourself
 before calling `AcceptInvite` — `PreviewInvite` reads the invited address out
 of a token without consuming it, so compare that against the authenticated
 user's own verified address (`auth.UserBase.EmailVerifiedAt`, if that is where
-your accounts live).
+your accounts live). A plain `==` is the right comparison: `Preview.Email` and
+`auth.UserBase.Email` are both the output of the same trim-and-lowercase rule
+(`invite.NormalizeEmail` *is* `auth.NormalizeEmail`), so nobody is refused for
+having been invited as `Bob@Example.com`. That was not true through v0.1.0,
+when `invite` stored addresses verbatim and this advice, followed literally,
+turned away legitimate recipients.
 
 **An existing member is idempotent, but not symmetrically.** If the ctx
 subject already has standing in the link's container, `JoinViaLink` returns
