@@ -68,6 +68,16 @@
           "authentication/rate-limiting",
           "authentication/wiring"
         ]
+      },
+      {
+        "group": "Invitations",
+        "icon": "envelope-open-text",
+        "pages": [
+          "invitations/overview",
+          "invitations/email-invites",
+          "invitations/links",
+          "invitations/security"
+        ]
       }
     ],
     "global": {
