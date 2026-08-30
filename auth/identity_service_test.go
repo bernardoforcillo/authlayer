@@ -785,6 +785,151 @@ func TestSignInWithLinkAlwaysDoesNotVerifyTheLocalAccount(t *testing.T) {
 	}
 }
 
+// --- the assertion itself must be well formed ------------------------------
+
+// blankIdentityCases enumerates every way ExternalIdentity.Provider or
+// .Subject can be blank. Whitespace-only is in here because nothing in this
+// package trims either field — they are matched byte-for-byte — so "   " is
+// not merely ugly input, it is a distinct key that would collide with the
+// next caller who sends the same spaces.
+var blankIdentityCases = []struct {
+	name              string
+	provider, subject string
+}{
+	{"provider empty", "", "sub-1"},
+	{"provider whitespace", "  \t ", "sub-1"},
+	{"subject empty", "google", ""},
+	{"subject whitespace", "google", " \n"},
+	{"both empty", "", ""},
+	{"both whitespace", " ", "\t"},
+}
+
+// TestSignInWithRejectsABlankProviderOrSubject pins the enforcement of
+// ExternalIdentity's "both are required", which the doc promised and nothing
+// used to check.
+//
+// A blank subject is not a harmless empty string. Provider and Subject are
+// the account key, so an empty subject is a key every caller who sends one
+// SHARES: the first blank-subject sign-in at a provider provisions an
+// account and links a row to it, and the second resolves that same row on
+// rung 1 and is signed in as the first caller's user. The only thing that
+// ever stood in the way was the store's (provider, subject) uniqueness,
+// which does not prevent that at all — it converts the SECOND link attempt
+// into ErrIdentityLinked about an account the caller never named, which is a
+// baffling answer to a caller-side input mistake.
+//
+// So the refusal must come first, and must write nothing: no user, no
+// identity row, no session.
+func TestSignInWithRejectsABlankProviderOrSubject(t *testing.T) {
+	for _, tc := range blankIdentityCases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, store, ids := newOAuthService(t)
+			ctx := context.Background()
+
+			res, err := svc.SignInWith(ctx, signInReq(auth.ExternalIdentity{
+				Provider:      tc.provider,
+				Subject:       tc.subject,
+				Email:         "blank@example.com",
+				EmailVerified: true,
+			}))
+			if !errors.Is(err, auth.ErrProviderSubjectRequired) {
+				t.Fatalf("SignInWith err = %v, want ErrProviderSubjectRequired", err)
+			}
+			assertNoTokens(t, res)
+			assertNoIdentityRow(t, ids, tc.provider, tc.subject)
+			// The address is well formed, so without the check the ladder
+			// would have provisioned an account on it — the refusal has to
+			// beat rung 2, not merely exist.
+			if _, err := store.FindUserByEmail(ctx, "blank@example.com"); !errors.Is(err, auth.ErrUserNotFound) {
+				t.Fatalf("FindUserByEmail err = %v, want ErrUserNotFound — a malformed assertion must not provision an account", err)
+			}
+		})
+	}
+}
+
+// TestLinkIdentityRejectsABlankProviderOrSubject is the same rule on the
+// other entry point. Enforcing it in only one of the two would be worse than
+// the original gap: an application would learn the rule from whichever path
+// it happened to exercise first and be ambushed by the other, and
+// LinkIdentity is precisely the path that writes a row with no sign-in
+// behind it.
+//
+// The user here is real, so ErrUserNotFound cannot stand in for the refusal:
+// the only thing that can produce ErrProviderSubjectRequired is the check.
+func TestLinkIdentityRejectsABlankProviderOrSubject(t *testing.T) {
+	for _, tc := range blankIdentityCases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, ids := newOAuthService(t)
+			ctx := context.Background()
+			user := signUpVerified(t, svc, "linker@example.com", validPassword)
+
+			got, err := svc.LinkIdentity(ctx, user.ID, auth.ExternalIdentity{
+				Provider:      tc.provider,
+				Subject:       tc.subject,
+				Email:         "linker@example.com",
+				EmailVerified: true,
+			})
+			if !errors.Is(err, auth.ErrProviderSubjectRequired) {
+				t.Fatalf("LinkIdentity err = %v, want ErrProviderSubjectRequired", err)
+			}
+			if got.ID != "" {
+				t.Fatalf("LinkIdentity returned %+v alongside its error, want the zero Identity", got)
+			}
+			assertNoIdentityRow(t, ids, tc.provider, tc.subject)
+			if list := identitiesOf(t, ids, user.ID); len(list) != 0 {
+				t.Fatalf("user has %d identities after the refusal, want 0", len(list))
+			}
+		})
+	}
+}
+
+// TestBlankProviderSubjectIsRefusedBeforeTheStoreIsTouched proves the two
+// checks above are not merely producing the right sentinel by accident, from
+// somewhere downstream: neither entry point may read or write ANYTHING
+// first. The store double fails every call it receives, so any store contact
+// surfaces as its own error instead of the refusal.
+func TestBlankProviderSubjectIsRefusedBeforeTheStoreIsTouched(t *testing.T) {
+	svc, _, _ := newOAuthService(t, auth.WithIdentityStore(explodingIdentityStore{}))
+	ctx := context.Background()
+	blank := auth.ExternalIdentity{Provider: "google", Subject: "  "}
+
+	if _, err := svc.SignInWith(ctx, signInReq(blank)); !errors.Is(err, auth.ErrProviderSubjectRequired) {
+		t.Fatalf("SignInWith err = %v, want ErrProviderSubjectRequired with no store contact", err)
+	}
+	// LinkIdentity reads the USER before it reaches the identity store, so a
+	// nonexistent id is what proves the refusal beat that read too: without
+	// the check this would be ErrUserNotFound.
+	if _, err := svc.LinkIdentity(ctx, "no-such-user", blank); !errors.Is(err, auth.ErrProviderSubjectRequired) {
+		t.Fatalf("LinkIdentity err = %v, want ErrProviderSubjectRequired with no store contact", err)
+	}
+}
+
+// explodingIdentityStore fails every method. Embedding the interface rather
+// than implementing it means a method added to the port later still compiles
+// here and still panics if reached, which is the correct outcome for a
+// double whose whole purpose is "must not be called".
+type explodingIdentityStore struct{ auth.IdentityStore }
+
+func (explodingIdentityStore) CreateIdentity(context.Context, auth.Identity) (auth.Identity, error) {
+	return auth.Identity{}, errIdentityBoom
+}
+
+func (explodingIdentityStore) FindIdentityByProviderSubject(context.Context, string, string) (auth.Identity, error) {
+	return auth.Identity{}, errIdentityBoom
+}
+
+func (explodingIdentityStore) ListIdentitiesByUser(context.Context, string) ([]auth.Identity, error) {
+	return nil, errIdentityBoom
+}
+
+func (explodingIdentityStore) TouchIdentity(context.Context, string, time.Time) error {
+	return errIdentityBoom
+}
+
+func (explodingIdentityStore) DeleteIdentityIfNotLast(context.Context, string, string, bool) error {
+	return errIdentityBoom
+}
+
 // --- rung 2: resolving the address -----------------------------------------
 
 // TestSignInWithRequiresAnEmail pins ErrEmailRequired and, more importantly,

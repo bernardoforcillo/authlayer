@@ -112,6 +112,11 @@ type ExternalIdentity struct {
 	// [Identity.Provider] and [Identity.Subject]. Both are required: a
 	// blank Subject would make every account at that provider collide on
 	// the same key.
+	//
+	// "Required" is enforced, not merely stated. [Service.SignInWith] and
+	// [Service.LinkIdentity] — the only two entry points that accept an
+	// ExternalIdentity — refuse a blank or whitespace-only value in either
+	// field with [ErrProviderSubjectRequired], before touching any store.
 	Provider, Subject string
 	// Email is the address the provider asserted, which may be empty
 	// (GitHub with a private address is the usual case) — see
@@ -252,6 +257,30 @@ var (
 	// to two local users — see [Identity.Subject]'s uniqueness MUST for
 	// what breaks otherwise.
 	ErrIdentityLinked = errors.New("authlayer/auth: external identity already linked to an account")
+	// ErrProviderSubjectRequired: an [ExternalIdentity] arrived with a blank
+	// — empty, or nothing but whitespace — Provider or Subject. Returned by
+	// [Service.SignInWith] and [Service.LinkIdentity], before either of them
+	// reads or writes anything.
+	//
+	// Both fields are required, [ExternalIdentity.Provider] and
+	// [ExternalIdentity.Subject] say so, and this is what makes that
+	// documented requirement true rather than advisory. Neither value is
+	// normalized or trimmed anywhere in this package — they are matched
+	// byte-for-byte, per [Identity.Subject] — so the check REJECTS a
+	// whitespace-only value rather than quietly folding it to empty,
+	// matching how [Service.RequestEmailChange] treats an address that
+	// normalizes away to nothing.
+	//
+	// A blank Subject is not a harmless no-op. It is a key that every
+	// account at that provider collides on: the first such call links a row
+	// which any later blank-subject sign-in at the same provider then
+	// resolves to — one caller signed in as another — and the only thing
+	// standing in the way is the (Provider, Subject) uniqueness constraint,
+	// which downgrades the second call from that takeover to an
+	// [ErrIdentityLinked] naming an account the caller never mentioned.
+	// Takeover and a baffling conflict are both the wrong answer to what is
+	// simply a malformed request, so it is refused as one.
+	ErrProviderSubjectRequired = errors.New("authlayer/auth: external identity requires a provider and a subject")
 	// ErrLinkRequiresVerification: an external sign-in resolved to an
 	// existing local account by email address, but the configured [Linking]
 	// policy refused to link them — see [LinkVerified] and [LinkNever].

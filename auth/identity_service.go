@@ -3,7 +3,31 @@ package auth
 import (
 	"context"
 	"errors"
+	"strings"
 )
+
+// requireProviderSubject rejects an [ExternalIdentity] whose Provider or
+// Subject is blank — empty, or nothing but whitespace — with
+// [ErrProviderSubjectRequired].
+//
+// It is one function called from both [Service.SignInWith] and
+// [Service.LinkIdentity] rather than two inline checks, because those are
+// the only two entry points that accept an ExternalIdentity and enforcing
+// the rule in one of them would be worse than not enforcing it at all: an
+// application would learn the rule from whichever path it exercised first
+// and be ambushed by the other. See [ErrProviderSubjectRequired] for what a
+// blank Subject actually does once it reaches a store.
+//
+// It trims only to TEST the value, never to rewrite it. Provider and Subject
+// are matched byte-for-byte everywhere in this package (see
+// [Identity.Subject]), so storing a trimmed value would create a link that
+// no later sign-in with the caller's own, untrimmed input could resolve.
+func requireProviderSubject(ext ExternalIdentity) error {
+	if strings.TrimSpace(ext.Provider) == "" || strings.TrimSpace(ext.Subject) == "" {
+		return ErrProviderSubjectRequired
+	}
+	return nil
+}
 
 // SignInWith signs a user in from an external provider's assertion, and is
 // the only method in this package that can create an account without a
@@ -13,7 +37,10 @@ import (
 // no provider token is stored).
 //
 // It requires [WithIdentityStore]; without it every call fails with
-// [ErrOAuthNotConfigured] before anything is read or written.
+// [ErrOAuthNotConfigured] before anything is read or written. A blank — or
+// whitespace-only — Identity.Provider or Identity.Subject is refused the
+// same way, with [ErrProviderSubjectRequired]: see that sentinel for why an
+// empty subject is a shared key rather than a value that simply misses.
 //
 // # The resolution ladder
 //
@@ -183,6 +210,14 @@ func (s *Service) SignInWith(ctx context.Context, req SignInRequest) (SignInResu
 	}
 
 	ext := req.Identity
+
+	// A malformed assertion is refused before any store is touched — see
+	// [ErrProviderSubjectRequired]. This is above rung 1 rather than folded
+	// into it because a blank subject does not MISS the lookup, it matches
+	// whatever earlier blank-subject row exists at that provider.
+	if err := requireProviderSubject(ext); err != nil {
+		return zero, err
+	}
 
 	// Rung 1 — the (provider, subject) pair. See "Why the subject rung
 	// comes first": this must stay above the address resolution below.
@@ -377,6 +412,10 @@ func (s *Service) mayLink(providerVerified bool, u UserBase) bool {
 //     re-pointed. Re-pointing would let anyone able to authenticate as
 //     themselves claim a subject that then signs in as the victim, which is
 //     the same end state as forging the victim's password.
+//   - ext.Provider or ext.Subject is blank, or nothing but whitespace:
+//     [ErrProviderSubjectRequired], before the account is even read. See
+//     that sentinel for why a blank subject is a takeover key rather than a
+//     harmless empty string.
 //   - userID names no account: [ErrUserNotFound]. The account is read before
 //     the link is written, so a row is never left dangling — pointing at a
 //     user that does not exist, occupying a (Provider, Subject) pair nobody
@@ -419,6 +458,14 @@ func (s *Service) LinkIdentity(ctx context.Context, userID string, ext ExternalI
 
 	identities, err := s.identities()
 	if err != nil {
+		return zero, err
+	}
+
+	// A malformed assertion is refused before any store is touched — see
+	// [ErrProviderSubjectRequired] — and therefore before the user read
+	// below, so a blank subject cannot be answered with ErrUserNotFound
+	// instead of the input error it actually is.
+	if err := requireProviderSubject(ext); err != nil {
 		return zero, err
 	}
 
