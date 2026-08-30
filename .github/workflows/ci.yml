@@ -124,7 +124,7 @@ jobs:
       - name: test (race)
         run: go test -race ./... -count=1
 
-      # The readme's own Checks list ends with these two, and they are the
+      # The readme's own Checks list ends with these three, and they are the
       # only thing that proves the documented entry points still run rather
       # than merely still compile. Output is discarded; a non-zero exit is
       # the signal.
@@ -132,6 +132,7 @@ jobs:
         run: |
           go run ./examples/basic > /dev/null
           go run ./examples/auth > /dev/null
+          go run ./examples/reset > /dev/null
 
       # The lane where several of this project's Criticals were actually
       # found. A CI that stops before it would not protect the thing that
