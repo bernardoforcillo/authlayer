@@ -548,6 +548,99 @@ func TestUpdateUserEmailConcurrentSameAddressExactlyOneWinner(t *testing.T) {
 	}
 }
 
+// --- DeleteUser ---
+
+// TestDeleteUserRemovesTheRowOnly pins auth.Store.DeleteUser's "the user row
+// ONLY" against this store specifically: the user goes, its address becomes
+// available to a new sign-up, and its sessions and verifications are still
+// there — this store declares no cascade, and the caller is what sequences
+// the sweeps.
+func TestDeleteUserRemovesTheRowOnly(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user1", Email: "gone@example.com", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user2", Email: "stays@example.com", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if _, err := st.CreateSession(ctx, auth.Session{ID: "sess1", UserID: "user1", FamilyID: "fam1", TokenHash: "hash1"}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := st.CreateVerification(ctx, auth.Verification{ID: "ver1", UserID: "user1", Purpose: "signup", TokenHash: "vhash1"}); err != nil {
+		t.Fatalf("CreateVerification: %v", err)
+	}
+
+	if err := st.DeleteUser(ctx, "user1"); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+
+	if _, err := st.FindUserByID(ctx, "user1"); !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("FindUserByID(the deleted user) err = %v, want ErrUserNotFound", err)
+	}
+	if _, err := st.FindUserByID(ctx, "user2"); err != nil {
+		t.Fatalf("the other user should have survived, got err = %v", err)
+	}
+	if _, err := st.FindSessionByHash(ctx, "hash1"); err != nil {
+		t.Fatalf("the deleted user's session should have survived, got err = %v — DeleteUser removes the user row only", err)
+	}
+	if _, err := st.FindVerificationByHash(ctx, "vhash1"); err != nil {
+		t.Fatalf("the deleted user's verification should have survived, got err = %v — DeleteUser removes the user row only", err)
+	}
+
+	if _, err := st.CreateUser(ctx, auth.UserBase{ID: "user3", Email: "gone@example.com", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("CreateUser reusing the deleted account's address: %v — hard deletion gives the address back", err)
+	}
+}
+
+func TestDeleteUserNotFound(t *testing.T) {
+	st := newAuthStore()
+	if err := st.DeleteUser(context.Background(), "nonesuch"); !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("DeleteUser(unknown id) err = %v, want ErrUserNotFound", err)
+	}
+}
+
+// TestDeletedAtRoundTrips pins that this store keeps auth.UserBase.DeletedAt
+// as it was handed it, in both states. No Store method writes the field, so
+// CreateUser is the only way in and Find* the only way back out; a store
+// that dropped it would report every anonymized account as a live one.
+func TestDeletedAtRoundTrips(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	fresh, err := st.CreateUser(ctx, auth.UserBase{ID: "user1", Email: "live@example.com", CreatedAt: now, UpdatedAt: now})
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	if fresh.DeletedAt != nil {
+		t.Fatalf("a fresh user came back with DeletedAt = %v, want nil", fresh.DeletedAt)
+	}
+
+	stamped := now.Add(time.Minute)
+	if _, err := st.CreateUser(ctx, auth.UserBase{
+		ID: "user2", Email: "anon@example.com", CreatedAt: now, UpdatedAt: now, DeletedAt: &stamped,
+	}); err != nil {
+		t.Fatalf("CreateUser with DeletedAt set: %v", err)
+	}
+	got, err := st.FindUserByID(ctx, "user2")
+	if err != nil {
+		t.Fatalf("FindUserByID: %v", err)
+	}
+	if got.DeletedAt == nil || !got.DeletedAt.Equal(stamped) {
+		t.Fatalf("DeletedAt = %v, want %v", got.DeletedAt, stamped)
+	}
+	byEmail, err := st.FindUserByEmail(ctx, "anon@example.com")
+	if err != nil {
+		t.Fatalf("FindUserByEmail: %v", err)
+	}
+	if byEmail.DeletedAt == nil || !byEmail.DeletedAt.Equal(stamped) {
+		t.Fatalf("FindUserByEmail DeletedAt = %v, want %v", byEmail.DeletedAt, stamped)
+	}
+}
+
 // --- Sessions ---
 
 func TestCreateAndFindSessionByHash(t *testing.T) {
@@ -704,6 +797,55 @@ func TestDeleteSessionsByFamilyNoMatchesIsNotError(t *testing.T) {
 	st := newAuthStore()
 	if err := st.DeleteSessionsByFamily(context.Background(), "nonesuch"); err != nil {
 		t.Fatalf("DeleteSessionsByFamily: %v", err)
+	}
+}
+
+// TestDeleteSessionsByUserRemovesEveryFamilyOfThatUser pins the difference
+// between this sweep and DeleteSessionsByFamily beside it: three families
+// belonging to one user, all revoked by one call, with another user's
+// session left alone. A single-family fixture would pass against an
+// implementation that revokes only the first family it finds — the exact
+// defect authtest's own negative control for this method injects.
+func TestDeleteSessionsByUserRemovesEveryFamilyOfThatUser(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	for _, sess := range []auth.Session{
+		{ID: "sess1", UserID: "user1", FamilyID: "fam1", TokenHash: "hash1"},
+		{ID: "sess2", UserID: "user1", FamilyID: "fam1", TokenHash: "hash2"},
+		{ID: "sess3", UserID: "user1", FamilyID: "fam2", TokenHash: "hash3"},
+		{ID: "sess4", UserID: "user1", FamilyID: "fam3", TokenHash: "hash4"},
+		{ID: "sess5", UserID: "user2", FamilyID: "fam4", TokenHash: "hash5"},
+	} {
+		if _, err := st.CreateSession(ctx, sess); err != nil {
+			t.Fatalf("CreateSession(%s): %v", sess.ID, err)
+		}
+	}
+
+	if err := st.DeleteSessionsByUser(ctx, "user1"); err != nil {
+		t.Fatalf("DeleteSessionsByUser: %v", err)
+	}
+
+	for _, hash := range []string{"hash1", "hash2", "hash3", "hash4"} {
+		if _, err := st.FindSessionByHash(ctx, hash); !errors.Is(err, auth.ErrSessionNotFound) {
+			t.Fatalf("user1 session %s survived DeleteSessionsByUser: err = %v", hash, err)
+		}
+	}
+	if _, err := st.FindSessionByHash(ctx, "hash5"); err != nil {
+		t.Fatalf("user2's session should have survived, got err = %v", err)
+	}
+	left, err := st.ListSessionsByUser(ctx, "user1")
+	if err != nil {
+		t.Fatalf("ListSessionsByUser: %v", err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("ListSessionsByUser(user1) returned %d session(s) after the sweep, want 0", len(left))
+	}
+}
+
+func TestDeleteSessionsByUserNoMatchesIsNotError(t *testing.T) {
+	st := newAuthStore()
+	if err := st.DeleteSessionsByUser(context.Background(), "nonesuch"); err != nil {
+		t.Fatalf("DeleteSessionsByUser: %v", err)
 	}
 }
 
@@ -1516,6 +1658,48 @@ func TestDeleteVerificationsByUserAndPurposeNoMatchesIsNotError(t *testing.T) {
 	st := newAuthStore()
 	if err := st.DeleteVerificationsByUserAndPurpose(context.Background(), "nonesuch", "signup"); err != nil {
 		t.Fatalf("DeleteVerificationsByUserAndPurpose: %v", err)
+	}
+}
+
+// TestDeleteVerificationsByUserRemovesEveryPurpose pins what separates this
+// sweep from the (user, purpose) one above: it is keyed on the user alone,
+// so a purpose this codebase never names — "later_flow" here — goes with the
+// rest. auth.Verification.Purpose is an open string, so an implementation
+// that fanned out over a fixed list of known purposes would leave that row
+// redeemable.
+func TestDeleteVerificationsByUserRemovesEveryPurpose(t *testing.T) {
+	st := newAuthStore()
+	ctx := context.Background()
+	for _, v := range []auth.Verification{
+		{ID: "ver1", UserID: "user1", Purpose: "password_reset", TokenHash: "hash1"},
+		{ID: "ver2", UserID: "user1", Purpose: "email_change", TokenHash: "hash2"},
+		{ID: "ver3", UserID: "user1", Purpose: "signup", TokenHash: "hash3"},
+		{ID: "ver4", UserID: "user1", Purpose: "later_flow", TokenHash: "hash4"},
+		{ID: "ver5", UserID: "user2", Purpose: "password_reset", TokenHash: "hash5"},
+	} {
+		if _, err := st.CreateVerification(ctx, v); err != nil {
+			t.Fatalf("CreateVerification(%s): %v", v.ID, err)
+		}
+	}
+
+	if err := st.DeleteVerificationsByUser(ctx, "user1"); err != nil {
+		t.Fatalf("DeleteVerificationsByUser: %v", err)
+	}
+
+	for _, hash := range []string{"hash1", "hash2", "hash3", "hash4"} {
+		if _, err := st.FindVerificationByHash(ctx, hash); !errors.Is(err, auth.ErrVerificationNotFound) {
+			t.Fatalf("user1 verification %s survived DeleteVerificationsByUser: err = %v", hash, err)
+		}
+	}
+	if _, err := st.FindVerificationByHash(ctx, "hash5"); err != nil {
+		t.Fatalf("user2's verification should have survived, got err = %v", err)
+	}
+}
+
+func TestDeleteVerificationsByUserNoMatchesIsNotError(t *testing.T) {
+	st := newAuthStore()
+	if err := st.DeleteVerificationsByUser(context.Background(), "nonesuch"); err != nil {
+		t.Fatalf("DeleteVerificationsByUser: %v", err)
 	}
 }
 

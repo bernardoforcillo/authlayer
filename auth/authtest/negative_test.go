@@ -436,6 +436,129 @@ func (s sharedTokenHashes) CreateVerification(_ context.Context, v auth.Verifica
 	return v, nil
 }
 
+// droppedDeletedAt stores a user without its DeletedAt, the way a backend
+// whose table has no deleted_at column at all behaves — store/drops'
+// CREATE TABLE IF NOT EXISTS cannot add the column to a users table that
+// already exists, so this is the shape a v0.1.0 database that skipped the
+// ALTER TABLE actually presents. A dropped stamp makes an anonymized
+// account indistinguishable from a live one.
+type droppedDeletedAt struct{ *refStore }
+
+func (s droppedDeletedAt) CreateUser(ctx context.Context, u auth.UserBase) (auth.UserBase, error) {
+	u.DeletedAt = nil
+	return s.refStore.CreateUser(ctx, u)
+}
+
+// cascadingDeleteUser takes the user's sessions with it, the ON DELETE
+// CASCADE shape [auth.Store.DeleteUser]'s "the user row only" rules out: the
+// service orders the cascade so access stops first, and a store that
+// performs its own hides whether that order was followed.
+type cascadingDeleteUser struct{ *refStore }
+
+func (s cascadingDeleteUser) DeleteUser(ctx context.Context, userID string) error {
+	if err := s.refStore.DeleteUser(ctx, userID); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, sess := range s.sessions {
+		if sess.UserID == userID {
+			delete(s.sessions, id)
+		}
+	}
+	return nil
+}
+
+// silentDeleteUser answers a missing user with nil instead of
+// ErrUserNotFound, so a caller deleting an account that was never there
+// cannot tell.
+type silentDeleteUser struct{ *refStore }
+
+func (s silentDeleteUser) DeleteUser(ctx context.Context, userID string) error {
+	if err := s.refStore.DeleteUser(ctx, userID); errors.Is(err, auth.ErrUserNotFound) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return nil
+}
+
+// oneFamilyOnlySessionDelete revokes a single one of the user's families
+// rather than all of them — the defect [auth.Store.DeleteSessionsByUser]'s
+// own doc says a caller cannot work around, since it is precisely why the
+// method exists instead of a loop over DeleteSessionsByFamily. It is the
+// committed form of this task's mandatory mutation.
+type oneFamilyOnlySessionDelete struct{ *refStore }
+
+func (s oneFamilyOnlySessionDelete) DeleteSessionsByUser(ctx context.Context, userID string) error {
+	s.mu.Lock()
+	family := ""
+	for _, sess := range s.sessions {
+		if sess.UserID == userID {
+			family = sess.FamilyID
+			break
+		}
+	}
+	s.mu.Unlock()
+	if family == "" {
+		return nil
+	}
+	// Not s.refStore.DeleteSessionsByFamily: this type overrides only
+	// DeleteSessionsByUser, so the promoted method is the same one.
+	return s.DeleteSessionsByFamily(ctx, family)
+}
+
+// notFoundOnEmptySweep reports a sweep that matched no rows as a not-found
+// error on both by-user methods, which the port says is not an error at all:
+// a user with no session and no pending token is the ordinary case, and a
+// caller that treats it as a failure aborts a deletion that had nothing to
+// do.
+type notFoundOnEmptySweep struct{ *refStore }
+
+func (s notFoundOnEmptySweep) DeleteSessionsByUser(ctx context.Context, userID string) error {
+	s.mu.Lock()
+	found := false
+	for _, sess := range s.sessions {
+		if sess.UserID == userID {
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return auth.ErrSessionNotFound
+	}
+	return s.refStore.DeleteSessionsByUser(ctx, userID)
+}
+
+func (s notFoundOnEmptySweep) DeleteVerificationsByUser(ctx context.Context, userID string) error {
+	s.mu.Lock()
+	found := false
+	for _, v := range s.verifications {
+		if v.UserID == userID {
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return auth.ErrVerificationNotFound
+	}
+	return s.refStore.DeleteVerificationsByUser(ctx, userID)
+}
+
+// onePurposeOnlyVerificationDelete sweeps only "password_reset", the shape a
+// backend implemented as a delegation to
+// [auth.Store.DeleteVerificationsByUserAndPurpose] over a hard-coded list
+// takes — leaving a pending magic link or email-change token alive for an
+// account being deleted. Purpose is an open string the service layer
+// defines, so no such list can be complete.
+type onePurposeOnlyVerificationDelete struct{ *refStore }
+
+func (s onePurposeOnlyVerificationDelete) DeleteVerificationsByUser(ctx context.Context, userID string) error {
+	return s.DeleteVerificationsByUserAndPurpose(ctx, userID, "password_reset")
+}
+
 // ── Driving a check and capturing its verdict ──────────────────────────
 
 // recorder is a [tb] that records failures instead of reporting them to the
@@ -611,6 +734,41 @@ func TestTheContractRejectsNonCompliantStores(t *testing.T) {
 			defect:   "two verifications may share one token hash",
 			check:    "CreateVerification/TokenHashIsUnique",
 			newStore: func() auth.Store { return sharedTokenHashes{newRefStore()} },
+		},
+		{
+			defect:   "CreateUser drops UserBase.DeletedAt",
+			check:    "CreateUser/RoundTripsDeletedAt",
+			newStore: func() auth.Store { return droppedDeletedAt{newRefStore()} },
+		},
+		{
+			defect:   "DeleteUser cascades to the user's sessions",
+			check:    "DeleteUser/RemovesTheUserRowOnly",
+			newStore: func() auth.Store { return cascadingDeleteUser{newRefStore()} },
+		},
+		{
+			defect:   "DeleteUser answers a missing user with nil",
+			check:    "DeleteUser/UnknownIDReturnsErrUserNotFound",
+			newStore: func() auth.Store { return silentDeleteUser{newRefStore()} },
+		},
+		{
+			defect:   "DeleteSessionsByUser revokes only one of the user's families",
+			check:    "DeleteSessionsByUser/RemovesEveryFamilyAndOnlyThatUser",
+			newStore: func() auth.Store { return oneFamilyOnlySessionDelete{newRefStore()} },
+		},
+		{
+			defect:   "DeleteSessionsByUser reports a user with no sessions as not found",
+			check:    "DeleteSessionsByUser/ZeroRowsIsNotAnError",
+			newStore: func() auth.Store { return notFoundOnEmptySweep{newRefStore()} },
+		},
+		{
+			defect:   "DeleteVerificationsByUser sweeps only one purpose",
+			check:    "DeleteVerificationsByUser/RemovesEveryPurposeAndOnlyThatUser",
+			newStore: func() auth.Store { return onePurposeOnlyVerificationDelete{newRefStore()} },
+		},
+		{
+			defect:   "DeleteVerificationsByUser reports a user with no verifications as not found",
+			check:    "DeleteVerificationsByUser/ZeroRowsIsNotAnError",
+			newStore: func() auth.Store { return notFoundOnEmptySweep{newRefStore()} },
 		},
 	}
 

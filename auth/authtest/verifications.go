@@ -28,6 +28,8 @@ func verificationChecks() []check {
 		{"DeleteVerification/UnknownIDReturnsErrVerificationNotFound", checkDeleteVerificationNotFound},
 		{"DeleteVerificationsByUserAndPurpose/RemovesOnlyThatPair", checkDeleteVerificationsByUserAndPurpose},
 		{"DeleteVerificationsByUserAndPurpose/ZeroRowsIsNotAnError", checkDeleteVerificationsByUserAndPurposeEmpty},
+		{"DeleteVerificationsByUser/RemovesEveryPurposeAndOnlyThatUser", checkDeleteVerificationsByUser},
+		{"DeleteVerificationsByUser/ZeroRowsIsNotAnError", checkDeleteVerificationsByUserEmpty},
 	}
 }
 
@@ -167,6 +169,57 @@ func checkDeleteVerificationsByUserAndPurposeEmpty(t tb, st auth.Store) {
 	t.Helper()
 	err := st.DeleteVerificationsByUserAndPurpose(context.Background(), newID(), "signup")
 	wantNoErr(t, "DeleteVerificationsByUserAndPurpose(a pair with no rows)", err)
+}
+
+// checkDeleteVerificationsByUser asserts the whole-account sweep covers
+// EVERY purpose, unlike the (userID, purpose) sweep beside it, and stays
+// scoped to one user: two rows of one purpose and one of each of the other
+// two all go in a single call, while another user's row of the same purpose
+// survives.
+//
+// Every purpose is exercised rather than one standing in for the rest for
+// the reason [purposes] gives, plus one this method adds: a pending
+// password-reset or magic-link token is a login credential sitting in a
+// mailbox, so a sweep that covered only the purposes it happened to be
+// tested against would leave a live way into an account whose owner has
+// just asked for it to be deleted. An implementation that delegates to
+// [auth.Store.DeleteVerificationsByUserAndPurpose] for a fixed list of
+// purposes is the shape this catches: the port keeps Purpose an open string
+// the service layer defines, so no backend can enumerate it.
+func checkDeleteVerificationsByUser(t tb, st auth.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+	userID := newID()
+	otherUser := newID()
+
+	doomed := []auth.Verification{
+		mustCreateVerification(t, st, newVerification(userID, "password_reset", newEmail(), at)),
+		mustCreateVerification(t, st, newVerification(userID, "password_reset", newEmail(), at)),
+		mustCreateVerification(t, st, newVerification(userID, "signup", newEmail(), at)),
+		mustCreateVerification(t, st, newVerification(userID, "email_change", newEmail(), at)),
+	}
+	survivor := mustCreateVerification(t, st, newVerification(otherUser, "password_reset", newEmail(), at))
+
+	wantNoErr(t, "DeleteVerificationsByUser", st.DeleteVerificationsByUser(ctx, userID))
+
+	for _, v := range doomed {
+		if _, err := st.FindVerificationByHash(ctx, v.TokenHash); !errors.Is(err, auth.ErrVerificationNotFound) {
+			t.Fatalf("FindVerificationByHash(%s, purpose %q) error = %v, want ErrVerificationNotFound — every purpose goes, not a fixed list of them", v.ID, v.Purpose, err)
+		}
+	}
+	if _, err := st.FindVerificationByHash(ctx, survivor.TokenHash); err != nil {
+		t.Fatalf("FindVerificationByHash(another user's verification) error = %v, want nil — the sweep is scoped to one user", err)
+	}
+}
+
+// checkDeleteVerificationsByUserEmpty asserts sweeping a user with no
+// verifications is not an error — the ordinary case for an account with no
+// token outstanding.
+func checkDeleteVerificationsByUserEmpty(t tb, st auth.Store) {
+	t.Helper()
+	err := st.DeleteVerificationsByUser(context.Background(), newID())
+	wantNoErr(t, "DeleteVerificationsByUser(a user with no verifications)", err)
 }
 
 // checkPurgeExpired asserts the cutoff is STRICT and applies to both kinds:

@@ -1,15 +1,17 @@
 // Package authtest is the executable contract for
 // [github.com/bernardoforcillo/authlayer/auth.Store].
 //
-// auth.Store is an eighteen-method port, and seven of those methods carry an
+// auth.Store is a twenty-one-method port, and ten of those methods carry an
 // explicit MUST — normative requirements on the implementation, not on its
 // callers, several of which exist because violating them reopens a specific
 // security hole (an enumeration oracle at sign-up, a silently certified
 // address nobody proved control of, two successful rotations of one refresh
 // token, a revoked session family resurrected by the rotation that was
-// racing its revocation). Until this package existed those seven were
-// enforced by prose and by the two backends this repository happens to
-// ship. A third-party backend author had no way to check their work.
+// racing its revocation, a single live refresh token or one-time credential
+// outliving the sweep that was clearing an account out). Until this package
+// existed they were enforced by prose and by the two backends this
+// repository happens to ship. A third-party backend author had no way to
+// check their work.
 //
 // # Using it
 //

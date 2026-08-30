@@ -21,6 +21,7 @@ func userChecks() []check {
 		{"CreateUser/NormalizesTheAddress", checkCreateUserNormalizes},
 		{"CreateUser/DuplicateAddressReturnsErrEmailTaken", checkCreateUserDuplicateAddress},
 		{"CreateUser/DuplicateIDReturnsErrIDTakenAndKeepsTheRow", checkCreateUserDuplicateID},
+		{"CreateUser/RoundTripsDeletedAt", checkCreateUserDeletedAt},
 		{"FindUserByID/UnknownIDReturnsErrUserNotFound", checkFindUserByIDNotFound},
 		{"FindUserByEmail/NormalizesTheAddress", checkFindUserByEmailNormalizes},
 		{"FindUserByEmail/UnknownAddressReturnsErrUserNotFound", checkFindUserByEmailNotFound},
@@ -37,6 +38,8 @@ func userChecks() []check {
 		{"UpdateUserEmail/SameAddressIsNotASelfConflict", checkUpdateUserEmailSameAddress},
 		{"UpdateUserEmail/AnotherUsersAddressReturnsErrEmailTaken", checkUpdateUserEmailTaken},
 		{"UpdateUserEmail/UnknownUserReturnsErrUserNotFound", checkUpdateUserEmailUnknownUser},
+		{"DeleteUser/RemovesTheUserRowOnly", checkDeleteUser},
+		{"DeleteUser/UnknownIDReturnsErrUserNotFound", checkDeleteUserUnknownUser},
 	}
 }
 
@@ -149,6 +152,59 @@ func checkCreateUserDuplicateID(t tb, st auth.Store) {
 	if _, err := st.FindUserByEmail(ctx, clash.Email); !errors.Is(err, auth.ErrUserNotFound) {
 		t.Fatalf("FindUserByEmail(%q) error = %v, want ErrUserNotFound — the rejected create's address must not exist", clash.Email, err)
 	}
+}
+
+// checkCreateUserDeletedAt asserts [auth.UserBase.DeletedAt] survives a
+// round trip in both of its states. A freshly created user is not
+// anonymized, so it comes back nil; a user created with the field set comes
+// back holding the same instant, through FindUserByID and FindUserByEmail
+// alike.
+//
+// It is the only obligation in this suite that reaches the column at all —
+// no Store method writes DeletedAt, so a backend that never declares it
+// (store/drops' CREATE TABLE IF NOT EXISTS cannot add a column to a table
+// that already exists; see that store's CreateSchema doc) would otherwise
+// look compliant right up until an anonymized account failed to be
+// recognised as one. The field's doc makes recognising it the business of
+// every authentication entry point, so silently dropping it is an
+// authentication defect, not a missing convenience field.
+func checkCreateUserDeletedAt(t tb, st auth.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+
+	fresh := mustCreateUser(t, st, newUser(newEmail(), at))
+	if fresh.DeletedAt != nil {
+		t.Fatalf("CreateUser returned DeletedAt %v for a fresh user, want nil — a new account is not anonymized", fresh.DeletedAt)
+	}
+	got, err := st.FindUserByID(ctx, fresh.ID)
+	wantNoErr(t, "FindUserByID(a fresh user)", err)
+	if got.DeletedAt != nil {
+		t.Fatalf("FindUserByID returned DeletedAt %v for a fresh user, want nil", got.DeletedAt)
+	}
+
+	stampedAt := at.Add(time.Minute)
+	u := newUser(newEmail(), at)
+	u.DeletedAt = &stampedAt
+	created := mustCreateUser(t, st, u)
+	if created.DeletedAt == nil {
+		t.Fatalf("CreateUser returned DeletedAt = nil for a user created with it set, want %v", stampedAt)
+	}
+	wantTimeEqual(t, "CreateUser returned DeletedAt", *created.DeletedAt, stampedAt)
+
+	byID, err := st.FindUserByID(ctx, u.ID)
+	wantNoErr(t, "FindUserByID(a stamped user)", err)
+	if byID.DeletedAt == nil {
+		t.Fatalf("FindUserByID returned DeletedAt = nil, want the stored %v — the column is not persisted", stampedAt)
+	}
+	wantTimeEqual(t, "FindUserByID DeletedAt", *byID.DeletedAt, stampedAt)
+
+	byEmail, err := st.FindUserByEmail(ctx, u.Email)
+	wantNoErr(t, "FindUserByEmail(a stamped user)", err)
+	if byEmail.DeletedAt == nil {
+		t.Fatalf("FindUserByEmail returned DeletedAt = nil, want the stored %v", stampedAt)
+	}
+	wantTimeEqual(t, "FindUserByEmail DeletedAt", *byEmail.DeletedAt, stampedAt)
 }
 
 // checkFindUserByIDNotFound asserts an id no user holds is reported as
@@ -460,4 +516,76 @@ func checkUpdateUserEmailUnknownUser(t tb, st auth.Store) {
 	t.Helper()
 	err := st.UpdateUserEmail(context.Background(), newID(), newEmail(), stamp())
 	wantErrIs(t, "UpdateUserEmail(unknown user)", err, auth.ErrUserNotFound)
+}
+
+// checkDeleteUser asserts [auth.Store.DeleteUser]'s "the user row, and
+// nothing else": the id and the address both stop resolving, another user is
+// untouched, and — the half that is easy to get wrong in a SQL backend that
+// declares ON DELETE CASCADE — the deleted user's own sessions and
+// verifications are still there afterwards.
+//
+// That last part is not fastidiousness about scope. The port makes the
+// service layer order the cascade, and the order is fail-safe: sessions
+// first, so access stops before anything irreversible happens, then
+// verifications, then the user row last. A DeleteUser that quietly took the
+// other two with it would make that ordering unobservable — a store could
+// then satisfy every test in this suite while performing the cascade in
+// whatever order its foreign keys happened to impose, including one that
+// destroys the account's data before its access.
+//
+// It also asserts the deleted account's address can be signed up under
+// again — hard deletion is the posture that gives an address back — and that
+// deleting the same id twice reports ErrUserNotFound the second time, the
+// same shape [auth.Store.DeleteSession] and [auth.Store.DeleteVerification]
+// use for their own by-id deletes.
+func checkDeleteUser(t tb, st auth.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+
+	target := mustCreateUser(t, st, newUser(newEmail(), at))
+	bystander := mustCreateUser(t, st, newUser(newEmail(), at))
+	sess := mustCreateSession(t, st, newSession(target.ID, newID(), at))
+	ver := mustCreateVerification(t, st, newVerification(target.ID, "password_reset", newEmail(), at))
+
+	wantNoErr(t, "DeleteUser", st.DeleteUser(ctx, target.ID))
+
+	if _, err := st.FindUserByID(ctx, target.ID); !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("FindUserByID(the deleted user) error = %v, want ErrUserNotFound", err)
+	}
+	if _, err := st.FindUserByEmail(ctx, target.Email); !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("FindUserByEmail(the deleted user's address) error = %v, want ErrUserNotFound — the address must be free again", err)
+	}
+	if _, err := st.FindUserByID(ctx, bystander.ID); err != nil {
+		t.Fatalf("FindUserByID(another user) error = %v, want nil — DeleteUser removes one row", err)
+	}
+
+	if _, err := st.FindSessionByHash(ctx, sess.TokenHash); err != nil {
+		t.Fatalf("FindSessionByHash(the deleted user's session) error = %v, want nil — DeleteUser removes the user row ONLY; the caller orders the cascade", err)
+	}
+	if _, err := st.FindVerificationByHash(ctx, ver.TokenHash); err != nil {
+		t.Fatalf("FindVerificationByHash(the deleted user's verification) error = %v, want nil — DeleteUser removes the user row ONLY; the caller orders the cascade", err)
+	}
+
+	// The address is genuinely free again, not merely unresolvable: a new
+	// sign-up under it must succeed. Hard deletion is the posture that gives
+	// an address back, and a backend whose unique index still held the old
+	// row's entry would refuse this with ErrEmailTaken.
+	reused := mustCreateUser(t, st, newUser(target.Email, at))
+	if reused.ID == target.ID {
+		t.Fatalf("fixture error: the reusing account must be a different id than the deleted one")
+	}
+
+	err := st.DeleteUser(ctx, target.ID)
+	wantErrIs(t, "DeleteUser(the same id twice)", err, auth.ErrUserNotFound)
+}
+
+// checkDeleteUserUnknownUser asserts an id no user holds is ErrUserNotFound
+// rather than a silent nil. The port distinguishes it from the two
+// by-user sweeps deliberately — see [auth.Store.DeleteUser]'s doc — because
+// a caller deleting an account by id needs to know the account was there.
+func checkDeleteUserUnknownUser(t tb, st auth.Store) {
+	t.Helper()
+	err := st.DeleteUser(context.Background(), newID())
+	wantErrIs(t, "DeleteUser(unknown id)", err, auth.ErrUserNotFound)
 }

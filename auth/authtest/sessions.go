@@ -21,6 +21,8 @@ func sessionChecks() []check {
 		{"DeleteSession/UnknownIDReturnsErrSessionNotFound", checkDeleteSessionNotFound},
 		{"DeleteSessionsByFamily/RemovesTheFamilyAndNothingElse", checkDeleteSessionsByFamily},
 		{"DeleteSessionsByFamily/ZeroRowsIsNotAnError", checkDeleteSessionsByFamilyEmpty},
+		{"DeleteSessionsByUser/RemovesEveryFamilyAndOnlyThatUser", checkDeleteSessionsByUser},
+		{"DeleteSessionsByUser/ZeroRowsIsNotAnError", checkDeleteSessionsByUserEmpty},
 		{"MarkRotated/WinsOnceThenReportsTheRotatedSession", checkMarkRotated},
 		{"MarkRotated/UnknownHashReturnsErrSessionNotFound", checkMarkRotatedNotFound},
 		{"MarkRotated/IgnoresExpiry", checkMarkRotatedIgnoresExpiry},
@@ -231,6 +233,71 @@ func checkDeleteSessionsByFamilyEmpty(t tb, st auth.Store) {
 	t.Helper()
 	err := st.DeleteSessionsByFamily(context.Background(), newID())
 	wantNoErr(t, "DeleteSessionsByFamily(a family with no sessions)", err)
+}
+
+// checkDeleteSessionsByUser asserts [auth.Store.DeleteSessionsByUser]'s
+// "every family": three families belonging to one user — one holding a
+// current session, one holding a rotated session, one holding an already
+// expired session — all go in a single call, while a session belonging to a
+// DIFFERENT user survives untouched.
+//
+// Three families rather than one is the point of the check. This method's
+// whole reason to exist on the port is that its caller cannot get the same
+// effect by enumerating families and looping over
+// [auth.Store.DeleteSessionsByFamily] (see its doc), so an implementation
+// that quietly revokes only one family — the first it finds, the newest, the
+// one whose id sorts first — is exactly the defect worth catching, and it is
+// invisible against a fixture with a single family. Rotated and expired
+// sessions are included because they are still rows: a superseded session is
+// the tripwire reuse detection reads, and leaving one behind for an account
+// that is being deleted or anonymized leaves a live row keyed to a user that
+// is about to stop existing.
+func checkDeleteSessionsByUser(t tb, st auth.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+	userID := newID()
+
+	current := mustCreateSession(t, st, newSession(userID, newID(), at))
+
+	rotatedSession := newSession(userID, newID(), at)
+	rotatedAt := at
+	rotatedSession.RotatedAt = &rotatedAt
+	rotated := mustCreateSession(t, st, rotatedSession)
+
+	expiredSession := newSession(userID, newID(), at)
+	expiredSession.ExpiresAt = at.Add(-time.Hour)
+	expired := mustCreateSession(t, st, expiredSession)
+
+	otherUser := newID()
+	survivor := mustCreateSession(t, st, newSession(otherUser, newID(), at))
+
+	wantNoErr(t, "DeleteSessionsByUser", st.DeleteSessionsByUser(ctx, userID))
+
+	for _, s := range []auth.Session{current, rotated, expired} {
+		if _, err := st.FindSessionByHash(ctx, s.TokenHash); !errors.Is(err, auth.ErrSessionNotFound) {
+			t.Fatalf("FindSessionByHash(session %s, family %s) error = %v, want ErrSessionNotFound — every family belonging to the user goes, not just one", s.ID, s.FamilyID, err)
+		}
+	}
+	left, err := st.ListSessionsByUser(ctx, userID)
+	wantNoErr(t, "ListSessionsByUser(the swept user)", err)
+	if len(left) != 0 {
+		t.Fatalf("ListSessionsByUser returned %v after DeleteSessionsByUser, want none", sortedIDs(left))
+	}
+
+	if _, err := st.FindSessionByHash(ctx, survivor.TokenHash); err != nil {
+		t.Fatalf("FindSessionByHash(another user's session) error = %v, want nil — the sweep is scoped to one user", err)
+	}
+}
+
+// checkDeleteSessionsByUserEmpty asserts sweeping a user with no sessions is
+// not an error — the port says so explicitly, and it is the ordinary case
+// for an account that has never logged in or has already been logged out
+// everywhere.
+func checkDeleteSessionsByUserEmpty(t tb, st auth.Store) {
+	t.Helper()
+	err := st.DeleteSessionsByUser(context.Background(), newID())
+	wantNoErr(t, "DeleteSessionsByUser(a user with no sessions)", err)
 }
 
 // checkMarkRotated asserts the sequential half of the compare-and-set: the
