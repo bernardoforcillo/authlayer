@@ -87,15 +87,23 @@
 //
 // # Verification tokens
 //
-// [Verification] covers three one-time flows that all share the same shape —
+// [Verification] covers four one-time flows that all share the same shape —
 // mint an opaque token, email or otherwise deliver it, redeem it once — so
-// they share one table rather than three: Purpose distinguishes "signup"
+// they share one table rather than four: Purpose distinguishes "signup"
 // (issued before EmailVerifiedAt is set), "email_change" (redeemed to
-// overwrite UserBase.Email via [Store.UpdateUserEmail]), and
-// "password_reset" (redeemed to overwrite UserBase.PasswordHash). Email
+// overwrite UserBase.Email via [Store.UpdateUserEmail]),
+// "password_reset" (redeemed to overwrite UserBase.PasswordHash), and
+// "magic_link" (redeemed for a [Session] directly, with no password step —
+// see [Service.RedeemMagicLink]). Email
 // carries the address the token was minted for, regardless of Purpose — see
 // that field's own doc for why it is never conditionally populated. Like
 // EmailInvite, only the token's hash is stored.
+//
+// The last two are BEARER CREDENTIALS for the account, not attestations
+// about an address, which is why both are swept by every credential
+// rotation and remediation path in this package — see
+// [Service.ChangePassword]'s doc, "The sweep matrix", for the whole table
+// and for the two methods that deliberately do not sweep.
 package auth
 
 import (
@@ -246,7 +254,8 @@ type Verification struct {
 	// without the constraint its result silently depends on row order rather
 	// than being well-defined.
 	TokenHash string `drop:"token_hash"`
-	// Purpose is one of "signup", "email_change", or "password_reset". It is
+	// Purpose is one of "signup", "email_change", "password_reset" or
+	// "magic_link". It is
 	// a plain string, not a typed enum, matching Session and EmailInvite's
 	// stance elsewhere in this codebase: the service layer defines and
 	// validates the closed set of values it accepts, a persistence port does
@@ -275,6 +284,14 @@ type Verification struct {
 	//     the address the token was DELIVERED to. That comparison is the
 	//     only thing standing between a reset and certifying an address
 	//     nobody proved control of.
+	//   - "magic_link": the address the link was delivered to, and
+	//     load-bearing for the identical reason — a completed
+	//     [github.com/bernardoforcillo/authlayer/auth.Service.RedeemMagicLink]
+	//     compares this field against the account's CURRENT Email and
+	//     stamps UserBase.EmailVerifiedAt only if they match, then passes
+	//     this exact value to [Store.MarkEmailVerified]. Everything the
+	//     "password_reset" bullet says about an un-normalized stored value
+	//     applies here unchanged.
 	//
 	// This field MUST NOT be conditionally populated by Purpose. It used to
 	// be named NewEmail and was documented empty for every Purpose but

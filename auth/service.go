@@ -56,7 +56,7 @@ import (
 	"github.com/bernardoforcillo/authlayer/token"
 )
 
-// The three closed values [Verification.Purpose] takes — see that field's
+// The four closed values [Verification.Purpose] takes — see that field's
 // doc and [Store]'s sentinel-error doc for why the closed set lives here,
 // in the service layer, rather than on the Store port.
 const (
@@ -74,6 +74,18 @@ const (
 	// VerifyEmail refuses it with [ErrVerificationPurpose] rather than
 	// silently accepting it and burning the token for nothing.
 	PurposePasswordReset = "password_reset"
+	// PurposeMagicLink marks a Verification minted by
+	// [Service.RequestMagicLink] for a passwordless sign-in. Not redeemable
+	// through [Service.VerifyEmail] — [Service.RedeemMagicLink] owns this
+	// purpose's redemption, and VerifyEmail refuses it with
+	// [ErrVerificationPurpose] without burning it, the same stance it takes
+	// on PurposePasswordReset.
+	//
+	// This is the only purpose whose redemption issues a SESSION, which is
+	// why it is swept by every credential-rotation and remediation path
+	// that already sweeps the other two redeemable-by-mail purposes — see
+	// [Service.ChangePassword]'s doc, "The sweep matrix".
+	PurposeMagicLink = "magic_link"
 )
 
 // defaultVerificationTTL is the default for [WithVerificationTTL]: how long
@@ -90,6 +102,13 @@ const defaultVerificationTTL = 24 * time.Hour
 // address" attestation), and a short window is the conventional stance this
 // class of flow takes elsewhere.
 const defaultPasswordResetTTL = time.Hour
+
+// defaultMagicLinkTTL is the default for [WithMagicLinkTTL]: how long a
+// "magic_link" [Verification] stays redeemable. Shorter still than
+// defaultPasswordResetTTL's hour, because redeeming one does not merely
+// let its holder SET a credential — it IS the credential: [Service.RedeemMagicLink]
+// exchanges it directly for a session, with no password step in between.
+const defaultMagicLinkTTL = 15 * time.Minute
 
 // Sentinel errors returned by Service, layered on top of the ones [Store]
 // already defines (ErrUserNotFound and friends propagate through verbatim
@@ -262,10 +281,12 @@ type config struct {
 	signingKey [][]byte
 	accessTTL  time.Duration
 	refreshTTL time.Duration
-	// verificationTTL and passwordResetTTL are the two [Verification]
-	// lifetimes — see [WithVerificationTTL] and [WithPasswordResetTTL].
+	// verificationTTL, passwordResetTTL and magicLinkTTL are the three
+	// [Verification] lifetimes — see [WithVerificationTTL],
+	// [WithPasswordResetTTL] and [WithMagicLinkTTL].
 	verificationTTL  time.Duration
 	passwordResetTTL time.Duration
+	magicLinkTTL     time.Duration
 	clock            func() time.Time
 	idGen            func() string
 	limiter          RateLimiter
@@ -273,9 +294,21 @@ type config struct {
 	// additionally consults — see [WithPasswordResetRateLimiter]'s doc for
 	// why it is a second, independent config slot rather than reusing
 	// limiter (which stays IP-keyed everywhere it is used).
-	resetLimiter         RateLimiter
-	claimsExtender       func(UserBase) map[string]any
-	requireVerifiedEmail bool
+	resetLimiter RateLimiter
+	// magicLinkLimiter is the address-keyed [RateLimiter]
+	// [Service.RequestMagicLink] additionally consults — a third,
+	// independent slot for the same reason resetLimiter is a second one:
+	// limiter stays IP-keyed everywhere it is used, and a deployment may
+	// want a tighter bucket on magic links than on password resets (a
+	// magic link is a login, not a credential-set form). See
+	// [WithMagicLinkRateLimiter].
+	magicLinkLimiter RateLimiter
+	// magicLinkProvisioning is [WithMagicLinkProvisioning]: whether
+	// [Service.RequestMagicLink] creates an account for an address it does
+	// not recognise. Defaults to false.
+	magicLinkProvisioning bool
+	claimsExtender        func(UserBase) map[string]any
+	requireVerifiedEmail  bool
 }
 
 func defaultConfig() config {
@@ -286,6 +319,7 @@ func defaultConfig() config {
 		refreshTTL:       30 * 24 * time.Hour,
 		verificationTTL:  defaultVerificationTTL,
 		passwordResetTTL: defaultPasswordResetTTL,
+		magicLinkTTL:     defaultMagicLinkTTL,
 		clock:            func() time.Time { return time.Now().UTC() },
 		idGen:            uid.NewV7,
 	}
@@ -437,6 +471,66 @@ func WithPasswordResetTTL(d time.Duration) Option {
 	}
 }
 
+// WithMagicLinkTTL sets how long a "magic_link" [Verification] minted by
+// [Service.RequestMagicLink] stays redeemable: ExpiresAt is stamped as
+// CreatedAt+d. The default is fifteen minutes — shorter than
+// [WithPasswordResetTTL]'s hour, and far shorter than
+// [WithVerificationTTL]'s day, because this token is not a step towards a
+// credential, it IS one: [Service.RedeemMagicLink] exchanges it for a live
+// session with nothing else asked of its holder. d <= 0 is ignored,
+// leaving the default (or a prior option) in place.
+//
+// This is the whole of the window in which a link sitting unread in a
+// mailbox is a working login, so it is the one knob that bounds the
+// "mailbox compromised later" case. It is not the only control: the link
+// is single-use ([Service.RedeemMagicLink] burns it), re-issuing invalidates
+// the previous one ([Service.RequestMagicLink]), and every credential
+// rotation sweeps it (see [Service.ChangePassword]'s doc, "The sweep
+// matrix"). Lengthening it past the default trades directly against all
+// three; the cost of a short window is only that a user who opens the mail
+// late must ask for another link, since an expired token is
+// [ErrVerificationExpired] and is never burned by the attempt.
+func WithMagicLinkTTL(d time.Duration) Option {
+	return func(c *config) {
+		if d > 0 {
+			c.magicLinkTTL = d
+		}
+	}
+}
+
+// WithMagicLinkProvisioning controls whether [Service.RequestMagicLink]
+// CREATES an account for an address it does not recognise, rather than
+// silently minting nothing. The default is false: magic links sign existing
+// accounts in and register nobody.
+//
+// # What enabling this exposes, stated plainly
+//
+// With it on, anyone who can receive mail at an address can bring an
+// account for that address into existence, unauthenticated, by asking for a
+// link and clicking it. That is exactly the exposure an open
+// [Service.SignUp] endpoint already has — which is why a deployment that
+// already offers open self-service registration gives up nothing new here —
+// but it is a real change for a deployment that does not, and it is not
+// free. [WithMagicLinkRateLimiter] is the control, and it gates
+// provisioning itself, not merely the minting that follows it: a denial
+// from that limiter creates no account. [WithRateLimiter]'s IP-keyed limit
+// applies first and bounds the same thing per source.
+//
+// The account created holds no password credential at all
+// (PasswordHash "", so [Service.Login] can never authenticate it — see
+// [UserBase]'s doc) and an unset EmailVerifiedAt: ASKING for a link proves
+// nothing about the address, and only [Service.RedeemMagicLink] — which
+// requires actually receiving the mail — stamps it.
+//
+// One consequence worth planning for: a probe of an unregistered address
+// leaves a real, permanent row behind. Unlike the verifications a magic
+// link also creates, that row never expires and [Store.PurgeExpired] does
+// not remove it, so a deployment enabling this should expect its users
+// table to accumulate addresses nobody ever signed in with.
+func WithMagicLinkProvisioning(enabled bool) Option {
+	return func(c *config) { c.magicLinkProvisioning = enabled }
+}
+
 // WithClock sets the clock Service stamps CreatedAt/UpdatedAt/ExpiresAt
 // and checks expiry against. The default is time.Now().UTC(). A nil clock
 // is ignored.
@@ -552,6 +646,46 @@ func WithRateLimiter(l RateLimiter) Option {
 // how many timing samples an attacker can collect.
 func WithPasswordResetRateLimiter(l RateLimiter) Option {
 	return func(c *config) { c.resetLimiter = l }
+}
+
+// WithMagicLinkRateLimiter wires a third, independent [RateLimiter] that
+// [Service.RequestMagicLink] consults, keyed by the NORMALIZED email
+// address rather than by IP — see [NormalizeEmail]. The default is nil,
+// meaning RequestMagicLink imposes no address-keyed limit at all;
+// [WithRateLimiter]'s IP-keyed limit, if configured, still applies on its
+// own. It is deliberately NOT the same slot as
+// [WithPasswordResetRateLimiter]: the two flows have different costs and a
+// deployment may want different buckets for them.
+//
+// A denial from this limiter is never surfaced as [ErrRateLimited] the way
+// WithRateLimiter's IP-keyed denial is — see [Service.RequestMagicLink]'s
+// doc, "The enumeration property", point 2, for why: an address-keyed rate
+// limit that surfaced as a distinguishable error would itself become the
+// existence oracle that method's whole design exists to close.
+//
+// This limiter is the control for three separate things, and only the
+// first is about enumeration:
+//
+//   - It bounds how many timing samples an attacker can collect against
+//     ONE address, which is the resource [Service.RequestMagicLink]'s
+//     residual timing channel needs (the same argument
+//     [WithPasswordResetRateLimiter]'s doc makes for its own flow).
+//   - It bounds GRIEFING. RequestMagicLink invalidates an address's earlier
+//     "magic_link" token every time a new one is minted, so anyone who
+//     merely knows an address can kill a victim's genuine, unclicked link
+//     at will by looping requests. That is inherent to the re-issue
+//     contract [Store.DeleteVerificationsByUserAndPurpose] documents, not
+//     a bug this method can avoid while honouring it.
+//   - With [WithMagicLinkProvisioning] enabled, it bounds ACCOUNT
+//     CREATION: a denial from this limiter provisions nothing, so this is
+//     the control that keeps "anyone who can receive mail can create an
+//     account" from also meaning "anyone at all can create unlimited
+//     accounts". See WithMagicLinkProvisioning's own doc.
+//
+// This package configures no default here, for the reason [WithRateLimiter]'s
+// own default is nil: the right bucket size is an operator decision.
+func WithMagicLinkRateLimiter(l RateLimiter) Option {
+	return func(c *config) { c.magicLinkLimiter = l }
 }
 
 // WithRequireVerifiedEmail controls whether [Service.Login] refuses an
