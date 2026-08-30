@@ -1,0 +1,194 @@
+---
+title: "Invitations"
+description: "Admitting someone who has no standing in a scope yet — a one-time emailed token, or a reusable link — both ending at GrantMembership."
+---
+
+`invite` admits a person who has **no standing in a scope yet**, without a
+direct [`AddMember`](/authorization/members) call. Two artifacts, one purpose:
+
+<Columns cols={2}>
+  <Card title="Email invite" icon="envelope" href="/invitations/email-invites">
+    A one-time token minted for one address. Delivered once, never redisplayed
+    — so only its sha256 is stored.
+  </Card>
+  <Card title="Link" icon="link" href="/invitations/links">
+    A reusable code with a use limit and an optional expiry. Its whole purpose
+    is to be shown again, so `Code` is stored in the clear.
+  </Card>
+</Columns>
+
+Both end at `scope.Service.GrantMembership`.
+
+## Wiring it
+
+`invite.New` takes the **generic `*scope.Service`**, which `org.Service` embeds
+under the embedded type's own name.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/invite"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member]())
+isvc := invite.New(svc.Service, memory.NewInviteStore()) // .Service, not svc
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme") // alice is owner
+owner := org.WithOrg(ctx, acme.ID)
+```
+
+`store/memory`'s `NewInviteStore` is the dev/test backend, exactly as
+`memory.New` is for `scope.Store`; `store/drops` ships the production one as
+`dropsstore.NewInviteStore(db)`, with its own `CreateSchema`.
+
+## The email flow
+
+{/* verify:main */}
+```go
+inv, token, err := isvc.InviteByEmail(owner, "bob@example.com", org.RoleMember)
+fmt.Println("minted:", err, inv.Email, inv.RoleKey, token != "")
+// Deliver `token` yourself — authlayer knows no base URL and owns no transport.
+
+bob := org.WithSubject(context.Background(), "bob")
+joined, err := isvc.AcceptInvite(bob, token)
+fmt.Println("accepted:", err, joined.Name)
+
+_, err = isvc.AcceptInvite(bob, token)
+fmt.Println("one-time:", errors.Is(err, invite.ErrInviteNotFound))
+```
+
+```
+minted: <nil> bob@example.com member true
+accepted: <nil> Acme
+one-time: true
+```
+
+## The link flow
+
+Same shape, minus the email step.
+
+{/* verify:main */}
+```go
+link, code, err := isvc.CreateLink(owner, org.RoleMember, 5, nil) // 5 uses, never expires
+fmt.Println("link:", err, link.MaxUses, link.ExpiresAt == nil, code != "")
+
+carol := org.WithSubject(context.Background(), "carol")
+joined, err = isvc.JoinViaLink(carol, code)
+fmt.Println("joined:", err, joined.Name)
+
+members, _ := svc.ListMembers(owner)
+fmt.Println("members now:", len(members))
+```
+
+```
+link: <nil> 5 true true
+joined: <nil> Acme
+members now: 3
+```
+
+`maxUses` of **0 means unlimited**, and a negative value is
+`ErrInvalidMaxUses`, raised before any store is touched.
+
+## Both flows end at `GrantMembership`
+
+<Warning>
+`scope.Service.GrantMembership` admits the named user at the named role while
+performing **no actor check of its own** — not even `member:create`, let alone
+the [escalation guard](/authorization/privilege-escalation).
+
+Every actor-facing rule already ran when the credential was minted, and the
+person accepting it has no standing yet to check in the first place. So
+`GrantMembership` is only as safe as whatever decided to call it: it must never
+be reachable except by presenting a credential minted for exactly that container
+and role.
+
+`AcceptInvite`, `JoinViaLink`, and `ListLinks`' code redaction are what
+guarantee that. All three are on [Invitation security](/invitations/security).
+</Warning>
+
+One consequence reaches your audit trail: a `MemberAdded` event from
+`GrantMembership` sets `ActorID` to the **admitted user**, because the inviter
+decided at mint time and is not present. Record attribution when the invitation
+is minted if you need it — see [Hooks and events](/authorization/hooks#grantmembership-cannot-name-an-actor).
+
+## What each call requires
+
+| Call | Permission | Notes |
+|---|---|---|
+| `InviteByEmail(ctx, email, roleKey)` | `invite:create` + escalation guard | returns the plain token **once** |
+| `CreateLink(ctx, roleKey, maxUses, expiresAt)` | `invite:create` + escalation guard | `maxUses` 0 = unlimited |
+| `ListInvites(ctx)` | `invite:read` | |
+| `ListLinks(ctx)` | `invite:read` | `Code` is **redacted** unless the reader could have minted it |
+| `RevokeInvite(ctx, id)` / `RevokeLink(ctx, id)` | `invite:delete` | a cross-tenant id is reported as not-found |
+| `AcceptInvite(ctx, token)` / `JoinViaLink(ctx, code)` | subject only | no standing required — that is the point |
+| `PreviewInvite(ctx, token)` / `PreviewLink(ctx, code)` | nothing | unauthenticated, consumes nothing |
+| `PurgeExpired(ctx, before)` | **nothing, and it spans every container** | cron only |
+
+`invite:create`, `invite:read` and `invite:delete` sit on the
+[control-statement surface](/concepts/statements#the-control-statements-you-get-for-free)
+every `NewAccess` builds, so the built-in `admin` role acquires all three
+automatically.
+
+<Warning>
+`Service.PurgeExpired(ctx, before)` deletes every expired invite and link across
+**every container the `Store` holds**, performs no authorization check, and
+reads neither a subject nor a container from the context. Call it from a cron
+job, never from a per-request handler wired to caller input — an unauthenticated
+caller who could trigger it at will gets a cross-tenant denial-of-service knob.
+</Warning>
+
+## Delivery is your job
+
+{/* verify:main */}
+```go
+_, token, err = isvc.InviteByEmail(owner, "dana@example.com", org.RoleMember)
+if err != nil {
+	panic(err)
+}
+fmt.Println("mail dana a link containing this token:", token != "")
+```
+
+```
+mail dana a link containing this token: true
+```
+
+`WithNotifier(n)` wires a `Notifier` that `InviteByEmail` calls **once,
+synchronously**, immediately after the invite is persisted. It is optional sugar
+over calling one yourself right after `InviteByEmail` returns; the default
+(`nil`) sends nothing at all.
+
+<Warning>
+A `Notifier` returning an error propagates to `InviteByEmail`'s caller — and at
+that point the invite row **still exists** while its token cannot be recovered.
+Re-invite the same address to mint a fresh one.
+</Warning>
+
+{/* verify:stdout "minted: <nil> bob@example.com member true\naccepted: <nil> Acme\none-time: true\nlink: <nil> 5 true true\njoined: <nil> Acme\nmembers now: 3\nmail dana a link containing this token: true" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Email invites" icon="envelope" href="/invitations/email-invites">
+    Expiry, preview, revocation, and re-inviting an address.
+  </Card>
+  <Card title="Links" icon="link" href="/invitations/links">
+    Use limits, expiry, revocation, and the idempotent re-click.
+  </Card>
+  <Card title="Security" icon="lock" href="/invitations/security">
+    Code redaction, claim-first ordering, bearer semantics, the inviter
+    recheck.
+  </Card>
+  <Card title="Errors" icon="triangle-exclamation" href="/reference/errors">
+    The seven `invite` sentinels and their suggested statuses.
+  </Card>
+</Columns>

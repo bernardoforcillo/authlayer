@@ -1,0 +1,319 @@
+---
+title: "Email invitations"
+description: "A one-time token minted for one address, stored only as its hash — expiry, preview, revocation, and what re-inviting an address does."
+---
+
+An `EmailInvite` is delivered once and never redisplayed to anyone, **including
+the inviter**. So only its sha256 is stored, in `TokenHash`: an attacker who
+steals the row still cannot produce a token that hashes to it.
+
+<Note>
+Read [Invitations](/invitations/overview) first for the wiring and for the
+permissions each call needs. This page is the email flow in detail.
+</Note>
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/invite"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member]())
+isvc := invite.New(svc.Service, memory.NewInviteStore(),
+	invite.WithInviteExpiry(7*24*time.Hour)) // the default
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+
+inv, token, err := isvc.InviteByEmail(owner, "bob@example.com", org.RoleAdmin)
+fmt.Println(err, inv.Email, inv.RoleKey, inv.InvitedBy == "alice")
+fmt.Println("expires in about a week:", inv.ExpiresAt.After(time.Now()))
+fmt.Println("only the hash is stored:", inv.TokenHash != "" && inv.TokenHash != token)
+```
+
+```
+<nil> bob@example.com admin true
+expires in about a week: true
+only the hash is stored: true
+```
+
+## The record
+
+<ResponseField name="ID" type="string">
+  The invite's own id, and what `RevokeInvite` takes.
+</ResponseField>
+<ResponseField name="ContainerID" type="string">
+  The scope being invited into.
+</ResponseField>
+<ResponseField name="Email" type="string">
+  Stored **exactly as you passed it** — this package does not normalize
+  addresses. A delivery hint and an audit record, never an authorization test.
+  See [bearer semantics](/invitations/security#an-email-invite-is-a-bearer-credential)
+  and [normalization is yours](#addresses-are-stored-verbatim).
+</ResponseField>
+<ResponseField name="RoleKey" type="string">
+  The role granted on acceptance.
+</ResponseField>
+<ResponseField name="TokenHash" type="string">
+  sha256 of the plaintext. **Must be unique** across every row — the backend
+  obligation that keeps a lookup single-row.
+</ResponseField>
+<ResponseField name="InvitedBy" type="string">
+  The minting actor. Never reaches an acceptance hook — record attribution here,
+  at mint time, if your audit trail needs it.
+</ResponseField>
+<ResponseField name="ExpiresAt" type="time.Time">
+  A plain value, not a pointer: an email invite always expires.
+  `WithInviteExpiry(d)` sets the window; seven days by default.
+</ResponseField>
+
+## Previewing without consuming
+
+`PreviewInvite` reads what a token is for **without spending it**, and requires
+no authentication — so a "you've been invited" landing page can tell an
+anonymous visitor what they are being offered.
+
+{/* verify:main */}
+```go
+p, err := isvc.PreviewInvite(context.Background(), token)
+fmt.Println(err, p.RoleKey, p.Email, "valid:", p.Valid, "container:", p.ContainerID == acme.ID)
+```
+
+```
+<nil> admin bob@example.com valid: true container: true
+```
+
+`Preview` deliberately does not expose the container record itself, which may
+carry fields of your own devising that are not meant for an anonymous reader.
+
+<Tip>
+`Preview.Email` is also how you **bind an invitation to its recipient** if your
+application needs that: compare it against the authenticated user's own verified
+address before calling `AcceptInvite` — after normalizing both, since
+[this package stores addresses verbatim](#addresses-are-stored-verbatim).
+</Tip>
+
+## Accepting
+
+{/* verify:main */}
+```go
+bob := org.WithSubject(context.Background(), "bob")
+joined, err := isvc.AcceptInvite(bob, token)
+fmt.Println("accepted:", err, joined.Name)
+
+_, err = isvc.AcceptInvite(bob, token)
+fmt.Println("the token is spent:", errors.Is(err, invite.ErrInviteNotFound))
+
+_, err = isvc.AcceptInvite(bob, "never-minted")
+fmt.Println("an unknown token:", errors.Is(err, invite.ErrInviteNotFound))
+```
+
+```
+accepted: <nil> Acme
+the token is spent: true
+an unknown token: true
+```
+
+<Warning>
+`AcceptInvite` **claims the credential first and admits second**. A failure
+after the claim burns the invitation and admits no one — under-admission, the
+safe direction — at the cost that accepting is **not safe to retry** with the
+same token. The invitee has to be re-invited.
+
+That ordering is load-bearing, not stylistic. See
+[claim first, admit second](/invitations/security#claim-first-admit-second).
+</Warning>
+
+### An existing member is folded into success
+
+{/* verify:main */}
+```go
+// bob is already an admin. Invite him again, at a LOWER role.
+_, lower, _ := isvc.InviteByEmail(owner, "bob@example.com", org.RoleMember)
+again, err := isvc.AcceptInvite(bob, lower)
+fmt.Println("re-accept:", err, again.Name)
+
+standing, _, _ := svc.Standing(context.Background(), acme.ID, "bob")
+fmt.Println("bob is still an admin:", standing.Allows(org.ResourceMember, org.ActionCreate))
+```
+
+```
+re-accept: <nil> Acme
+bob is still an admin: true
+```
+
+<Warning>
+A duplicate's `scope.ErrAlreadyMember` is folded into **success**, after the
+token has already been consumed — and nothing in the return value distinguishes
+"already had this role" from "already had a lesser one".
+
+This never over-privileges: folding a duplicate can only leave someone at or
+below what they already had. But it can **silently swallow an intended
+promotion**. Check `scope.Service.Standing` first, or route promotions through
+`ChangeMemberRole`, if your application needs to tell the two apart.
+</Warning>
+
+## Re-inviting replaces
+
+{/* verify:main */}
+```go
+_, first, _ := isvc.InviteByEmail(owner, "carol@example.com", org.RoleMember)
+_, second, _ := isvc.InviteByEmail(owner, "carol@example.com", org.RoleAdmin)
+
+carol := org.WithSubject(context.Background(), "carol")
+_, err = isvc.AcceptInvite(carol, first)
+fmt.Println("the first token is dead:", errors.Is(err, invite.ErrInviteNotFound))
+_, err = isvc.AcceptInvite(carol, second)
+fmt.Println("the second works:", err)
+```
+
+```
+the first token is dead: true
+the second works: <nil>
+```
+
+That is what the `(ContainerID, Email)` uniqueness constraint buys. Without it,
+two racing invitations leave a container holding two live tokens where its
+pending-invitations screen shows one row — and revoking the visible one leaves
+the other redeemable. It is a constraint on the **pair**: the same person
+invited to two containers is two legitimate rows.
+
+## Addresses are stored verbatim
+
+<Warning>
+`invite` performs **no normalization at all**. Unlike
+[`auth`](/authentication/overview), which passes every address through
+`auth.NormalizeEmail` (trim, lowercase) on every read and write, this package
+stores and matches the exact string you hand it.
+
+So `(ContainerID, Email)` uniqueness — and therefore "re-inviting replaces" — is
+**byte-exact**. Two casings of one address are two rows, both live, and revoking
+the one your screen shows leaves the other redeemable.
+</Warning>
+
+{/* verify:main */}
+```go
+_, lowerTok, _ := isvc.InviteByEmail(owner, "erin@example.com", org.RoleMember)
+_, upperTok, _ := isvc.InviteByEmail(owner, "Erin@Example.com", org.RoleMember)
+
+open := 0
+for _, t := range []string{lowerTok, upperTok} {
+	if p, err := isvc.PreviewInvite(context.Background(), t); err == nil && p.Valid {
+		open++
+	}
+}
+fmt.Println("live invitations for one human:", open)
+```
+
+```
+live invitations for one human: 2
+```
+
+Two consequences to handle in your own code:
+
+<Columns cols={2}>
+  <Card title="Normalize before you call" icon="wand-magic-sparkles">
+    Lowercase and trim the address yourself — `auth.NormalizeEmail` is exported
+    and is exactly what the authentication half applies — so re-inviting really
+    does replace.
+  </Card>
+  <Card title="Normalize before you compare" icon="code-compare">
+    `Preview.Email` comes back exactly as it went in, while
+    `auth.UserBase.Email` is always normalized. A raw `==` between the two
+    refuses a legitimate recipient invited as `Bob@Example.com`.
+  </Card>
+</Columns>
+
+{/* verify:main */}
+```go
+// The comparison that actually works, when binding an invitation to its
+// recipient. auth.NormalizeEmail is trim + lowercase.
+p, _ = isvc.PreviewInvite(context.Background(), upperTok)
+fmt.Println("raw compare:       ", p.Email == "erin@example.com")
+fmt.Println("normalized compare:", auth.NormalizeEmail(p.Email) == "erin@example.com")
+```
+
+```
+raw compare:        false
+normalized compare: true
+```
+
+## Listing and revoking
+
+{/* verify:main */}
+```go
+_, _, _ = isvc.InviteByEmail(owner, "dana@example.com", org.RoleMember)
+
+pending, _ := isvc.ListInvites(owner)
+addresses := make([]string, 0, len(pending))
+for _, i := range pending {
+	addresses = append(addresses, i.Email)
+}
+sort.Strings(addresses)
+fmt.Println("pending:", addresses)
+
+fmt.Println("revoke:", isvc.RevokeInvite(owner, pending[0].ID))
+fmt.Println("revoke again:", errors.Is(
+	isvc.RevokeInvite(owner, pending[0].ID), invite.ErrInviteNotFound))
+```
+
+```
+pending: [Erin@Example.com dana@example.com erin@example.com]
+revoke: <nil>
+revoke again: true
+```
+
+Note the two rows for Erin — that is the
+[verbatim-address behaviour](#addresses-are-stored-verbatim) showing up on a
+management screen. `ListInvites` returns the container's rows in **no specified
+order**; sort before you render.
+
+<Note>
+`RevokeInvite` reports `ErrInviteNotFound` for an id that exists in **another
+container**, so a cross-tenant id is indistinguishable from a missing one.
+`ListInvites` never returns a token or anything that could be turned into one —
+only the hash is stored, so there is nothing to leak.
+</Note>
+
+## Expiry
+
+`ErrInviteExpired` describes *why a redemption did not happen*, rather than a
+lookup miss. Expired rows are removed by
+`invite.Service.PurgeExpired(ctx, before)` — a **cron-only** call that spans
+every container the store holds and authorizes nothing.
+
+{/* verify:main */}
+```go
+removed, err := isvc.PurgeExpired(context.Background(), time.Now().UTC().Add(-24*time.Hour))
+fmt.Println("purged:", err, removed)
+```
+
+```
+purged: <nil> 0
+```
+
+{/* verify:stdout "<nil> bob@example.com admin true\nexpires in about a week: true\nonly the hash is stored: true\n<nil> admin bob@example.com valid: true container: true\naccepted: <nil> Acme\nthe token is spent: true\nan unknown token: true\nre-accept: <nil> Acme\nbob is still an admin: true\nthe first token is dead: true\nthe second works: <nil>\nlive invitations for one human: 2\nraw compare:        false\nnormalized compare: true\npending: [Erin@Example.com dana@example.com erin@example.com]\nrevoke: <nil>\nrevoke again: true\npurged: <nil> 0" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Links" icon="link" href="/invitations/links">
+    The reusable form, and how it differs.
+  </Card>
+  <Card title="Security" icon="lock" href="/invitations/security">
+    Bearer semantics, claim ordering, and the inviter recheck.
+  </Card>
+</Columns>

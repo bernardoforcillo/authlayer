@@ -1,0 +1,214 @@
+---
+title: "Email verification and change"
+description: "One table, three purposes. Confirming an address, moving one — which requires the current password — and the uniqueness check that deliberately happens at redemption."
+---
+
+Three one-time flows share the same shape — mint an opaque token, deliver it,
+redeem it once — so they share one `Verification` table. `Purpose`
+distinguishes them:
+
+| Purpose | Minted by | Redeemed by | Default TTL |
+|---|---|---|---|
+| `signup` | `SignUp` | `VerifyEmail` | 24 h |
+| `email_change` | `RequestEmailChange` | `VerifyEmail` | 24 h |
+| `password_reset` | `RequestPasswordReset` | `ResetPassword` | 1 h |
+
+Only the token's **hash** is stored, exactly as for a
+[refresh token](/authentication/sessions) and an
+[email invite](/invitations/email-invites).
+
+## Confirming a new account's address
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault")
+svc := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithVerificationTTL(24*time.Hour),  // signup + email_change
+	auth.WithPasswordResetTTL(1*time.Hour),  // password_reset
+	auth.WithRequireVerifiedEmail(true))
+
+ctx := context.Background()
+res, _ := svc.SignUp(ctx, "bob@example.com", "Correct-Horse-Battery-7")
+// Deliver res.VerifyToken to bob@example.com yourself.
+
+u, err := svc.VerifyEmail(ctx, res.VerifyToken)
+fmt.Println("verified:", err, u.EmailVerifiedAt != nil)
+
+_, err = svc.VerifyEmail(ctx, res.VerifyToken)
+fmt.Println("one-time:", errors.Is(err, auth.ErrVerificationNotFound))
+```
+
+```
+verified: <nil> true
+one-time: true
+```
+
+<Warning>
+Presenting the **wrong kind** of token is `ErrVerificationPurpose` — a
+`password_reset` token at `VerifyEmail`, say. An **expired** one is
+`ErrVerificationExpired`, checked *before* the claim, so the token is not burned
+by its own expiry check.
+</Warning>
+
+## Changing an address requires the current password
+
+{/* verify:main */}
+```go
+_, err = svc.RequestEmailChange(ctx, res.User.ID, "not-the-password", "new@example.com")
+fmt.Println("wrong password:", errors.Is(err, auth.ErrInvalidCredentials))
+
+changeTok, err := svc.RequestEmailChange(ctx, res.User.ID,
+	"Correct-Horse-Battery-7", "  New@Example.com ")
+fmt.Println("armed:", err, changeTok != "")
+```
+
+```
+wrong password: true
+armed: <nil> true
+```
+
+<Note>
+Arming a rotation of the account's **login identifier** is the same kind of act
+as rotating its password, so it is held to `ChangePassword`'s standard — the
+same check, with the same timing discipline. An account with no password
+credential spends a comparable `Dummy` and gets the same
+`ErrInvalidCredentials`, and a caller who fails the check is not even told
+whether the address they proposed was well-formed.
+
+Without that check, a briefly-held session or a leaked 15-minute access token
+bought a **24-hour account takeover**, because `VerifyEmail` redeems the result
+with no authentication at all.
+</Note>
+
+## Redemption is unauthenticated, and moves the account
+
+{/* verify:main */}
+```go
+moved, err := svc.VerifyEmail(ctx, changeTok) // no session, no password
+fmt.Println("moved:", err, moved.Email, "re-certified:", moved.EmailVerifiedAt != nil)
+
+_, err = svc.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+fmt.Println("the old address no longer resolves:", errors.Is(err, auth.ErrInvalidCredentials))
+
+_, err = svc.Login(ctx, "new@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+fmt.Println("the new one does:", err)
+```
+
+```
+moved: <nil> new@example.com re-certified: true
+the old address no longer resolves: true
+the new one does: <nil>
+```
+
+`Store.UpdateUserEmail` clears `EmailVerifiedAt` unconditionally — moving the
+address proves nothing about the new one on its own — and the redemption then
+certifies the new address immediately after, in the same atomic step.
+
+### The uniqueness check happens at redemption, not before
+
+<Warning>
+`RequestEmailChange` deliberately does **not** pre-check whether the new address
+is already registered. A pre-check there would be an un-rate-limited "is this
+address registered?" oracle for **any authenticated caller**.
+
+So `Store.UpdateUserEmail` at redemption is the only enforcement point there is,
+and it must be atomic: splitting it into a read and a later write is what lets
+two accounts end up sharing one address.
+</Warning>
+
+{/* verify:main */}
+```go
+// carol tries to move onto an address that is already taken.
+carol, _ := svc.SignUp(ctx, "carol@example.com", "Correct-Horse-Battery-7")
+collide, err := svc.RequestEmailChange(ctx, carol.User.ID,
+	"Correct-Horse-Battery-7", "new@example.com") // no error here, by design
+fmt.Println("armed against a taken address:", err, collide != "")
+
+_, err = svc.VerifyEmail(ctx, collide)
+fmt.Println("refused at redemption:", errors.Is(err, auth.ErrEmailTaken))
+```
+
+```
+armed against a taken address: <nil> true
+refused at redemption: true
+```
+
+An **empty** proposed address (once normalized) is `ErrEmailRequired`, raised
+before anything is minted.
+
+## The mirror sweep
+
+Redeeming an `email_change` invalidates the account's outstanding
+`password_reset` tokens. A reset link is deliverable to exactly one address, so
+moving the account away from that address — often precisely because the mailbox
+is no longer trustworthy — must not leave a link sitting in the abandoned
+mailbox able to reset the credential of the account at its new one.
+
+<Note>
+That redemption does **not** revoke sessions. `VerifyEmail` is unauthenticated
+by construction, so giving it a sign-out-everywhere effect would hand a
+denial-of-service lever to anyone who obtains the link — and arming the token
+already cost the current password.
+
+`LogoutAll` is the authenticated control for that. An application that wants
+"changing your address signs you out everywhere" composes the two.
+</Note>
+
+The sweep does not run on the `signup` branch: that redemption certifies the
+address the account already holds and rotates nothing, so a reset token for that
+same mailbox is still a token for that same mailbox.
+
+<Warning>
+This sweep is **sequential-only**, exactly as
+[`ChangePassword`'s](/authentication/passwords#both-sweeps-are-sequential-only)
+is. A `RequestPasswordReset` whose `Store.CreateVerification` is genuinely
+concurrent with the redemption can still mint a token that survives it.
+</Warning>
+
+## `MarkEmailVerified` re-checks the address atomically
+
+The stamp is only ever applied to the address the redeemed token was
+*delivered* to. If the account's address changed since the token was minted, it
+is **not** certified at all, and the store reports `ErrEmailMismatch` rather
+than trusting whatever the row now holds.
+
+That guard is what makes the
+[reset-certifies-the-address](/authentication/passwords#a-completed-reset-also-verifies-the-address)
+behaviour safe.
+
+{/* verify:stdout "verified: <nil> true\none-time: true\nwrong password: true\narmed: <nil> true\nmoved: <nil> new@example.com re-certified: true\nthe old address no longer resolves: true\nthe new one does: <nil>\narmed against a taken address: <nil> true\nrefused at redemption: true" */}
+
+## No resend path
+
+<Warning>
+authlayer exposes **no** "resend the verification email" call. Under
+`WithRequireVerifiedEmail(true)`, the way back in for an account whose signup
+mail was lost is a completed
+[password reset](/authentication/passwords#a-completed-reset-also-verifies-the-address),
+which stamps `EmailVerifiedAt` when it is not already set.
+</Warning>
+
+## Next
+
+<Columns cols={2}>
+  <Card title="The password lifecycle" icon="lock" href="/authentication/passwords">
+    The two sweeps, from the other direction.
+  </Card>
+  <Card title="Rate limiting" icon="gauge" href="/authentication/rate-limiting">
+    Bounding the reset request, and the measured timing residual.
+  </Card>
+</Columns>

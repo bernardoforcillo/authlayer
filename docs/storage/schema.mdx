@@ -1,0 +1,310 @@
+---
+title: "The schema"
+description: "Eight tables across three independent stores, printed from the code that defines them — and which constraint or index is load-bearing rather than decorative."
+---
+
+Three stores own eight tables between them, and none of them declares a foreign
+key — not to a users table from the RBAC side, which authlayer does not own, and
+not between the three auth tables either.
+
+<Note>
+The column lists below are **printed by a program the documentation gate runs**,
+straight out of `dropsstore.NewSchema`, `NewAuthSchema` and `NewInviteSchema`.
+They cannot drift from the code.
+</Note>
+
+{/* verify:import */}
+```go
+import (
+	"fmt"
+	"sort"
+
+	"github.com/bernardoforcillo/authlayer/org"
+	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
+	"github.com/bernardoforcillo/drops/pg"
+)
+```
+
+{/* verify:decl */}
+```go
+func describe(t *pg.Table) {
+	fmt.Println(t.Name())
+	for _, c := range t.Columns() {
+		flags := ""
+		if c.IsPrimaryKey() {
+			flags += " PK"
+		}
+		if c.IsUnique() {
+			flags += " UNIQUE"
+		}
+		if !c.IsNotNull() {
+			flags += " NULL"
+		}
+		fmt.Printf("  %s%s\n", c.Name(), flags)
+	}
+	if pk := t.CompositePrimaryKey(); len(pk) > 0 {
+		names := make([]string, 0, len(pk))
+		for _, c := range pk {
+			names = append(names, c.Name())
+		}
+		fmt.Printf("  PRIMARY KEY %v\n", names)
+	}
+	var uniques []string
+	for name, cols := range t.CompositeUniques() {
+		names := make([]string, 0, len(cols))
+		for _, c := range cols {
+			names = append(names, c.Name())
+		}
+		uniques = append(uniques, fmt.Sprintf("  UNIQUE %v as %s", names, name))
+	}
+	sort.Strings(uniques)
+	for _, u := range uniques {
+		fmt.Println(u)
+	}
+	fmt.Printf("  indexes: %d\n", len(t.Indexes()))
+}
+```
+
+## The RBAC tables
+
+{/* verify:main */}
+```go
+s := dropsstore.NewSchema[org.Organization, org.Member]()
+describe(s.Containers)
+describe(s.Members)
+describe(s.Roles)
+```
+
+```
+organizations
+  id PK
+  owner_id
+  created_at
+  updated_at
+  name
+  slug UNIQUE
+  indexes: 0
+organization_members
+  container_id
+  user_id
+  role_key
+  joined_at
+  PRIMARY KEY [container_id user_id]
+  indexes: 0
+organization_roles
+  id PK
+  container_id
+  key
+  name
+  permissions
+  created_at
+  UNIQUE [container_id key] as organization_roles_container_key
+  indexes: 0
+```
+
+`name` and `slug` on `organizations` are `org.Organization`'s **own** fields, not
+the engine's — a [custom scope](/authorization/custom-scopes) puts yours there
+instead. `permissions` is a `BYTEA` holding
+[encoded grant *names*](/concepts/statements#encoding-is-by-name-not-by-bit-index),
+never bit indices, which is what lets the column survive changes to your
+statement set.
+
+<Warning>
+The unique constraints are load-bearing. They are what turn a concurrent
+double-insert into `ErrSlugTaken`, `ErrAlreadyMember` or `ErrRoleKeyTaken`
+instead of a duplicate row, **because the engine does not pre-check any of the
+three**.
+
+`CreateSchema` emits the composite ones itself — `PRIMARY KEY (container_id,
+user_id)` and `UNIQUE (container_id, key)` — since drops' `CREATE TABLE` covers
+single-column constraints only. Keep them if you own these tables in your own
+migrations.
+</Warning>
+
+## The auth tables
+
+{/* verify:main */}
+```go
+a := dropsstore.NewAuthSchema()
+describe(a.Users)
+describe(a.Sessions)
+describe(a.Verifications)
+```
+
+```
+users
+  id PK
+  email UNIQUE
+  email_verified_at NULL
+  password_hash
+  created_at
+  updated_at
+  UNIQUE [email] as users_email_key
+  indexes: 0
+sessions
+  id PK
+  user_id
+  token_hash
+  family_id
+  expires_at
+  created_at
+  rotated_at NULL
+  user_agent
+  ip
+  UNIQUE [token_hash] as sessions_token_hash
+  indexes: 1
+verifications
+  id PK
+  user_id
+  token_hash
+  purpose
+  email
+  expires_at
+  created_at
+  UNIQUE [token_hash] as verifications_token_hash
+  indexes: 1
+```
+
+<Note>
+`email` appears **twice** — inline on the column and again as a named
+constraint. That is deliberate:
+`CREATE TABLE IF NOT EXISTS` is a no-op against a table that already exists, so
+the guarded `ALTER TABLE` is what self-heals a users table created by an older
+version or by hand.
+
+Neither `token_hash` carries the inline flag at all, because their uniqueness is
+a **MUST on the backend** rather than something declared on the record's
+`drop:` tag. Both are registered as one-column constraints so `CreateSchema`
+emits the `ALTER TABLE` either way.
+</Note>
+
+### All three UNIQUE constraints earn their place
+
+<Columns cols={2}>
+  <Card title="users.email" icon="user">
+    What `SignUp` reads "already registered" off. Without it the duplicate
+    branch never fires and
+    [enumeration safety](/authentication/sign-up) has nothing to be safe about.
+  </Card>
+  <Card title="Both token_hash columns" icon="fingerprint">
+    Keep a hash lookup single-row, and turn a generation bug into a loud error
+    instead of an ambiguous multi-row match. Without the one on `sessions`,
+    [`MarkRotated`'s single winner](/authentication/refresh-rotation) breaks
+    with no atomicity defect at all.
+  </Card>
+</Columns>
+
+### Both indexes are load-bearing too
+
+<Columns cols={2}>
+  <Card title="sessions (family_id)" icon="layer-group">
+    Keeps `DeleteSessionsByFamily`'s two statements — and therefore every
+    `LogoutAll` iteration — off a table scan. Every family revocation reads and
+    locks by it, and `LogoutAll` runs one transaction per family.
+  </Card>
+  <Card title="verifications (user_id, purpose)" icon="shield-halved">
+    A **security** index. It runs on every `RequestPasswordReset`, so without it
+    the [residual timing channel](/authentication/rate-limiting#enumeration-safety-is-bounded-not-absolute)
+    grows with the number of pending tokens held for *all* users.
+  </Card>
+</Columns>
+
+Both are emitted as `CREATE INDEX IF NOT EXISTS`, so `CreateSchema` self-heals a
+table missing one.
+
+<Warning>
+That second one was measured, not assumed. Seeding 40,000 other users' pending
+tokens moved the known branch's floor from 2.3–2.5 ms to 4.7–5.0 ms **without**
+the index, and left it at 2.4–2.8 ms **with** it. A backend that omits it — a
+third-party `Store`, or your own migrations owning these tables — puts the
+growth term back.
+</Warning>
+
+## The invitation tables
+
+{/* verify:main */}
+```go
+i := dropsstore.NewInviteSchema()
+describe(i.EmailInvites)
+describe(i.Links)
+```
+
+```
+organization_invites
+  id PK
+  container_id
+  email
+  role_key
+  token_hash
+  invited_by
+  expires_at
+  created_at
+  UNIQUE [container_id email] as organization_invites_container_email
+  UNIQUE [token_hash] as organization_invites_token_hash
+  indexes: 0
+organization_invite_links
+  id PK
+  container_id
+  code
+  role_key
+  created_by
+  max_uses
+  use_count
+  expires_at NULL
+  revoked_at NULL
+  created_at
+  UNIQUE [code] as organization_invite_links_code
+  indexes: 0
+```
+
+<Warning>
+None of the three constraints here carries the inline `unique` flag on its
+column — like the `token_hash` columns above, each is registered as a named
+one-column constraint that `CreateSchema` emits as an `ALTER TABLE`. All three
+are
+[MUSTs on any backend](/storage/overview#the-seven-invitation-musts), and all three
+bound *who gets in*:
+
+- **`token_hash`** — what makes one emailed token pay out once.
+- **`code`** — without it two concurrent redeemers resolve **different** rows
+  and each atomically wins the one it picked, so a `MaxUses` limit bounds
+  nothing while every individual consume behaves perfectly.
+- **`(container_id, email)`** — what makes re-inviting an address replace rather
+  than duplicate when two calls race. A constraint on the **pair**: the same
+  person invited to two containers is two legitimate rows.
+</Warning>
+
+Note that this constraint is **byte-exact on the address**, because `invite`
+[does not normalize](/invitations/email-invites#addresses-are-stored-verbatim).
+
+{/* verify:stdout "organizations\n  id PK\n  owner_id\n  created_at\n  updated_at\n  name\n  slug UNIQUE\n  indexes: 0\norganization_members\n  container_id\n  user_id\n  role_key\n  joined_at\n  PRIMARY KEY [container_id user_id]\n  indexes: 0\norganization_roles\n  id PK\n  container_id\n  key\n  name\n  permissions\n  created_at\n  UNIQUE [container_id key] as organization_roles_container_key\n  indexes: 0\nusers\n  id PK\n  email UNIQUE\n  email_verified_at NULL\n  password_hash\n  created_at\n  updated_at\n  UNIQUE [email] as users_email_key\n  indexes: 0\nsessions\n  id PK\n  user_id\n  token_hash\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  user_agent\n  ip\n  UNIQUE [token_hash] as sessions_token_hash\n  indexes: 1\nverifications\n  id PK\n  user_id\n  token_hash\n  purpose\n  email\n  expires_at\n  created_at\n  UNIQUE [token_hash] as verifications_token_hash\n  indexes: 1\norganization_invites\n  id PK\n  container_id\n  email\n  role_key\n  token_hash\n  invited_by\n  expires_at\n  created_at\n  UNIQUE [container_id email] as organization_invites_container_email\n  UNIQUE [token_hash] as organization_invites_token_hash\n  indexes: 0\norganization_invite_links\n  id PK\n  container_id\n  code\n  role_key\n  created_by\n  max_uses\n  use_count\n  expires_at NULL\n  revoked_at NULL\n  created_at\n  UNIQUE [code] as organization_invite_links_code\n  indexes: 0" */}
+
+## Column types
+
+Every id column is a PostgreSQL `uuid` **by default** — including the ones
+holding a user id, since authlayer mints those too. See
+[Ids](/concepts/ids) for the options that retype them, and for the deployment
+failure that only shows up against a real database.
+
+Timestamps are `timestamptz`-shaped; the two nullable ones above
+(`email_verified_at`, `rotated_at`, plus a link's `expires_at` and `revoked_at`)
+are the only columns that may hold `NULL`.
+
+## Owning these tables yourself
+
+`st.Schema()`, `NewAuthSchema()` and `NewInviteSchema()` expose the definitions
+if you would rather generate DDL for your own migration tool. If you do, keep
+every constraint and index on this page — each one is here because something
+breaks without it, and the two indexes are the ones most easily dropped by
+accident.
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Custom backends" icon="plug" href="/storage/custom-backends">
+    The two executable contract suites.
+  </Card>
+  <Card title="Ids" icon="hashtag" href="/concepts/ids">
+    Non-UUID generators and the column options they need.
+  </Card>
+</Columns>

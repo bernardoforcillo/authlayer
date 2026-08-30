@@ -1,0 +1,99 @@
+---
+title: "authlayer"
+sidebarTitle: "Introduction"
+description: "Reusable authentication and authorization for Go — scope RBAC, invitations, and a session core you import rather than deploy."
+---
+
+authlayer is a Go **library**. You import it, hand it a store, and call it from
+your own handlers. It gives you two halves that share nothing but a user id
+string:
+
+<Columns cols={2}>
+  <Card title="Authorization" icon="shield-halved" href="/concepts/scopes">
+    Code-defined permission statements, hybrid default and custom roles,
+    permission checks, a privilege-escalation guard, lifecycle hooks, nested
+    scopes, and query-level row filtering.
+  </Card>
+  <Card title="Authentication" icon="key" href="/authentication/overview">
+    Users, password credentials, revocable server-side sessions with
+    refresh-token rotation and reuse detection, email verification, and the
+    password lifecycle.
+  </Card>
+</Columns>
+
+```sh
+go get github.com/bernardoforcillo/authlayer
+```
+
+Requires **Go 1.26+**. The current release is **v0.1.0**.
+
+## What authlayer is not
+
+This is the misconception worth clearing first, because it decides how much of
+your application authlayer replaces:
+
+<AccordionGroup>
+  <Accordion title="It is not an HTTP server, a middleware, or a CLI" icon="server">
+    There are no handlers, no cookies, no middleware, no base URL, and no
+    binary to run. Every method takes a `context.Context` and returns values.
+    Your application owns transport entirely — which route, which status code,
+    which cookie flags, which session storage on the browser side.
+  </Accordion>
+  <Accordion title="It does not send email" icon="envelope">
+    `SignUp`, `RequestPasswordReset`, `RequestEmailChange` and
+    `InviteByEmail` each return a plaintext token **exactly once**. Turning
+    that into a message — which template, which link, which provider — is
+    yours. authlayer knows no base URL.
+  </Accordion>
+  <Accordion title="It does not own your user profile" icon="user">
+    The authentication half persists `auth.UserBase` and nothing else: an id,
+    a normalized email, a verification stamp, a password hash, timestamps.
+    A `DisplayName` or `Plan` field lives in your own table, keyed by
+    `UserBase.ID`. That is what keeps authlayer's migrations from ever owning
+    a column your product's shape decides.
+  </Accordion>
+  <Accordion title="It has no OAuth in this release" icon="right-to-bracket">
+    Social and enterprise identity providers are not shipped. The rest of the
+    authentication core — password credentials, email verification, revocable
+    sessions with refresh rotation — is.
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+The authorization half stores **no users at all** and declares no foreign key
+to yours. A user id is a value it carries, never one it validates against a
+schema of its own. You can adopt `scope`/`org` on top of an existing user
+table and change nothing about how your accounts work.
+</Note>
+
+## The dependency budget
+
+Three requirements, and which one you pay depends on what you import:
+
+| Package | Pulls in |
+|---|---|
+| `access`, `token` | standard library only |
+| `password`, and so `auth` | `golang.org/x/crypto` — bcrypt only |
+| `scope`, `org`, `team`, `invite` | `github.com/bernardoforcillo/drops` |
+| `store/drops` | `github.com/jackc/pgx/v5` |
+
+The UUIDv7 generator behind every id authlayer mints is written out in
+`internal/uid` rather than depended on, which is what keeps that list at three.
+
+## Where to go next
+
+<Columns cols={2}>
+  <Card title="Install" icon="download" href="/get-started/installation">
+    The module, the import paths, and the two packages both named `stdlib`.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/get-started/quickstart">
+    Two complete programs — RBAC and sign-up-to-login — that run with no
+    database.
+  </Card>
+  <Card title="Concepts" icon="diagram-project" href="/concepts/scopes">
+    Scopes, statements, roles, and the two enforcement points.
+  </Card>
+  <Card title="Storage" icon="database" href="/storage/overview">
+    The three `Store` ports, the shipped backends, and the schema.
+  </Card>
+</Columns>

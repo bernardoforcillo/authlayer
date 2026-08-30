@@ -1,0 +1,126 @@
+---
+title: "Context"
+description: "The acting subject and the active scope travel on the context, not as arguments — so one context drives both the in-memory decision and the SQL guards."
+---
+
+authlayer does not take an actor argument. **Who is acting** and **which scope
+they are acting in** travel on the `context.Context`.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+ctx := context.Background()
+ctx = org.WithSubject(ctx, "alice") // who is acting
+ctx = org.WithOrg(ctx, "org-123")   // which organization
+
+userID, haveSubject := org.SubjectFrom(ctx)
+orgID, haveOrg := org.OrgFrom(ctx)
+fmt.Println(userID, haveSubject, orgID, haveOrg)
+```
+
+```
+alice true org-123 true
+```
+
+## Why not an argument
+
+Because the same context has to drive **both**
+[enforcement points](/concepts/decisions#the-two-enforcement-points). An
+in-memory `Can` and a drops `pg.Guard` rendered into a `SELECT` must agree
+about who is asking, and threading an actor through a query builder by hand is
+exactly the kind of plumbing that gets forgotten on one path.
+
+authlayer reuses drops' own context keys — `pg.WithSubject` and `pg.WithTenant`
+— rather than defining its own, which is what makes that agreement automatic.
+
+## The generic names, and the flavoured ones
+
+`scope` is the engine, and each ready-made instance renames the scope helper to
+match its container:
+
+| Package | Subject | Active scope | Read back |
+|---|---|---|---|
+| `scope` | `WithSubject` | `WithScope` | `SubjectFrom`, `ScopeFrom` |
+| `org` | `WithSubject` | `WithOrg` | `SubjectFrom`, `OrgFrom` |
+| `team` | `WithSubject` | `WithTeam` | `SubjectFrom`, `TeamFrom` |
+
+<Warning>
+`org.WithOrg` and `team.WithTeam` set the **same** underlying "active
+container" key, so only one is active at a time. This matters in exactly one
+place: `team.Service.CreateTeam` reads the **organization** on the context —
+`org.WithOrg` — because that is the scope being created *in*. Every other team
+operation reads the **team**. Switch between them as your code moves from
+creating a team to operating inside one.
+</Warning>
+
+## Missing context is never a silent allow
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member]())
+
+noSubject := org.WithOrg(context.Background(), "org-123")
+_, err := svc.Can(noSubject, org.ResourceMember, org.ActionCreate)
+fmt.Println("no subject:", errors.Is(err, org.ErrSubjectMissing))
+
+noOrg := org.WithSubject(context.Background(), "alice")
+_, err = svc.Can(noOrg, org.ResourceMember, org.ActionCreate)
+fmt.Println("no org:", errors.Is(err, org.ErrOrgMissing))
+```
+
+```
+no subject: true
+no org: true
+```
+
+Both are wiring bugs rather than caller input, which is why they suggest a
+**500** and not a 403 — see [Errors](/reference/errors).
+
+<Note>
+`CreateOrganization` is the one operation that needs no active scope: there is
+no organization yet. It needs a subject, and the caller becomes the owner.
+</Note>
+
+## Where the subject comes from
+
+authlayer mints nothing onto the context for you — it owns no transport, so it
+never sees your request. In a typical handler the subject is the `sub` claim of
+a verified access token:
+
+{/* verify:skip a handler sketch: it needs an *auth.Service and an *http.Request this page does not construct, and the same pairing is compiled and run on /authentication/access-tokens */}
+```go
+claims, err := authSvc.VerifyAccessToken(bearer)
+if err != nil {
+	return err
+}
+ctx := org.WithOrg(org.WithSubject(r.Context(), claims.Subject), orgIDFromRoute)
+```
+
+If you are using the [authorization half alone](/concepts/scopes#scopes-carry-no-users),
+the subject is whatever user id your existing system already has. `scope`
+carries it as an opaque value and never validates it against a schema of its
+own.
+
+{/* verify:stdout "alice true org-123 true\nno subject: true\nno org: true" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Checking permissions" icon="scale-balanced" href="/authorization/checking-permissions">
+    The three call shapes, and which is safe to expose.
+  </Card>
+  <Card title="Query-level filtering" icon="database" href="/authorization/query-filtering">
+    The same context, pushed into SQL.
+  </Card>
+</Columns>

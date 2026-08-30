@@ -1,0 +1,173 @@
+---
+title: "How a decision is made"
+description: "The five-step ladder every permission check walks, what 'elevated' means, and the two enforcement points that read the same context."
+---
+
+Every check — `Can`, `Authorize`, `HasPermission`, and the guard that filters
+rows in SQL — resolves the actor's **standing** in a container by walking the
+same ladder.
+
+<Steps>
+  <Step title="Load the container" icon="box">
+    Absent is `ErrContainerNotFound` (`org.ErrOrgNotFound` is the same value).
+  </Step>
+  <Step title="Owner bypass" icon="crown">
+    If `Policy.OwnerBypass` is on — the default — and the actor owns the
+    container, they are **elevated** with full permissions. No membership
+    lookup, no role resolution. This is what makes a mis-configured container
+    always recoverable.
+  </Step>
+  <Step title="Load the membership" icon="id-card">
+    Absent is `ErrNotMember`. A non-member is never treated as a member with
+    no grants; the two are different answers.
+  </Step>
+  <Step title="Resolve the role key" icon="key">
+    A code-defined default if the registry knows it, otherwise a custom role
+    loaded from the store and decoded. Neither is `ErrRoleNotFound`.
+  </Step>
+  <Step title="Decide" icon="scale-balanced">
+    The actor is **elevated** if the resolved permission set is full.
+    Otherwise they must hold every requested `(resource, action)` pair.
+  </Step>
+</Steps>
+
+## What "elevated" buys, and what it does not
+
+An elevated actor passes every fine-grained check that names at least one
+action, **and** the privilege-escalation guard — for them every grant set is
+trivially a subset of their own.
+
+<Warning>
+A check naming **no** actions denies everyone, elevated included. There is
+nothing to authorize, so there is nothing to allow.
+</Warning>
+
+Multiple actions are an **AND**, not an OR: `Authorize(ctx, "project",
+"create", "update")` requires both.
+
+## Nothing is cached
+
+Every check hits the store for the container, the membership, and — when the
+role key names a custom role — the role record. That is a deliberate trade:
+
+<Columns cols={2}>
+  <Card title="What you get" icon="bolt">
+    A permission change takes effect immediately, everywhere, and there is no
+    invalidation to get wrong. Revoking someone mid-request is a store write,
+    not a cache dance.
+  </Card>
+  <Card title="What it costs" icon="server">
+    Store round trips per check. If you need fewer, wrap the **`Store`**, not
+    the `Service` — a decorator over the port keeps every authorization rule
+    intact while changing where the bytes come from.
+  </Card>
+</Columns>
+
+## The two enforcement points
+
+authlayer enforces authorization in two different places, and both read the
+acting subject and the active scope from the **same** `context`.
+
+<Columns cols={2}>
+  <Card title="In-memory decision" icon="microchip" href="/authorization/checking-permissions">
+    `Can` / `Authorize` / `HasPermission` answer *"may this user do X?"*. Use
+    them in handlers, before a mutation.
+  </Card>
+  <Card title="Query-level guard" icon="database" href="/authorization/query-filtering">
+    A drops `pg.Guard` answers *"which rows may this user see?"*, pushed into
+    the SQL so a `SELECT` cannot return another tenant's rows.
+  </Card>
+</Columns>
+
+<Warning>
+The two agree for every container where the subject holds a membership whose
+role key resolves. They **diverge in a nested scope**: `PermissionGuard` and
+`ContainersWith` resolve membership-based standing only and do not walk the
+parent rung, so an organization admin who administers a team purely through
+inheritance gets `true` from `Can` and **no rows** from a guard built over that
+team. That is a known gap, not a rule — see
+[Query-level filtering](/authorization/query-filtering#nested-scopes-diverge).
+</Warning>
+
+## Seeing the ladder run
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member]())
+
+alice := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(alice, "Acme", "acme")
+inOrg := org.WithOrg(alice, acme.ID)
+_, _ = svc.AddMember(inOrg, "bob", org.RoleMember)
+
+// Step 1: no such container.
+missing := org.WithOrg(alice, "00000000-0000-0000-0000-000000000000")
+_, err := svc.Can(missing, org.ResourceMember, org.ActionCreate)
+fmt.Println("no container:", errors.Is(err, org.ErrOrgNotFound))
+
+// Step 3: a subject with no membership at all.
+carol := org.WithOrg(org.WithSubject(context.Background(), "carol"), acme.ID)
+err = svc.Authorize(carol, org.ResourceMember, org.ActionCreate)
+fmt.Println("not a member:", errors.Is(err, org.ErrNotMember))
+
+// Step 5: a member whose role grants nothing.
+bob := org.WithOrg(org.WithSubject(context.Background(), "bob"), acme.ID)
+err = svc.Authorize(bob, org.ResourceMember, org.ActionCreate)
+fmt.Println("member, forbidden:", errors.Is(err, org.ErrForbidden))
+
+// Step 2: the owner, elevated by ownership rather than by role.
+fmt.Println("owner elevated:", must(svc.Can(inOrg, org.ResourceOrganization, org.ActionDelete)))
+
+// Zero actions denies even the owner.
+fmt.Println("owner, no actions:", must(svc.Can(inOrg, org.ResourceOrganization)))
+```
+
+{/* verify:decl */}
+```go
+func must(ok bool, err error) bool {
+	if err != nil {
+		panic(err)
+	}
+	return ok
+}
+```
+
+```
+no container: true
+not a member: true
+member, forbidden: true
+owner elevated: true
+owner, no actions: false
+```
+
+{/* verify:stdout "no container: true\nnot a member: true\nmember, forbidden: true\nowner elevated: true\nowner, no actions: false" */}
+
+<Tip>
+`Can` folds `ErrForbidden` and `ErrNotMember` into a plain `false`, so the
+error it returns means the question could not be **answered** — a missing
+subject, a missing scope, a store failure. That is not a denial. Check the
+error first.
+</Tip>
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Context" icon="share-nodes" href="/concepts/context">
+    Where the subject and the active scope come from.
+  </Card>
+  <Card title="Checking permissions" icon="scale-balanced" href="/authorization/checking-permissions">
+    Which of the three call shapes to reach for.
+  </Card>
+</Columns>

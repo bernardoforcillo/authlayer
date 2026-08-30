@@ -1,0 +1,154 @@
+---
+title: "store/memory"
+description: "The in-process, map-backed backend — the reference implementation of every contract, and the one divergence it still has."
+---
+
+`store/memory` is an in-process store backed by maps. Zero dependencies,
+concurrency safe, and the reference implementation of the contracts. Use it for
+development, tests and examples.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/invite"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+scopeStore := memory.New[org.Organization, org.Member]() // scope.Store
+inviteStore := memory.NewInviteStore()                   // invite.Store
+authStore := memory.NewAuthStore()                       // auth.Store
+
+svc := org.New(org.NewAccess(nil), scopeStore)
+isvc := invite.New(svc.Service, inviteStore)
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, err := svc.CreateOrganization(ctx, "Acme", "acme")
+fmt.Println(err, acme.Name, isvc != nil, authStore != nil)
+```
+
+```
+<nil> Acme true true
+```
+
+All three are generic-free to construct except `memory.New`, which takes the
+same container and member type parameters your `scope.Service` uses.
+
+## What it enforces
+
+Every uniqueness constraint its ports describe.
+
+<Columns cols={2}>
+  <Card title="auth.Store" icon="user">
+    One account per normalized email, no id collision on any `Create*`
+    (`auth.ErrIDTaken`), and `token_hash` uniqueness on **both** `Session` and
+    `Verification`, reported as `memory.ErrTokenHashTaken`.
+  </Card>
+  <Card title="invite.Store" icon="envelope">
+    `EmailInvite.TokenHash` (also `memory.ErrTokenHashTaken` — same column
+    meaning, same failure), `(ContainerID, Email)` as
+    `memory.ErrInviteEmailTaken`, and `Link.Code` as `memory.ErrLinkCodeTaken`.
+  </Card>
+</Columns>
+
+<Note>
+Both used to defer those to `store/drops`, which has always had them as `UNIQUE`
+constraints. That left a caller who developed here and deployed there meeting
+the constraint for the first time **in production**, so it went away.
+</Note>
+
+A collision gets a **backend-level** error rather than a port sentinel, because
+`auth.Store` classifies only `ErrIDTaken` on the `Create*` methods and
+`invite.Store` classifies no conflict-on-create at all. `store/drops` answers the
+same cases with the driver's own unique violation — so match on your backend's
+error, not on a portable sentinel, if you need to distinguish it.
+
+{/* verify:main */}
+```go
+_, code, _ := isvc.CreateLink(org.WithOrg(ctx, acme.ID), org.RoleMember, 1, nil)
+
+// Both backends refuse a duplicate code; only the ERROR VALUE differs.
+_, err = inviteStore.CreateLink(context.Background(), invite.Link{
+	ID: "dup", ContainerID: acme.ID, Code: code, RoleKey: org.RoleMember,
+})
+fmt.Println("duplicate code refused:", err == memory.ErrLinkCodeTaken)
+```
+
+```
+duplicate code refused: true
+```
+
+## Atomicity
+
+Both stores satisfy every atomicity MUST their ports state by holding **one
+mutex for each method's entire body**, so no check-then-write can be split by a
+concurrent call.
+
+That is also why `store/memory` owes neither of
+[`DeleteSessionsByFamily`'s two extra MUSTs](/storage/overview#the-strictest-port):
+its `CreateSuccessorSession` takes no row-level lock that a family deletion
+could be snapshotted behind, so there is no gap to close.
+
+## What it does not do
+
+<Warning>
+It does **not** enforce uniqueness of your own fields. A `Slug` on your
+container type is a database concern; `memory.New` will happily hold two
+organizations with the same slug, where `store/drops` returns
+`scope.ErrConflict` (`org.ErrSlugTaken`).
+</Warning>
+
+{/* verify:main */}
+```go
+dup, err := svc.CreateOrganization(ctx, "Acme Again", "acme") // the same slug
+fmt.Println("memory accepts a duplicate slug:", err, dup.Slug)
+```
+
+```
+memory accepts a duplicate slug: <nil> acme
+```
+
+`WithTx` approximates a transaction by **snapshot-and-restore under a mutex**,
+which is enough for the engine's one use of it but is not a real transaction.
+
+## The one remaining divergence
+
+<Warning>
+Recorded rather than closed. `store/drops` types an invite's and a link's `id`
+as a `PRIMARY KEY`, so reusing one is a unique violation there — while
+`memory.InviteStore` keys its maps by ID, and a create under an id already
+present **overwrites** the row.
+
+`invite.Store` documents no id-collision contract and `invite` has no sentinel
+for one (unlike `auth.ErrIDTaken`), so nothing in the backend is entitled to
+invent one. The service mints a fresh UUIDv7 for every record, so the case does
+not arise in practice — but a hand-written test that reuses an id will behave
+differently on the two backends.
+</Warning>
+
+{/* verify:stdout "<nil> Acme true true\nduplicate code refused: true\nmemory accepts a duplicate slug: <nil> acme" */}
+
+## Use it for tests, not for production
+
+<Note>
+Nothing here persists across a restart, and nothing is shared between processes.
+`store/memory` is the right store for unit tests, examples and local
+development; it is the wrong one for anything that has to survive a deploy.
+</Note>
+
+## Next
+
+<Columns cols={2}>
+  <Card title="store/drops" icon="database" href="/storage/postgres">
+    The production backend, and what changes when you swap.
+  </Card>
+  <Card title="Custom backends" icon="plug" href="/storage/custom-backends">
+    The contract suites `store/memory` itself runs.
+  </Card>
+</Columns>

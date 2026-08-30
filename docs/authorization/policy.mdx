@@ -1,0 +1,146 @@
+---
+title: "Policy"
+description: "The four tunable authorization invariants — and why the zero Policy is not the defaults."
+---
+
+`Policy` bundles the invariants you are allowed to tune. It is set at
+construction through `WithPolicy` and never changes afterwards, so a `Service`
+is immutable once built.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/scope"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+strict := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member](),
+	org.WithPolicy(org.Policy{
+		Escalation:        scope.EscalationStrict,
+		LastOwnerLocked:   true,
+		MembersFromParent: true,
+		OwnerBypass:       false, // the only deviation from the defaults
+	}))
+
+alice := org.WithSubject(context.Background(), "alice")
+acme, _ := strict.CreateOrganization(alice, "Acme", "acme")
+inAcme := org.WithOrg(alice, acme.ID)
+
+ok, _ := strict.Can(inAcme, org.ResourceOrganization, org.ActionDelete)
+fmt.Println("owner still elevated with OwnerBypass off:", ok)
+```
+
+```
+owner still elevated with OwnerBypass off: true
+```
+
+<Note>
+Clearing `OwnerBypass` does not lock the owner out on its own. The owner
+membership `CreateContainer` seeds holds the `owner` **role key**, and that
+role is full — so the owner stays elevated through their role rather than
+through the bypass. The bypass is the safety net for when that role key is
+*not* what it should be.
+</Note>
+
+## The four fields
+
+<ResponseField name="Escalation" type="scope.EscalationMode" default="EscalationStrict">
+  Selects the [privilege-escalation guard](/authorization/privilege-escalation).
+  `EscalationOff` disables it entirely, at all five call sites.
+  `EscalationAllowEqual` currently behaves **exactly** like `EscalationStrict`
+  — it is reserved for future strictly-less semantics and changes nothing
+  today.
+</ResponseField>
+
+<ResponseField name="LastOwnerLocked" type="bool" default="true">
+  The owner cannot be removed, demoted, or leave (`ErrLastOwner`). Ownership
+  still moves through `TransferOwnership`, which is the intended path. Clearing
+  it allows a container with no owner membership at all, so only do so if your
+  application enforces its own invariant.
+</ResponseField>
+
+<ResponseField name="MembersFromParent" type="bool" default="true">
+  In a [nested scope](/authorization/nested-scopes), `AddMember` refuses a user
+  with no standing in the parent (`ErrNotParentMember`) — you cannot be on a
+  team without being in the organization that owns it. It has **no effect**
+  without `WithParent`, and it constrains `AddMember` only: the owner
+  membership seeded by `CreateContainer` is not checked separately, because
+  creating a container in a parent already requires standing there.
+</ResponseField>
+
+<ResponseField name="OwnerBypass" type="bool" default="true">
+  The container owner gets the full permission set and elevated standing
+  regardless of the role key on their membership, so a container whose roles
+  were mis-configured is always recoverable. Clearing it makes the owner an
+  ordinary member subject to their role — which **can lock the owner out of
+  their own container**.
+</ResponseField>
+
+## `WithPolicy` replaces, it does not merge
+
+<Warning>
+The zero `Policy` is **not** the defaults. For three of the four fields, zero is
+the *most permissive* value reachable: no owner protection, no owner bypass, no
+parent-membership requirement. Only `Escalation` happens to have the strict
+mode as its zero.
+
+`WithPolicy` sets the whole struct, so pass a fully populated one. Leaving a
+field out is not "keep the default" — it is "turn it off".
+</Warning>
+
+{/* verify:main */}
+```go
+loose := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member](),
+	org.WithPolicy(org.Policy{Escalation: scope.EscalationStrict}))
+
+beta, _ := loose.CreateOrganization(alice, "Beta", "beta")
+inBeta := org.WithOrg(alice, beta.ID)
+
+// LastOwnerLocked defaulted to false in that struct literal, so the owner
+// can now leave the container and strand it.
+fmt.Println("owner leaves under a zero-ish policy:", loose.LeaveContainer(inBeta))
+```
+
+```
+owner leaves under a zero-ish policy: <nil>
+```
+
+Compare with the [default](/authorization/members#the-last-owner-is-locked),
+where the same call is `ErrLastOwner`.
+
+{/* verify:stdout "owner still elevated with OwnerBypass off: true\nowner leaves under a zero-ish policy: <nil>" */}
+
+## Invitations are configured separately
+
+`invite.Service` does **not** read `Policy`. It takes its own options, and an
+`invite.Service` and the `scope.Service` it wraps are configured independently:
+
+| Option | Purpose |
+|---|---|
+| `WithRecheckInviterOnAccept(b)` | Default `true`. Re-check the inviter's *current* standing before admitting anyone. See [Invitation security](/invitations/security#rechecking-the-inviter). |
+| `WithInviteExpiry(d)` | How long a freshly minted email invite stays acceptable; default seven days. Links take their expiry per-link, at `CreateLink`. |
+| `WithNotifier(n)` | Deliver each minted invitation; default `nil` sends nothing. Sugar over calling a `Notifier` yourself. |
+| `WithTokens(gen)` | Override the token/code generator. **Tests only** — `gen` is the entire source of unguessability for every credential the service mints. |
+
+One field of `Policy` does reach invitations, indirectly: `MembersFromParent`
+is enforced inside `GrantMembership`, which is where both acceptance paths end.
+That interaction burns a credential and is worth reading before you send a team
+invitation — [see the note](/invitations/security#on-a-nested-scope-admit-to-the-parent-first).
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Options" icon="sliders" href="/reference/options">
+    Every option on every service, in one table.
+  </Card>
+  <Card title="Nested scopes" icon="sitemap" href="/authorization/nested-scopes">
+    Where `MembersFromParent` starts to matter.
+  </Card>
+</Columns>

@@ -1,0 +1,173 @@
+---
+title: "Sign-up and the enumeration property"
+description: "A duplicate address is not an error. Both outcomes return (SignUpResult, nil) — and the property holds by construction, up to the boundary of the function and no further."
+---
+
+A library that returns a token cannot fake "we emailed the account already on
+file". So `SignUp` does not try: **a duplicate address is not an error**. Both
+outcomes return `(SignUpResult, nil)`.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault")
+svc := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute))
+
+ctx := context.Background()
+
+first, err := svc.SignUp(ctx, "bob@example.com", "Correct-Horse-Battery-7")
+fmt.Println("new:      ", first.Created, first.VerifyToken != "", err)
+
+again, err := svc.SignUp(ctx, "BOB@example.com", "Some-Other-Password-9")
+fmt.Println("duplicate:", again.Created, again.VerifyToken != "", err)
+fmt.Println("duplicate hands back the ZERO user:", again.User == (auth.UserBase{}))
+```
+
+```
+new:       true true <nil>
+duplicate: false false <nil>
+duplicate hands back the ZERO user: true
+```
+
+The one thing that *does* error is a weak password, and it is checked **before**
+the address is looked up at all:
+
+{/* verify:main */}
+```go
+weak, err := svc.SignUp(ctx, "carol@example.com", "short")
+fmt.Println("weak:", weak.Created, errors.Is(err, auth.ErrWeakPassword))
+```
+
+```
+weak: false true
+```
+
+## The property holds by construction
+
+Not by argument. Three things make it structural:
+
+<Steps>
+  <Step title="The password is validated first" icon="key">
+    Before the address is looked up, so a weak-password rejection reveals
+    nothing about whether the address exists.
+  </Step>
+  <Step title="Every Store call after CreateUser runs on both branches" icon="code-branch">
+    The read-back and the verification mint run on the duplicate branch too,
+    with their results discarded. There is no call — and therefore no failure —
+    that one branch can reach and the other cannot.
+  </Step>
+  <Step title="The duplicate branch hands back the zero User" icon="eye-slash">
+    Never the account it found. That record's `ID`, `CreatedAt` and
+    `EmailVerifiedAt` would each answer "is this address registered?" on their
+    own, in one request, to someone who has proven nothing about the address.
+  </Step>
+</Steps>
+
+<Note>
+A probe never touches the real accountholder's pending verification either. The
+duplicate branch's mint is purely **additive**, so nobody can destroy a victim's
+emailed link by "signing up" as them.
+</Note>
+
+## What the caller must do
+
+<Warning>
+A public sign-up handler must emit a **fixed response regardless of outcome** —
+same status code, same body shape, same rough latency.
+
+That is stronger than "don't branch on `Created`". `Created`, whether
+`VerifyToken` is present, whether `User` is populated, and the wall clock are
+**all observable**, and any one of them reaching the client answers the
+question the method exists not to answer.
+
+Use `VerifyToken` — non-empty only when `Created` is true — to decide whether to
+**send mail**, never to decide what to tell the HTTP client.
+</Warning>
+
+The property is enforced up to the boundary of the function and no further.
+
+{/* verify:main */}
+```go
+// The shape a handler should use.
+res, err := svc.SignUp(ctx, "dana@example.com", "Correct-Horse-Battery-7")
+if err != nil {
+	panic(err) // ErrWeakPassword and store failures are real errors
+}
+if res.VerifyToken != "" {
+	fmt.Println("send mail to", res.User.Email)
+}
+fmt.Println("respond 202 Accepted, same body, either way")
+```
+
+```
+send mail to dana@example.com
+respond 202 Accepted, same body, either way
+```
+
+## Two `Store` obligations are load-bearing here
+
+This is a **joint** property, not one `SignUp` can guarantee alone. Both are
+documented as requirements on the [port](/storage/overview):
+
+<Columns cols={2}>
+  <Card title="CreateUser decides ErrEmailTaken from the write" icon="pen">
+    Never from a cheaper read first — otherwise a condition that denies writes
+    but not reads makes a duplicate answer faster than a new one.
+  </Card>
+  <Card title="FindUserByEmail reads its own writes" icon="book-open">
+    A stale replica answering the read-back turns the pairing into an oracle
+    from inside the store.
+  </Card>
+</Columns>
+
+`store/memory` and `store/drops` both honour them. A third-party backend that
+does not reopens the oracle where no amount of care in `SignUp` itself can see
+it — which is why
+[`authtest.RunStoreContract`](/storage/custom-backends) asserts the observable
+consequence.
+
+## The residual is timing, and it is measured
+
+<Warning>
+`SignUp` and `RequestPasswordReset` equalise the **sequence of calls** and the
+**set of errors** each branch can produce. Neither equalises the **wall clock**.
+
+On `RequestPasswordReset` the residual is measured rather than assumed, by a
+harness in the tree. Read
+[Enumeration safety is bounded](/authentication/rate-limiting#enumeration-safety-is-bounded-not-absolute)
+for the numbers and for the control that bounds it.
+</Warning>
+
+{/* verify:stdout "new:       true true <nil>\nduplicate: false false <nil>\nduplicate hands back the ZERO user: true\nweak: false true\nsend mail to dana@example.com\nrespond 202 Accepted, same body, either way" */}
+
+## Password rules
+
+`password.DefaultRules()` is the default policy: **12 characters**, upper,
+lower, digit, and one character that is neither a letter, a digit, nor
+whitespace — so padding a short password with spaces cannot satisfy it. Swap it
+with `auth.WithRules(r)`. See
+[The password lifecycle](/authentication/passwords#the-strength-policy).
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Email verification" icon="envelope-circle-check" href="/authentication/email-verification">
+    Redeeming the `VerifyToken` this returned.
+  </Card>
+  <Card title="Login" icon="right-to-bracket" href="/authentication/login">
+    What happens once the account exists.
+  </Card>
+</Columns>
