@@ -78,6 +78,17 @@
           "invitations/links",
           "invitations/security"
         ]
+      },
+      {
+        "group": "Storage",
+        "icon": "database",
+        "pages": [
+          "storage/overview",
+          "storage/memory",
+          "storage/postgres",
+          "storage/schema",
+          "storage/custom-backends"
+        ]
       }
     ],
     "global": {

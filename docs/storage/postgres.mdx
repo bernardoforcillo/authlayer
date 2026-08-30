@@ -1,0 +1,236 @@
+---
+title: "store/drops"
+description: "The PostgreSQL backend — the wiring in full with both stdlib imports, table naming, column derivation, and exactly what CreateSchema will and will not do."
+---
+
+`store/drops` declares **`package dropsstore`**, and it is the production
+backend: three stores over their own tables, generic over your container and
+member types, deriving columns from `drop:` struct tags.
+
+## The wiring, in full
+
+This is the one place production wiring is written down, so it is written out
+with imports included — because two of the packages involved are both named
+`stdlib` and one of them is imported only for its side effect.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	"github.com/bernardoforcillo/drops/pg"
+	"github.com/bernardoforcillo/drops/stdlib" // used BY NAME: wraps a *sql.DB
+	_ "github.com/jackc/pgx/v5/stdlib"         // BLANK: registers the "pgx" driver
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/invite"
+	"github.com/bernardoforcillo/authlayer/org"
+	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
+)
+```
+
+{/* verify:decl */}
+```go
+func newOrgService(ctx context.Context, dsn string) (*org.Service, error) {
+	sqlDB, err := sql.Open("pgx", dsn) // "pgx" comes from the blank import above
+	if err != nil {
+		return nil, err
+	}
+	db := pg.New(stdlib.New(sqlDB))                        // a drops handle
+	st := dropsstore.New[org.Organization, org.Member](db) // the scope.Store
+	if err := st.CreateSchema(ctx); err != nil {           // or use your own migrations
+		return nil, err
+	}
+	return org.New(org.NewAccess(nil), st), nil
+}
+```
+
+<Warning>
+`drops/stdlib` is the adapter that turns a `database/sql` handle into a drops
+driver. `pgx/v5/stdlib` is the pgx driver itself, blank-imported so that its
+`init` registers the name `sql.Open` is given.
+
+**Neither is optional, and only one of them can own the identifier `stdlib`.**
+</Warning>
+
+`sql.Open` does not connect, so everything up to `CreateSchema` builds without a
+database. That is exactly how far this page's own executed sample goes:
+
+{/* verify:main */}
+```go
+sqlDB, err := sql.Open("pgx", "postgres://user:pass@localhost:5432/app?sslmode=disable")
+fmt.Println("open:", err)
+
+db := pg.New(stdlib.New(sqlDB))
+scopeStore := dropsstore.New[org.Organization, org.Member](db)
+authStore := dropsstore.NewAuthStore(db)
+inviteStore := dropsstore.NewInviteStore(db)
+
+orgSvc := org.New(org.NewAccess(nil), scopeStore)
+authSvc := auth.New(authStore)
+inviteSvc := invite.New(orgSvc.Service, inviteStore)
+fmt.Println("three services, three stores:",
+	orgSvc != nil, authSvc != nil, inviteSvc != nil)
+
+_ = newOrgService // the function above; calling it needs a live database
+```
+
+```
+open: <nil>
+three services, three stores: true true true
+```
+
+## Three stores, three sets of tables
+
+| Constructor | Port | Default tables |
+|---|---|---|
+| `New[C, M](db, opts...)` | `scope.Store` | `organizations`, `organization_members`, `organization_roles` |
+| `NewAuthStore(db, opts...)` | `auth.Store` | `users`, `sessions`, `verifications` |
+| `NewInviteStore(db, opts...)` | `invite.Store` | `organization_invites`, `organization_invite_links` |
+
+Each has its own `CreateSchema` and its own `Schema()`. **No foreign keys are
+declared** — not to a users table from the RBAC side, which authlayer does not
+own, and not between the three auth tables either.
+
+{/* verify:main */}
+```go
+fmt.Println(dropsstore.NewSchema[org.Organization, org.Member]().Containers.Name())
+fmt.Println(dropsstore.NewAuthSchema().Users.Name())
+fmt.Println(dropsstore.NewInviteSchema().Links.Name())
+```
+
+```
+organizations
+users
+organization_invite_links
+```
+
+## Renaming tables
+
+A different scope needs only a set of names:
+
+{/* verify:main */}
+```go
+teams := dropsstore.New[org.Organization, org.Member](db, dropsstore.WithNames(
+	dropsstore.Names{
+		Containers: "teams",
+		Members:    "team_members",
+		Roles:      "team_roles",
+	}))
+fmt.Println("renamed:", teams.Schema().Containers.Name())
+```
+
+```
+renamed: teams
+```
+
+`WithAuthNames(AuthNames{...})` and `WithInviteNames(InviteNames{...})` do the
+same for the other two — reach for the first if `users` is already taken in your
+database.
+
+## Column derivation
+
+Columns come from the `drop:` tags on your types.
+
+<Warning>
+Field types are restricted to `string`, `time.Time`, `[]byte`, `int` or `int32`
+— or a named type over `string`, `int` or `int32`. Anything else, **a pointer
+included**, panics at construction with the column named. Nullable columns are
+not supported yet.
+
+A field with no `drop:` tag (or `drop:"-"`) is not persisted. Your container
+type must tag `id`, `owner_id`, `created_at` and `updated_at`, and your member
+type `container_id`, `user_id`, `role_key` and `joined_at` — embedding
+`scope.ContainerBase` and `scope.MemberBase` does that for you, and a type that
+misses one is **rejected at construction** rather than at the first query.
+</Warning>
+
+## What `CreateSchema` does, and does not
+
+<Columns cols={2}>
+  <Card title="Idempotent" icon="rotate">
+    Every statement it issues is safe to re-run. Tables are
+    `CREATE TABLE IF NOT EXISTS`, indexes `CREATE INDEX IF NOT EXISTS`, and the
+    constraints a `CREATE TABLE` cannot carry go out as guarded `ALTER TABLE`s.
+  </Card>
+  <Card title="Additive only" icon="triangle-exclamation">
+    It only ever adds what is **missing**. A table that already exists with
+    different columns or constraints is left as it stands: `CreateSchema` will
+    **not migrate an existing schema forward**.
+  </Card>
+</Columns>
+
+`st.Schema()` exposes the table definitions if you would rather generate the DDL
+and run it through your own migration tool.
+
+<Note>
+One thing it does self-heal: the `UNIQUE` constraint on `users.email` is
+declared **both** inline and as a named `ALTER TABLE`, because
+`CREATE TABLE IF NOT EXISTS` is a no-op against a table that already exists. The
+guarded `ALTER` is what repairs a users table created by an older version or by
+hand — proven live, after a run against such a table left two rows sharing one
+address and `CreateUser` returning nil for the duplicate.
+</Note>
+
+## Id column types
+
+Every id authlayer mints lands in a `uuid` column **by default**. If you
+override `WithIDGenerator`, you need the matching option on each store, and
+`store/memory` will not warn you — see [Ids](/concepts/ids).
+
+| Store | Library ids | User ids |
+|---|---|---|
+| `New` | `WithTextLibraryIDs()` | `WithTextUserIDs()` |
+| `NewInviteStore` | `WithInviteTextLibraryIDs()` | `WithInviteTextUserIDs()` |
+| `NewAuthStore` | `WithAuthTextLibraryIDs()` — moves **all five** columns | none, deliberately |
+
+{/* verify:main */}
+```go
+textIDs := dropsstore.New[org.Organization, org.Member](db,
+	dropsstore.WithTextLibraryIDs(), dropsstore.WithTextUserIDs())
+fmt.Println("options compose:", textIDs != nil)
+```
+
+```
+options compose: true
+```
+
+`CreateSchema` emits the right DDL either way and stays idempotent, but — like
+everything else it does — it will not retype a table that already exists. Choose
+before the tables are created, or retype the columns in your own migration.
+
+## The live test lane
+
+A live end-to-end suite sits behind a build tag, so the default `go test ./...`
+stays database-free:
+
+```sh
+AUTHLAYER_TEST_DSN='postgres://user:pass@host/scratch?sslmode=disable' go test -tags integration ./store/drops/
+```
+
+<Warning>
+**This lane is destructive and wants the database to itself.** It `DROP`s the
+auth, RBAC and invite tables in the target database on the way in and rebuilds
+them, so point `AUTHLAYER_TEST_DSN` at a scratch database, never at anything you
+care about.
+
+It also expects **exclusive** use of it: two copies running at once — or
+anything else writing those tables — will fail each other in ways that look like
+product bugs (`relation ... does not exist` mid-run, timing measurements
+polluted by the other client's writes).
+</Warning>
+
+{/* verify:stdout "open: <nil>\nthree services, three stores: true true true\norganizations\nusers\norganization_invite_links\nrenamed: teams\noptions compose: true" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="The schema" icon="table" href="/storage/schema">
+    Every table and column, and which constraint is load-bearing.
+  </Card>
+  <Card title="Query-level filtering" icon="filter" href="/authorization/query-filtering">
+    Mounting a guard on a drops entity.
+  </Card>
+</Columns>
