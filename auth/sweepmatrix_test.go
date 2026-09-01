@@ -134,7 +134,7 @@ func newSweepFixture(t *testing.T, email string) *sweepFixture {
 		t.Fatalf("RequestPasswordReset(%q) = (_, %v, %v), want a token", email, ok, err)
 	}
 	newAddress := fmt.Sprintf(sweepNewAddrTmpl, email)
-	changeTok, err := svc.RequestEmailChange(ctx, user.ID, sweepPassword, newAddress)
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "", sweepPassword, newAddress)
 	if err != nil {
 		t.Fatalf("RequestEmailChange(%q): %v", email, err)
 	}
@@ -304,7 +304,7 @@ func sweepMatrix() []sweepRow {
 		{
 			name: "DeleteAccount",
 			run: func(t *testing.T, f *sweepFixture) {
-				if err := f.svc.DeleteAccount(context.Background(), f.user.ID, sweepPassword); err != nil {
+				if err := f.svc.DeleteAccount(context.Background(), f.user.ID, "", sweepPassword); err != nil {
 					t.Fatalf("DeleteAccount: %v", err)
 				}
 			},
@@ -316,7 +316,7 @@ func sweepMatrix() []sweepRow {
 		{
 			name: "AnonymizeAccount",
 			run: func(t *testing.T, f *sweepFixture) {
-				if err := f.svc.AnonymizeAccount(context.Background(), f.user.ID, sweepPassword); err != nil {
+				if err := f.svc.AnonymizeAccount(context.Background(), f.user.ID, "", sweepPassword); err != nil {
 					t.Fatalf("AnonymizeAccount: %v", err)
 				}
 			},
@@ -489,10 +489,10 @@ func TestSweepMatrixFailsClosedOnEveryVerificationSweep(t *testing.T) {
 			return err
 		}},
 		{"DeleteAccount", "DeleteVerificationsByUser", func(f *sweepFixture) error {
-			return f.svc.DeleteAccount(context.Background(), f.user.ID, sweepPassword)
+			return f.svc.DeleteAccount(context.Background(), f.user.ID, "", sweepPassword)
 		}},
 		{"AnonymizeAccount", "DeleteVerificationsByUser", func(f *sweepFixture) error {
-			return f.svc.AnonymizeAccount(context.Background(), f.user.ID, sweepPassword)
+			return f.svc.AnonymizeAccount(context.Background(), f.user.ID, "", sweepPassword)
 		}},
 	}
 
@@ -523,10 +523,10 @@ func TestSweepMatrixFailsClosedOnTheIdentitySweep(t *testing.T) {
 			return f.svc.ResetPassword(context.Background(), f.resetTok, sweepNextPass)
 		}},
 		{"DeleteAccount", func(f *sweepFixture) error {
-			return f.svc.DeleteAccount(context.Background(), f.user.ID, sweepPassword)
+			return f.svc.DeleteAccount(context.Background(), f.user.ID, "", sweepPassword)
 		}},
 		{"AnonymizeAccount", func(f *sweepFixture) error {
-			return f.svc.AnonymizeAccount(context.Background(), f.user.ID, sweepPassword)
+			return f.svc.AnonymizeAccount(context.Background(), f.user.ID, "", sweepPassword)
 		}},
 	}
 

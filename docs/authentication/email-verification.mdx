@@ -74,10 +74,10 @@ the token.
 
 {/* verify:main */}
 ```go
-_, err = svc.RequestEmailChange(ctx, res.User.ID, "not-the-password", "new@example.com")
+_, err = svc.RequestEmailChange(ctx, res.User.ID, "", "not-the-password", "new@example.com")
 fmt.Println("wrong password:", errors.Is(err, auth.ErrInvalidCredentials))
 
-changeTok, err := svc.RequestEmailChange(ctx, res.User.ID,
+changeTok, err := svc.RequestEmailChange(ctx, res.User.ID, "",
 	"Correct-Horse-Battery-7", "  New@Example.com ")
 fmt.Println("armed:", err, changeTok != "")
 ```
@@ -140,7 +140,7 @@ two accounts end up sharing one address.
 ```go
 // carol tries to move onto an address that is already taken.
 carol, _ := svc.SignUp(ctx, "carol@example.com", "Correct-Horse-Battery-7")
-collide, err := svc.RequestEmailChange(ctx, carol.User.ID,
+collide, err := svc.RequestEmailChange(ctx, carol.User.ID, "",
 	"Correct-Horse-Battery-7", "new@example.com") // no error here, by design
 fmt.Println("armed against a taken address:", err, collide != "")
 

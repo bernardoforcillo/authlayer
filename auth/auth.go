@@ -331,6 +331,34 @@ type Session struct {
 	// IP is the client's address at the time this session was minted, an
 	// audit/display field only — never a security check.
 	IP string `drop:"ip"`
+	// MFAAt is WHEN this session last proved a second factor, and nil when
+	// it never has. Unlike UserAgent and IP it IS a security field: it is
+	// the whole input to [Service.RequireFreshMFA], which the sensitive
+	// methods consult before they will act — see auth/stepup.go.
+	//
+	// It is a time and not a bool, deliberately. "This session passed MFA
+	// at some point" is a claim about a moment that may be six months gone
+	// and says nothing about who is holding the session now; "this session
+	// proved a factor at 10:04" can be compared against a window and goes
+	// stale on its own. auth/stepup.go carries the argument.
+	//
+	// Two paths stamp it, and they are the two where a second factor was
+	// actually presented: [Service.CompleteMFA], which exchanges a
+	// challenge for a session, and [Service.FinishPasskeyLogin], because a
+	// passkey IS a second factor (see auth/mfa_service.go, "What the second
+	// factor gates, door by door"). An ordinary [Service.Login], a magic
+	// link and an external sign-in all leave it nil. [Service.Refresh]
+	// INHERITS it from the rotated predecessor, unchanged and un-renewed: a
+	// rotation is not a re-authentication, so it neither proves a factor nor
+	// un-proves one, and the inherited stamp keeps ageing toward the same
+	// expiry it always had.
+	//
+	// An implementation MUST round-trip it, nil included, like every other
+	// nullable column here. A backend that dropped it would refuse every
+	// step-up (fail-closed, but every enrolled user is then locked out of
+	// changing their own password); one that invented a value would PASS
+	// every step-up, which is the direction that matters.
+	MFAAt *time.Time `drop:"mfa_at"`
 }
 
 // Verification is a one-time, hashed token backing the signup,

@@ -244,7 +244,7 @@ func seedDeletableAccount(t *testing.T, svc *auth.Service, store auth.Store, ema
 	if err != nil || !ok {
 		t.Fatalf("RequestPasswordReset(%q) = (_, %v, %v), want (token, true, nil)", email, ok, err)
 	}
-	change, err := svc.RequestEmailChange(ctx, u.ID, validPassword, "moved-"+email)
+	change, err := svc.RequestEmailChange(ctx, u.ID, "", validPassword, "moved-"+email)
 	if err != nil {
 		t.Fatalf("RequestEmailChange(%q): %v", email, err)
 	}
@@ -306,7 +306,7 @@ func TestDeleteAccountRemovesEverythingAuthlayerHolds(t *testing.T) {
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "dana@example.com")
 
-	if err := svc.DeleteAccount(ctx, acct.user.ID, validPassword); err != nil {
+	if err := svc.DeleteAccount(ctx, acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
 
@@ -336,7 +336,7 @@ func TestDeleteAccountFreesTheAddressForReuse(t *testing.T) {
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "erin@example.com")
 
-	if err := svc.DeleteAccount(ctx, acct.user.ID, validPassword); err != nil {
+	if err := svc.DeleteAccount(ctx, acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
 
@@ -354,7 +354,7 @@ func TestDeleteAccountWrongPasswordDeletesNothing(t *testing.T) {
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "fay@example.com")
 
-	err := svc.DeleteAccount(ctx, acct.user.ID, "not-the-password-9!")
+	err := svc.DeleteAccount(ctx, acct.user.ID, "", "not-the-password-9!")
 	if !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Errorf("DeleteAccount with the wrong password = %v, want ErrInvalidCredentials — re-authentication is what gates this", err)
 	}
@@ -380,7 +380,7 @@ func TestDeleteAccountWithoutAPasswordProceedsOnTheCallersAuthority(t *testing.T
 		t.Fatalf("CreateUser: %v", err)
 	}
 
-	if err := svc.DeleteAccount(ctx, u.ID, ""); err != nil {
+	if err := svc.DeleteAccount(ctx, u.ID, "", ""); err != nil {
 		t.Fatalf("DeleteAccount on a password-less account = %v, want nil — there is nothing to re-authenticate against", err)
 	}
 	if _, err := store.FindUserByID(ctx, u.ID); !errors.Is(err, auth.ErrUserNotFound) {
@@ -406,7 +406,7 @@ func TestDeleteAccountWithoutAPasswordIgnoresWhateverWasPassed(t *testing.T) {
 	// A non-empty currentPassword against an account with no hash must not
 	// become a refusal: the asymmetry is "nothing to check", not "check it
 	// against the empty string".
-	if err := svc.DeleteAccount(ctx, u.ID, "whatever-the-caller-happened-to-send"); err != nil {
+	if err := svc.DeleteAccount(ctx, u.ID, "", "whatever-the-caller-happened-to-send"); err != nil {
 		t.Fatalf("DeleteAccount on a password-less account with a non-empty currentPassword = %v, want nil", err)
 	}
 }
@@ -414,7 +414,7 @@ func TestDeleteAccountWithoutAPasswordIgnoresWhateverWasPassed(t *testing.T) {
 func TestDeleteAccountUnknownUser(t *testing.T) {
 	svc, _ := newTestService(t)
 
-	err := svc.DeleteAccount(context.Background(), "no-such-user-id", validPassword)
+	err := svc.DeleteAccount(context.Background(), "no-such-user-id", "", validPassword)
 	if !errors.Is(err, auth.ErrUserNotFound) {
 		t.Errorf("DeleteAccount on an unknown id = %v, want ErrUserNotFound", err)
 	}
@@ -429,7 +429,7 @@ func TestDeleteAccountHookErrorAbortsWithNothingDeleted(t *testing.T) {
 	}))
 	acct := seedDeletableAccount(t, svc, store, "iris@example.com")
 
-	err := svc.DeleteAccount(context.Background(), acct.user.ID, validPassword)
+	err := svc.DeleteAccount(context.Background(), acct.user.ID, "", validPassword)
 	if !errors.Is(err, errHookBoom) {
 		t.Errorf("DeleteAccount with a failing hook = %v, want the hook's own error — a hook error aborts", err)
 	}
@@ -448,7 +448,7 @@ func TestDeleteAccountHookRunsBeforeAnyStoreWrite(t *testing.T) {
 	acct := seedDeletableAccount(t, svc, rec, "jo@example.com")
 
 	rec.reset()
-	if err := svc.DeleteAccount(context.Background(), acct.user.ID, validPassword); err != nil {
+	if err := svc.DeleteAccount(context.Background(), acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
 
@@ -467,7 +467,7 @@ func TestDeleteAccountAbortingHookWritesNothingAtAll(t *testing.T) {
 	acct := seedDeletableAccount(t, svc, rec, "kai@example.com")
 
 	rec.reset()
-	if err := svc.DeleteAccount(context.Background(), acct.user.ID, validPassword); !errors.Is(err, errHookBoom) {
+	if err := svc.DeleteAccount(context.Background(), acct.user.ID, "", validPassword); !errors.Is(err, errHookBoom) {
 		t.Fatalf("DeleteAccount with a failing hook = %v, want errHookBoom", err)
 	}
 
@@ -486,7 +486,7 @@ func TestDeleteAccountOrdersSessionsBeforeVerificationsBeforeTheUserRow(t *testi
 	acct := seedDeletableAccount(t, svc, rec, "lee@example.com")
 
 	rec.reset()
-	if err := svc.DeleteAccount(context.Background(), acct.user.ID, validPassword); err != nil {
+	if err := svc.DeleteAccount(context.Background(), acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
 
@@ -512,7 +512,7 @@ func TestDeleteAccountMidCascadeFailureLeavesTheFailSafeDirection(t *testing.T) 
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, rec, "mo@example.com")
 
-	if err := svc.DeleteAccount(ctx, acct.user.ID, validPassword); !errors.Is(err, errCascadeBoom) {
+	if err := svc.DeleteAccount(ctx, acct.user.ID, "", validPassword); !errors.Is(err, errCascadeBoom) {
 		t.Fatalf("DeleteAccount = %v, want the store's own error — a cascade failure must be reported, not swallowed", err)
 	}
 
@@ -533,7 +533,7 @@ func TestDeleteAccountRevokedSessionNoLongerRefreshes(t *testing.T) {
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "nina@example.com")
 
-	if err := svc.DeleteAccount(ctx, acct.user.ID, validPassword); err != nil {
+	if err := svc.DeleteAccount(ctx, acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
 
@@ -552,7 +552,7 @@ func TestDeleteAccountPendingResetTokenNoLongerRedeems(t *testing.T) {
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "omar@example.com")
 
-	if err := svc.DeleteAccount(ctx, acct.user.ID, validPassword); err != nil {
+	if err := svc.DeleteAccount(ctx, acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
 
@@ -569,7 +569,7 @@ func TestDeleteAccountWithNoHookConfigured(t *testing.T) {
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "pia@example.com")
 
-	if err := svc.DeleteAccount(ctx, acct.user.ID, validPassword); err != nil {
+	if err := svc.DeleteAccount(ctx, acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("DeleteAccount without a hook configured: %v", err)
 	}
 	if _, err := store.FindUserByID(ctx, acct.user.ID); !errors.Is(err, auth.ErrUserNotFound) {
@@ -586,7 +586,7 @@ func TestDeleteAccountHookReceivesTheUserID(t *testing.T) {
 	}))
 	acct := seedDeletableAccount(t, svc, store, "quinn@example.com")
 
-	if err := svc.DeleteAccount(context.Background(), acct.user.ID, validPassword); err != nil {
+	if err := svc.DeleteAccount(context.Background(), acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
 	if len(seen) != 1 || seen[0] != acct.user.ID {
@@ -602,7 +602,7 @@ func TestDeleteAccountDoesNotFireTheHookForAnUnknownUser(t *testing.T) {
 		return nil
 	}))
 
-	if err := svc.DeleteAccount(context.Background(), "no-such-user-id", validPassword); !errors.Is(err, auth.ErrUserNotFound) {
+	if err := svc.DeleteAccount(context.Background(), "no-such-user-id", "", validPassword); !errors.Is(err, auth.ErrUserNotFound) {
 		t.Fatalf("DeleteAccount on an unknown id = %v, want ErrUserNotFound", err)
 	}
 	if fired {
@@ -619,7 +619,7 @@ func TestDeleteAccountDoesNotFireTheHookOnAFailedReauthentication(t *testing.T) 
 	}))
 	acct := seedDeletableAccount(t, svc, store, "rae@example.com")
 
-	if err := svc.DeleteAccount(context.Background(), acct.user.ID, "not-the-password-9!"); !errors.Is(err, auth.ErrInvalidCredentials) {
+	if err := svc.DeleteAccount(context.Background(), acct.user.ID, "", "not-the-password-9!"); !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Fatalf("DeleteAccount with the wrong password = %v, want ErrInvalidCredentials", err)
 	}
 	if fired {
@@ -646,7 +646,7 @@ func TestDeleteAccountOnAnAnonymizedAccount(t *testing.T) {
 		t.Fatalf("CreateUser: %v", err)
 	}
 
-	if err := svc.DeleteAccount(ctx, u.ID, ""); err != nil {
+	if err := svc.DeleteAccount(ctx, u.ID, "", ""); err != nil {
 		t.Fatalf("DeleteAccount on an anonymized account = %v, want nil — a hard delete supersedes a soft one", err)
 	}
 	if _, err := store.FindUserByID(ctx, u.ID); !errors.Is(err, auth.ErrUserNotFound) {
@@ -661,7 +661,7 @@ func TestDeleteAccountPropagatesTheFirstSweepsOutage(t *testing.T) {
 	acct := seedDeletableAccount(t, svc, rec, "sam@example.com")
 
 	rec.fail["DeleteSessionsByUser"] = errCascadeBoom
-	if err := svc.DeleteAccount(ctx, acct.user.ID, validPassword); !errors.Is(err, errCascadeBoom) {
+	if err := svc.DeleteAccount(ctx, acct.user.ID, "", validPassword); !errors.Is(err, errCascadeBoom) {
 		t.Fatalf("DeleteAccount = %v, want the store's own error as-is", err)
 	}
 	assertAccountIntact(t, rec, acct, "a DeleteAccount whose very first sweep failed")
@@ -672,7 +672,7 @@ func TestWithAccountDeletionHookNilIsIgnored(t *testing.T) {
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "tess@example.com")
 
-	if err := svc.DeleteAccount(ctx, acct.user.ID, validPassword); err != nil {
+	if err := svc.DeleteAccount(ctx, acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("DeleteAccount with a nil hook configured = %v, want nil — a nil f leaves the default (no hook) in place", err)
 	}
 }
@@ -703,7 +703,7 @@ func TestAnonymizeAccountScrubsStampsAndSweeps(t *testing.T) {
 	acct := seedDeletableAccount(t, svc, store, "uma@example.com")
 
 	before := time.Now().UTC()
-	if err := svc.AnonymizeAccount(ctx, acct.user.ID, validPassword); err != nil {
+	if err := svc.AnonymizeAccount(ctx, acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount: %v", err)
 	}
 
@@ -750,7 +750,7 @@ func TestAnonymizeAccountFreesTheOriginalAddressForANewSignUp(t *testing.T) {
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "vera@example.com")
 
-	if err := svc.AnonymizeAccount(ctx, acct.user.ID, validPassword); err != nil {
+	if err := svc.AnonymizeAccount(ctx, acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount: %v", err)
 	}
 
@@ -783,10 +783,10 @@ func TestAnonymizeAccountScrubbedAddressesDoNotCollide(t *testing.T) {
 	first := mustSignUp(t, svc, "wren@example.com", validPassword)
 	second := mustSignUp(t, svc, "xu@example.com", validPassword)
 
-	if err := svc.AnonymizeAccount(ctx, first.ID, validPassword); err != nil {
+	if err := svc.AnonymizeAccount(ctx, first.ID, "", validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount(first): %v", err)
 	}
-	if err := svc.AnonymizeAccount(ctx, second.ID, validPassword); err != nil {
+	if err := svc.AnonymizeAccount(ctx, second.ID, "", validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount(second) = %v, want nil — two anonymized accounts must not collide on the users.email UNIQUE constraint", err)
 	}
 
@@ -811,7 +811,7 @@ func TestAnonymizeAccountWrongPasswordChangesNothing(t *testing.T) {
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "yara@example.com")
 
-	err := svc.AnonymizeAccount(ctx, acct.user.ID, "not-the-password-9!")
+	err := svc.AnonymizeAccount(ctx, acct.user.ID, "", "not-the-password-9!")
 	if !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Errorf("AnonymizeAccount with the wrong password = %v, want ErrInvalidCredentials — re-authentication gates this exactly as it gates DeleteAccount", err)
 	}
@@ -844,7 +844,7 @@ func TestAnonymizeAccountWithoutAPasswordProceedsOnTheCallersAuthority(t *testin
 		t.Fatalf("CreateUser: %v", err)
 	}
 
-	if err := svc.AnonymizeAccount(ctx, u.ID, "whatever-the-caller-happened-to-send"); err != nil {
+	if err := svc.AnonymizeAccount(ctx, u.ID, "", "whatever-the-caller-happened-to-send"); err != nil {
 		t.Fatalf("AnonymizeAccount on a password-less account = %v, want nil — there is nothing to re-authenticate against", err)
 	}
 	got, err := store.FindUserByID(ctx, u.ID)
@@ -866,7 +866,7 @@ func TestAnonymizeAccountOnAnAlreadyAnonymizedAccountIsIdempotent(t *testing.T) 
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "abe@example.com")
 
-	if err := svc.AnonymizeAccount(ctx, acct.user.ID, validPassword); err != nil {
+	if err := svc.AnonymizeAccount(ctx, acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount: %v", err)
 	}
 	first, err := store.FindUserByID(ctx, acct.user.ID)
@@ -874,7 +874,7 @@ func TestAnonymizeAccountOnAnAlreadyAnonymizedAccountIsIdempotent(t *testing.T) 
 		t.Fatalf("FindUserByID: %v", err)
 	}
 
-	if err := svc.AnonymizeAccount(ctx, acct.user.ID, ""); err != nil {
+	if err := svc.AnonymizeAccount(ctx, acct.user.ID, "", ""); err != nil {
 		t.Fatalf("AnonymizeAccount on an already-anonymized account = %v, want nil", err)
 	}
 	second, err := store.FindUserByID(ctx, acct.user.ID)
@@ -891,7 +891,7 @@ func TestAnonymizeAccountOnAnAlreadyAnonymizedAccountIsIdempotent(t *testing.T) 
 
 func TestAnonymizeAccountUnknownUser(t *testing.T) {
 	svc, _ := newTestService(t)
-	err := svc.AnonymizeAccount(context.Background(), "no-such-user-id", validPassword)
+	err := svc.AnonymizeAccount(context.Background(), "no-such-user-id", "", validPassword)
 	if !errors.Is(err, auth.ErrUserNotFound) {
 		t.Errorf("AnonymizeAccount on an unknown id = %v, want ErrUserNotFound", err)
 	}
@@ -906,7 +906,7 @@ func TestAnonymizeAccountHookErrorAbortsWithNothingWritten(t *testing.T) {
 	}))
 	acct := seedDeletableAccount(t, svc, store, "bea@example.com")
 
-	err := svc.AnonymizeAccount(context.Background(), acct.user.ID, validPassword)
+	err := svc.AnonymizeAccount(context.Background(), acct.user.ID, "", validPassword)
 	if !errors.Is(err, errHookBoom) {
 		t.Errorf("AnonymizeAccount with a failing hook = %v, want the hook's own error — a hook error aborts, exactly as it does for DeleteAccount", err)
 	}
@@ -925,7 +925,7 @@ func TestAnonymizeAccountOrdersTheHookThenSessionsThenVerificationsThenTheStamp(
 	acct := seedDeletableAccount(t, svc, rec, "cleo@example.com")
 
 	rec.reset()
-	if err := svc.AnonymizeAccount(context.Background(), acct.user.ID, validPassword); err != nil {
+	if err := svc.AnonymizeAccount(context.Background(), acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount: %v", err)
 	}
 
@@ -945,7 +945,7 @@ func TestAnonymizeAccountAbortingHookWritesNothingAtAll(t *testing.T) {
 	acct := seedDeletableAccount(t, svc, rec, "dov@example.com")
 
 	rec.reset()
-	if err := svc.AnonymizeAccount(context.Background(), acct.user.ID, validPassword); !errors.Is(err, errHookBoom) {
+	if err := svc.AnonymizeAccount(context.Background(), acct.user.ID, "", validPassword); !errors.Is(err, errHookBoom) {
 		t.Fatalf("AnonymizeAccount with a failing hook = %v, want errHookBoom", err)
 	}
 	got := rec.snapshot()
@@ -963,7 +963,7 @@ func TestAnonymizeAccountDoesNotFireTheHookOnAFailedReauthentication(t *testing.
 	}))
 	acct := seedDeletableAccount(t, svc, store, "eli@example.com")
 
-	if err := svc.AnonymizeAccount(context.Background(), acct.user.ID, "not-the-password-9!"); !errors.Is(err, auth.ErrInvalidCredentials) {
+	if err := svc.AnonymizeAccount(context.Background(), acct.user.ID, "", "not-the-password-9!"); !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Fatalf("AnonymizeAccount with the wrong password = %v, want ErrInvalidCredentials", err)
 	}
 	if fired {
@@ -984,7 +984,7 @@ func TestAnonymizeAccountMidCascadeFailureLeavesTheFailSafeDirection(t *testing.
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, rec, "fern@example.com")
 
-	if err := svc.AnonymizeAccount(ctx, acct.user.ID, validPassword); !errors.Is(err, errCascadeBoom) {
+	if err := svc.AnonymizeAccount(ctx, acct.user.ID, "", validPassword); !errors.Is(err, errCascadeBoom) {
 		t.Fatalf("AnonymizeAccount = %v, want the store's own error — a cascade failure must be reported, not swallowed", err)
 	}
 
@@ -1011,7 +1011,7 @@ func TestAnonymizeAccountPropagatesTheFirstSweepsOutage(t *testing.T) {
 	acct := seedDeletableAccount(t, svc, rec, "gus@example.com")
 
 	rec.fail["DeleteSessionsByUser"] = errCascadeBoom
-	if err := svc.AnonymizeAccount(ctx, acct.user.ID, validPassword); !errors.Is(err, errCascadeBoom) {
+	if err := svc.AnonymizeAccount(ctx, acct.user.ID, "", validPassword); !errors.Is(err, errCascadeBoom) {
 		t.Fatalf("AnonymizeAccount = %v, want the store's own error as-is", err)
 	}
 	assertAccountIntact(t, rec, acct, "an AnonymizeAccount whose very first sweep failed")
@@ -1022,7 +1022,7 @@ func TestAnonymizeAccountWithNoHookConfigured(t *testing.T) {
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "hugo@example.com")
 
-	if err := svc.AnonymizeAccount(ctx, acct.user.ID, validPassword); err != nil {
+	if err := svc.AnonymizeAccount(ctx, acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount without a hook configured: %v", err)
 	}
 	got, err := store.FindUserByID(ctx, acct.user.ID)
@@ -1255,7 +1255,7 @@ func TestChangePasswordRefusesAnAnonymizedAccount(t *testing.T) {
 func TestRequestEmailChangeRefusesAnAnonymizedAccount(t *testing.T) {
 	f := newStampedFixture(t, "orly@example.com")
 
-	_, err := f.stamped.RequestEmailChange(context.Background(), f.acct.user.ID, validPassword, "orly-moved@example.com")
+	_, err := f.stamped.RequestEmailChange(context.Background(), f.acct.user.ID, "", validPassword, "orly-moved@example.com")
 	if !errors.Is(err, auth.ErrUserNotFound) {
 		t.Fatalf("RequestEmailChange with the CORRECT password against a stamped account = %v, want ErrUserNotFound — arming an identifier rotation on an anonymized row would put a real address back on it", err)
 	}
@@ -1313,7 +1313,7 @@ func TestAnonymizedAccountIsRefusedEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "rune@example.com")
 
-	if err := svc.AnonymizeAccount(ctx, acct.user.ID, validPassword); err != nil {
+	if err := svc.AnonymizeAccount(ctx, acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount: %v", err)
 	}
 
@@ -1337,7 +1337,7 @@ func TestAnonymizedAccountIsRefusedEndToEnd(t *testing.T) {
 	if err := svc.ChangePassword(ctx, acct.user.ID, "", validPassword, "Another-Horse-Battery-9!"); !errors.Is(err, auth.ErrUserNotFound) {
 		t.Errorf("ChangePassword after AnonymizeAccount = %v, want ErrUserNotFound", err)
 	}
-	if _, err := svc.RequestEmailChange(ctx, acct.user.ID, validPassword, "rune-moved@example.com"); !errors.Is(err, auth.ErrUserNotFound) {
+	if _, err := svc.RequestEmailChange(ctx, acct.user.ID, "", validPassword, "rune-moved@example.com"); !errors.Is(err, auth.ErrUserNotFound) {
 		t.Errorf("RequestEmailChange after AnonymizeAccount = %v, want ErrUserNotFound", err)
 	}
 	if err := svc.ResetPassword(ctx, acct.resetToken, "Another-Horse-Battery-9!"); err == nil {
@@ -1357,7 +1357,7 @@ func TestAnonymizeAccountLeavesTheRowReadable(t *testing.T) {
 	ctx := context.Background()
 	acct := seedDeletableAccount(t, svc, store, "sage@example.com")
 
-	if err := svc.AnonymizeAccount(ctx, acct.user.ID, validPassword); err != nil {
+	if err := svc.AnonymizeAccount(ctx, acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount: %v", err)
 	}
 
@@ -1380,7 +1380,7 @@ func TestAnonymizeAccountLeavesTheRowReadable(t *testing.T) {
 func TestDeleteAccountStillWorksOnAStampedAccount(t *testing.T) {
 	f := newStampedFixture(t, "tova@example.com")
 
-	if err := f.stamped.DeleteAccount(context.Background(), f.acct.user.ID, validPassword); err != nil {
+	if err := f.stamped.DeleteAccount(context.Background(), f.acct.user.ID, "", validPassword); err != nil {
 		t.Fatalf("DeleteAccount on a stamped account = %v, want nil — a hard delete supersedes a soft one", err)
 	}
 	if _, err := f.store.FindUserByID(context.Background(), f.acct.user.ID); !errors.Is(err, auth.ErrUserNotFound) {

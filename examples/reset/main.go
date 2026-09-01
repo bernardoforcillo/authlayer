@@ -207,11 +207,11 @@ func main() {
 	// briefly-held session, or a leaked 15-minute access token, bought a
 	// 24-hour account takeover.
 	step("change the address")
-	_, err = svc.RequestEmailChange(ctx, alice.User.ID, "not-her-password", aliceNewAddress)
+	_, err = svc.RequestEmailChange(ctx, alice.User.ID, "", "not-her-password", aliceNewAddress)
 	expect(errors.Is(err, auth.ErrInvalidCredentials), "a wrong password must not arm a rotation")
 	fmt.Println("  wrong current password -> ErrInvalidCredentials (nothing minted)")
 
-	changeTok, err := svc.RequestEmailChange(ctx, alice.User.ID, aliceResetPass, aliceNewAddress)
+	changeTok, err := svc.RequestEmailChange(ctx, alice.User.ID, "", aliceResetPass, aliceNewAddress)
 	must(err)
 	fmt.Printf("  email_change token (you deliver this to the NEW address): %s...\n", short(changeTok))
 

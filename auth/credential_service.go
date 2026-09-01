@@ -600,8 +600,13 @@ func (s *Service) FinishPasskeyLogin(ctx context.Context, a VerifiedAssertion, i
 		}
 	}
 
-	// One minting path, shared with [Service.Login] — see mintSession.
-	return s.mintSession(ctx, u, ip, userAgent)
+	// One minting path, shared with [Service.Login] — see mintSession. The
+	// &now is [Session.MFAAt], and it follows from "A passkey IS the second
+	// factor" above: this login presented one, so the session it mints is
+	// FRESH for [Service.RequireFreshMFA]. Without the stamp, an account
+	// holding both a passkey and a confirmed TOTP factor could sign in here
+	// and then never satisfy step-up.
+	return s.mintSession(ctx, u, ip, userAgent, &now)
 }
 
 // ListPasskeys returns the WebAuthn credentials registered to userID, and

@@ -391,6 +391,13 @@ type config struct {
 	// passkeyChallengeTTL is how long a [Challenge] stays claimable — see
 	// [WithPasskeyChallengeTTL], also in credential.go.
 	passkeyChallengeTTL time.Duration
+	// stepUpWindow is how old [Session.MFAAt] may be before
+	// [Service.RequireFreshMFA] refuses — see [WithStepUpWindow], declared
+	// in stepup.go beside the check it configures. Unlike linking and
+	// mfaEnforcement this one IS assigned by defaultConfig rather than left
+	// at its zero value, because here zero means OFF: see that option's doc
+	// for why the two stances differ.
+	stepUpWindow time.Duration
 }
 
 func defaultConfig() config {
@@ -404,6 +411,7 @@ func defaultConfig() config {
 		magicLinkTTL:        defaultMagicLinkTTL,
 		mfaChallengeTTL:     defaultMFAChallengeTTL,
 		passkeyChallengeTTL: defaultPasskeyChallengeTTL,
+		stepUpWindow:        defaultStepUpWindow,
 		clock:               func() time.Time { return time.Now().UTC() },
 		idGen:               uid.NewV7,
 	}
@@ -1523,7 +1531,9 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 		return LoginResult{User: u, MFA: challenge}, nil
 	}
 
-	return s.mintSession(ctx, u, ip, userAgent)
+	// nil: a password is not a second factor, so this session has proved
+	// none. See [Session.MFAAt].
+	return s.mintSession(ctx, u, ip, userAgent, nil)
 }
 
 // mintSession is the session-issuing tail shared by [Service.Login] and
@@ -1555,7 +1565,7 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 // which is the one thing this function hard-codes the other way.
 //
 // The order inside is load-bearing, and is the order [Service.Login]'s own
-// doc describes at point 6: PasswordHash is scrubbed BEFORE the claims
+// doc describes at point 8: PasswordHash is scrubbed BEFORE the claims
 // extender runs, and [github.com/bernardoforcillo/authlayer/token.Issue]
 // runs BEFORE [Store.CreateSession], so a misconfigured signing key fails
 // without leaving an orphaned session row behind.
@@ -1567,7 +1577,17 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 // ip and userAgent are recorded on the [Session] as audit fields and are
 // not validated here; a caller that requires them non-empty checks that
 // itself, as [Service.Login] does with [ErrMissingIP].
-func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent string) (LoginResult, error) {
+//
+// mfaAt is the freshness stamp — [Session.MFAAt] — and it is a PARAMETER
+// rather than something this function decides, because only the caller knows
+// whether a second factor was actually presented. Pass &now from the two
+// paths where one was ([Service.CompleteMFA] and [Service.FinishPasskeyLogin])
+// and nil from every other. It is written in the same [Store.CreateSession]
+// INSERT as the rest of the row, deliberately: a stamp applied afterwards
+// would leave a window in which the session exists and is not yet fresh, and
+// a second failure mode in which the mint succeeds, the stamp fails, and the
+// caller is handed an error for a session that is already live.
+func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent string, mfaAt *time.Time) (LoginResult, error) {
 	var zero LoginResult
 
 	now := s.cfg.clock()
@@ -1593,9 +1613,9 @@ func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent str
 	if s.cfg.claimsExtender != nil {
 		extra = s.cfg.claimsExtender(u)
 	}
-	// Issued BEFORE CreateSession, deliberately — see "Order of checks"
-	// point 7 above: a bad signing key must fail before any Session row
-	// exists to be orphaned.
+	// Issued BEFORE CreateSession, deliberately — see [Service.Login]'s
+	// "Order of checks" point 8: a bad signing key must fail before any
+	// Session row exists to be orphaned.
 	accessToken, err := token.Issue(token.Claims{
 		Subject:   u.ID,
 		SessionID: sessionID,
@@ -1620,6 +1640,9 @@ func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent str
 		CreatedAt: now,
 		UserAgent: userAgent,
 		IP:        ip,
+		// nil unless a second factor was presented on the way here — see
+		// [Session.MFAAt] for which paths pass a stamp and which do not.
+		MFAAt: mfaAt,
 	}); err != nil {
 		return zero, err
 	}
@@ -2332,6 +2355,17 @@ func (s *Service) Refresh(ctx context.Context, refreshPlain string) (LoginResult
 		// signature this package does not offer today.
 		UserAgent: rotated.UserAgent,
 		IP:        rotated.IP,
+		// MFAAt: inherited too, and inherited UNCHANGED — the predecessor's
+		// instant, never now. A rotation is not a re-authentication, so it
+		// cannot prove a second factor; but it is not a de-authentication
+		// either, so dropping the stamp would make step-up unsatisfiable in
+		// practice: at the default TTLs a session is rotated every fifteen
+		// minutes, and a user who proved a factor two minutes ago would be
+		// refused because their client refreshed in between. Carrying the
+		// ORIGINAL time forward is what keeps both true — the stamp ages
+		// out exactly when it would have without the rotation. See
+		// [Session.MFAAt] and [Service.RequireFreshMFA].
+		MFAAt: rotated.MFAAt,
 	})
 	if err != nil {
 		return zero, err
@@ -2775,6 +2809,15 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // password out-of-band, say) gets exactly that "everywhere" behaviour,
 // which is the safe direction to default to.
 //
+// Since step-up landed, that parameter carries a SECOND job: it is also the
+// session whose second-factor freshness point 5 checks. The two jobs fail in
+// the same direction, which is why one parameter can hold both — an id that
+// names nothing revokes everything AND satisfies no step-up. For an account
+// with a confirmed [MFAFactor] the out-of-band service account above
+// therefore no longer gets "everywhere", it gets [ErrStepUpRequired]: this
+// method is not reachable without a session that has recently proved a
+// factor, whatever else the caller knows.
+//
 // # What revocation does not revoke
 //
 // "Revoked" above means the [Session] row — the refresh token — is gone:
@@ -2813,15 +2856,23 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //     A mismatch is ErrInvalidCredentials — nothing is written, and next is
 //     never even validated, so a caller who does not know the current
 //     password learns nothing about next's own validity either.
-//  5. next is validated against the configured [password.Rules];
+//  5. [Service.RequireFreshMFA] — for an account holding a CONFIRMED
+//     [MFAFactor], currentSessionID must name a session of userID's that
+//     proved a second factor inside [WithStepUpWindow], or this is
+//     [ErrStepUpRequired] with nothing written. For an account with no
+//     confirmed factor it is a no-op; see that method's doc, which is where
+//     the reasoning for both halves lives. It runs AFTER point 4 so a
+//     caller who does not know the password learns nothing about what
+//     second factor the account holds.
+//  6. next is validated against the configured [password.Rules];
 //     [ErrWeakPassword] on failure.
-//  6. next is hashed and persisted via [Store.UpdateUserPassword].
-//  7. Every outstanding "password_reset", "email_change" AND "magic_link"
+//  7. next is hashed and persisted via [Store.UpdateUserPassword].
+//  8. Every outstanding "password_reset", "email_change" AND "magic_link"
 //     [Verification] for this account is invalidated, via three
 //     [Store.DeleteVerificationsByUserAndPurpose] calls — one per purpose,
 //     all fail-closed. See "The sweep matrix" and "Why these purposes, and
 //     what the sweep does not cover" below.
-//  8. Every session NOT sharing currentSessionID's family is revoked via
+//  9. Every session NOT sharing currentSessionID's family is revoked via
 //     [Store.DeleteSessionsByFamily], one call per distinct OTHER family —
 //     the same "list, then delete per distinct family" shape
 //     [Service.LogoutAll] uses, so a rotated-but-unexpired predecessor row
@@ -3002,6 +3053,16 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 		return ErrInvalidCredentials
 	}
 
+	// Step-up, on this method's own line — see [Service.RequireFreshMFA].
+	// After the credential check, so a caller who does not know the password
+	// is told that and learns nothing about the account's second factor;
+	// before next is validated, for the same reason that check is: a caller
+	// who cannot act learns nothing about the password they proposed. A
+	// no-op for an account with no confirmed factor.
+	if err := s.RequireFreshMFA(ctx, userID, currentSessionID); err != nil {
+		return err
+	}
+
 	if failed := password.Validate(next, s.cfg.rules); len(failed) > 0 {
 		return fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
 	}
@@ -3015,7 +3076,7 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 		return err
 	}
 
-	// Close ALL THREE token side doors — see the method doc's point 7 and
+	// Close ALL THREE token side doors — see the method doc's point 8 and
 	// "The sweep matrix". The email_change sweep is not a tidier variant of
 	// the reset one, and the magic_link sweep is not a tidier variant of
 	// either: each is a separate door, and shipping the fix for one of them
@@ -3747,6 +3808,17 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 //     never even normalized, so a caller who does not know the password
 //     learns nothing about the address they proposed either — the same
 //     stance ChangePassword takes on next.
+//     Point 2 has a second half: [Service.RequireFreshMFA] with
+//     currentSessionID, immediately after the credential check and before
+//     newEmail is even looked at. An account holding a CONFIRMED
+//     [MFAFactor] must present this call from a session of its own that
+//     proved a second factor inside [WithStepUpWindow], or this is
+//     [ErrStepUpRequired] with nothing minted; an account with no confirmed
+//     factor is unaffected. currentSessionID is the same value
+//     [Service.ChangePassword] takes, and this method takes it for the same
+//     reason that one does: arming an identifier rotation is the same kind
+//     of act as rotating the password, and [Service.VerifyEmail] redeems
+//     what this mints with no authentication whatsoever.
 //  3. newEmail is normalized (see [NormalizeEmail]) and, if that leaves it
 //     empty — a literal "", or whitespace-only input — this returns
 //     [ErrEmailRequired]. Without this, an empty newEmail minted a token
@@ -3789,7 +3861,7 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 //
 // A Store, Hasher or [token.GenerateOpaque] error at any step is returned
 // as-is.
-func (s *Service) RequestEmailChange(ctx context.Context, userID, current, newEmail string) (string, error) {
+func (s *Service) RequestEmailChange(ctx context.Context, userID, currentSessionID, current, newEmail string) (string, error) {
 	u, err := s.store.FindUserByID(ctx, userID)
 	if err != nil {
 		return "", err
@@ -3814,6 +3886,13 @@ func (s *Service) RequestEmailChange(ctx context.Context, userID, current, newEm
 	}
 	if !s.cfg.hasher.Verify(current, u.PasswordHash) {
 		return "", ErrInvalidCredentials
+	}
+
+	// Step-up, on this method's own line — see [Service.RequireFreshMFA] —
+	// and after the credential check for [Service.ChangePassword]'s reason.
+	// A no-op for an account with no confirmed factor.
+	if err := s.RequireFreshMFA(ctx, userID, currentSessionID); err != nil {
+		return "", err
 	}
 
 	normalized := NormalizeEmail(newEmail)

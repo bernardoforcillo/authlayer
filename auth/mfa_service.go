@@ -709,12 +709,17 @@ func (s *Service) CompleteMFA(ctx context.Context, challengeToken, code, ip, use
 		return zero, err
 	}
 
-	// One minting path, shared with [Service.Login] — see mintSession.
-	return s.mintSession(ctx, u, ip, userAgent)
+	// One minting path, shared with [Service.Login] — see mintSession. The
+	// &now is [Session.MFAAt]: a factor was just presented and spent, and
+	// this is the instant that makes the new session FRESH for
+	// [Service.RequireFreshMFA]. It is stamped in the same INSERT as the
+	// row, so no session of this method's ever exists unstamped.
+	return s.mintSession(ctx, u, ip, userAgent, &now)
 }
 
 // DisableMFA removes userID's second factor and every recovery code with
-// it, after proving the caller knows the account's CURRENT password.
+// it, after proving the caller knows the account's CURRENT password AND
+// holds a session that proved the factor recently.
 //
 // The password is not ceremony. Disabling MFA is the one operation that
 // makes an account strictly easier to break into, so it is the one that
@@ -722,6 +727,34 @@ func (s *Service) CompleteMFA(ctx context.Context, challengeToken, code, ip, use
 // access token or an XSS payload all carry a live session and none of them
 // carries the password. It is the same stance [Service.ChangePassword]
 // takes on the credential it replaces.
+//
+// # It also needs a FRESH second factor
+//
+// currentSessionID is the caller's own session — the SessionID claim off
+// the access token that authenticated this request, exactly as
+// [Service.ChangePassword] takes it — and [Service.RequireFreshMFA] must
+// pass on it: the session must have proved a second factor within
+// [WithStepUpWindow], or this is [ErrStepUpRequired] and nothing is
+// removed.
+//
+// Of the five methods step-up gates, this is the one whose absence would
+// undo the other four. An attacker holding a session AND the password can,
+// without this check, simply turn the factor off and then perform every
+// other gated action unchallenged; the gate on the credential rotation
+// would be worth nothing while the gate on the credential ITSELF was
+// missing.
+//
+// It strands nobody who was not already stranded. Every door that can mint
+// a session for an account with a confirmed factor either proves that
+// factor ([Service.Login] plus [Service.CompleteMFA], a magic link or an
+// external sign-in plus the same completion) or IS one
+// ([Service.FinishPasskeyLogin]) — so a user who can reach this method at
+// all can reach it freshly. A lost authenticator is answered by a RECOVERY
+// CODE: completing a challenge with one stamps [Session.MFAAt] exactly as a
+// TOTP code does, which is what keeps "I lost my phone" a self-service
+// operation and not a support ticket. A user with neither the
+// authenticator nor a code cannot sign in in the first place, so this check
+// takes nothing further from them.
 //
 // # It clears the codes first, then the factor
 //
@@ -748,7 +781,7 @@ func (s *Service) CompleteMFA(ctx context.Context, challengeToken, code, ip, use
 // is that such an account's MFA is not disableable through this method.
 // [ErrFactorNotFound] when there is nothing enrolled. Any other Store
 // failure is returned as-is.
-func (s *Service) DisableMFA(ctx context.Context, userID, currentPassword string) error {
+func (s *Service) DisableMFA(ctx context.Context, userID, currentSessionID, currentPassword string) error {
 	st, err := s.mfa()
 	if err != nil {
 		return err
@@ -767,6 +800,15 @@ func (s *Service) DisableMFA(ctx context.Context, userID, currentPassword string
 	}
 	if !s.cfg.hasher.Verify(currentPassword, u.PasswordHash) {
 		return ErrInvalidCredentials
+	}
+
+	// Step-up, on this method's own line — see [Service.RequireFreshMFA]
+	// and "It also needs a FRESH second factor" above. After the password
+	// check, so a wrong password is reported as one. Never a no-op in
+	// practice: reaching the line below means the account holds a confirmed
+	// factor, which is exactly the case RequireFreshMFA does gate.
+	if err := s.RequireFreshMFA(ctx, userID, currentSessionID); err != nil {
+		return err
 	}
 
 	// Codes first — see the method doc for why the retry semantics decide

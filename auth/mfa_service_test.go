@@ -846,7 +846,10 @@ func TestCompleteMFAAfterDisableMFAFailsClosed(t *testing.T) {
 	e := enrolConfirmed(t, f, "lena@example.com")
 	pending := loginOwingMFA(t, f, "lena@example.com")
 
-	if err := f.svc.DisableMFA(ctx, e.user.ID, validPassword); err != nil {
+	// DisableMFA is step-up gated, so this needs a session that just proved
+	// the factor — see TestDisableMFARequiresAFreshSecondFactor.
+	fresh := freshSessionFor(t, f, e, "lena@example.com")
+	if err := f.svc.DisableMFA(ctx, e.user.ID, fresh, validPassword); err != nil {
 		t.Fatalf("DisableMFA: %v", err)
 	}
 	if _, err := f.svc.CompleteMFA(ctx, pending.MFA.Token, e.recovery[0], "1.2.3.4", "agent"); !errors.Is(err, auth.ErrFactorNotFound) {
@@ -892,7 +895,10 @@ func TestAnonymizeAccountSweepsOutstandingChallenges(t *testing.T) {
 	e := enrolConfirmed(t, f, "nuri@example.com")
 	pending := loginOwingMFA(t, f, "nuri@example.com")
 
-	if err := f.svc.AnonymizeAccount(ctx, e.user.ID, validPassword); err != nil {
+	// AnonymizeAccount is step-up gated for an account with a confirmed
+	// factor — see TestAnonymizeAccountRequiresAFreshSecondFactor.
+	fresh := freshSessionFor(t, f, e, "nuri@example.com")
+	if err := f.svc.AnonymizeAccount(ctx, e.user.ID, fresh, validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount: %v", err)
 	}
 	if _, err := f.store.FindVerificationByHash(ctx, token.HashOpaque(pending.MFA.Token)); !errors.Is(err, auth.ErrVerificationNotFound) {
@@ -1320,7 +1326,7 @@ func TestDisableMFARequiresTheCurrentPassword(t *testing.T) {
 	ctx := context.Background()
 	e := enrolConfirmed(t, f, "ulla@example.com")
 
-	if err := f.svc.DisableMFA(ctx, e.user.ID, "not-the-password"); !errors.Is(err, auth.ErrInvalidCredentials) {
+	if err := f.svc.DisableMFA(ctx, e.user.ID, "", "not-the-password"); !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Fatalf("DisableMFA with a wrong password = %v, want ErrInvalidCredentials", err)
 	}
 	if _, err := f.mfa.FindFactor(ctx, e.user.ID); err != nil {
@@ -1336,7 +1342,10 @@ func TestDisableMFARequiresTheCurrentPassword(t *testing.T) {
 	// Still gated.
 	loginOwingMFA(t, f, "ulla@example.com")
 
-	if err := f.svc.DisableMFA(ctx, e.user.ID, validPassword); err != nil {
+	// The right password AND a session that just proved the factor: this
+	// method needs both — see TestDisableMFARequiresAFreshSecondFactor.
+	fresh := freshSessionFor(t, f, e, "ulla@example.com")
+	if err := f.svc.DisableMFA(ctx, e.user.ID, fresh, validPassword); err != nil {
 		t.Fatalf("DisableMFA with the right password: %v", err)
 	}
 	if _, err := f.mfa.FindFactor(ctx, e.user.ID); !errors.Is(err, auth.ErrFactorNotFound) {
@@ -1366,7 +1375,7 @@ func TestDisableMFARefusesAnAccountWithNoPassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
-	if err := f.svc.DisableMFA(ctx, u.ID, ""); !errors.Is(err, auth.ErrInvalidCredentials) {
+	if err := f.svc.DisableMFA(ctx, u.ID, "", ""); !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Fatalf("DisableMFA on a passwordless account = %v, want ErrInvalidCredentials", err)
 	}
 }
@@ -1374,7 +1383,7 @@ func TestDisableMFARefusesAnAccountWithNoPassword(t *testing.T) {
 func TestDisableMFAWithoutAFactorIsFactorNotFound(t *testing.T) {
 	f := newMFAService(t)
 	u := mustSignUp(t, f.svc, "wilf@example.com", validPassword)
-	if err := f.svc.DisableMFA(context.Background(), u.ID, validPassword); !errors.Is(err, auth.ErrFactorNotFound) {
+	if err := f.svc.DisableMFA(context.Background(), u.ID, "", validPassword); !errors.Is(err, auth.ErrFactorNotFound) {
 		t.Fatalf("DisableMFA with nothing enrolled = %v, want ErrFactorNotFound", err)
 	}
 }
@@ -1390,7 +1399,7 @@ func TestMFAEntryPointsRefuseWithoutAStore(t *testing.T) {
 	if _, err := svc.ConfirmMFAEnrolment(ctx, u.ID, "123456"); !errors.Is(err, auth.ErrMFANotConfigured) {
 		t.Fatalf("ConfirmMFAEnrolment = %v, want ErrMFANotConfigured", err)
 	}
-	if err := svc.DisableMFA(ctx, u.ID, validPassword); !errors.Is(err, auth.ErrMFANotConfigured) {
+	if err := svc.DisableMFA(ctx, u.ID, "", validPassword); !errors.Is(err, auth.ErrMFANotConfigured) {
 		t.Fatalf("DisableMFA = %v, want ErrMFANotConfigured", err)
 	}
 }

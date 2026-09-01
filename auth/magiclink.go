@@ -496,6 +496,9 @@ func (s *Service) RedeemMagicLink(ctx context.Context, plainToken, ip, userAgent
 		return LoginResult{User: u, MFA: challenge}, nil
 	}
 
-	// One minting path, shared with [Service.Login] — see mintSession.
-	return s.mintSession(ctx, u, ip, userAgent)
+	// One minting path, shared with [Service.Login] — see mintSession. The
+	// nil is [Session.MFAAt]: a link is not a second factor, so a session
+	// minted here has proved none. An account that HAS one never reaches
+	// this line — it left with a challenge above.
+	return s.mintSession(ctx, u, ip, userAgent, nil)
 }

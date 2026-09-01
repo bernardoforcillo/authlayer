@@ -486,7 +486,9 @@ func (s *Service) SignInWith(ctx context.Context, req SignInRequest) (SignInResu
 		return SignInResult{Created: created, User: u, MFA: challenge}, nil
 	}
 
-	minted, err := s.mintSession(ctx, u, req.IP, req.UserAgent)
+	// nil: an external assertion is not a second factor — see
+	// [SignInResult.MFA]. An account holding one left with a challenge.
+	minted, err := s.mintSession(ctx, u, req.IP, req.UserAgent, nil)
 	if err != nil {
 		return zero, err
 	}
@@ -550,7 +552,9 @@ func (s *Service) signInLinkedIdentity(ctx context.Context, identities IdentityS
 		return SignInResult{Created: false, User: u, MFA: challenge}, nil
 	}
 
-	minted, err := s.mintSession(ctx, u, req.IP, req.UserAgent)
+	// nil: an external assertion is not a second factor — see
+	// [SignInResult.MFA]. An account holding one left with a challenge.
+	minted, err := s.mintSession(ctx, u, req.IP, req.UserAgent, nil)
 	if err != nil {
 		return zero, err
 	}

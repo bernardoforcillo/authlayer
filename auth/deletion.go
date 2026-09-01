@@ -146,6 +146,21 @@ func WithAccountDeletionHook(f func(ctx context.Context, userID string) error) O
 //     [Service.ChangePassword] does, and a mismatch is
 //     [ErrInvalidCredentials]. Nothing is written and the hook does not
 //     run. See "An account with no password" for the other case.
+//     Point 2 has a SECOND half since step-up landed:
+//     [Service.RequireFreshMFA] with currentSessionID. An account holding a
+//     CONFIRMED [MFAFactor] must present this call from a session of its
+//     own that proved a second factor inside [WithStepUpWindow], or this is
+//     [ErrStepUpRequired] with nothing written and no hook fired; an
+//     account with no confirmed factor is unaffected, and that method's doc
+//     carries the reasoning for both halves. It runs after the password
+//     check so a wrong password is reported as a wrong password, and before
+//     point 3 so a refusal has run none of the application's own cleanup.
+//     An ALREADY-ANONYMIZED account is exempt from it: it holds no session
+//     that could ever satisfy the check and nothing signs into it, so
+//     gating it would contradict point 1 and leave a stamped row nothing
+//     could remove. For an account with a confirmed factor and NO password,
+//     this check is the only credential in the call — see "An account with
+//     no password".
 //  3. The hook, if one is configured — BEFORE any authlayer row is
 //     written. Its error aborts, and nothing has been written yet, which is
 //     the whole reason it is here rather than at the end. See
@@ -304,7 +319,7 @@ func WithAccountDeletionHook(f func(ctx context.Context, userID string) error) O
 //
 // A [Store] or [github.com/bernardoforcillo/authlayer/password.Hasher] error at any step is returned as-is, and
 // so is the hook's — see the package's "Fail closed" constraint.
-func (s *Service) DeleteAccount(ctx context.Context, userID, currentPassword string) error {
+func (s *Service) DeleteAccount(ctx context.Context, userID, currentSessionID, currentPassword string) error {
 	// Step 1. ErrUserNotFound and every other Store error propagate as-is.
 	u, err := s.store.FindUserByID(ctx, userID)
 	if err != nil {
@@ -319,6 +334,29 @@ func (s *Service) DeleteAccount(ctx context.Context, userID, currentPassword str
 	// with ChangePassword and for what the caller therefore owes.
 	if u.PasswordHash != "" && !s.cfg.hasher.Verify(currentPassword, u.PasswordHash) {
 		return ErrInvalidCredentials
+	}
+
+	// Step 2b. Step-up, on this method's own line — see
+	// [Service.RequireFreshMFA]. After the password check and BEFORE the
+	// hook, so a refused deletion has run none of the application's own
+	// cleanup. A no-op for an account with no confirmed factor; for an
+	// account that has one AND no password, it is the only credential in
+	// this call.
+	//
+	// An ANONYMIZED account is exempt, and that exemption is load-bearing:
+	// such an account holds no sessions (the anonymization deleted them)
+	// and can be signed into by nothing, so the check could never be
+	// satisfied — and this method must keep working against a stamped row,
+	// or a deployment that anonymized an account with a confirmed factor
+	// would be left holding a row nothing could ever remove. See "A stamped
+	// account is still deletable" and [Service.RequireFreshMFA]'s "An
+	// account with no confirmed factor is not gated", which is the same
+	// argument reached by a different route: an unsatisfiable refusal on an
+	// operation that grants nothing is a lockout, not a control.
+	if u.DeletedAt == nil {
+		if err := s.RequireFreshMFA(ctx, userID, currentSessionID); err != nil {
+			return err
+		}
 	}
 
 	// Step 3. The hook, BEFORE any row of ours is written. Its error aborts
@@ -417,6 +455,11 @@ func anonymizedEmail(userID string) string {
 //     with no password". Everything it says there applies here unchanged,
 //     including what the caller therefore owes: establish that the caller
 //     owns the account before calling.
+//     Point 2's second half is [Service.RequireFreshMFA] with
+//     currentSessionID — DeleteAccount's, verbatim, including the exemption
+//     for an account that is already anonymized, which here is also what
+//     keeps "Anonymizing twice" true. It is this method's OWN call, not one
+//     the two postures share.
 //  3. The hook, if one is configured — BEFORE any authlayer row is written,
 //     so its error aborts with nothing written. See
 //     [WithAccountDeletionHook], and note it is the SAME hook DeleteAccount
@@ -634,7 +677,10 @@ func anonymizedEmail(userID string) string {
 // # Anonymizing twice
 //
 // A second AnonymizeAccount on an already-anonymized account succeeds and
-// changes nothing meaningful. It re-runs the hook (which must tolerate that
+// changes nothing meaningful — including when the account holds a confirmed
+// [MFAFactor], which is why the step-up check exempts a stamped row: nothing here
+// sweeps factor rows, and a stamped account has no session left that could
+// ever prove one. It re-runs the hook (which must tolerate that
 // — see [WithAccountDeletionHook]), sweeps three already-empty record kinds,
 // and re-writes the same scrubbed address the row already holds, which
 // [Store.MarkUserDeleted] does not treat as a self-conflict. It also never
@@ -665,7 +711,7 @@ func anonymizedEmail(userID string) string {
 // [github.com/bernardoforcillo/authlayer/password.Hasher] error at any step
 // is returned as-is, and so is the hook's — see the package's "Fail closed"
 // constraint.
-func (s *Service) AnonymizeAccount(ctx context.Context, userID, currentPassword string) error {
+func (s *Service) AnonymizeAccount(ctx context.Context, userID, currentSessionID, currentPassword string) error {
 	// Step 1. ErrUserNotFound and every other Store error propagate as-is.
 	// An already-anonymized account is NOT refused here — see the method
 	// doc, "Anonymizing twice".
@@ -681,6 +727,22 @@ func (s *Service) AnonymizeAccount(ctx context.Context, userID, currentPassword 
 	// construction.
 	if u.PasswordHash != "" && !s.cfg.hasher.Verify(currentPassword, u.PasswordHash) {
 		return ErrInvalidCredentials
+	}
+
+	// Step 2b. Step-up, on this method's OWN line — DeleteAccount's rule
+	// verbatim, and its own call rather than one the two share, so that
+	// removing either fails only its own test. See [Service.RequireFreshMFA].
+	//
+	// The same exemption for an ALREADY-ANONYMIZED account, for the same
+	// reason and for one more: this method is documented to be repeatable
+	// (see "Anonymizing twice"), and a stamped account has no session left
+	// that could ever satisfy the check — nothing here sweeps [MFAFactor]
+	// rows, so a stamped account may well still hold a confirmed one.
+	// Gating the repeat would turn a no-op into a permanent refusal.
+	if u.DeletedAt == nil {
+		if err := s.RequireFreshMFA(ctx, userID, currentSessionID); err != nil {
+			return err
+		}
 	}
 
 	// Step 3. The hook, BEFORE any row of ours is written. Its error aborts

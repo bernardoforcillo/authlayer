@@ -96,7 +96,7 @@ func WithAuthTextLibraryIDs() AuthOption {
 //	<users>          id PK, email, email_verified_at, password_hash,
 //	                 created_at, updated_at, deleted_at, UNIQUE (email)
 //	<sessions>       id PK, user_id, token_hash, family_id, expires_at,
-//	                 created_at, rotated_at, user_agent, ip,
+//	                 created_at, rotated_at, user_agent, ip, mfa_at,
 //	                 UNIQUE (token_hash), INDEX (family_id)
 //	<verifications>  id PK, user_id, token_hash, purpose, email, expires_at,
 //	                 created_at, UNIQUE (token_hash),
@@ -139,6 +139,24 @@ func WithAuthTextLibraryIDs() AuthOption {
 // from it would be consistent. That is why this store offers no equivalent of
 // [WithTextUserIDs] or [WithInviteTextUserIDs], and why the one id option it
 // does offer, [WithAuthTextLibraryIDs], moves all five columns together.
+//
+// sessions.mfa_at is nullable and carries no constraint or index either —
+// it is [auth.Session.MFAAt], the step-up freshness stamp
+// [github.com/bernardoforcillo/authlayer/auth.Service.RequireFreshMFA]
+// reads. It arrives on a FRESH table only, exactly as users.deleted_at
+// does and with the identical consequence: a sessions table created before
+// this field existed needs one hand-run migration before this store can
+// write to it at all, because every INSERT names mfa_at and the first
+// CreateSession against an unmigrated table fails with SQLSTATE 42703
+// (undefined_column):
+//
+//	ALTER TABLE sessions ADD COLUMN IF NOT EXISTS mfa_at timestamptz;
+//
+// (with the real table name if [WithAuthNames] moved it). timestamptz and
+// nullable, no DEFAULT — NULL, "this session never proved a second
+// factor", is what every pre-existing row should hold, and it is the
+// fail-closed value: such a session satisfies no step-up until its holder
+// proves a factor again.
 //
 // users.deleted_at is nullable and carries no constraint or index — it is
 // [auth.UserBase.DeletedAt], the anonymization stamp. It arrives on a FRESH
@@ -288,7 +306,8 @@ func (st *AuthStore) Schema() *AuthSchema { return st.s }
 // "Adds what is missing" stops at constraints and indexes. It does NOT add a
 // missing COLUMN: a column exists only inside CREATE TABLE IF NOT EXISTS,
 // which no-ops in full against a table that is already there. So a users
-// table created before users.deleted_at was declared needs the ALTER TABLE
+// table created before users.deleted_at was declared, or a sessions table
+// created before sessions.mfa_at was, needs the matching ALTER TABLE
 // [AuthSchema]'s doc gives, run by hand, before this store can insert into
 // it at all.
 // Running CreateSchema against such a table reports success while leaving

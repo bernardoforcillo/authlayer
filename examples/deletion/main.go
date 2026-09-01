@@ -109,9 +109,16 @@ func main() {
 	// The hook does not fire on a failed re-authentication: the check comes
 	// first, so a wrong password does not send your application off
 	// deleting rows.
+	//
+	// The third argument is the caller's own session id, which
+	// RequireFreshMFA checks for a recently proven second factor. This
+	// Service wires no MFAStore, so that check is a no-op here and "" is
+	// honest; an application offering MFA passes the SessionID claim off
+	// the access token that authenticated the request, exactly as
+	// ChangePassword takes it.
 	step("a wrong password refuses")
 	before := len(hookLog)
-	err := svc.DeleteAccount(ctx, erin.id, "not-her-password")
+	err := svc.DeleteAccount(ctx, erin.id, "", "not-her-password")
 	expect(errors.Is(err, auth.ErrInvalidCredentials), "a wrong password must refuse")
 	expect(len(hookLog) == before, "the hook must not fire on a failed re-authentication")
 	fmt.Println("  wrong current password -> ErrInvalidCredentials, and the hook never ran")
@@ -126,7 +133,7 @@ func main() {
 	// error back to act on.
 	step("a hook error aborts")
 	failHook = true
-	err = svc.DeleteAccount(ctx, erin.id, erinPassword)
+	err = svc.DeleteAccount(ctx, erin.id, "", erinPassword)
 	expect(errors.Is(err, errHookRefused), "the hook's own error must reach the caller")
 	fmt.Printf("  DeleteAccount -> %v\n", err)
 	assertIntact(ctx, svc, &erin, 2, "an aborted deletion must leave the account whole")
@@ -147,7 +154,7 @@ func main() {
 	// at all. What the ORDER buys is that every partial state falls on the
 	// safe side.
 	step("hard deletion")
-	must(svc.DeleteAccount(ctx, erin.id, erinPassword))
+	must(svc.DeleteAccount(ctx, erin.id, "", erinPassword))
 	fmt.Printf("  %s\n", hookLog[len(hookLog)-1])
 
 	_, err = svc.Login(ctx, erinAddress, erinPassword, "203.0.113.9", "laptop")
@@ -183,7 +190,7 @@ func main() {
 	// foreign key. If so, removing the row leaves those pointing at
 	// nothing.
 	step("anonymization")
-	must(svc.AnonymizeAccount(ctx, frank.id, frankPassword))
+	must(svc.AnonymizeAccount(ctx, frank.id, "", frankPassword))
 	fmt.Printf("  %s\n", hookLog[len(hookLog)-1])
 
 	stamped, err := svc.User(ctx, frank.id)
@@ -282,7 +289,7 @@ func furnish(ctx context.Context, svc *auth.Service, email, plain string) accoun
 	resetToken, ok, err := svc.RequestPasswordReset(ctx, email, "203.0.113.9")
 	must(err)
 	expect(ok, "a registered address must mint a reset token")
-	_, err = svc.RequestEmailChange(ctx, res.User.ID, plain, "moved-"+email)
+	_, err = svc.RequestEmailChange(ctx, res.User.ID, "", plain, "moved-"+email)
 	must(err)
 
 	// A linked social account is a way IN that needs no password at all, so

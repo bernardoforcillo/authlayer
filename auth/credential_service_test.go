@@ -750,7 +750,7 @@ func TestPasskeyCeremoniesRefuseAnAnonymizedAccount(t *testing.T) {
 	}
 	loginChallenge := mustBeginLogin(t, svc)
 
-	if err := svc.AnonymizeAccount(ctx, u.ID, validPassword); err != nil {
+	if err := svc.AnonymizeAccount(ctx, u.ID, "", validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount: %v", err)
 	}
 
