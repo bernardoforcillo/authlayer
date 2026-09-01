@@ -49,9 +49,9 @@ const (
 	frankAddress  = "frank@example.com"
 )
 
-// hookError is what the application's own cleanup returns when it could not
+// errHookRefused is what the application's own cleanup returns when it could not
 // finish. Returning it is what makes the whole deletion abort.
-var hookError = errors.New("the billing service could not be reached")
+var errHookRefused = errors.New("the billing service could not be reached")
 
 func main() {
 	ctx := context.Background()
@@ -78,7 +78,7 @@ func main() {
 		auth.WithAccountDeletionHook(func(_ context.Context, userID string) error {
 			if failHook {
 				hookLog = append(hookLog, "hook REFUSED for "+short(userID))
-				return hookError
+				return errHookRefused
 			}
 			hookLog = append(hookLog, "hook cleaned up rows for "+short(userID))
 			return nil
@@ -127,7 +127,7 @@ func main() {
 	step("a hook error aborts")
 	failHook = true
 	err = svc.DeleteAccount(ctx, erin.id, erinPassword)
-	expect(errors.Is(err, hookError), "the hook's own error must reach the caller")
+	expect(errors.Is(err, errHookRefused), "the hook's own error must reach the caller")
 	fmt.Printf("  DeleteAccount -> %v\n", err)
 	assertIntact(ctx, svc, &erin, 2, "an aborted deletion must leave the account whole")
 	fmt.Println("  erin's sessions, tokens and password all still work")
