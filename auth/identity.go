@@ -1,11 +1,21 @@
 // Package auth (this file) adds external — "OAuth", "social", "sign in with
 // X" — identities to the credential model auth.go defines. It is a separate
-// file rather than more of auth.go for one concrete reason: [Store] is a
-// released, 18-method port, and adding a method to it would break every
-// third-party backend that already implements it. [IdentityStore] is a
-// second, OPTIONAL port instead, wired with [WithIdentityStore] and absent
-// by default, exactly as invite.Store is its own port rather than more of
-// this one.
+// file rather than more of auth.go for one concrete reason: identities are
+// FUNCTIONALITY. A deployment that never offers a social login never needs
+// one, and a backend that cannot store one is still a complete backend for
+// every deployment that does not, so requiring every existing implementation
+// of the released [Store] to grow methods for a feature most will never
+// enable would be a cost paid for nothing. [IdentityStore] is a second,
+// OPTIONAL port instead, wired with [WithIdentityStore] and absent by
+// default, exactly as invite.Store is its own port rather than more of this
+// one.
+//
+// That is a rule about what the methods are FOR, not a rule against ever
+// growing a released port. Account deletion added four methods to [Store]
+// itself, because every deployment eventually has to remove an account and a
+// Store that silently could not is not one anybody can finish deploying. See
+// auth.go's package doc, "Deletion, and why it is on this port rather than
+// beside it", for both halves of that distinction.
 //
 // # What this package stores, and what it refuses to
 //
@@ -372,9 +382,9 @@ var (
 	// attempted on a [Service] built without [WithIdentityStore].
 	//
 	// The port is optional — an application that offers no external sign-in
-	// wires none, and the 18-method [Store] it already has is untouched —
-	// so every entry point that needs one resolves it through a single
-	// guard that returns this, rather than dereferencing a nil interface.
+	// wires none, and the [Store] it already has is untouched — so every
+	// entry point that needs one resolves it through a single guard that
+	// returns this, rather than dereferencing a nil interface.
 	ErrOAuthNotConfigured = errors.New("authlayer/auth: no identity store configured")
 )
 
