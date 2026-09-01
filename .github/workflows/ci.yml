@@ -134,6 +134,8 @@ jobs:
           go run ./examples/auth > /dev/null
           go run ./examples/reset > /dev/null
           go run ./examples/oauth > /dev/null
+          go run ./examples/magiclink > /dev/null
+          go run ./examples/deletion > /dev/null
 
       # The lane where several of this project's Criticals were actually
       # found. A CI that stops before it would not protect the thing that
