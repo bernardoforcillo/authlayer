@@ -1508,9 +1508,9 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 	// Step 7: the second factor, consulted only once the password and
 	// every check above it have passed. A confirmed factor short-circuits
 	// the mint entirely and hands back a challenge with EMPTY tokens — see
-	// mfaAtLogin, and [LoginResult.MFA] for what a caller that has never
+	// mfaAtSignIn, and [LoginResult.MFA] for what a caller that has never
 	// heard of this field gets.
-	challenge, err := s.mfaAtLogin(ctx, u)
+	challenge, err := s.mfaAtSignIn(ctx, u)
 	if err != nil {
 		return zero, err
 	}

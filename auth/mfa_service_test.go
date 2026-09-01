@@ -1395,29 +1395,34 @@ func TestMFAEntryPointsRefuseWithoutAStore(t *testing.T) {
 	}
 }
 
-// TestOtherSignInDoorsAreNotGatedByMFA pins a DISCLOSED LIMITATION rather
-// than a property: Login is the only entry point that consults a factor, so
-// an account with TOTP enrolled is still reachable through a magic link or
-// an external provider. auth/mfa_service.go's package doc argues why that
-// is scoped out rather than forgotten — the right answer differs per door,
-// and both belong with step-up authentication.
+// TestEverySignInDoorsDecisionOnTheSecondFactorIsPinned is the successor to
+// TestOtherSignInDoorsAreNotGatedByMFA, which pinned the DISCLOSED
+// LIMITATION that Login was the only door consulting a factor. That
+// limitation is gone: three of the four doors now demand the factor and the
+// fourth IS one, and this test pins all four decisions side by side so that
+// none of them can change without a reader meeting the whole matrix.
 //
-// The test exists so the limitation cannot change silently in either
-// direction: whoever gates these doors will fail here and be sent to the
-// doc that has to change with them.
-func TestOtherSignInDoorsAreNotGatedByMFA(t *testing.T) {
+// The per-door tests live in auth/signindoors_test.go and each exercises one
+// door alone — which is what proves the checks independent rather than one
+// shared guard. This one exists for the reader who wants the four answers in
+// one place, and it names the doc section that has to change with them.
+func TestEverySignInDoorsDecisionOnTheSecondFactorIsPinned(t *testing.T) {
 	ids := memory.NewIdentityStore()
+	creds := memory.NewCredentialStore()
 	f := newMFAService(t,
 		auth.WithIdentityStore(ids),
+		auth.WithCredentialStore(creds),
 		auth.WithLinking(auth.LinkAlways),
 		auth.WithMFAEnforcement(auth.EnforcementRequired),
 	)
 	ctx := context.Background()
-	enrolConfirmed(t, f, "yusuf@example.com")
+	e := enrolConfirmed(t, f, "yusuf@example.com")
 
-	// The password door IS gated.
+	// 1. The password door: gated, and gated first.
 	loginOwingMFA(t, f, "yusuf@example.com")
 
+	// 2. The magic-link door: gated. A mailbox is also this package's
+	// password-reset channel, so it cannot also be the second factor.
 	magic, ok, err := f.svc.RequestMagicLink(ctx, "yusuf@example.com", "1.2.3.4")
 	if err != nil || !ok {
 		t.Fatalf("RequestMagicLink: ok=%v err=%v", ok, err)
@@ -1426,15 +1431,32 @@ func TestOtherSignInDoorsAreNotGatedByMFA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RedeemMagicLink: %v", err)
 	}
-	if res.MFA != nil || res.AccessToken == "" {
-		t.Fatalf("RedeemMagicLink now returns a challenge (mfa=%v); update auth/mfa_service.go's \"What the second factor does not gate\" section with it", res.MFA)
+	if res.MFA == nil || res.AccessToken != "" {
+		t.Fatalf("RedeemMagicLink mints a session outright again (mfa=%v); update auth/mfa_service.go's \"What the second factor gates, door by door\" section with it", res.MFA)
 	}
 
+	// 3. The external-identity door: gated. This package cannot see what
+	// the provider checked.
 	ext, err := f.svc.SignInWith(ctx, signInReq(googleExt("yusuf@example.com", true)))
 	if err != nil {
 		t.Fatalf("SignInWith: %v", err)
 	}
-	if ext.AccessToken == "" || ext.RefreshToken == "" {
-		t.Fatal("SignInWith no longer mints a session outright for an account with a confirmed factor; update the same section with whatever it does instead")
+	if ext.MFA == nil || ext.AccessToken != "" {
+		t.Fatal("SignInWith mints a session outright again for an account with a confirmed factor; update the same section with whatever it does instead")
+	}
+
+	// 4. The passkey door: NOT gated, deliberately — a passkey is itself a
+	// possession factor, so a TOTP code on top would be a second factor
+	// demanded of a second factor.
+	cred := registerPasskey(t, f.svc, e.user.ID, newCred(9))
+	pk, err := f.svc.FinishPasskeyLogin(ctx, auth.VerifiedAssertion{
+		CredentialID: cred.CredentialID,
+		Challenge:    mustBeginLogin(t, f.svc),
+	}, "1.2.3.4", "agent")
+	if err != nil {
+		t.Fatalf("FinishPasskeyLogin: %v", err)
+	}
+	if pk.MFA != nil || pk.AccessToken == "" {
+		t.Fatalf("FinishPasskeyLogin now owes a second factor (mfa=%v); update the same section with it", pk.MFA)
 	}
 }

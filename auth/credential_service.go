@@ -505,6 +505,32 @@ func (s *Service) BeginPasskeyLogin(ctx context.Context) (string, error) {
 // [WithPasskeyChallengeTTL]'s default is the shortest lifetime in this
 // package.
 //
+// # A passkey IS the second factor
+//
+// This is the ONE sign-in door that does not consult an [MFAFactor]. An
+// account holding a confirmed TOTP factor signs in here outright — no
+// [MFAChallenge], no [ErrMFARequired], not even under [EnforcementRequired]
+// — where [Service.Login], [Service.RedeemMagicLink] and
+// [Service.SignInWith] all stop and demand one.
+//
+// A passkey is a private key bound to hardware the user holds, registered to
+// THIS account through this package's own [CredentialStore] and resolvable
+// to no other. It is a possession factor by construction, and it shares no
+// channel with the password or the mailbox — which is exactly what the other
+// two doors fail: a magic link arrives where a password reset arrives, and
+// an external assertion carries no statement about what the provider
+// checked. Demanding a TOTP code on top of a passkey is a second factor
+// demanded of a second factor.
+//
+// The decision rests on the caller, and that is worth naming twice. This
+// method verifies nothing (see above), so "a passkey authenticated this" is
+// the CALLER's claim; and this package never sees the WebAuthn
+// user-verification (UV) flag, so it cannot tell a passkey unlocked with a
+// biometric or a PIN from one that merely sat plugged in. A deployment that
+// needs UV must require it in its verifier, because nothing here can.
+// auth/mfa_service.go's package doc, "What the second factor gates, door by
+// door", holds the matrix all four doors are decided in.
+//
 // # What a successful login does NOT do
 //
 // It verifies no email address ([Service.RedeemMagicLink] does, because a

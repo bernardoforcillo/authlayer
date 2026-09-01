@@ -63,6 +63,10 @@ func requireProviderSubject(ext ExternalIdentity) error {
 //     the PROVIDER and the configured [Linking] policy allows, otherwise
 //     [ErrLinkRequiresVerification]. Created is false.
 //
+// Both rungs end at the SECOND FACTOR, not at a session: an account owing
+// one gets a [MFAChallenge] in [SignInResult.MFA] and no tokens. See "An
+// external identity is not a second factor" below.
+//
 // # A caller-supplied address never links
 //
 // The link branch is reached on nothing but a matching address, so WHOSE
@@ -203,6 +207,46 @@ func requireProviderSubject(ext ExternalIdentity) error {
 //
 // [Service.LinkIdentity] carries its own third check for the same reason;
 // see its "What it refuses".
+//
+// # An external identity is not a second factor
+//
+// An account holding a CONFIRMED [MFAFactor] does NOT get a session here.
+// This method returns a [SignInResult] whose AccessToken and RefreshToken
+// are EMPTY and whose MFA field carries a short-lived [MFAChallenge], with
+// a nil error and no [Session] row created — the identical pending state
+// [Service.Login] returns, finished the identical way through
+// [Service.CompleteMFA]. Under [EnforcementRequired] an account with NO
+// confirmed factor is refused outright with [ErrMFARequired].
+//
+// The provider may have enforced a second factor of its own. This package
+// cannot see whether it did, cannot name which one, and cannot know whether
+// this deployment trusts it — [ExternalIdentity] carries no such field and
+// could not be believed if it did. And under [LinkVerified] or [LinkAlways]
+// an identity reaches an existing account on the strength of a matching
+// ADDRESS, so accepting one as the factor would let any provider willing to
+// assert an address stand in for it. auth/mfa_service.go's package doc,
+// "What the second factor gates, door by door", carries the full argument
+// and names the honest ways a deployment can trust a provider's own factor
+// instead.
+//
+// Like the stamped-account refusal above, this is TWO checks, one per rung,
+// for the same reason and pinned by a test naming each rung. Both run LAST,
+// after everything else the rung does — which has one consequence worth
+// stating rather than discovering: on rung 2 the identity is LINKED before
+// the challenge is returned, so an external sign-in that stops at a
+// challenge still leaves the link behind. That is deliberate. Checking
+// above [IdentityStore.CreateIdentity] instead would mean an account with a
+// confirmed factor could never link a provider through this method at all,
+// since [Service.CompleteMFA] mints a session and does no linking. The
+// residual is narrow — an attacker who can make the provider assert the
+// victim's address gains a linked identity and no session, where before
+// this section existed they gained a session outright.
+//
+// Provisioning under [EnforcementRequired] deserves its own sentence: a
+// brand-new account has no confirmed factor, so it is created, linked, and
+// then refused with ErrMFARequired. The account exists and cannot sign in
+// until it enrols. A deployment running EnforcementRequired alongside
+// external sign-up must therefore drive enrolment itself.
 //
 // # Fail closed
 //
@@ -425,6 +469,23 @@ func (s *Service) SignInWith(ctx context.Context, req SignInRequest) (SignInResu
 		}
 	}
 
+	// The second factor, consulted last — the ADDRESS rung's own call to
+	// mfaAtSignIn, separate from rung 1's rather than a guard the two share,
+	// exactly as each rung carries its own anonymized-account refusal. A
+	// confirmed factor short-circuits the mint entirely and hands back a
+	// challenge with EMPTY tokens; see the method doc's "An external
+	// identity is not a second factor".
+	challenge, err := s.mfaAtSignIn(ctx, u)
+	if err != nil {
+		return zero, err
+	}
+	if challenge != nil {
+		// Deliberately NOT mintSession, so this line is the only thing
+		// scrubbing the credential digest off the record handed back.
+		u.PasswordHash = ""
+		return SignInResult{Created: created, User: u, MFA: challenge}, nil
+	}
+
 	minted, err := s.mintSession(ctx, u, req.IP, req.UserAgent)
 	if err != nil {
 		return zero, err
@@ -457,6 +518,13 @@ func (s *Service) SignInWith(ctx context.Context, req SignInRequest) (SignInResu
 // separately". It is placed after the user load and before
 // [IdentityStore.TouchIdentity], so a refused sign-in does not stamp
 // LastUsedAt for a use that did not happen.
+//
+// It carries rung 1's own SECOND-FACTOR check too, on the same terms and
+// for the same reason, and that one is placed after TouchIdentity: the
+// identity WAS used — the provider's assertion resolved to this account —
+// and a sign-in that stops at a challenge is a sign-in in progress, not a
+// refusal. See [Service.SignInWith]'s "An external identity is not a second
+// factor".
 func (s *Service) signInLinkedIdentity(ctx context.Context, identities IdentityStore, linked Identity, req SignInRequest) (SignInResult, error) {
 	var zero SignInResult
 
@@ -469,6 +537,17 @@ func (s *Service) signInLinkedIdentity(ctx context.Context, identities IdentityS
 	}
 	if err := identities.TouchIdentity(ctx, linked.ID, s.cfg.clock()); err != nil {
 		return zero, err
+	}
+
+	challenge, err := s.mfaAtSignIn(ctx, u)
+	if err != nil {
+		return zero, err
+	}
+	if challenge != nil {
+		// Deliberately NOT mintSession, so this line is the only thing
+		// scrubbing the credential digest off the record handed back.
+		u.PasswordHash = ""
+		return SignInResult{Created: false, User: u, MFA: challenge}, nil
 	}
 
 	minted, err := s.mintSession(ctx, u, req.IP, req.UserAgent)
