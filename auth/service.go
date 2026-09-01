@@ -56,7 +56,7 @@ import (
 	"github.com/bernardoforcillo/authlayer/token"
 )
 
-// The four closed values [Verification.Purpose] takes — see that field's
+// The five closed values [Verification.Purpose] takes — see that field's
 // doc and [Store]'s sentinel-error doc for why the closed set lives here,
 // in the service layer, rather than on the Store port.
 const (
@@ -86,6 +86,30 @@ const (
 	// that already sweeps the other two redeemable-by-mail purposes — see
 	// [Service.ChangePassword]'s doc, "The sweep matrix".
 	PurposeMagicLink = "magic_link"
+	// PurposeMFAChallenge marks a Verification minted by [Service.Login]
+	// when the account owes a second factor: the short-lived, single-use
+	// handle [Service.CompleteMFA] exchanges, together with a TOTP or
+	// recovery code, for the session Login deliberately did not mint. See
+	// [MFAChallenge] and auth/mfa_service.go's package doc for why the
+	// pending state is a Verification rather than a fifth table.
+	//
+	// It is redeemable through [Service.CompleteMFA] and NOWHERE else.
+	// [Service.VerifyEmail] whitelists the two purposes it redeems and so
+	// refuses this one already; [Service.ResetPassword] and
+	// [Service.RedeemMagicLink] each refuse anything but their own. Those
+	// refusals are not bookkeeping: a challenge is a HALF-authenticated
+	// login — its holder has proven a password and nothing else — and
+	// redeeming one anywhere that issues a session or sets a credential
+	// without the second factor would hand back exactly what withholding
+	// the session was for.
+	//
+	// Unlike the other four, this purpose is never mailed anywhere. Its
+	// [Verification.Email] is populated (the field's contract is
+	// unconditional) but proves nothing and certifies nothing: completing
+	// a challenge does not stamp [UserBase.EmailVerifiedAt], because
+	// nothing about the address was demonstrated by holding the handle
+	// Login just returned over an already-authenticated channel.
+	PurposeMFAChallenge = "mfa_challenge"
 )
 
 // defaultVerificationTTL is the default for [WithVerificationTTL]: how long
@@ -109,6 +133,17 @@ const defaultPasswordResetTTL = time.Hour
 // let its holder SET a credential — it IS the credential: [Service.RedeemMagicLink]
 // exchanges it directly for a session, with no password step in between.
 const defaultMagicLinkTTL = 15 * time.Minute
+
+// defaultMFAChallengeTTL is the default for [WithMFAChallengeTTL]: how long
+// a "mfa_challenge" [Verification] minted by [Service.Login] stays
+// exchangeable through [Service.CompleteMFA]. The shortest of the five, and
+// for a reason none of the others share: it is not a link that has to
+// survive a mail queue and a distracted human, it is the gap between two
+// steps of one sitting — read the code off an authenticator and type it in.
+// Minutes are generous for that; hours would only widen the window in which
+// a challenge stolen from a browser's memory, a proxy log or a shared
+// terminal is still worth something to whoever took it.
+const defaultMFAChallengeTTL = 5 * time.Minute
 
 // Sentinel errors returned by Service, layered on top of the ones [Store]
 // already defines (ErrUserNotFound and friends propagate through verbatim
@@ -325,6 +360,28 @@ type config struct {
 	// see [WithAccountDeletionHook] and [Service.DeleteAccount], both in
 	// deletion.go. nil means no hook, which is the default.
 	accountDeletionHook func(ctx context.Context, userID string) error
+	// mfaStore is the OPTIONAL second-factor port — see [WithMFAStore] and
+	// [MFAStore]. nil means no MFA is configured, and every entry point
+	// needing it fails with [ErrMFANotConfigured] rather than
+	// dereferencing this.
+	mfaStore MFAStore
+	// mfaCipher encrypts TOTP secrets at rest — see [WithMFASecretCipher].
+	// nil means enrolment is REFUSED with [ErrMFACipherNotConfigured]
+	// rather than falling back to storing a plaintext bearer credential;
+	// auth/mfa.go's package doc carries that argument.
+	mfaCipher Cipher
+	// mfaEnforcement is whether a second factor is optional or mandatory —
+	// see [Enforcement] and [WithMFAEnforcement]. Left at its ZERO VALUE by
+	// defaultConfig rather than assigned there, exactly as linking is:
+	// [EnforcementOptional] is that zero value, so a config built by any
+	// route at all carries the policy that cannot lock anybody out.
+	mfaEnforcement Enforcement
+	// mfaChallengeTTL is how long a "mfa_challenge" [Verification] stays
+	// exchangeable — see [WithMFAChallengeTTL].
+	mfaChallengeTTL time.Duration
+	// mfaIssuer is the label an authenticator app shows beside the account —
+	// see [WithMFAIssuer]. Empty is valid and renders a URI with no issuer.
+	mfaIssuer string
 }
 
 func defaultConfig() config {
@@ -336,6 +393,7 @@ func defaultConfig() config {
 		verificationTTL:  defaultVerificationTTL,
 		passwordResetTTL: defaultPasswordResetTTL,
 		magicLinkTTL:     defaultMagicLinkTTL,
+		mfaChallengeTTL:  defaultMFAChallengeTTL,
 		clock:            func() time.Time { return time.Now().UTC() },
 		idGen:            uid.NewV7,
 	}
@@ -808,6 +866,112 @@ func WithLinking(m Linking) Option {
 	}
 }
 
+// WithMFAStore wires the OPTIONAL [MFAStore] port, enabling TOTP second
+// factors and recovery codes. The default is nil: a Service built without
+// this option persists no factor state at all, every account behaves
+// exactly as it did before MFA existed, and every entry point that needs
+// the port refuses with [ErrMFANotConfigured] rather than dereferencing
+// nil. A nil s is ignored, leaving the default (or a prior option) in
+// place.
+//
+// It is a separate port, not part of [Store], for the reason auth/mfa.go's
+// package doc gives: a second factor is functionality a deployment may
+// never offer, so a backend that cannot store one is still a complete
+// backend — the same test [IdentityStore] passed and account deletion
+// failed.
+//
+// Wiring the store is not sufficient on its own. Enrolment also needs
+// [WithMFASecretCipher], and refuses without it.
+func WithMFAStore(s MFAStore) Option {
+	return func(c *config) {
+		if s != nil {
+			c.mfaStore = s
+		}
+	}
+}
+
+// WithMFASecretCipher wires the [Cipher] that encrypts TOTP secrets before
+// they reach the [MFAStore], and decrypts them to validate a code. There is
+// NO DEFAULT and no fallback: a Service without one refuses to enrol a
+// factor at all, with [ErrMFACipherNotConfigured]. A nil c is ignored,
+// leaving the default (or a prior option) in place.
+//
+// The refusal is the point, and auth/mfa.go's package doc argues it in
+// full: a TOTP secret is the bearer credential the user's authenticator
+// holds, so a table of plaintext secrets is a working second-factor bypass
+// for every enrolled user the moment the database is read — which is
+// precisely the compromise the second factor was added to survive.
+// Refusing at enrolment turns a missing key into a loud failure on the
+// first attempt instead of a silent one discovered in a breach.
+//
+// authlayer ships no implementation. The algorithm is the easy half;
+// deciding where the key lives is the half that determines whether the
+// ciphertext is worth anything, and that decision is the deployment's.
+func WithMFASecretCipher(c Cipher) Option {
+	return func(cfg *config) {
+		if c != nil {
+			cfg.mfaCipher = c
+		}
+	}
+}
+
+// WithMFAEnforcement sets whether a second factor is optional or mandatory
+// for password logins — see [Enforcement]. The default is
+// [EnforcementOptional], which is Enforcement's zero value, so a caller who
+// says nothing gets the policy that cannot lock anyone out.
+//
+// It PANICS on a value outside the two declared constants, matching
+// [WithLinking]'s stance for the identical reason: an enforcement policy is
+// a security decision made once, at wiring time, and a Service holding a
+// mode no branch of [Service.Login] handles is either an unexplainable
+// denial or a silent downgrade to "no second factor required".
+func WithMFAEnforcement(m Enforcement) Option {
+	return func(c *config) {
+		switch m {
+		case EnforcementOptional, EnforcementRequired:
+			c.mfaEnforcement = m
+		default:
+			panic(fmt.Sprintf("authlayer/auth: WithMFAEnforcement(%d): unknown enforcement mode", int(m)))
+		}
+	}
+}
+
+// WithMFAChallengeTTL overrides how long a "mfa_challenge" [Verification]
+// minted by [Service.Login] stays exchangeable through
+// [Service.CompleteMFA]. The default is [defaultMFAChallengeTTL] (five
+// minutes) — see that constant for why it is the shortest of the five
+// verification lifetimes. A non-positive d is ignored, leaving the default
+// (or a prior option) in place, exactly as [WithMagicLinkTTL] does: a
+// zero-or-negative TTL would mint challenges that are already expired,
+// making every MFA login unfinishable.
+func WithMFAChallengeTTL(d time.Duration) Option {
+	return func(c *config) {
+		if d > 0 {
+			c.mfaChallengeTTL = d
+		}
+	}
+}
+
+// WithMFAIssuer sets the issuer name written into the otpauth URI
+// [Service.BeginMFAEnrolment] returns — the label an authenticator app
+// shows above the account, and the one a user scans through to find the
+// right code among thirty. Use the application's name, and keep it STABLE:
+// changing it does not migrate anything, it merely relabels factors
+// enrolled afterwards, leaving a user with two differently-named entries
+// for one account.
+//
+// The default is empty, which renders a URI with no issuer label and no
+// `issuer` parameter (see internal/totp.ProvisioningURI) — valid, scannable,
+// and anonymous in the user's app. That is a deliberate no-default rather
+// than a guess: this package does not know the application's name, and a
+// placeholder would be scanned into thousands of authenticators before
+// anyone noticed.
+func WithMFAIssuer(name string) Option {
+	return func(c *config) {
+		c.mfaIssuer = name
+	}
+}
+
 // SignUpResult is the outcome of [Service.SignUp]. Both branches return a
 // nil error; Created and VerifyToken are what differ, and User is populated
 // only on the new-account branch.
@@ -884,6 +1048,35 @@ type LoginResult struct {
 	// rotated away and will fail with [ErrTokenReuse], revoking the whole
 	// family, if presented again.
 	RefreshToken string
+	// MFA is non-nil on exactly one path: a [Service.Login] that
+	// authenticated the password of an account owing a second factor. On
+	// that path NO SESSION EXISTS — AccessToken and RefreshToken are both
+	// "" and nothing was persisted — and the login finishes by exchanging
+	// MFA.Token, with a TOTP or recovery code, through
+	// [Service.CompleteMFA]. It is nil on every other successful outcome:
+	// an ordinary Login, a [Service.Refresh], a [Service.RedeemMagicLink],
+	// a [Service.SignInWith], and CompleteMFA's own result.
+	//
+	// # Why a caller written before this field existed still fails closed
+	//
+	// This field was added after v0.1.0, so code compiled against that
+	// version reads AccessToken and never looks here. It gets "" — and ""
+	// is not a degraded token, it is not a token at all:
+	// [github.com/bernardoforcillo/authlayer/token.Parse] refuses it, and
+	// so does every middleware built on it. The empty string is doing real
+	// work in this design, and it is why the tokens are left empty rather
+	// than populated "for convenience" alongside the challenge: an
+	// unmodified v0.1.0 caller that ignores MFA entirely under-grants (its
+	// users cannot sign in until it is updated) instead of handing out a
+	// session the second factor was never presented for. Under-granting is
+	// the only acceptable direction here, and a test in this package's
+	// suite pins it against exactly that caller.
+	//
+	// A caller that DOES know about MFA must branch on MFA != nil before
+	// touching either token, not on err != nil alone: an MFA-owed login is
+	// a nil error and a successful outcome — the password was correct —
+	// that simply is not finished yet.
+	MFA *MFAChallenge
 }
 
 // Service mints, authenticates, and verifies accounts for one application.
@@ -1160,7 +1353,8 @@ func (s *Service) mintSignupVerification(ctx context.Context, userID, email stri
 	return plainToken, nil
 }
 
-// Login authenticates email/plainPassword and, on success, mints a new
+// Login authenticates email/plainPassword and, unless the account owes a
+// second factor (see "The pending state" below), mints a new
 // session: an access token (a short-lived, HS256-signed JWT — see
 // [WithJWT]) and a refresh token (a long-lived opaque bearer token, whose
 // hash becomes the minted [Session]'s TokenHash). Both, with the
@@ -1213,7 +1407,20 @@ func (s *Service) mintSignupVerification(ctx context.Context, userID, email stri
 //     [ErrEmailNotVerified] here, never earlier, so a caller who does not
 //     already know the password cannot use the verified-or-not distinction
 //     as its own enumeration channel.
-//  7. Only once every check above has passed does this touch the Store
+//  7. Only once credentials are proven AND point 6 has passed does this
+//     consult the second factor, if an [MFAStore] is wired. A CONFIRMED
+//     [MFAFactor] means the login is not finished: this returns a
+//     [LoginResult] whose AccessToken and RefreshToken are EMPTY and whose
+//     MFA field carries a short-lived [MFAChallenge], with a nil error and
+//     no Session row created — see "The pending state" below. An
+//     UNCONFIRMED factor gates nothing. With [EnforcementRequired] an
+//     account with no confirmed factor is refused here with
+//     [ErrMFARequired], a sentinel of its own so an application can route
+//     the user into enrolment instead of showing them "wrong password".
+//     Ordered after point 6 for the same reason point 6 is ordered after
+//     point 5: neither "is MFA enrolled?" nor "is the address verified?"
+//     may become an oracle for a caller who has not proven the password.
+//  8. Only once every check above has passed does this touch the Store
 //     with a write ([Store.CreateSession]) — and even that is ordered
 //     LAST, after [token.Issue] has already succeeded (see mintSession,
 //     the minting tail this method and [Service.SignInWith] share): a
@@ -1221,6 +1428,17 @@ func (s *Service) mintSignupVerification(ctx context.Context, userID, email stri
 //     fails before any Session row is persisted, rather than leaving an
 //     orphaned, unreachable-by-refresh-token row behind that
 //     [Store.ListSessionsByUser] would still report.
+//
+// # The pending state
+//
+// A login that owes a second factor returns (LoginResult, nil): a nil
+// error, because the password WAS correct, and a result carrying nothing a
+// caller can authenticate with. The tokens are the empty string, not a
+// short-lived or restricted token, so a caller written against v0.1.0 that
+// reads AccessToken and ignores MFA receives a value
+// [github.com/bernardoforcillo/authlayer/token.Parse] refuses rather than
+// one it accepts. See [LoginResult.MFA]'s own doc, which carries the whole
+// argument, and [Service.CompleteMFA], which finishes the login.
 //
 // # Fail closed
 //
@@ -1275,6 +1493,24 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 
 	if s.cfg.requireVerifiedEmail && u.EmailVerifiedAt == nil {
 		return zero, ErrEmailNotVerified
+	}
+
+	// Step 7: the second factor, consulted only once the password and
+	// every check above it have passed. A confirmed factor short-circuits
+	// the mint entirely and hands back a challenge with EMPTY tokens — see
+	// mfaAtLogin, and [LoginResult.MFA] for what a caller that has never
+	// heard of this field gets.
+	challenge, err := s.mfaAtLogin(ctx, u)
+	if err != nil {
+		return zero, err
+	}
+	if challenge != nil {
+		// Deliberately NOT mintSession: no session row, no access token,
+		// no refresh token. PasswordHash is scrubbed here because this is
+		// the one success path that does not go through mintSession, which
+		// is where every other return value gets scrubbed.
+		u.PasswordHash = ""
+		return LoginResult{User: u, MFA: challenge}, nil
 	}
 
 	return s.mintSession(ctx, u, ip, userAgent)
