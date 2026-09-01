@@ -73,7 +73,7 @@ falling back to a default — construction **panics**: `scope.New` when
 <ResponseField name="WithVerificationTTL(d time.Duration)" type="Option" default="24 hours">
   Lifetime of `signup` **and** `email_change` tokens. Shortening it shortens how
   long an `email_change` token stays armed, which is
-  [the strongest of the three](/authentication/email-verification).
+  [the strongest of the address-change tokens](/authentication/email-verification).
 </ResponseField>
 
 <ResponseField name="WithPasswordResetTTL(d time.Duration)" type="Option" default="1 hour">
@@ -81,10 +81,36 @@ falling back to a default — construction **panics**: `scope.New` when
   full credential change, not an "I own this address" attestation.
 </ResponseField>
 
+<ResponseField name="WithMagicLinkTTL(d time.Duration)" type="Option" default="15 min">
+  Lifetime of `magic_link` tokens, and the shortest of the four purposes on
+  purpose: that token is not a step towards a credential, it **is** one. See
+  [Magic links](/authentication/magic-links).
+</ResponseField>
+
+<ResponseField name="WithMagicLinkProvisioning(enabled bool)" type="Option" default="false">
+  When on, `RequestMagicLink` **creates** the account for an unrecognised
+  address rather than falling through. Off by default, and not free: anyone who
+  can receive mail can then create an account for any address they control —
+  the exposure an open `SignUp` endpoint already has. The rate limiter is the
+  control, not this option's absence.
+</ResponseField>
+
+<ResponseField name="WithAccountDeletionHook(f func(ctx, userID) error)" type="Option" default="none">
+  The application's own cleanup, fired by **both**
+  [`DeleteAccount` and `AnonymizeAccount`](/authentication/account-deletion)
+  **before** any authlayer row is touched. **An error from it aborts the whole
+  call** — fail closed. It is where your own tables go, and critically the
+  `scope` memberships authlayer cannot reach. It must tolerate running again,
+  and it is not told which posture is running.
+</ResponseField>
+
 <ResponseField name="WithRequireVerifiedEmail(require bool)" type="Option" default="false">
   When on, `Login` refuses an unconfirmed address with `ErrEmailNotVerified` —
   checked **only after** the password verifies. There is no resend path; a
-  completed reset is the way out.
+  completed reset — or a redeemed
+  [magic link](/authentication/magic-links) — is the way out.
+  `RedeemMagicLink` deliberately does not consult this option: a redemption
+  **is** the proof it demands.
 </ResponseField>
 
 <ResponseField name="WithHasher(h password.Hasher)" type="Option" default="password.Bcrypt(0)">
@@ -97,14 +123,21 @@ falling back to a default — construction **panics**: `scope.New` when
 </ResponseField>
 
 <ResponseField name="WithRateLimiter(l RateLimiter)" type="Option" default="none">
-  IP-keyed. Consulted by `Login` **and** `RequestPasswordReset`. Fails closed:
-  an error from the limiter refuses the call.
+  IP-keyed. Consulted by `Login`, `RequestPasswordReset` **and**
+  `RequestMagicLink`. Fails closed: an error from the limiter refuses the call.
 </ResponseField>
 
 <ResponseField name="WithPasswordResetRateLimiter(l RateLimiter)" type="Option" default="none">
   Address-keyed, `RequestPasswordReset` only. A denial returns the same
   `("", false, nil)` an unknown address gets — **not** `ErrRateLimited`. See
   [Rate limiting](/authentication/rate-limiting).
+</ResponseField>
+
+<ResponseField name="WithMagicLinkRateLimiter(l RateLimiter)" type="Option" default="none">
+  Address-keyed, `RequestMagicLink` only — the counterpart to the one above,
+  with the same `("", false, nil)` denial and the same reason for it. Its
+  denial is answered **before** the provisioning branch, so a denied request
+  creates no account either.
 </ResponseField>
 
 <ResponseField name="WithClaimsExtender(f func(UserBase) map[string]any)" type="Option" default="none">
@@ -127,8 +160,10 @@ falling back to a default — construction **panics**: `scope.New` when
   Wire the **optional** [external-identity](/oauth/overview) port. Without it,
   all four identity methods fail with `ErrOAuthNotConfigured` and nothing is
   persisted. A `nil` store is ignored. It is a port of its own rather than five
-  more methods on `auth.Store`, because that interface is released and adding to
-  it would break every third-party backend.
+  more methods on `auth.Store` because identities are **functionality** — a
+  deployment that never offers a social login never needs one. Deletion is not,
+  which is why its four methods went onto `auth.Store` itself. See
+  [Account deletion](/authentication/account-deletion#the-storage-cost).
 </ResponseField>
 
 <ResponseField name="WithLinking(m Linking)" type="Option" default="LinkVerified — Linking's zero value">

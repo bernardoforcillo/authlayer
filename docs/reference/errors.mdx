@@ -100,12 +100,19 @@ apart.
 Eighteen belong to the password-and-session core. The six for
 [external identities](/oauth/overview) follow in their own table below.
 
+Neither [magic links](/authentication/magic-links) nor
+[account deletion](/authentication/account-deletion) added a sentinel, which is
+deliberate rather than an oversight: both reuse the ones already in their
+methods' documented error sets, so no caller's error handling changes, and — for
+the two enumeration-safe request methods — a *new* error would itself have been
+the oracle their shape exists to close.
+
 | Error | Meaning | Suggested status |
 |---|---|---|
-| `ErrUserNotFound` | No user with that id or email | 404 |
+| `ErrUserNotFound` | No user with that id or email — **and** the refusal every authentication entry point gives an [anonymized account](/authentication/account-deletion) | 404 |
 | `ErrSessionNotFound` | No session with that id or token hash | 404 |
 | `ErrVerificationNotFound` | No verification with that id or token hash | 404 |
-| `ErrInvalidCredentials` | `Login` failed — unknown address, no password credential, or wrong password, deliberately indistinguishable | 401 |
+| `ErrInvalidCredentials` | `Login` failed — unknown address, no password credential, wrong password, or an [anonymized account](/authentication/account-deletion), deliberately indistinguishable. Also the wrong-current-password refusal from `ChangePassword`, `DeleteAccount` and `AnonymizeAccount` | 401 |
 | `ErrTokenInvalid` | The refresh token is unknown or its session has expired. The family is **not** revoked | 401 |
 | `ErrTokenReuse` | A rotated-away refresh token was presented again — see the note below | 401 |
 | `ErrSessionRevoked` | `Refresh` won the rotation, but the family was revoked before the successor could be persisted | 401 |
@@ -115,10 +122,10 @@ Eighteen belong to the password-and-session core. The six for
 | `ErrEmailMismatch` | `MarkEmailVerified` was asked to certify an address that is not the user's current one | 409 |
 | `ErrVerificationExpired` | The verification's `ExpiresAt` has passed — checked **before** the claim, so the token is not burned | 410 |
 | `ErrWeakPassword` | Fails the configured `password.Rules`; wraps the failed rule names | 400 |
-| `ErrVerificationPurpose` | Right token, wrong flow — a `password_reset` token at `VerifyEmail`, say | 400 |
+| `ErrVerificationPurpose` | Right token, wrong flow — a `password_reset` token at `VerifyEmail`, or at `RedeemMagicLink`, say. Checked **before** the claim, so the token is not burned | 400 |
 | `ErrEmailRequired` | An address that is empty once normalized — `RequestEmailChange`'s new address, or a `SignInWith` whose provider returned none and whose `FallbackEmail` is blank too | 400 |
-| `ErrRateLimited` | The IP-keyed `RateLimiter` refused. **Never** returned for the address-keyed reset limiter | 429 |
-| `ErrMissingIP` | `Login` or `RequestPasswordReset` was called with an empty ip — a wiring bug, not caller input | 500 |
+| `ErrRateLimited` | The IP-keyed `RateLimiter` refused. **Never** returned for either address-keyed limiter, reset or [magic-link](/authentication/magic-links) | 429 |
+| `ErrMissingIP` | `Login`, `RequestPasswordReset` or `RequestMagicLink` was called with an empty ip — a wiring bug, not caller input. `RedeemMagicLink` deliberately does not refuse one: it consults no limiter | 500 |
 | `ErrStoreContract` | A `Store` returned a value its own contract forbids, where continuing would silently degrade a security control | 500 |
 
 <Warning>

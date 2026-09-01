@@ -83,18 +83,30 @@ and what leaves one window in external sign-in
 
 ## The strictest port
 
-`auth.Store` carries **seven MUSTs across its eighteen methods**, and they are
-not all the same kind of obligation.
+`auth.Store` carries **eleven MUSTs across its twenty-two methods**, and they
+are not all the same kind of obligation. Four of them arrived with
+[account deletion](/authentication/account-deletion), which grew the port from
+the eighteen methods it shipped with.
 
 <AccordionGroup>
 
-<Accordion title="Four demand atomicity" icon="lock">
-`MarkRotated`, `CreateSuccessorSession`, `MarkEmailVerified`, `UpdateUserEmail`.
+<Accordion title="Five demand atomicity" icon="lock">
+`MarkRotated`, `CreateSuccessorSession`, `MarkEmailVerified`, `UpdateUserEmail`,
+`MarkUserDeleted`.
 
 Splitting any of them into a read and a later write **reopens a security hole**
 rather than merely narrowing a race: two successful rotations of one token; a
 successor resurrecting a family that was revoked mid-rotation; an address
 certified that nobody proved control of; two accounts sharing one address.
+
+`MarkUserDeleted` is the one whose two halves fail in **opposite** directions,
+which is why its five field writes have to land together. *Stamped but not
+scrubbed*: every entry point already refuses the row while it still holds the
+real address and the live password hash, so the user was told the account was
+anonymized and it is not. *Scrubbed but not stamped*: the row reports as a
+**live** account whose address is derived from the user id — not a secret — and
+a caller who guesses it can drive a password reset against an account that was
+supposed to be closed.
 
 That last one has nothing above it to catch it — `RequestEmailChange`
 [deliberately does not pre-check the new address](/authentication/email-verification#the-uniqueness-check-happens-at-redemption-not-before),
@@ -110,7 +122,7 @@ registered?" oracle from inside the store, where no amount of care in `SignUp`
 itself can see it.
 </Accordion>
 
-<Accordion title="One demands the opposite: an extra read, and serialization" icon="arrows-rotate">
+<Accordion title="Two demand the opposite: an extra read, and serialization" icon="arrows-rotate">
 `DeleteSessionsByFamily` carries two MUSTs that apply to any backend whose
 `CreateSuccessorSession` holds a row-level lock on the predecessor for a
 transaction's duration — the shape `store/drops` uses.
@@ -132,6 +144,34 @@ follows has no ordering of its own.
 A backend whose `CreateSuccessorSession` takes no such lock —
 `store/memory`, whose single mutex spans both methods' whole bodies — has no gap
 to close and owes neither.
+
+`DeleteSessionsByUser` inherits both MUSTs unchanged, because a whole-user
+revocation is a superset of a family one. The survivor it would otherwise leave
+is a fully rotating refresh token for an account whose owner has just asked for
+it to be deleted — the worst possible moment for one to outlive its sweep.
+</Accordion>
+
+<Accordion title="Two constrain the shape of the deletion cascade" icon="broom">
+Both are about what a backend must **not** quietly do for you.
+
+`DeleteUser` removes the user row **only**, and must not cascade to that
+user's sessions or verifications. A backend whose
+`FOREIGN KEY ... ON DELETE CASCADE` performs the sweep as a side effect has
+taken the [ordering decision](/authentication/account-deletion#the-order-is-fail-safe-and-is-not-negotiable)
+away from the caller and made it unobservable: a caller that skipped the sweeps
+entirely and one that ran them in the right order look identical afterwards,
+against that backend and no other.
+
+`DeleteVerificationsByUser` must filter on `userID` **alone**, never on a list
+of purposes it knows about. `Purpose` is an open string this port neither
+validates nor enumerates, so implementing this as a fan-out over
+`DeleteVerificationsByUserAndPurpose` does not satisfy it — no such list can be
+complete, and a purpose added by a later flow, or minted by a deployment
+itself, would walk straight through the sweep.
+
+The two by-user sweeps both answer a match of zero rows with `nil`; `DeleteUser`
+answers `ErrUserNotFound`, because a caller deleting an account needs to know
+whether there was one.
 </Accordion>
 
 <Accordion title="Two more sit on the record types, not on a method" icon="fingerprint">
