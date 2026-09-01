@@ -213,7 +213,9 @@ func TestFinishPasskeyLoginSatisfiesTheSecondFactor(t *testing.T) {
 	f, _, _ := doorFixture(t)
 	ctx := context.Background()
 	e := enrolConfirmed(t, f, "quinn@example.com")
-	cred := registerPasskey(t, f.svc, e.user.ID, newCred(1))
+	// The account holds a confirmed factor, so REGISTERING the passkey needs
+	// a stepped-up session — a different gate from the login door under test.
+	cred := registerPasskeyFrom(t, f.svc, e.user.ID, freshSessionFor(t, f, e, "quinn@example.com"), newCred(1))
 
 	res, err := f.svc.FinishPasskeyLogin(ctx, auth.VerifiedAssertion{
 		CredentialID: cred.CredentialID,

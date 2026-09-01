@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/bernardoforcillo/authlayer/auth"
 	"github.com/bernardoforcillo/authlayer/store/memory"
@@ -16,7 +17,7 @@ import (
 // ============================================================
 //
 // This file is the executable form of the table in [auth.Service.ChangePassword]'s
-// doc, "The sweep matrix". Eleven paths against five credential kinds, and
+// doc, "The sweep matrix". Twelve paths against seven credential kinds, and
 // EVERY cell is asserted — the deliberate non-sweeps included.
 //
 // Testing the non-sweeps matters as much as testing the sweeps. Milestone
@@ -31,6 +32,25 @@ import (
 // The cells are asserted from ONE fixture per row, so a path that swept a
 // column it should not have is caught by the same run that checks the
 // columns it should.
+//
+// # Mutations, recorded
+//
+// The point of a matrix is that its cells are INDEPENDENT calls rather than
+// one call reached from several places, so the mutations that matter here
+// remove a single cell's sweep and require exactly that cell to fail. Two
+// were run and both restored:
+//
+//   - Removing the trusted-device sweep from [auth.Service.ChangePassword]
+//     ONLY: failed TestSweepMatrix/ChangePassword's trusted-device cell,
+//     that path's fail-closed sub-test, and
+//     TestChangePasswordRevokesADeviceThatWasActuallyTrusted. Every other
+//     row's trusted-device cell — ResetPassword, LogoutAll, DeleteAccount,
+//     AnonymizeAccount, DisableMFA — still passed.
+//   - Removing the MFA-state sweep from [auth.Service.DeleteAccount] ONLY:
+//     failed that row's two MFA cells (factor and recovery codes) and its
+//     fail-closed sub-test, and nothing else. AnonymizeAccount's identical
+//     cells still passed, which is what proves the two postures make two
+//     calls.
 
 // verdict is what the matrix says about one (path, credential) cell.
 type verdict int
@@ -71,6 +91,16 @@ type sweepRow struct {
 	// "only those two touch it" is itself a claim.
 	signup, reset, change, magic verdict
 	identity                     verdict
+	// trusted is the trusted-device column: a device is a long-lived bearer
+	// token that skips the SECOND factor, so every path that sweeps anything
+	// at all sweeps these.
+	trusted verdict
+	// mfa is the second-factor column — the [auth.MFAFactor] and its
+	// [auth.RecoveryCode]s together, asserted separately but always with the
+	// same verdict, because nothing in this package removes one without the
+	// other. Only the two TERMINATION rows and DisableMFA fill it in; see
+	// the doc's "Reading the matrix" for why no remediation path may.
+	mfa verdict
 	// families is how many of the TWO seeded session families must survive.
 	families int
 	// extraSessions is how many session rows the path itself is expected to
@@ -85,6 +115,7 @@ type sweepFixture struct {
 	svc   *auth.Service
 	store *memory.AuthStore
 	ids   *memory.IdentityStore
+	mfa   *memory.MFAStore
 
 	user auth.UserBase
 
@@ -114,7 +145,8 @@ func newSweepFixture(t *testing.T, email string) *sweepFixture {
 
 	store := memory.NewAuthStore()
 	ids := memory.NewIdentityStore()
-	svc := newServiceOver(t, store, auth.WithIdentityStore(ids))
+	mfa := memory.NewMFAStore()
+	svc := newServiceOver(t, store, sweepOptions(ids, mfa)...)
 
 	// Deliberately NOT verified: the signup token has to stay outstanding
 	// so its column can be asserted, and nothing in this file needs a
@@ -152,8 +184,25 @@ func newSweepFixture(t *testing.T, email string) *sweepFixture {
 		t.Fatalf("LinkIdentity: %v", err)
 	}
 
+	// The second-factor state and the two trusted devices are seeded
+	// STRAIGHT INTO THE STORE, and the factor is left UNCONFIRMED.
+	//
+	// Both choices keep the eleven pre-existing rows meaning exactly what
+	// they meant before this column existed. An unconfirmed factor gates
+	// nothing anywhere in this package — [auth.Service.RequireFreshMFA] is a
+	// documented no-op for it — so every path below behaves as it always
+	// did, and a fixture that confirmed one would instead be testing the
+	// step-up ladder in eleven places at once. Nothing under test here reads
+	// ConfirmedAt: the sweeps are unconditional by construction.
+	//
+	// The realism the shortcut gives up is bought back by
+	// TestChangePasswordRevokesADeviceThatWasActuallyTrusted, which mints a
+	// device through [auth.Service.TrustThisDevice] on an account with a
+	// confirmed factor and requires the same sweep to take it.
+	seedMFAState(t, mfa, user.ID)
+
 	f := &sweepFixture{
-		svc: svc, store: store, ids: ids, user: user,
+		svc: svc, store: store, ids: ids, mfa: mfa, user: user,
 		signupTok: res.VerifyToken, resetTok: resetTok, changeTok: changeTok, magicTok: magicTok,
 		refreshA: refreshA, refreshB: refreshB, accessA: accessA,
 		newAddress: newAddress, provider: sweepProvider,
@@ -171,6 +220,93 @@ func newSweepFixture(t *testing.T, email string) *sweepFixture {
 	// path then found missing would report "swept" for free.
 	f.assertArmed(t)
 	return f
+}
+
+// sweepOptions is the wiring every Service in this file is built with, so a
+// fail-closed test that swaps one store out keeps the other two ports. A
+// rebuild that forgot [auth.WithMFAStore] would make both new columns' sweeps
+// silent no-ops and every one of their cells pass for the wrong reason.
+func sweepOptions(ids *memory.IdentityStore, mfa *memory.MFAStore) []auth.Option {
+	return []auth.Option{auth.WithIdentityStore(ids), auth.WithMFAStore(mfa)}
+}
+
+// seedMFAState arms the two new columns: one factor, two recovery codes and
+// two trusted devices. See newSweepFixture for why the factor is left
+// unconfirmed and why the devices are written directly.
+func seedMFAState(t *testing.T, mfa *memory.MFAStore, userID string) {
+	t.Helper()
+	ctx := context.Background()
+	at := time.Now().UTC()
+
+	if err := mfa.UpsertFactor(ctx, auth.MFAFactor{
+		UserID:    userID,
+		SecretEnc: "enc-sweep-secret",
+		CreatedAt: at,
+	}); err != nil {
+		t.Fatalf("seeding the factor: %v", err)
+	}
+	codes := make([]auth.RecoveryCode, 2)
+	for i := range codes {
+		codes[i] = auth.RecoveryCode{
+			ID:        fmt.Sprintf("%s-rc-%d", userID, i),
+			UserID:    userID,
+			CodeHash:  fmt.Sprintf("rc-hash-%s-%d", userID, i),
+			CreatedAt: at,
+		}
+	}
+	if err := mfa.ReplaceRecoveryCodes(ctx, userID, codes); err != nil {
+		t.Fatalf("seeding the recovery codes: %v", err)
+	}
+	for i := range 2 {
+		if _, err := mfa.CreateTrustedDevice(ctx, auth.TrustedDevice{
+			ID:        fmt.Sprintf("%s-td-%d", userID, i),
+			UserID:    userID,
+			TokenHash: fmt.Sprintf("td-hash-%s-%d", userID, i),
+			Label:     fmt.Sprintf("device %d", i),
+			CreatedAt: at,
+			ExpiresAt: at.Add(30 * 24 * time.Hour),
+		}); err != nil {
+			t.Fatalf("seeding trusted device %d: %v", i, err)
+		}
+	}
+}
+
+// trustedCount is the trusted-device column's reading.
+func (f *sweepFixture) trustedCount(t *testing.T) int {
+	t.Helper()
+	rows, err := f.mfa.ListTrustedDevices(context.Background(), f.user.ID)
+	if err != nil {
+		t.Fatalf("ListTrustedDevices: %v", err)
+	}
+	return len(rows)
+}
+
+// factorPresent and recoveryCodeCount are the MFA column's two readings. They
+// are asserted against the SAME verdict but read separately, because "the
+// factor went and the codes did not" is a live credential for a second factor
+// that no longer exists — the exact half-swept state this file exists to
+// catch.
+func (f *sweepFixture) factorPresent(t *testing.T) bool {
+	t.Helper()
+	_, err := f.mfa.FindFactor(context.Background(), f.user.ID)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, auth.ErrFactorNotFound):
+		return false
+	default:
+		t.Fatalf("FindFactor: %v", err)
+		return false
+	}
+}
+
+func (f *sweepFixture) recoveryCodeCount(t *testing.T) int {
+	t.Helper()
+	rows, err := f.mfa.ListRecoveryCodes(context.Background(), f.user.ID)
+	if err != nil {
+		t.Fatalf("ListRecoveryCodes: %v", err)
+	}
+	return len(rows)
 }
 
 func (f *sweepFixture) sessionByRefresh(t *testing.T, refresh string) auth.Session {
@@ -244,6 +380,15 @@ func (f *sweepFixture) assertArmed(t *testing.T) {
 	if seeded, extra := f.seededFamilies(t); seeded != 2 || extra != 0 {
 		t.Fatalf("fixture error: seeded families = %d (want 2), extra sessions = %d (want 0)", seeded, extra)
 	}
+	if n := f.trustedCount(t); n != 2 {
+		t.Fatalf("fixture error: trusted devices = %d, want 2", n)
+	}
+	if !f.factorPresent(t) {
+		t.Fatalf("fixture error: no MFA factor is armed before the path runs")
+	}
+	if n := f.recoveryCodeCount(t); n != 2 {
+		t.Fatalf("fixture error: recovery codes = %d, want 2", n)
+	}
 }
 
 // checkCell asserts one cell and names the column, the path and the
@@ -279,7 +424,7 @@ func sweepMatrix() []sweepRow {
 				}
 			},
 			signup: survives, reset: gone, change: gone, magic: gone,
-			identity: survives, families: 1,
+			identity: survives, trusted: gone, mfa: survives, families: 1,
 		},
 		{
 			name: "ResetPassword",
@@ -289,7 +434,7 @@ func sweepMatrix() []sweepRow {
 				}
 			},
 			signup: survives, reset: gone, change: gone, magic: gone,
-			identity: gone, families: 0,
+			identity: gone, trusted: gone, mfa: survives, families: 0,
 		},
 		{
 			name: "LogoutAll",
@@ -299,7 +444,7 @@ func sweepMatrix() []sweepRow {
 				}
 			},
 			signup: survives, reset: gone, change: gone, magic: gone,
-			identity: survives, families: 0,
+			identity: survives, trusted: gone, mfa: survives, families: 0,
 		},
 		{
 			name: "DeleteAccount",
@@ -311,7 +456,7 @@ func sweepMatrix() []sweepRow {
 			// The termination rows sweep by USER, not by purpose, so
 			// "signup" goes too — the one column no other row touches.
 			signup: gone, reset: gone, change: gone, magic: gone,
-			identity: gone, families: 0,
+			identity: gone, trusted: gone, mfa: gone, families: 0,
 		},
 		{
 			name: "AnonymizeAccount",
@@ -321,7 +466,30 @@ func sweepMatrix() []sweepRow {
 				}
 			},
 			signup: gone, reset: gone, change: gone, magic: gone,
-			identity: gone, families: 0,
+			identity: gone, trusted: gone, mfa: gone, families: 0,
+		},
+		{
+			name: "DisableMFA",
+			run: func(t *testing.T, f *sweepFixture) {
+				claims, err := f.svc.VerifyAccessToken(f.accessA)
+				if err != nil {
+					t.Fatalf("VerifyAccessToken: %v", err)
+				}
+				if err := f.svc.DisableMFA(context.Background(), f.user.ID, claims.SessionID, sweepPassword); err != nil {
+					t.Fatalf("DisableMFA: %v", err)
+				}
+			},
+			// The mfa cell is the point of the call. The trusted cell is the
+			// one that needed arguing: a token whose only meaning is "skip
+			// the second factor" is not merely inert once there is none, it
+			// is a bypass waiting for the user to re-enrol — and re-enrolment
+			// necessarily runs through this method. Everything else is
+			// untouched: turning an authenticator off is not a statement that
+			// the mailbox or the devices are compromised, and signing the
+			// user out of everything for it would be a surprise, not a
+			// safeguard.
+			signup: survives, reset: survives, change: survives, magic: survives,
+			identity: survives, trusted: gone, mfa: gone, families: 2,
 		},
 		{
 			name: "UnlinkIdentity",
@@ -335,7 +503,7 @@ func sweepMatrix() []sweepRow {
 			// none of its business. The sessions ARE, because a session
 			// minted through the identity would otherwise keep rotating.
 			signup: survives, reset: survives, change: survives, magic: survives,
-			identity: gone, families: 0,
+			identity: gone, trusted: survives, mfa: survives, families: 0,
 		},
 		{
 			name: "VerifyEmail (email_change)",
@@ -349,7 +517,7 @@ func sweepMatrix() []sweepRow {
 			// call burns. Sessions are deliberately untouched: this method
 			// is unauthenticated by construction.
 			signup: survives, reset: gone, change: gone, magic: gone,
-			identity: survives, families: 2,
+			identity: survives, trusted: survives, mfa: survives, families: 2,
 		},
 		{
 			name: "VerifyEmail (signup)",
@@ -362,7 +530,7 @@ func sweepMatrix() []sweepRow {
 			// nothing, so a token for that same mailbox is still a token
 			// for that same mailbox.
 			signup: gone, reset: survives, change: survives, magic: survives,
-			identity: survives, families: 2,
+			identity: survives, trusted: survives, mfa: survives, families: 2,
 		},
 		{
 			name: "RedeemMagicLink",
@@ -374,7 +542,7 @@ func sweepMatrix() []sweepRow {
 			// Burns its own token and nothing else. Signing in on a new
 			// device is not a revocation event.
 			signup: survives, reset: survives, change: survives, magic: gone,
-			identity: survives, families: 2, extraSessions: 1,
+			identity: survives, trusted: survives, mfa: survives, families: 2, extraSessions: 1,
 		},
 		{
 			name: "Logout",
@@ -384,7 +552,7 @@ func sweepMatrix() []sweepRow {
 				}
 			},
 			signup: survives, reset: survives, change: survives, magic: survives,
-			identity: survives, families: 1,
+			identity: survives, trusted: survives, mfa: survives, families: 1,
 		},
 		{
 			name: "RevokeSession",
@@ -394,7 +562,7 @@ func sweepMatrix() []sweepRow {
 				}
 			},
 			signup: survives, reset: survives, change: survives, magic: survives,
-			identity: survives, families: 1,
+			identity: survives, trusted: survives, mfa: survives, families: 1,
 		},
 	}
 }
@@ -412,6 +580,18 @@ func TestSweepMatrix(t *testing.T) {
 			checkCell(t, row.name, "email_change", row.change, f.present(t, f.changeTok))
 			checkCell(t, row.name, "magic_link", row.magic, f.present(t, f.magicTok))
 			checkCell(t, row.name, "identity", row.identity, f.identityCount(t) > 0)
+			checkCell(t, row.name, "trusted device", row.trusted, f.trustedCount(t) > 0)
+			// The MFA column is read twice against ONE verdict: a path that
+			// took the factor and left the codes has left live credentials
+			// for a second factor that no longer exists, and one that did
+			// the reverse has left a factor nobody can recover.
+			checkCell(t, row.name, "mfa factor", row.mfa, f.factorPresent(t))
+			checkCell(t, row.name, "recovery codes", row.mfa, f.recoveryCodeCount(t) > 0)
+			if row.trusted == survives {
+				if n := f.trustedCount(t); n != 2 {
+					t.Errorf("%s / trusted device: %d of the 2 seeded devices survived, want both — a path that took SOME of them is half a sweep, which is the shape of defect this matrix exists to catch", row.name, n)
+				}
+			}
 
 			seeded, extra := f.seededFamilies(t)
 			if seeded != row.families {
@@ -432,8 +612,8 @@ func TestSweepMatrix(t *testing.T) {
 // assert something plausible by accident.
 func TestSweepMatrixIsExhaustive(t *testing.T) {
 	rows := sweepMatrix()
-	if len(rows) != 11 {
-		t.Fatalf("the matrix has %d rows, and [auth.Service.ChangePassword]'s doc lists 11 — the table and the test must be changed together", len(rows))
+	if len(rows) != 12 {
+		t.Fatalf("the matrix has %d rows, and [auth.Service.ChangePassword]'s doc lists 12 — the table and the test must be changed together", len(rows))
 	}
 	seen := map[string]bool{}
 	for _, r := range rows {
@@ -447,7 +627,7 @@ func TestSweepMatrixIsExhaustive(t *testing.T) {
 	}
 	for _, want := range []string{
 		"ChangePassword", "ResetPassword", "LogoutAll", "DeleteAccount",
-		"AnonymizeAccount", "UnlinkIdentity", "VerifyEmail (email_change)",
+		"AnonymizeAccount", "DisableMFA", "UnlinkIdentity", "VerifyEmail (email_change)",
 		"VerifyEmail (signup)", "RedeemMagicLink", "Logout", "RevokeSession",
 	} {
 		if !seen[want] {
@@ -502,7 +682,7 @@ func TestSweepMatrixFailsClosedOnEveryVerificationSweep(t *testing.T) {
 			// the sweep, so the seeding itself is not the thing that breaks.
 			f := newSweepFixture(t, fmt.Sprintf("failclosed-%d@example.com", i))
 			rec := &deletionRecorder{AuthStore: f.store, fail: map[string]error{p.method: errCascadeBoom}}
-			f.svc = newServiceOver(t, rec, auth.WithIdentityStore(f.ids))
+			f.svc = newServiceOver(t, rec, sweepOptions(f.ids, f.mfa)...)
 
 			if err := p.run(f); !errors.Is(err, errCascadeBoom) {
 				t.Fatalf("%s with %s failing = %v, want the store's own error — a sweep that errors must never be swallowed", p.name, p.method, err)
@@ -533,7 +713,7 @@ func TestSweepMatrixFailsClosedOnTheIdentitySweep(t *testing.T) {
 	for i, p := range paths {
 		t.Run(p.name, func(t *testing.T) {
 			f := newSweepFixture(t, fmt.Sprintf("idfailclosed-%d@example.com", i))
-			f.svc = newServiceOver(t, f.store, auth.WithIdentityStore(failingDeleteIdentityStore{f.ids}))
+			f.svc = newServiceOver(t, f.store, auth.WithIdentityStore(failingDeleteIdentityStore{f.ids}), auth.WithMFAStore(f.mfa))
 
 			if err := p.run(f); !errors.Is(err, errCascadeBoom) {
 				t.Fatalf("%s with DeleteIdentity failing = %v, want the store's own error — an identity left standing is a live credential the path did not remove", p.name, err)
@@ -612,7 +792,7 @@ func TestVerifyEmailChangeFailsClosedWhenTheMagicLinkSweepFails(t *testing.T) {
 	f := newSweepFixture(t, "abandoned-failclosed@example.com")
 
 	rec := &purposeFailStore{AuthStore: f.store, failPurpose: auth.PurposeMagicLink}
-	svc := newServiceOver(t, rec, auth.WithIdentityStore(f.ids))
+	svc := newServiceOver(t, rec, sweepOptions(f.ids, f.mfa)...)
 
 	if _, err := svc.VerifyEmail(context.Background(), f.changeTok); !errors.Is(err, errCascadeBoom) {
 		t.Fatalf("VerifyEmail(email_change) with the magic_link sweep failing = %v, want the store's own error", err)
@@ -640,4 +820,220 @@ func (s *purposeFailStore) DeleteVerificationsByUserAndPurpose(ctx context.Conte
 		return errCascadeBoom
 	}
 	return s.AuthStore.DeleteVerificationsByUserAndPurpose(ctx, userID, purpose)
+}
+
+// --- the two columns this branch added -------------------------------------
+
+// errMFABoom is the failure the two new columns' fail-closed doubles inject.
+var errMFABoom = errors.New("mfa store exploded")
+
+// failingTrustedSweep delegates everything except the by-user device sweep.
+type failingTrustedSweep struct {
+	*memory.MFAStore
+}
+
+func (failingTrustedSweep) DeleteTrustedDevicesByUser(context.Context, string) error {
+	return errMFABoom
+}
+
+// failingMFASweep fails the recovery-code half of the MFA sweep and delegates
+// everything else, including the trusted-device sweep — so a failure here
+// names the MFA column and not its neighbour.
+type failingMFASweep struct {
+	*memory.MFAStore
+}
+
+func (failingMFASweep) ReplaceRecoveryCodes(context.Context, string, []auth.RecoveryCode) error {
+	return errMFABoom
+}
+
+// TestSweepMatrixFailsClosedOnTheTrustedDeviceSweep is the trusted-device
+// column's half of the rule every "swept" cell carries: a sweep that ran and
+// errored must reach the caller. Swallowing it would leave a live
+// second-factor bypass behind while telling the user their remediation
+// succeeded — worse than not sweeping at all, because nothing prompts a
+// retry.
+func TestSweepMatrixFailsClosedOnTheTrustedDeviceSweep(t *testing.T) {
+	paths := []struct {
+		name string
+		run  func(f *sweepFixture) error
+	}{
+		{"ChangePassword", func(f *sweepFixture) error {
+			claims, err := f.svc.VerifyAccessToken(f.accessA)
+			if err != nil {
+				return err
+			}
+			return f.svc.ChangePassword(context.Background(), f.user.ID, claims.SessionID, sweepPassword, sweepNextPass)
+		}},
+		{"ResetPassword", func(f *sweepFixture) error {
+			return f.svc.ResetPassword(context.Background(), f.resetTok, sweepNextPass)
+		}},
+		{"LogoutAll", func(f *sweepFixture) error {
+			return f.svc.LogoutAll(context.Background(), f.user.ID)
+		}},
+		{"DeleteAccount", func(f *sweepFixture) error {
+			return f.svc.DeleteAccount(context.Background(), f.user.ID, "", sweepPassword)
+		}},
+		{"AnonymizeAccount", func(f *sweepFixture) error {
+			return f.svc.AnonymizeAccount(context.Background(), f.user.ID, "", sweepPassword)
+		}},
+		{"DisableMFA", func(f *sweepFixture) error {
+			return f.svc.DisableMFA(context.Background(), f.user.ID, "", sweepPassword)
+		}},
+	}
+
+	for i, p := range paths {
+		t.Run(p.name, func(t *testing.T) {
+			f := newSweepFixture(t, fmt.Sprintf("tdfailclosed-%d@example.com", i))
+			f.svc = newServiceOver(t, f.store,
+				auth.WithIdentityStore(f.ids),
+				auth.WithMFAStore(failingTrustedSweep{f.mfa}))
+
+			if err := p.run(f); !errors.Is(err, errMFABoom) {
+				t.Fatalf("%s with DeleteTrustedDevicesByUser failing = %v, want the store's own error — a trusted device left standing is a live second-factor bypass the path did not remove", p.name, err)
+			}
+		})
+	}
+}
+
+// TestSweepMatrixFailsClosedOnTheMFASweep is the same rule for the MFA
+// column, on the two TERMINATION rows that fill it in.
+func TestSweepMatrixFailsClosedOnTheMFASweep(t *testing.T) {
+	paths := []struct {
+		name string
+		run  func(f *sweepFixture) error
+	}{
+		{"DeleteAccount", func(f *sweepFixture) error {
+			return f.svc.DeleteAccount(context.Background(), f.user.ID, "", sweepPassword)
+		}},
+		{"AnonymizeAccount", func(f *sweepFixture) error {
+			return f.svc.AnonymizeAccount(context.Background(), f.user.ID, "", sweepPassword)
+		}},
+	}
+
+	for i, p := range paths {
+		t.Run(p.name, func(t *testing.T) {
+			f := newSweepFixture(t, fmt.Sprintf("mfafailclosed-%d@example.com", i))
+			f.svc = newServiceOver(t, f.store,
+				auth.WithIdentityStore(f.ids),
+				auth.WithMFAStore(failingMFASweep{f.mfa}))
+
+			if err := p.run(f); !errors.Is(err, errMFABoom) {
+				t.Fatalf("%s with ReplaceRecoveryCodes failing = %v, want the store's own error — recovery codes left behind after an account ends are live credentials for a factor nobody owns", p.name, err)
+			}
+		})
+	}
+}
+
+// TestSweepsAreNoOpsWithoutAnMFAStore pins the optional port's other half: a
+// Service built with no [auth.WithMFAStore] has no devices and no factors to
+// sweep, so every row of the matrix must still run to completion rather than
+// failing on a port that is not there. It is the same stated limit
+// sweepIdentities carries, and it is the failure mode a missing nil check
+// would produce for EVERY deployment that never enables MFA.
+func TestSweepsAreNoOpsWithoutAnMFAStore(t *testing.T) {
+	ctx := context.Background()
+	svc, store := newTestService(t)
+
+	u := mustSignUp(t, svc, "no-mfa-store@example.com", sweepPassword)
+	_, access, _ := mustLogin(t, svc, "no-mfa-store@example.com", sweepPassword)
+	claims, err := svc.VerifyAccessToken(access)
+	if err != nil {
+		t.Fatalf("VerifyAccessToken: %v", err)
+	}
+
+	if err := svc.ChangePassword(ctx, u.ID, claims.SessionID, sweepPassword, sweepNextPass); err != nil {
+		t.Fatalf("ChangePassword with no MFAStore = %v, want nil", err)
+	}
+	if err := svc.LogoutAll(ctx, u.ID); err != nil {
+		t.Fatalf("LogoutAll with no MFAStore = %v, want nil", err)
+	}
+	if err := svc.DeleteAccount(ctx, u.ID, "", sweepNextPass); err != nil {
+		t.Fatalf("DeleteAccount with no MFAStore = %v, want nil", err)
+	}
+	if _, err := store.FindUserByID(ctx, u.ID); !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("the account survived DeleteAccount: %v", err)
+	}
+}
+
+// TestChangePasswordRevokesADeviceThatWasActuallyTrusted is the realism the
+// matrix fixture gives up when it seeds its devices straight into the store.
+//
+// Here the device is minted the way an application mints one — a confirmed
+// factor, a session that has just completed [auth.Service.CompleteMFA], and
+// [auth.Service.TrustThisDevice] — and the assertion is not that a row
+// vanished but that the TOKEN stops working: after the password change the
+// same cookie no longer skips the second factor.
+func TestChangePasswordRevokesADeviceThatWasActuallyTrusted(t *testing.T) {
+	f := newMFAService(t)
+	ctx := context.Background()
+
+	e := enrolConfirmed(t, f, "sweep-real@example.com")
+	device := trustDevice(t, f, e, "sweep-real@example.com", "the laptop")
+
+	// It works before the rotation, so the assertion after it is about the
+	// sweep and not about the device never having worked.
+	before, err := f.svc.LoginWithTrustedDevice(ctx, "sweep-real@example.com", validPassword, "203.0.113.7", "agent", device)
+	if err != nil {
+		t.Fatalf("LoginWithTrustedDevice before the rotation: %v", err)
+	}
+	if before.MFA != nil {
+		t.Fatal("fixture error: the device did not skip the challenge before the rotation")
+	}
+
+	sid := sessionIDOf(t, f.svc, before.AccessToken)
+	next := "Another-Good-Password-7!"
+	if err := f.svc.ChangePassword(ctx, e.user.ID, sid, validPassword, next); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+
+	after, err := f.svc.LoginWithTrustedDevice(ctx, "sweep-real@example.com", next, "203.0.113.7", "agent", device)
+	if err != nil {
+		t.Fatalf("LoginWithTrustedDevice after the rotation = %v, want a challenge and no error", err)
+	}
+	if after.MFA == nil {
+		t.Fatal("the trusted device still skipped the second factor after ChangePassword — the whole point of the sweep is that a rotation leaves nothing armed that can quietly undo it")
+	}
+}
+
+// TestTheMatrixHasNoPasskeyColumnAndThatIsDisclosed pins a GAP, not a
+// decision, so that it stays visible instead of being rediscovered.
+//
+// A [auth.Credential] registered through
+// [auth.Service.FinishPasskeyRegistration] survives every row of the table,
+// the two TERMINATION rows included: a hard DeleteAccount leaves the
+// credential rows behind, filed under a user id that no longer resolves, and
+// a later account issued that id under a non-random [auth.WithIDGenerator]
+// would inherit a working passkey it never registered. That is the identical
+// argument DeleteAccount's step 6 makes for sweeping identities.
+//
+// It is not closed here because [auth.CredentialStore] has no by-user delete
+// to call — closing it is a change to the passkey port, not to this row set.
+// Until then a deployment offering passkeys removes them from
+// [auth.WithAccountDeletionHook]. When that method lands, this test should
+// FAIL, and the right response is to give passkeys a column rather than to
+// delete the test.
+func TestTheMatrixHasNoPasskeyColumnAndThatIsDisclosed(t *testing.T) {
+	ctx := context.Background()
+	creds := memory.NewCredentialStore()
+	svc, _ := newTestService(t, auth.WithCredentialStore(creds))
+
+	u := mustSignUp(t, svc, "passkey-gap@example.com", sweepPassword)
+	registerPasskey(t, svc, u.ID, newCred('g'))
+	if rows, err := creds.ListCredentialsByUser(ctx, u.ID); err != nil || len(rows) != 1 {
+		t.Fatalf("fixture error: credentials = %v (%v), want 1", rows, err)
+	}
+
+	if err := svc.DeleteAccount(ctx, u.ID, "", sweepPassword); err != nil {
+		t.Fatalf("DeleteAccount: %v", err)
+	}
+
+	rows, err := creds.ListCredentialsByUser(ctx, u.ID)
+	if err != nil {
+		t.Fatalf("ListCredentialsByUser: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("passkeys after DeleteAccount = %d, want the 1 this DISCLOSED GAP leaves behind.\n"+
+			"If a by-user passkey sweep has since landed, this test has done its job: give passkeys a COLUMN in auth.Service.ChangePassword's matrix, fill in every row, and replace this test with those cells — do not simply delete it.", len(rows))
+	}
 }

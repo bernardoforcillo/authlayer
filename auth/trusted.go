@@ -56,9 +56,14 @@
 // # Revocation, and where the sweeps live
 //
 // A trusted device is a credential, so it belongs in the sweep matrix, and
-// [Service.ChangePassword]'s doc holds the whole table.
-// [Service.RevokeTrustedDevice] drops one on request;
-// [Service.PurgeExpired] removes the expired rows.
+// [Service.ChangePassword]'s doc holds the whole table. The short version:
+// every remediation path revokes every device ([Service.ChangePassword],
+// [Service.ResetPassword], [Service.LogoutAll]), both termination paths do
+// ([Service.DeleteAccount], [Service.AnonymizeAccount]), and so does
+// [Service.DisableMFA] — a token whose only meaning is "skip the second
+// factor" is not merely pointless once there is no second factor, it is a
+// bypass waiting for the user to re-enrol. [Service.RevokeTrustedDevice]
+// drops one on request; [Service.PurgeExpired] removes the expired rows.
 //
 // # Mutations, recorded
 //
@@ -410,4 +415,20 @@ func (s *Service) trustedDeviceAtSignIn(ctx context.Context, u UserBase, deviceT
 		return nil, nil
 	}
 	return &d, nil
+}
+
+// sweepTrustedDevices removes every trusted device on userID's account. It
+// is the trusted-device column of [Service.ChangePassword]'s sweep matrix,
+// called on its OWN LINE by each path whose cell says "swept" so that
+// removing one call fails exactly one cell's test.
+//
+// A [Service] with no [WithMFAStore] holds no devices, so it sweeps nothing
+// and reports no error — the same stated limit [Service.sweepIdentities]
+// carries for its own port: a second Service wired differently over the same
+// tables is outside what this one can reason about.
+func (s *Service) sweepTrustedDevices(ctx context.Context, userID string) error {
+	if s.cfg.mfaStore == nil {
+		return nil
+	}
+	return s.cfg.mfaStore.DeleteTrustedDevicesByUser(ctx, userID)
 }

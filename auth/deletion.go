@@ -182,6 +182,18 @@ func WithAccountDeletionHook(f func(ctx context.Context, userID string) error) O
 //     and reports no error — see [Service.sweepIdentities] for that, and
 //     for the two-Services-one-users-table configuration it cannot cover,
 //     which is this step's one stated limit.
+//     Step 6 has a SECOND half since trusted devices landed, step 6b: the
+//     account's second-factor state, when the [Service] was built with
+//     [WithMFAStore] — every [TrustedDevice]
+//     ([Service.sweepTrustedDevices]), then every [RecoveryCode] and the
+//     [MFAFactor] itself ([Service.sweepMFAState]). Two calls on two lines,
+//     because they are two columns of the sweep matrix and removing one
+//     must fail only its own cell. Neither is a way IN on its own — both
+//     need a first factor this call is about to remove — which is why they
+//     follow step 6 rather than preceding it, and they still precede step 7
+//     so the row outlives everything keyed on it. A Service with no MFA
+//     store sweeps nothing here and reports no error, the same limit step 6
+//     carries. See "The second-factor state goes too" below.
 //  7. [Store.DeleteUser] — the user row, LAST.
 //
 // Steps 4 and 7 are the pair that matters. Sessions before the row means a
@@ -192,6 +204,49 @@ func WithAccountDeletionHook(f func(ctx context.Context, userID string) error) O
 // expire on their own. The first is recoverable; the second leaves credential
 // rows behind with nothing left to find them from. See "What is not atomic
 // here, and why" for the full statement.
+//
+// # The second-factor state goes too
+//
+// Step 6b sweeps what no REMEDIATION path in the matrix sweeps: the
+// [MFAFactor], the [RecoveryCode]s, and the [TrustedDevice]s. The asymmetry
+// is the whole of this column's argument.
+//
+// A remediation path must not touch the factor. [Service.ChangePassword] and
+// [Service.ResetPassword] rotate the FIRST factor, and sweeping the second
+// one there would mean that whoever compromised a password — or a mailbox,
+// on the reset path — could strip the second factor by exercising the
+// recovery flow it exists to survive. Two independent factors would collapse
+// into one, in the direction of the attacker. So they leave it alone, and
+// the matrix says so.
+//
+// Termination is not remediation. Here the account is ending, and every row
+// keyed on the user id has to go with it, for two reasons this package
+// already accepts elsewhere:
+//
+//   - A surviving [MFAFactor] row is an encrypted TOTP secret filed under an
+//     id that no longer resolves, and a surviving [RecoveryCode] set is a
+//     handful of password-grade hashes beside it. The identity sweep at step
+//     6 states the consequence for its own rows and it is identical here: a
+//     later account issued the same id would INHERIT a confirmed second
+//     factor it never enrolled, and a confirmed factor is a login gate — so
+//     the inheriting user would be asked for a code only its predecessor
+//     could produce. [WithIDGenerator] makes an id sequence a supported
+//     configuration, so "ids are never reused" is a property of the default
+//     generator and not of this package.
+//   - "Delete my account" means the data as well as the access. A TOTP
+//     secret is a bearer credential the user handed over; leaving it in the
+//     database after they asked for removal is the same defect as leaving
+//     their address there.
+//
+// [Service.AnonymizeAccount] performs the identical sweep, where it matters
+// MORE rather than less: that posture keeps the row, so a factor left behind
+// would sit under a LIVE user id, on an account the deployment has told the
+// user is closed.
+//
+// Trusted devices are the fourth column and need no separate argument here:
+// they are swept by every path in the matrix that sweeps anything, because a
+// long-lived token whose only meaning is "skip the second factor" has no
+// reading under which it should survive a remediation or a termination.
 //
 // # An account with no password
 //
@@ -388,6 +443,24 @@ func (s *Service) DeleteAccount(ctx context.Context, userID, currentSessionID, c
 		return err
 	}
 
+	// Step 6b. The second-factor state: every [TrustedDevice], then the
+	// recovery codes and the [MFAFactor]. Two calls on two lines, because
+	// they are two columns of the matrix and removing one must fail only its
+	// own cell. See "The second-factor state goes too" in the method doc for
+	// why a termination path sweeps what no remediation path does.
+	//
+	// After step 6 rather than before it because neither is a way IN — both
+	// require a first factor this call is about to remove — and before step 7
+	// so the row still outlives everything keyed on it. A Service with no
+	// [WithMFAStore] sweeps nothing here and reports no error, the same
+	// limit [Service.sweepIdentities] carries.
+	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
+		return err
+	}
+	if err := s.sweepMFAState(ctx, userID); err != nil {
+		return err
+	}
+
 	// Step 7. The row, last.
 	return s.store.DeleteUser(ctx, userID)
 }
@@ -477,6 +550,12 @@ func anonymizedEmail(userID string) string {
 //     [Service.SignInWith] than through anything else, not less. A Service
 //     with no identity store configured sweeps nothing here and reports no
 //     error; see [Service.sweepIdentities] for that limit.
+//     Step 6b is [Service.DeleteAccount]'s verbatim: every [TrustedDevice],
+//     then the [RecoveryCode]s and the [MFAFactor], on two lines. It matters
+//     MORE on this posture than on the hard one — the row SURVIVES here, so
+//     a factor left behind is an encrypted TOTP secret filed under a live
+//     user id on an account the deployment has told its owner is closed. See
+//     "The second-factor state goes too" in DeleteAccount's doc.
 //  7. [Store.MarkUserDeleted] — the scrub and the stamp, LAST, and as ONE
 //     atomic step: that method's own MUST is what keeps a caller from ever
 //     seeing a row stamped-but-not-scrubbed or scrubbed-but-not-stamped.
@@ -736,9 +815,12 @@ func (s *Service) AnonymizeAccount(ctx context.Context, userID, currentSessionID
 	// The same exemption for an ALREADY-ANONYMIZED account, for the same
 	// reason and for one more: this method is documented to be repeatable
 	// (see "Anonymizing twice"), and a stamped account has no session left
-	// that could ever satisfy the check — nothing here sweeps [MFAFactor]
-	// rows, so a stamped account may well still hold a confirmed one.
-	// Gating the repeat would turn a no-op into a permanent refusal.
+	// that could ever satisfy the check. Step 6b now sweeps the [MFAFactor]
+	// too, so an account this method has already run against normally holds
+	// no confirmed factor and would not be gated anyway — but "normally" is
+	// not "always" (a partial failure, or a second Service wired over the
+	// same tables), and gating the repeat on the exception would turn a
+	// documented no-op into a permanent refusal.
 	if u.DeletedAt == nil {
 		if err := s.RequireFreshMFA(ctx, userID, currentSessionID); err != nil {
 			return err
@@ -769,6 +851,20 @@ func (s *Service) AnonymizeAccount(ctx context.Context, userID, currentSessionID
 	// [WithIdentityStore] sweeps nothing here and reports no error; see
 	// [Service.sweepIdentities].
 	if err := s.sweepIdentities(ctx, userID); err != nil {
+		return err
+	}
+
+	// Step 6b. The second-factor state — [Service.DeleteAccount]'s step 6b
+	// verbatim, two calls on two lines so each column of the matrix fails
+	// alone. It matters MORE on this posture than on the hard one: the row
+	// survives here, so a factor left behind is an encrypted TOTP secret and
+	// a set of recovery-code hashes filed under a live user id that the
+	// account's owner has asked to be scrubbed. See "The second-factor state
+	// goes too" in [Service.DeleteAccount]'s doc.
+	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
+		return err
+	}
+	if err := s.sweepMFAState(ctx, userID); err != nil {
 		return err
 	}
 

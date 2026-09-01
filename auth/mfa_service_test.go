@@ -1457,7 +1457,12 @@ func TestEverySignInDoorsDecisionOnTheSecondFactorIsPinned(t *testing.T) {
 	// 4. The passkey door: NOT gated, deliberately — a passkey is itself a
 	// possession factor, so a TOTP code on top would be a second factor
 	// demanded of a second factor.
-	cred := registerPasskey(t, f.svc, e.user.ID, newCred(9))
+	// Registering the passkey is itself step-up gated now (see
+	// FinishPasskeyRegistration, "It is step-up gated"), so this account —
+	// which holds a confirmed factor — registers from a session that has
+	// just proved one. That gate is about REGISTERING; the door being pinned
+	// below is the LOGIN.
+	cred := registerPasskeyFrom(t, f.svc, e.user.ID, freshSessionFor(t, f, e, "yusuf@example.com"), newCred(9))
 	pk, err := f.svc.FinishPasskeyLogin(ctx, auth.VerifiedAssertion{
 		CredentialID: cred.CredentialID,
 		Challenge:    mustBeginLogin(t, f.svc),

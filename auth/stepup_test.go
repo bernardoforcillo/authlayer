@@ -349,7 +349,10 @@ func TestFinishPasskeyLoginStampsFreshness(t *testing.T) {
 	ctx := context.Background()
 	acct := enrolWithSessions(t, f, "milo@example.com")
 
-	cred := registerPasskey(t, f.svc, acct.user.ID, newCred(3))
+	// acct.fresh is the session CompleteMFA minted, which is what the newly
+	// step-up-gated FinishPasskeyRegistration requires of an account holding
+	// a confirmed factor.
+	cred := registerPasskeyFrom(t, f.svc, acct.user.ID, acct.fresh, newCred(3))
 	res, err := f.svc.FinishPasskeyLogin(ctx, auth.VerifiedAssertion{
 		CredentialID: cred.CredentialID,
 		Challenge:    mustBeginLogin(t, f.svc),
@@ -532,5 +535,134 @@ func TestARecoveryCodeCanStepUp(t *testing.T) {
 	}
 	if err := f.svc.DisableMFA(ctx, acct.user.ID, sessionIDOf(t, f.svc, done.AccessToken), validPassword); err != nil {
 		t.Fatalf("DisableMFA after a recovery-code login = %v, want nil — otherwise losing a phone is a permanent lockout", err)
+	}
+}
+
+// --- the sixth and seventh gates -------------------------------------------
+
+// TestFinishPasskeyRegistrationRequiresAFreshSecondFactor pins the gate Task
+// 3 added, and it is a step-up BYPASS that is being closed rather than a
+// policy being tightened: a passkey is a sign-in credential, and
+// [auth.Service.FinishPasskeyLogin] stamps [auth.Session.MFAAt] on the
+// session it mints, so an ungated registration lets a stale session mint
+// itself a fresh one.
+//
+// It also pins the ORDER: the refusal happens before the challenge is
+// claimed, so a refused registration does not cost the user the ceremony
+// they are in the middle of.
+func TestFinishPasskeyRegistrationRequiresAFreshSecondFactor(t *testing.T) {
+	creds := memory.NewCredentialStore()
+	f := newMFAService(t, auth.WithCredentialStore(creds))
+	ctx := context.Background()
+
+	acct := enrolWithSessions(t, f, "petra@example.com")
+
+	challenge, err := f.svc.BeginPasskeyRegistration(ctx, acct.user.ID)
+	if err != nil {
+		t.Fatalf("BeginPasskeyRegistration: %v", err)
+	}
+	cred := newCred(7)
+	cred.Challenge = challenge
+
+	// acct.stale is a real session minted before the factor was enrolled —
+	// exactly what a thief holds.
+	if _, err := f.svc.FinishPasskeyRegistration(ctx, acct.user.ID, acct.stale, cred); !errors.Is(err, auth.ErrStepUpRequired) {
+		t.Fatalf("FinishPasskeyRegistration from a session that never proved a factor = %v, want ErrStepUpRequired", err)
+	}
+	if rows, err := creds.ListCredentialsByUser(ctx, acct.user.ID); err != nil || len(rows) != 0 {
+		t.Fatalf("the refused registration stored %v (%v), want nothing", rows, err)
+	}
+
+	// The SAME challenge still works from a stepped-up session: the refusal
+	// ran before the claim, so the ceremony survived it.
+	if _, err := f.svc.FinishPasskeyRegistration(ctx, acct.user.ID, acct.fresh, cred); err != nil {
+		t.Fatalf("FinishPasskeyRegistration from a fresh session = %v, want nil — a refusal must not burn the ceremony", err)
+	}
+}
+
+// TestFinishPasskeyRegistrationIsUngatedForAnAccountWithNoFactor is the other
+// half, and the one that decides whether the gate is shippable: an account
+// with no confirmed factor cannot step up, so registering a FIRST passkey
+// must be exactly as easy as it was before this gate existed.
+func TestFinishPasskeyRegistrationIsUngatedForAnAccountWithNoFactor(t *testing.T) {
+	creds := memory.NewCredentialStore()
+	svc, _ := newTestService(t, auth.WithCredentialStore(creds))
+	ctx := context.Background()
+
+	u := mustSignUp(t, svc, "rhea@example.com", validPassword)
+	// An empty session id, which is what an application that has never heard
+	// of step-up passes: still nil, because the account has nothing to prove.
+	registerPasskey(t, svc, u.ID, newCred(8))
+
+	rows, err := creds.ListCredentialsByUser(ctx, u.ID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("credentials = %v (%v), want the one just registered", rows, err)
+	}
+}
+
+// TestAStolenSessionCannotStepUpByRegisteringItsOwnPasskey is the attack the
+// gate exists for, driven end to end.
+//
+// The account is PASSWORD-LESS (provisioned by a magic link) and holds a
+// confirmed factor, which is the configuration where step-up is the only
+// credential [auth.Service.DeleteAccount] checks at all. The attacker holds a
+// session minted before the factor was enrolled. Ungated, the route is:
+// register your own passkey, sign in with it, receive a session stamped
+// MFAAt, and delete the victim's account without ever holding their factor.
+func TestAStolenSessionCannotStepUpByRegisteringItsOwnPasskey(t *testing.T) {
+	creds := memory.NewCredentialStore()
+	f := newMFAService(t,
+		auth.WithCredentialStore(creds),
+		auth.WithMagicLinkProvisioning(true))
+	ctx := context.Background()
+
+	// A password-less account: provisioned by a magic link, never by SignUp.
+	link, ok, err := f.svc.RequestMagicLink(ctx, "sasha@example.com", "203.0.113.7")
+	if err != nil || !ok {
+		t.Fatalf("RequestMagicLink = (_, %v, %v), want a token", ok, err)
+	}
+	stolen, err := f.svc.RedeemMagicLink(ctx, link, "203.0.113.7", "agent")
+	if err != nil {
+		t.Fatalf("RedeemMagicLink: %v", err)
+	}
+	if stolen.MFA != nil {
+		t.Fatal("fixture error: the account owed a second factor before it had one")
+	}
+	stolenSession := sessionIDOf(t, f.svc, stolen.AccessToken)
+	userID := stolen.User.ID
+
+	// The victim then enrols a second factor. The attacker's session predates
+	// it and has proved nothing.
+	secret, _, err := f.svc.BeginMFAEnrolment(ctx, userID)
+	if err != nil {
+		t.Fatalf("BeginMFAEnrolment: %v", err)
+	}
+	if _, err := f.svc.ConfirmMFAEnrolment(ctx, userID, totpCodeAt(t, secret, f.clock.now())); err != nil {
+		t.Fatalf("ConfirmMFAEnrolment: %v", err)
+	}
+
+	// Step-up already refuses the direct route.
+	if err := f.svc.DeleteAccount(ctx, userID, stolenSession, ""); !errors.Is(err, auth.ErrStepUpRequired) {
+		t.Fatalf("DeleteAccount from the stolen session = %v, want ErrStepUpRequired", err)
+	}
+
+	// The route around it: register an authenticator of the attacker's own.
+	challenge, err := f.svc.BeginPasskeyRegistration(ctx, userID)
+	if err != nil {
+		t.Fatalf("BeginPasskeyRegistration: %v", err)
+	}
+	cred := newCred(6)
+	cred.Challenge = challenge
+	if _, err := f.svc.FinishPasskeyRegistration(ctx, userID, stolenSession, cred); !errors.Is(err, auth.ErrStepUpRequired) {
+		t.Fatalf("FinishPasskeyRegistration from the stolen session = %v, want ErrStepUpRequired.\n"+
+			"Ungated, this is a complete step-up bypass: the attacker signs in with the passkey they just registered, FinishPasskeyLogin stamps Session.MFAAt on the session it mints, and every action RequireFreshMFA guards — including DeleteAccount on this password-less account, where step-up is the ONLY credential in the call — becomes available without the victim's second factor ever being presented.", err)
+	}
+	if rows, err := creds.ListCredentialsByUser(ctx, userID); err != nil || len(rows) != 0 {
+		t.Fatalf("the attacker registered %v (%v) — want nothing", rows, err)
+	}
+
+	// And the account is still there.
+	if _, err := f.svc.User(ctx, userID); err != nil {
+		t.Fatalf("the account is gone: %v", err)
 	}
 }

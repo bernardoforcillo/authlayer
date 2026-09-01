@@ -2732,7 +2732,12 @@ func (s *Service) LogoutAll(ctx context.Context, userID string) error {
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeMagicLink); err != nil {
 		return err
 	}
-	return nil
+	// Every [TrustedDevice], on this method's own line — see
+	// [Service.sweepTrustedDevices] and the matrix. "Sign out everywhere" is
+	// the control a user reaches for when they believe a machine is in the
+	// wrong hands, and a device left trusted means that machine still skips
+	// the second factor on its way back in.
+	return s.sweepTrustedDevices(ctx, userID)
 }
 
 // ListSessions returns every session belonging to userID — rotated or not,
@@ -2976,12 +2981,23 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //     [Store.DeleteVerificationsByUserAndPurpose] calls — one per purpose,
 //     all fail-closed. See "The sweep matrix" and "Why these purposes, and
 //     what the sweep does not cover" below.
+//     8b. Every [TrustedDevice] on the account is revoked, via
+//     [Service.sweepTrustedDevices], on this method's own line. It spares
+//     nothing — not even the machine this call came from — unlike point 9,
+//     which spares the caller's session family: a session family is
+//     something this caller demonstrably holds, while a device token is a
+//     cookie that may have been copied off the machine whose compromise
+//     prompted the rotation. A [Service] with no [WithMFAStore] holds no
+//     devices and sweeps nothing.
 //  9. Every session NOT sharing currentSessionID's family is revoked via
 //     [Store.DeleteSessionsByFamily], one call per distinct OTHER family —
 //     the same "list, then delete per distinct family" shape
 //     [Service.LogoutAll] uses, so a rotated-but-unexpired predecessor row
 //     in another family is swept too, not just the currently-live session
 //     in that family.
+//
+// What this method does NOT touch is the account's second factor — see the
+// matrix's "Reading the matrix", which is where that empty cell is argued.
 //
 // # The sweep matrix
 //
@@ -2995,38 +3011,42 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // features filling them were built on branches that could not see each
 // other.
 //
-// The five columns are the five kinds of credential this package can hold
+// The seven columns are the seven kinds of credential this package can hold
 // for an account: three [Verification] purposes, the external [Identity],
-// and the [Session]. Every row is a path that removes at least one of them.
+// the [Session], the [TrustedDevice], and the second-factor state
+// ([MFAFactor] plus its [RecoveryCode]s, one column because nothing ever
+// removes one without the other). Every row is a path that removes at least
+// one of them.
 //
-//	Path                       | password_reset | email_change | magic_link    | identity        | session
-//	---------------------------|----------------|--------------|---------------|-----------------|----------------------
-//	ChangePassword             | swept          | swept        | swept         | not swept       | all but the caller's
-//	ResetPassword              | swept          | swept        | swept         | swept           | all
-//	LogoutAll                  | swept          | swept        | swept         | not swept       | all
-//	DeleteAccount              | swept          | swept        | swept         | swept           | all
-//	AnonymizeAccount           | swept          | swept        | swept         | swept           | all
-//	UnlinkIdentity             | not swept      | not swept    | not swept     | that provider's | all
-//	VerifyEmail (email_change) | swept          | n/a          | swept         | not swept       | not swept
-//	VerifyEmail (signup)       | not swept      | not swept    | not swept     | not swept       | not swept
-//	RedeemMagicLink            | not swept      | not swept    | burns its own | not swept       | not swept
-//	Logout                     | not swept      | not swept    | not swept     | not swept       | the presented one
-//	RevokeSession              | not swept      | not swept    | not swept     | not swept       | the named family
+//	Path                       | password_reset | email_change | magic_link    | identity        | session              | trusted device | mfa
+//	---------------------------|----------------|--------------|---------------|-----------------|----------------------|----------------|-----------
+//	ChangePassword             | swept          | swept        | swept         | not swept       | all but the caller's | all            | not swept
+//	ResetPassword              | swept          | swept        | swept         | swept           | all                  | all            | not swept
+//	LogoutAll                  | swept          | swept        | swept         | not swept       | all                  | all            | not swept
+//	DeleteAccount              | swept          | swept        | swept         | swept           | all                  | all            | swept
+//	AnonymizeAccount           | swept          | swept        | swept         | swept           | all                  | all            | swept
+//	DisableMFA                 | not swept      | not swept    | not swept     | not swept       | not swept            | all            | swept
+//	UnlinkIdentity             | not swept      | not swept    | not swept     | that provider's | all                  | not swept      | not swept
+//	VerifyEmail (email_change) | swept          | n/a          | swept         | not swept       | not swept            | not swept      | not swept
+//	VerifyEmail (signup)       | not swept      | not swept    | not swept     | not swept       | not swept            | not swept      | not swept
+//	RedeemMagicLink            | not swept      | not swept    | burns its own | not swept       | not swept            | not swept      | not swept
+//	Logout                     | not swept      | not swept    | not swept     | not swept       | the presented one    | not swept      | not swept
+//	RevokeSession              | not swept      | not swept    | not swept     | not swept       | the named family     | not swept      | not swept
 //
 // Every cell has a test, the "not swept" ones included: a cell pinning
 // deliberate non-behaviour is what stops a later "fix" from breaking a
 // legitimate flow silently, and a cell pinning a sweep is what stops the
-// next feature from filling in three columns of five.
+// next feature from filling in three columns of seven.
 //
 // # Reading the matrix
 //
-// The rows fall into four groups.
+// The rows fall into five groups.
 //
 // REMEDIATION — ChangePassword, ResetPassword, LogoutAll. Each is something
 // a user does because they believe, or have just been told, that the
 // account is at risk, so each leaves nothing armed that can quietly undo
 // it. Every sweep in these rows is fail-closed: an erroring sweep is
-// returned to the caller, never swallowed. Two cells in this group are
+// returned to the caller, never swallowed. Three cells in this group are
 // deliberately empty rather than owed:
 //
 //   - ChangePassword does not disconnect identities, and ResetPassword
@@ -3036,13 +3056,45 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //     ResetPassword's "Why an unauthenticated recovery sweeps identities".
 //   - LogoutAll does not either, for the same reason: it revokes sessions
 //     on the authority of a caller who is already signed in.
+//   - None of the three touches the MFA column, and that is the most
+//     load-bearing empty cell in the table. ChangePassword rotates the
+//     first factor and ResetPassword recovers it through the mailbox;
+//     sweeping the SECOND factor on either would mean that whoever
+//     compromised a password, or a mailbox, could strip the second factor
+//     by exercising the very flow it exists to survive. Two independent
+//     factors would collapse into one, in the attacker's favour, on the
+//     path a user takes precisely because they suspect the first has
+//     leaked. LogoutAll only ever removes access and has no business
+//     touching a credential the user still holds in their pocket.
+//     [Service.DisableMFA] is where a user turns their second factor off,
+//     and it demands the password AND a fresh second factor to do it.
+//
+// The trusted-device column, by contrast, is filled in on all three rows,
+// because it is not a credential the user holds in their pocket: it is a
+// long-lived bearer token whose only meaning is "skip the second factor",
+// sitting in a browser that may be exactly the thing that leaked.
 //
 // TERMINATION — DeleteAccount, AnonymizeAccount. These sweep every column,
 // and their verification sweep is [Store.DeleteVerificationsByUser] — by
 // USER, not by purpose — so it takes "signup" too, which no other row
 // touches. Nothing is left for a purpose-scoped list to have missed. Their
 // identity sweeps are subject to the one configuration limit
-// [Service.sweepIdentities] states.
+// [Service.sweepIdentities] states, and their MFA and trusted-device sweeps
+// to the identical limit for [WithMFAStore]. The MFA column is theirs alone
+// — [Service.DeleteAccount]'s doc, "The second-factor state goes too",
+// carries the argument for why termination sweeps what remediation must
+// not.
+//
+// TURNING THE SECOND FACTOR OFF — DisableMFA. One row, and the only one
+// whose MFA cell is the point of the call rather than a consequence of it.
+// Its trusted-device cell is the one that needed arguing: a token meaning
+// "skip the second factor" is not merely inert once there is no second
+// factor, it is a bypass waiting for the user to re-enrol, since
+// re-enrolment necessarily runs through this method. See that method's "It
+// revokes every trusted device". It sweeps no verification and no session,
+// deliberately: disabling MFA is not a statement that the mailbox or the
+// devices are compromised, and a user who turns their authenticator off
+// should not be signed out of everything for it.
 //
 // ROTATION OF WHAT A CREDENTIAL POINTS AT — UnlinkIdentity, and
 // VerifyEmail's email_change branch. Neither is a password change, and each
@@ -3069,6 +3121,27 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // destroying it on a remediation path would strand a user who remediated
 // before confirming their address, since this package exposes no resend
 // path.
+//
+// # The eighth column, which does not exist yet
+//
+// PASSKEYS have no column, and their absence is a DISCLOSED GAP rather than
+// a decision. A [Credential] registered through
+// [Service.FinishPasskeyRegistration] survives every row of this table,
+// including the two TERMINATION rows — so a hard [Service.DeleteAccount]
+// leaves the credential rows behind, filed under a user id that no longer
+// resolves, and a later account issued that same id would inherit a working
+// passkey it never registered. That is the identical argument step 6 of
+// DeleteAccount makes for sweeping identities, one credential kind later.
+//
+// It is not fixed here because [CredentialStore] has no by-user delete to
+// call: closing it means a new method on that port, both backends, and its
+// own conformance check, which is a change to a different feature's port
+// than the one this row set touches. Until then a deployment offering
+// passkeys must remove them from [WithAccountDeletionHook], exactly as a
+// deployment whose identities live behind a Service that cannot see them
+// must (see [Service.sweepIdentities]).
+// TestTheMatrixHasNoPasskeyColumnAndThatIsDisclosed pins the gap so that it
+// stays visible rather than being rediscovered.
 //
 // Every sweep in the table is SEQUENTIAL ONLY. See "Why these purposes, and
 // what the sweep does not cover" below for the deterministic demonstration
@@ -3193,6 +3266,16 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 		return err
 	}
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeMagicLink); err != nil {
+		return err
+	}
+
+	// The fourth side door, on this method's OWN line — see
+	// [Service.sweepTrustedDevices] and the matrix. Unlike the session sweep
+	// below it spares nothing, not even the caller's own machine: a session
+	// family is the thing this caller is demonstrably holding, while a
+	// trusted device is a cookie that may have been copied off the machine
+	// whose compromise prompted this call.
+	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
 		return err
 	}
 
@@ -3807,6 +3890,15 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 		return err
 	}
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposeMagicLink); err != nil {
+		return err
+	}
+
+	// Every [TrustedDevice], on this method's OWN line — see
+	// [Service.sweepTrustedDevices] and the matrix. A password reset is
+	// UNAUTHENTICATED recovery, where every other credential has to be
+	// assumed hostile, and a trusted device is precisely a credential the
+	// person resetting cannot see and cannot have consented to.
+	if err := s.sweepTrustedDevices(ctx, v.UserID); err != nil {
 		return err
 	}
 

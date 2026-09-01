@@ -737,8 +737,8 @@ func (s *Service) CompleteMFA(ctx context.Context, challengeToken, code, ip, use
 // [WithStepUpWindow], or this is [ErrStepUpRequired] and nothing is
 // removed.
 //
-// Of the five methods step-up gates, this is the one whose absence would
-// undo the other four. An attacker holding a session AND the password can,
+// Of the seven methods step-up gates, this is the one whose absence would
+// undo the other six. An attacker holding a session AND the password can,
 // without this check, simply turn the factor off and then perform every
 // other gated action unchallenged; the gate on the credential rotation
 // would be worth nothing while the gate on the credential ITSELF was
@@ -767,6 +767,33 @@ func (s *Service) CompleteMFA(ctx context.Context, challengeToken, code, ip, use
 // first and failing leaves an account whose retry gets [ErrFactorNotFound]
 // and never reaches the codes at all, stranding them.
 //
+// # It revokes every trusted device
+//
+// [Service.sweepTrustedDevices] runs here too, on its own line, and this is
+// the row of the sweep matrix that needed the most argument.
+//
+// A [TrustedDevice] token means one thing and one thing only: "skip the
+// second factor". Once there is no second factor there is nothing to skip,
+// so the obvious reading is that a surviving device is merely meaningless —
+// [Service.trustedDeviceAtSignIn] refuses to consult one for an account with
+// no confirmed factor, so it grants nothing the day after this call.
+//
+// It is worse than meaningless, though, and that is why the sweep is here.
+// Re-enrolment goes DisableMFA → [Service.BeginMFAEnrolment] →
+// [Service.ConfirmMFAEnrolment] (see [ErrMFAAlreadyEnrolled], which is what
+// forces that route). Leaving the devices behind means a user who turns MFA
+// off and back on — after losing a phone, after changing authenticator apps
+// — finds every machine they ever trusted silently skipping the NEW factor,
+// a token minted against a secret that no longer exists. Whoever holds one
+// of those cookies gets the benefit of a second factor they were never
+// tested against. Sweeping here is what makes "trusted" mean "trusted for
+// the factor that is enrolled now".
+//
+// It runs BEFORE the codes and the factor for the same retry reason their
+// own order is chosen: a failure at this point leaves MFA fully on with
+// nothing trusted, which is a state the user can live in and a retry can
+// clear.
+//
 // Outstanding [MFAChallenge]s are deliberately NOT swept, because they need
 // no sweeping: [Service.CompleteMFA] loads the factor before it accepts
 // anything, so once the factor is gone every live challenge is already
@@ -780,7 +807,9 @@ func (s *Service) CompleteMFA(ctx context.Context, challengeToken, code, ip, use
 // OAuth-only account cannot satisfy this check, and the honest consequence
 // is that such an account's MFA is not disableable through this method.
 // [ErrFactorNotFound] when there is nothing enrolled. Any other Store
-// failure is returned as-is.
+// failure is returned as-is, the trusted-device sweep's included: a device
+// left standing while this call reports success is a bypass armed for the
+// next enrolment, and nothing would prompt a retry.
 func (s *Service) DisableMFA(ctx context.Context, userID, currentSessionID, currentPassword string) error {
 	st, err := s.mfa()
 	if err != nil {
@@ -811,12 +840,51 @@ func (s *Service) DisableMFA(ctx context.Context, userID, currentSessionID, curr
 		return err
 	}
 
+	// The trusted devices, on this method's own line and BEFORE the factor
+	// goes — see the method doc, "It revokes every trusted device", for what
+	// a surviving one would mean, and why it runs first: a failure here
+	// leaves MFA fully on with nothing trusted, which is the direction a
+	// retry can fix.
+	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
+		return err
+	}
+
 	// Codes first — see the method doc for why the retry semantics decide
 	// this order.
 	if err := st.ReplaceRecoveryCodes(ctx, userID, nil); err != nil {
 		return err
 	}
 	return st.DeleteFactor(ctx, userID)
+}
+
+// sweepMFAState removes userID's SECOND-FACTOR state: every recovery code,
+// then the [MFAFactor] itself. It is the MFA column of
+// [Service.ChangePassword]'s sweep matrix, and only the two TERMINATION rows
+// call it — see that table for why no remediation path does.
+//
+// It tolerates [ErrFactorNotFound], because "this account never enrolled" is
+// the ordinary state of most accounts and is not a failure of a sweep whose
+// job is to leave nothing behind. Every other error is returned as-is.
+//
+// The codes go first, matching [Service.DisableMFA]'s order and for the same
+// reason: a partial failure leaving the factor with no codes is a user who
+// can still authenticate, while one leaving codes with no factor is a set of
+// live credentials for a second factor that no longer exists.
+//
+// A [Service] with no [WithMFAStore] holds no factors, so it sweeps nothing
+// and reports no error — the same stated limit [Service.sweepIdentities]
+// carries for its own port.
+func (s *Service) sweepMFAState(ctx context.Context, userID string) error {
+	if s.cfg.mfaStore == nil {
+		return nil
+	}
+	if err := s.cfg.mfaStore.ReplaceRecoveryCodes(ctx, userID, nil); err != nil {
+		return err
+	}
+	if err := s.cfg.mfaStore.DeleteFactor(ctx, userID); err != nil && !errors.Is(err, ErrFactorNotFound) {
+		return err
+	}
+	return nil
 }
 
 // mfaAtSignIn is the second-factor step of every door that HAS one: it

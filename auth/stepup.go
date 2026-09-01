@@ -41,7 +41,7 @@
 //
 // # What it gates, and what it deliberately does not
 //
-// Five methods call it, each on its own line rather than through a guard
+// Seven methods call it, each on its own line rather than through a guard
 // they share:
 //
 //   - [Service.ChangePassword] — rotating the credential.
@@ -53,11 +53,29 @@
 //     single most valuable action available to whoever holds a stolen
 //     session, and the one that makes every other gate in this file
 //     removable.
+//   - [Service.TrustThisDevice] — minting a token that skips the second
+//     factor for thirty days. Ungated, a stolen session turns itself into a
+//     lasting bypass on the way out; auth/trusted.go carries that argument.
+//   - [Service.FinishPasskeyRegistration] — registering a new SIGN-IN
+//     credential, and the subtler of the two gates whose absence would make
+//     the rest removable: a passkey registered from a stolen session logs
+//     in through [Service.FinishPasskeyLogin], which stamps
+//     [Session.MFAAt], so the thief steps up without ever holding the
+//     account's factor. That method's own doc walks the whole route.
 //
-// Each of the five ALSO requires the account's current password, and the
-// step-up check runs AFTER that check, never before: a caller who does not
-// know the password is told exactly that, and learns nothing about what
-// second factor the account holds. The one gap in that pairing belongs to
+// Five of the seven ALSO require the account's current password, and there
+// the step-up check runs AFTER that check, never before: a caller who does
+// not know the password is told exactly that, and learns nothing about what
+// second factor the account holds. The two that do not are the two that ARM
+// a credential rather than rotating one — [Service.TrustThisDevice] and
+// [Service.FinishPasskeyRegistration]. Neither could ask for a password
+// without refusing every password-less account (an OAuth-only or
+// passkey-only user) a feature it can otherwise use, and neither needs to: a
+// second factor proved minutes ago is a stronger claim about who is present
+// than a password typed into a page an attacker may already be sitting in
+// front of.
+//
+// The one gap in that pairing belongs to
 // [Service.DeleteAccount] and [Service.AnonymizeAccount], which proceed
 // without a password for an account that HAS none (see DeleteAccount's "An
 // account with no password") — for such an account holding a confirmed
@@ -136,7 +154,7 @@ var ErrStepUpRequired = errors.New("authlayer/auth: this action needs a recently
 // default is [defaultStepUpWindow], fifteen minutes.
 //
 // d == 0 DISABLES step-up entirely: RequireFreshMFA returns nil without
-// reading anything, and the five methods that call it behave exactly as they
+// reading anything, and the seven methods that call it behave exactly as they
 // did before this feature existed. That is a real configuration, not a
 // degenerate one — a deployment may reasonably decide its sensitive actions
 // are sufficiently protected by the password they already require — and it
