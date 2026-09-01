@@ -325,19 +325,29 @@ type config struct {
 	// see [WithAccountDeletionHook] and [Service.DeleteAccount], both in
 	// deletion.go. nil means no hook, which is the default.
 	accountDeletionHook func(ctx context.Context, userID string) error
+	// credentialStore is the OPTIONAL passkey port — see
+	// [WithCredentialStore], declared in credential.go beside the port it
+	// wires. nil means no passkeys are configured, and every entry point
+	// needing it fails with [ErrPasskeysNotConfigured] rather than
+	// dereferencing this.
+	credentialStore CredentialStore
+	// passkeyChallengeTTL is how long a [Challenge] stays claimable — see
+	// [WithPasskeyChallengeTTL], also in credential.go.
+	passkeyChallengeTTL time.Duration
 }
 
 func defaultConfig() config {
 	return config{
-		hasher:           password.Bcrypt(0),
-		rules:            password.DefaultRules(),
-		accessTTL:        15 * time.Minute,
-		refreshTTL:       30 * 24 * time.Hour,
-		verificationTTL:  defaultVerificationTTL,
-		passwordResetTTL: defaultPasswordResetTTL,
-		magicLinkTTL:     defaultMagicLinkTTL,
-		clock:            func() time.Time { return time.Now().UTC() },
-		idGen:            uid.NewV7,
+		hasher:              password.Bcrypt(0),
+		rules:               password.DefaultRules(),
+		accessTTL:           15 * time.Minute,
+		refreshTTL:          30 * 24 * time.Hour,
+		verificationTTL:     defaultVerificationTTL,
+		passwordResetTTL:    defaultPasswordResetTTL,
+		magicLinkTTL:        defaultMagicLinkTTL,
+		passkeyChallengeTTL: defaultPasskeyChallengeTTL,
+		clock:               func() time.Time { return time.Now().UTC() },
+		idGen:               uid.NewV7,
 	}
 }
 
