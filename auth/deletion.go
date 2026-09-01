@@ -182,18 +182,34 @@ func WithAccountDeletionHook(f func(ctx context.Context, userID string) error) O
 //     and reports no error — see [Service.sweepIdentities] for that, and
 //     for the two-Services-one-users-table configuration it cannot cover,
 //     which is this step's one stated limit.
-//     Step 6 has a SECOND half since trusted devices landed, step 6b: the
-//     account's second-factor state, when the [Service] was built with
-//     [WithMFAStore] — every [TrustedDevice]
+//     Step 6 has had a SECOND half since trusted devices landed and a
+//     THIRD since passkeys got a column, and the split between them is
+//     "is this a way IN".
+//     6b. PASSKEYS, when the [Service] was built with
+//     [WithCredentialStore]: every [Credential] the account holds, in one
+//     [CredentialStore.DeleteCredentialsByUser] via
+//     [Service.sweepCredentials]. It sits with step 6 rather than with 6c
+//     because it is the same KIND of thing — a way IN that needs no
+//     password at all, and the most direct one this package has, since
+//     [Service.FinishPasskeyLogin] asks for nothing else. A surviving row
+//     is a working sign-in credential filed under an id that no longer
+//     resolves, and a later account issued that id under a non-random
+//     [WithIDGenerator] would inherit it. The sweep is by USER and makes no
+//     reachability check: [ErrLastCredential] is precisely the refusal that
+//     would preserve what this call is destroying. A Service with no
+//     credential store sweeps nothing here and reports no error, the same
+//     limit step 6 carries.
+//     6c. The account's second-factor state, when the [Service] was built
+//     with [WithMFAStore] — every [TrustedDevice]
 //     ([Service.sweepTrustedDevices]), then every [RecoveryCode] and the
 //     [MFAFactor] itself ([Service.sweepMFAState]). Two calls on two lines,
 //     because they are two columns of the sweep matrix and removing one
 //     must fail only its own cell. Neither is a way IN on its own — both
 //     need a first factor this call is about to remove — which is why they
-//     follow step 6 rather than preceding it, and they still precede step 7
-//     so the row outlives everything keyed on it. A Service with no MFA
-//     store sweeps nothing here and reports no error, the same limit step 6
-//     carries. See "The second-factor state goes too" below.
+//     follow steps 6 and 6b rather than preceding them, and they still
+//     precede step 7 so the row outlives everything keyed on it. A Service
+//     with no MFA store sweeps nothing here and reports no error, the same
+//     limit step 6 carries. See "The second-factor state goes too" below.
 //  7. [Store.DeleteUser] — the user row, LAST.
 //
 // Steps 4 and 7 are the pair that matters. Sessions before the row means a
@@ -207,7 +223,7 @@ func WithAccountDeletionHook(f func(ctx context.Context, userID string) error) O
 //
 // # The second-factor state goes too
 //
-// Step 6b sweeps what no REMEDIATION path in the matrix sweeps: the
+// Step 6c sweeps what no REMEDIATION path in the matrix sweeps: the
 // [MFAFactor], the [RecoveryCode]s, and the [TrustedDevice]s. The asymmetry
 // is the whole of this column's argument.
 //
@@ -443,17 +459,29 @@ func (s *Service) DeleteAccount(ctx context.Context, userID, currentSessionID, c
 		return err
 	}
 
-	// Step 6b. The second-factor state: every [TrustedDevice], then the
+	// Step 6b. Every passkey, on this method's own line — the matrix's
+	// eighth column. It sits BESIDE the identity sweep rather than with 6c
+	// because it is the same kind of thing: a way IN that needs no password,
+	// and the most direct one this package has. A failure at 6c with the
+	// credentials still standing would leave a live, password-less door into
+	// an account whose sessions are already gone; the reverse cannot happen.
+	// A Service with no [WithCredentialStore] sweeps nothing here and reports
+	// no error — see [Service.sweepCredentials].
+	if err := s.sweepCredentials(ctx, userID); err != nil {
+		return err
+	}
+
+	// Step 6c. The second-factor state: every [TrustedDevice], then the
 	// recovery codes and the [MFAFactor]. Two calls on two lines, because
 	// they are two columns of the matrix and removing one must fail only its
 	// own cell. See "The second-factor state goes too" in the method doc for
 	// why a termination path sweeps what no remediation path does.
 	//
-	// After step 6 rather than before it because neither is a way IN — both
-	// require a first factor this call is about to remove — and before step 7
-	// so the row still outlives everything keyed on it. A Service with no
-	// [WithMFAStore] sweeps nothing here and reports no error, the same
-	// limit [Service.sweepIdentities] carries.
+	// After steps 6 and 6b rather than before them because neither is a way
+	// IN — both require a first factor this call is about to remove — and
+	// before step 7 so the row still outlives everything keyed on it. A
+	// Service with no [WithMFAStore] sweeps nothing here and reports no
+	// error, the same limit [Service.sweepIdentities] carries.
 	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
 		return err
 	}
@@ -550,11 +578,16 @@ func anonymizedEmail(userID string) string {
 //     [Service.SignInWith] than through anything else, not less. A Service
 //     with no identity store configured sweeps nothing here and reports no
 //     error; see [Service.sweepIdentities] for that limit.
-//     Step 6b is [Service.DeleteAccount]'s verbatim: every [TrustedDevice],
-//     then the [RecoveryCode]s and the [MFAFactor], on two lines. It matters
-//     MORE on this posture than on the hard one — the row SURVIVES here, so
-//     a factor left behind is an encrypted TOTP secret filed under a live
-//     user id on an account the deployment has told its owner is closed. See
+//     Steps 6b and 6c are [Service.DeleteAccount]'s verbatim. 6b is every
+//     [Credential] the account holds, and it matters MORE on this posture
+//     than on the hard one for the reason step 7 makes plain: the row
+//     SURVIVES and its password hash is cleared, so a surviving passkey
+//     would be the only thing left that could authenticate an account the
+//     deployment has told its owner is closed — which is exactly what
+//     [UserBase.DeletedAt] forbids, and why [Service.FinishPasskeyLogin]
+//     refuses a stamped row too. 6c is every [TrustedDevice], then the
+//     [RecoveryCode]s and the [MFAFactor], on two lines; a factor left
+//     behind is an encrypted TOTP secret filed under a live user id. See
 //     "The second-factor state goes too" in DeleteAccount's doc.
 //  7. [Store.MarkUserDeleted] — the scrub and the stamp, LAST, and as ONE
 //     atomic step: that method's own MUST is what keeps a caller from ever
@@ -815,7 +848,7 @@ func (s *Service) AnonymizeAccount(ctx context.Context, userID, currentSessionID
 	// The same exemption for an ALREADY-ANONYMIZED account, for the same
 	// reason and for one more: this method is documented to be repeatable
 	// (see "Anonymizing twice"), and a stamped account has no session left
-	// that could ever satisfy the check. Step 6b now sweeps the [MFAFactor]
+	// that could ever satisfy the check. Step 6c now sweeps the [MFAFactor]
 	// too, so an account this method has already run against normally holds
 	// no confirmed factor and would not be gated anyway — but "normally" is
 	// not "always" (a partial failure, or a second Service wired over the
@@ -854,7 +887,15 @@ func (s *Service) AnonymizeAccount(ctx context.Context, userID, currentSessionID
 		return err
 	}
 
-	// Step 6b. The second-factor state — [Service.DeleteAccount]'s step 6b
+	// Step 6b. Every passkey — [Service.DeleteAccount]'s step 6b verbatim,
+	// and the step this posture needs most: step 7 clears the password hash,
+	// so a surviving credential would be the only thing left that could
+	// authenticate a row the deployment has told its owner is closed.
+	if err := s.sweepCredentials(ctx, userID); err != nil {
+		return err
+	}
+
+	// Step 6c. The second-factor state — [Service.DeleteAccount]'s step 6c
 	// verbatim, two calls on two lines so each column of the matrix fails
 	// alone. It matters MORE on this posture than on the hard one: the row
 	// survives here, so a factor left behind is an encrypted TOTP secret and

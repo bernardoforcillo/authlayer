@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 // ============================================================
 //
 // This file is the executable form of the table in [auth.Service.ChangePassword]'s
-// doc, "The sweep matrix". Twelve paths against seven credential kinds, and
+// doc, "The sweep matrix". Thirteen paths against eight credential kinds, and
 // EVERY cell is asserted — the deliberate non-sweeps included.
 //
 // Testing the non-sweeps matters as much as testing the sweeps. Milestone
@@ -51,6 +52,22 @@ import (
 //     fail-closed sub-test, and nothing else. AnonymizeAccount's identical
 //     cells still passed, which is what proves the two postures make two
 //     calls.
+//   - Removing the PASSKEY sweep from [auth.Service.DeleteAccount] ONLY:
+//     failed TestSweepMatrix/DeleteAccount's passkey cell, that row's
+//     fail-closed sub-test, and
+//     TestAPasskeyDoesNotOutliveTheAccountItAuthenticated. Every other row's
+//     passkey cell — AnonymizeAccount's identical one included — still
+//     passed, which is again what proves the two postures make two calls
+//     rather than reaching one shared cascade.
+//
+// The passkey column is also where the deliberate non-sweeps carry the most
+// weight in this file. Eleven of the thirteen rows say "not swept" there, and
+// they say it against a real argument rather than by omission — see the
+// matrix's "The passkey column, and why ResetPassword does not sweep it". A
+// later change that makes a remediation path "consistent" by sweeping
+// passkeys destroys hardware credentials on a flow an attacker can trigger
+// from a compromised mailbox, and TestSweepMatrix/ResetPassword is the thing
+// standing in its way.
 
 // verdict is what the matrix says about one (path, credential) cell.
 type verdict int
@@ -66,6 +83,12 @@ const (
 	// or the credential is the one the path consumes by definition. The
 	// matrix marks these rather than pretending they were tested.
 	notApplicable
+	// justThatOne: the path removes the ONE credential it was told to and
+	// leaves that account's others standing. It exists for the passkey
+	// column's DeletePasskey cell, where neither "swept" nor "not swept" is
+	// the truth and asserting either would pin the wrong behaviour: the
+	// matrix's own table says "that one's" there, and this is that cell.
+	justThatOne
 )
 
 func (v verdict) String() string {
@@ -74,6 +97,8 @@ func (v verdict) String() string {
 		return "swept"
 	case survives:
 		return "not swept"
+	case justThatOne:
+		return "that one's"
 	default:
 		return "n/a"
 	}
@@ -95,6 +120,15 @@ type sweepRow struct {
 	// token that skips the SECOND factor, so every path that sweeps anything
 	// at all sweeps these.
 	trusted verdict
+	// passkey is the eighth column: the [auth.Credential]s
+	// [auth.Service.FinishPasskeyRegistration] writes. Only the two
+	// TERMINATION rows sweep it and only DeletePasskey removes one of them,
+	// so eleven of the thirteen cells here are deliberate non-behaviour — the
+	// densest block of it in the table, and the reason is that a passkey is
+	// bound to hardware nobody who compromised the mailbox holds. See the
+	// matrix doc's "The passkey column, and why ResetPassword does not sweep
+	// it".
+	passkey verdict
 	// mfa is the second-factor column — the [auth.MFAFactor] and its
 	// [auth.RecoveryCode]s together, asserted separately but always with the
 	// same verdict, because nothing in this package removes one without the
@@ -110,14 +144,22 @@ type sweepRow struct {
 
 // sweepFixture is one account with every credential kind this package can
 // hold, armed at once: four outstanding verifications spanning all four
-// purposes, one linked external identity, and two session families.
+// purposes, one linked external identity, two registered passkeys, and two
+// session families.
 type sweepFixture struct {
 	svc   *auth.Service
 	store *memory.AuthStore
 	ids   *memory.IdentityStore
 	mfa   *memory.MFAStore
+	creds *memory.CredentialStore
 
 	user auth.UserBase
+
+	// The two passkeys the fixture registers, by surrogate id. Two rather
+	// than one for the trusted-device column's reason — a path that took
+	// SOME of them is half a sweep — and because DeletePasskey's cell is
+	// about which ONE went.
+	passkeyA, passkeyB string
 
 	signupTok string
 	resetTok  string
@@ -146,7 +188,8 @@ func newSweepFixture(t *testing.T, email string) *sweepFixture {
 	store := memory.NewAuthStore()
 	ids := memory.NewIdentityStore()
 	mfa := memory.NewMFAStore()
-	svc := newServiceOver(t, store, sweepOptions(ids, mfa)...)
+	creds := memory.NewCredentialStore()
+	svc := newServiceOver(t, store, sweepOptions(ids, mfa, creds)...)
 
 	// Deliberately NOT verified: the signup token has to stay outstanding
 	// so its column can be asserted, and nothing in this file needs a
@@ -201,9 +244,22 @@ func newSweepFixture(t *testing.T, email string) *sweepFixture {
 	// confirmed factor and requires the same sweep to take it.
 	seedMFAState(t, mfa, user.ID)
 
+	// The passkeys go through the real ceremony, unlike the MFA state above:
+	// [auth.Service.FinishPasskeyRegistration] is not gated for this account
+	// (the seeded factor is UNCONFIRMED, so RequireFreshMFA is a documented
+	// no-op), so there is no reason to reach past the service and every
+	// reason not to — a row written straight into the store could not catch a
+	// registration path that stopped writing one.
+	//
+	// Each fixture owns its own CredentialStore, so the credential-id labels
+	// may repeat across fixtures but must not repeat within one.
+	passkeyA := registerPasskey(t, svc, user.ID, newCred('p'))
+	passkeyB := registerPasskey(t, svc, user.ID, newCred('q'))
+
 	f := &sweepFixture{
-		svc: svc, store: store, ids: ids, mfa: mfa, user: user,
+		svc: svc, store: store, ids: ids, mfa: mfa, creds: creds, user: user,
 		signupTok: res.VerifyToken, resetTok: resetTok, changeTok: changeTok, magicTok: magicTok,
+		passkeyA: passkeyA.ID, passkeyB: passkeyB.ID,
 		refreshA: refreshA, refreshB: refreshB, accessA: accessA,
 		newAddress: newAddress, provider: sweepProvider,
 	}
@@ -223,11 +279,16 @@ func newSweepFixture(t *testing.T, email string) *sweepFixture {
 }
 
 // sweepOptions is the wiring every Service in this file is built with, so a
-// fail-closed test that swaps one store out keeps the other two ports. A
-// rebuild that forgot [auth.WithMFAStore] would make both new columns' sweeps
-// silent no-ops and every one of their cells pass for the wrong reason.
-func sweepOptions(ids *memory.IdentityStore, mfa *memory.MFAStore) []auth.Option {
-	return []auth.Option{auth.WithIdentityStore(ids), auth.WithMFAStore(mfa)}
+// fail-closed test that swaps one store out keeps the other three ports. A
+// rebuild that forgot [auth.WithMFAStore] or [auth.WithCredentialStore] would
+// make those columns' sweeps silent no-ops and every one of their cells pass
+// for the wrong reason.
+func sweepOptions(ids *memory.IdentityStore, mfa *memory.MFAStore, creds *memory.CredentialStore) []auth.Option {
+	return []auth.Option{
+		auth.WithIdentityStore(ids),
+		auth.WithMFAStore(mfa),
+		auth.WithCredentialStore(creds),
+	}
 }
 
 // seedMFAState arms the two new columns: one factor, two recovery codes and
@@ -267,6 +328,48 @@ func seedMFAState(t *testing.T, mfa *memory.MFAStore, userID string) {
 			ExpiresAt: at.Add(30 * 24 * time.Hour),
 		}); err != nil {
 			t.Fatalf("seeding trusted device %d: %v", i, err)
+		}
+	}
+}
+
+// passkeyIDs is the passkey column's reading: the surrogate ids of whatever
+// credentials the account still holds, sorted so a comparison against the two
+// the fixture registered does not depend on the store's iteration order.
+func (f *sweepFixture) passkeyIDs(t *testing.T) []string {
+	t.Helper()
+	rows, err := f.creds.ListCredentialsByUser(context.Background(), f.user.ID)
+	if err != nil {
+		t.Fatalf("ListCredentialsByUser: %v", err)
+	}
+	out := make([]string, 0, len(rows))
+	for _, c := range rows {
+		out = append(out, c.ID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// checkPasskeyCell asserts the passkey column for one row. It is its own
+// function rather than a [checkCell] call because this column has three
+// possible verdicts and because "some of them went" is a real, catchable
+// failure here: a sweep that removed one of two passkeys would read as
+// "survives" to a present/absent check and would leave half an account's
+// credentials behind.
+func (f *sweepFixture) checkPasskeyCell(t *testing.T, path string, want verdict) {
+	t.Helper()
+	got := f.passkeyIDs(t)
+	switch want {
+	case gone:
+		if len(got) != 0 {
+			t.Errorf("%s / passkey: %d of the 2 registered passkeys SURVIVED, and the matrix says %q — a credential outliving the account it authenticates is a working sign-in filed under an id that no longer resolves, and a later account issued that id inherits it", path, len(got), want)
+		}
+	case survives:
+		if len(got) != 2 {
+			t.Errorf("%s / passkey: %d of the 2 registered passkeys survived, and the matrix says %q — this cell is deliberate non-behaviour, and sweeping here destroys hardware credentials on a path an attacker can trigger from a compromised mailbox (see ChangePassword's doc, \"The passkey column, and why ResetPassword does not sweep it\")", path, len(got), want)
+		}
+	case justThatOne:
+		if len(got) != 1 || got[0] != f.passkeyB {
+			t.Errorf("%s / passkey: passkeys left = %v, want exactly the one that was NOT named (%q) — the matrix says %q, and a by-id removal that widened would be an account losing credentials it did not ask to lose", path, got, f.passkeyB, want)
 		}
 	}
 }
@@ -377,6 +480,9 @@ func (f *sweepFixture) assertArmed(t *testing.T) {
 	if n := f.identityCount(t); n != 1 {
 		t.Fatalf("fixture error: identities = %d, want 1", n)
 	}
+	if got := f.passkeyIDs(t); len(got) != 2 {
+		t.Fatalf("fixture error: passkeys = %v, want 2", got)
+	}
 	if seeded, extra := f.seededFamilies(t); seeded != 2 || extra != 0 {
 		t.Fatalf("fixture error: seeded families = %d (want 2), extra sessions = %d (want 0)", seeded, extra)
 	}
@@ -424,7 +530,12 @@ func sweepMatrix() []sweepRow {
 				}
 			},
 			signup: survives, reset: gone, change: gone, magic: gone,
-			identity: survives, trusted: gone, mfa: survives, families: 1,
+			// An AUTHENTICATED rotation does not disconnect identities and
+			// does not destroy passkeys either, and the passkey cell is the
+			// easier of the two: this caller proved they hold the current
+			// password, and rotating it says nothing about the authenticator
+			// in their pocket.
+			identity: survives, passkey: survives, trusted: gone, mfa: survives, families: 1,
 		},
 		{
 			name: "ResetPassword",
@@ -434,7 +545,17 @@ func sweepMatrix() []sweepRow {
 				}
 			},
 			signup: survives, reset: gone, change: gone, magic: gone,
-			identity: gone, trusted: gone, mfa: survives, families: 0,
+			// The two cells this row exists to keep apart. An identity is
+			// swept because an attacker can PROVISION one before the victim
+			// ever holds the account, so the documented recovery has to take
+			// it. A passkey is NOT, because there is no unauthenticated write
+			// path to one, because it is bound to hardware the mailbox
+			// compromise did not yield — and because this call is
+			// unauthenticated, so the person making it may be the attacker
+			// and the surviving passkey may be the owner's last door.
+			// TestAPasskeyPlantedFromAStolenSessionIsRemovableAfterAReset
+			// pins the residual that leaves.
+			identity: gone, passkey: survives, trusted: gone, mfa: survives, families: 0,
 		},
 		{
 			name: "LogoutAll",
@@ -444,7 +565,9 @@ func sweepMatrix() []sweepRow {
 				}
 			},
 			signup: survives, reset: gone, change: gone, magic: gone,
-			identity: survives, trusted: gone, mfa: survives, families: 0,
+			// It only ever removes ACCESS. A passkey is a credential the user
+			// still holds, exactly like the second factor beside it.
+			identity: survives, passkey: survives, trusted: gone, mfa: survives, families: 0,
 		},
 		{
 			name: "DeleteAccount",
@@ -456,7 +579,7 @@ func sweepMatrix() []sweepRow {
 			// The termination rows sweep by USER, not by purpose, so
 			// "signup" goes too — the one column no other row touches.
 			signup: gone, reset: gone, change: gone, magic: gone,
-			identity: gone, trusted: gone, mfa: gone, families: 0,
+			identity: gone, passkey: gone, trusted: gone, mfa: gone, families: 0,
 		},
 		{
 			name: "AnonymizeAccount",
@@ -465,8 +588,11 @@ func sweepMatrix() []sweepRow {
 					t.Fatalf("AnonymizeAccount: %v", err)
 				}
 			},
+			// Identical to DeleteAccount's, and asserted from its own
+			// fixture: the two postures make their own calls, so a sweep
+			// removed from one must fail only that one's cells.
 			signup: gone, reset: gone, change: gone, magic: gone,
-			identity: gone, trusted: gone, mfa: gone, families: 0,
+			identity: gone, passkey: gone, trusted: gone, mfa: gone, families: 0,
 		},
 		{
 			name: "DisableMFA",
@@ -489,7 +615,12 @@ func sweepMatrix() []sweepRow {
 			// user out of everything for it would be a surprise, not a
 			// safeguard.
 			signup: survives, reset: survives, change: survives, magic: survives,
-			identity: survives, trusted: gone, mfa: gone, families: 2,
+			// The passkey cell is not a near-miss of the mfa cell beside it.
+			// Turning a TOTP authenticator off says nothing about a hardware
+			// credential that is a DOOR rather than a gate on one — and
+			// sweeping here could remove the account's last way in, on a
+			// method whose whole purpose is to leave the user signed in.
+			identity: survives, passkey: survives, trusted: gone, mfa: gone, families: 2,
 		},
 		{
 			name: "UnlinkIdentity",
@@ -503,7 +634,31 @@ func sweepMatrix() []sweepRow {
 			// none of its business. The sessions ARE, because a session
 			// minted through the identity would otherwise keep rotating.
 			signup: survives, reset: survives, change: survives, magic: survives,
-			identity: gone, trusted: survives, mfa: survives, families: 0,
+			// Disconnecting a provider takes that provider's rows and nothing
+			// else. A passkey is a different credential kind entirely, and it
+			// is frequently what keeps the account reachable at all —
+			// [auth.Service.hasWayInBesides] counts it, which is what let the
+			// unlink above proceed.
+			identity: gone, passkey: survives, trusted: survives, mfa: survives, families: 0,
+		},
+		{
+			name: "DeletePasskey",
+			run: func(t *testing.T, f *sweepFixture) {
+				if err := f.svc.DeletePasskey(context.Background(), f.user.ID, f.passkeyA); err != nil {
+					t.Fatalf("DeletePasskey: %v", err)
+				}
+			},
+			// UnlinkIdentity's mirror, differing in exactly one cell: an
+			// unlink revokes every session and this revokes none. That is
+			// argued on the method — an unlink is a categorical statement
+			// about a whole credential SOURCE, while this removes one
+			// credential out of a set whose other members are still working,
+			// and a Session records no credential provenance for a narrower
+			// sweep to use. Signing a user out on their phone because they
+			// tidied an old laptop off a list is not what that screen says it
+			// does.
+			signup: survives, reset: survives, change: survives, magic: survives,
+			identity: survives, passkey: justThatOne, trusted: survives, mfa: survives, families: 2,
 		},
 		{
 			name: "VerifyEmail (email_change)",
@@ -517,7 +672,9 @@ func sweepMatrix() []sweepRow {
 			// call burns. Sessions are deliberately untouched: this method
 			// is unauthenticated by construction.
 			signup: survives, reset: gone, change: gone, magic: gone,
-			identity: survives, trusted: survives, mfa: survives, families: 2,
+			// A passkey is not deliverable to a mailbox, so moving the
+			// ADDRESS strands nothing about it.
+			identity: survives, passkey: survives, trusted: survives, mfa: survives, families: 2,
 		},
 		{
 			name: "VerifyEmail (signup)",
@@ -530,7 +687,7 @@ func sweepMatrix() []sweepRow {
 			// nothing, so a token for that same mailbox is still a token
 			// for that same mailbox.
 			signup: gone, reset: survives, change: survives, magic: survives,
-			identity: survives, trusted: survives, mfa: survives, families: 2,
+			identity: survives, passkey: survives, trusted: survives, mfa: survives, families: 2,
 		},
 		{
 			name: "RedeemMagicLink",
@@ -542,7 +699,7 @@ func sweepMatrix() []sweepRow {
 			// Burns its own token and nothing else. Signing in on a new
 			// device is not a revocation event.
 			signup: survives, reset: survives, change: survives, magic: gone,
-			identity: survives, trusted: survives, mfa: survives, families: 2, extraSessions: 1,
+			identity: survives, passkey: survives, trusted: survives, mfa: survives, families: 2, extraSessions: 1,
 		},
 		{
 			name: "Logout",
@@ -552,7 +709,7 @@ func sweepMatrix() []sweepRow {
 				}
 			},
 			signup: survives, reset: survives, change: survives, magic: survives,
-			identity: survives, trusted: survives, mfa: survives, families: 1,
+			identity: survives, passkey: survives, trusted: survives, mfa: survives, families: 1,
 		},
 		{
 			name: "RevokeSession",
@@ -562,7 +719,7 @@ func sweepMatrix() []sweepRow {
 				}
 			},
 			signup: survives, reset: survives, change: survives, magic: survives,
-			identity: survives, trusted: survives, mfa: survives, families: 1,
+			identity: survives, passkey: survives, trusted: survives, mfa: survives, families: 1,
 		},
 	}
 }
@@ -580,6 +737,7 @@ func TestSweepMatrix(t *testing.T) {
 			checkCell(t, row.name, "email_change", row.change, f.present(t, f.changeTok))
 			checkCell(t, row.name, "magic_link", row.magic, f.present(t, f.magicTok))
 			checkCell(t, row.name, "identity", row.identity, f.identityCount(t) > 0)
+			f.checkPasskeyCell(t, row.name, row.passkey)
 			checkCell(t, row.name, "trusted device", row.trusted, f.trustedCount(t) > 0)
 			// The MFA column is read twice against ONE verdict: a path that
 			// took the factor and left the codes has left live credentials
@@ -606,14 +764,14 @@ func TestSweepMatrix(t *testing.T) {
 
 // TestSweepMatrixIsExhaustive pins the matrix's SHAPE, not its contents: it
 // fails if a row is added without a verdict for every column, or if the
-// table shrinks below the eleven paths the doc lists. A matrix with a blank
-// cell is the exact failure mode this whole file exists to prevent, and Go's
-// zero value for verdict is "gone" — a silently-added row would otherwise
-// assert something plausible by accident.
+// table shrinks below the paths the doc lists. A matrix with a blank cell is
+// the exact failure mode this whole file exists to prevent, and Go's zero
+// value for verdict is "gone" — a silently-added row would otherwise assert
+// something plausible by accident.
 func TestSweepMatrixIsExhaustive(t *testing.T) {
 	rows := sweepMatrix()
-	if len(rows) != 12 {
-		t.Fatalf("the matrix has %d rows, and [auth.Service.ChangePassword]'s doc lists 12 — the table and the test must be changed together", len(rows))
+	if len(rows) != 13 {
+		t.Fatalf("the matrix has %d rows, and [auth.Service.ChangePassword]'s doc lists 13 — the table and the test must be changed together", len(rows))
 	}
 	seen := map[string]bool{}
 	for _, r := range rows {
@@ -627,8 +785,9 @@ func TestSweepMatrixIsExhaustive(t *testing.T) {
 	}
 	for _, want := range []string{
 		"ChangePassword", "ResetPassword", "LogoutAll", "DeleteAccount",
-		"AnonymizeAccount", "DisableMFA", "UnlinkIdentity", "VerifyEmail (email_change)",
-		"VerifyEmail (signup)", "RedeemMagicLink", "Logout", "RevokeSession",
+		"AnonymizeAccount", "DisableMFA", "UnlinkIdentity", "DeletePasskey",
+		"VerifyEmail (email_change)", "VerifyEmail (signup)", "RedeemMagicLink",
+		"Logout", "RevokeSession",
 	} {
 		if !seen[want] {
 			t.Errorf("the matrix has no row for %s, and the doc's table does", want)
@@ -682,7 +841,7 @@ func TestSweepMatrixFailsClosedOnEveryVerificationSweep(t *testing.T) {
 			// the sweep, so the seeding itself is not the thing that breaks.
 			f := newSweepFixture(t, fmt.Sprintf("failclosed-%d@example.com", i))
 			rec := &deletionRecorder{AuthStore: f.store, fail: map[string]error{p.method: errCascadeBoom}}
-			f.svc = newServiceOver(t, rec, sweepOptions(f.ids, f.mfa)...)
+			f.svc = newServiceOver(t, rec, sweepOptions(f.ids, f.mfa, f.creds)...)
 
 			if err := p.run(f); !errors.Is(err, errCascadeBoom) {
 				t.Fatalf("%s with %s failing = %v, want the store's own error — a sweep that errors must never be swallowed", p.name, p.method, err)
@@ -713,7 +872,10 @@ func TestSweepMatrixFailsClosedOnTheIdentitySweep(t *testing.T) {
 	for i, p := range paths {
 		t.Run(p.name, func(t *testing.T) {
 			f := newSweepFixture(t, fmt.Sprintf("idfailclosed-%d@example.com", i))
-			f.svc = newServiceOver(t, f.store, auth.WithIdentityStore(failingDeleteIdentityStore{f.ids}), auth.WithMFAStore(f.mfa))
+			f.svc = newServiceOver(t, f.store,
+				auth.WithIdentityStore(failingDeleteIdentityStore{f.ids}),
+				auth.WithMFAStore(f.mfa),
+				auth.WithCredentialStore(f.creds))
 
 			if err := p.run(f); !errors.Is(err, errCascadeBoom) {
 				t.Fatalf("%s with DeleteIdentity failing = %v, want the store's own error — an identity left standing is a live credential the path did not remove", p.name, err)
@@ -792,7 +954,7 @@ func TestVerifyEmailChangeFailsClosedWhenTheMagicLinkSweepFails(t *testing.T) {
 	f := newSweepFixture(t, "abandoned-failclosed@example.com")
 
 	rec := &purposeFailStore{AuthStore: f.store, failPurpose: auth.PurposeMagicLink}
-	svc := newServiceOver(t, rec, sweepOptions(f.ids, f.mfa)...)
+	svc := newServiceOver(t, rec, sweepOptions(f.ids, f.mfa, f.creds)...)
 
 	if _, err := svc.VerifyEmail(context.Background(), f.changeTok); !errors.Is(err, errCascadeBoom) {
 		t.Fatalf("VerifyEmail(email_change) with the magic_link sweep failing = %v, want the store's own error", err)
@@ -887,7 +1049,8 @@ func TestSweepMatrixFailsClosedOnTheTrustedDeviceSweep(t *testing.T) {
 			f := newSweepFixture(t, fmt.Sprintf("tdfailclosed-%d@example.com", i))
 			f.svc = newServiceOver(t, f.store,
 				auth.WithIdentityStore(f.ids),
-				auth.WithMFAStore(failingTrustedSweep{f.mfa}))
+				auth.WithMFAStore(failingTrustedSweep{f.mfa}),
+				auth.WithCredentialStore(f.creds))
 
 			if err := p.run(f); !errors.Is(err, errMFABoom) {
 				t.Fatalf("%s with DeleteTrustedDevicesByUser failing = %v, want the store's own error — a trusted device left standing is a live second-factor bypass the path did not remove", p.name, err)
@@ -916,7 +1079,8 @@ func TestSweepMatrixFailsClosedOnTheMFASweep(t *testing.T) {
 			f := newSweepFixture(t, fmt.Sprintf("mfafailclosed-%d@example.com", i))
 			f.svc = newServiceOver(t, f.store,
 				auth.WithIdentityStore(f.ids),
-				auth.WithMFAStore(failingMFASweep{f.mfa}))
+				auth.WithMFAStore(failingMFASweep{f.mfa}),
+				auth.WithCredentialStore(f.creds))
 
 			if err := p.run(f); !errors.Is(err, errMFABoom) {
 				t.Fatalf("%s with ReplaceRecoveryCodes failing = %v, want the store's own error — recovery codes left behind after an account ends are live credentials for a factor nobody owns", p.name, err)
@@ -925,13 +1089,16 @@ func TestSweepMatrixFailsClosedOnTheMFASweep(t *testing.T) {
 	}
 }
 
-// TestSweepsAreNoOpsWithoutAnMFAStore pins the optional port's other half: a
-// Service built with no [auth.WithMFAStore] has no devices and no factors to
+// TestSweepsAreNoOpsWithoutTheOptionalStores pins the optional ports' other
+// half: a Service built with no [auth.WithMFAStore] and no
+// [auth.WithCredentialStore] has no devices, no factors and no passkeys to
 // sweep, so every row of the matrix must still run to completion rather than
 // failing on a port that is not there. It is the same stated limit
 // sweepIdentities carries, and it is the failure mode a missing nil check
-// would produce for EVERY deployment that never enables MFA.
-func TestSweepsAreNoOpsWithoutAnMFAStore(t *testing.T) {
+// would produce for EVERY deployment that enables neither — which is most of
+// them, and none of which would be covered by any other test in this file,
+// since every fixture above wires all three.
+func TestSweepsAreNoOpsWithoutTheOptionalStores(t *testing.T) {
 	ctx := context.Background()
 	svc, store := newTestService(t)
 
@@ -948,12 +1115,32 @@ func TestSweepsAreNoOpsWithoutAnMFAStore(t *testing.T) {
 	if err := svc.LogoutAll(ctx, u.ID); err != nil {
 		t.Fatalf("LogoutAll with no MFAStore = %v, want nil", err)
 	}
-	if err := svc.DeleteAccount(ctx, u.ID, "", sweepNextPass); err != nil {
-		t.Fatalf("DeleteAccount with no MFAStore = %v, want nil", err)
+	if err := svc.ResetPassword(ctx, mustRequestReset(t, svc, "no-mfa-store@example.com"), sweepPassword); err != nil {
+		t.Fatalf("ResetPassword with neither optional store = %v, want nil", err)
+	}
+	if err := svc.DeleteAccount(ctx, u.ID, "", sweepPassword); err != nil {
+		t.Fatalf("DeleteAccount with neither optional store = %v, want nil", err)
 	}
 	if _, err := store.FindUserByID(ctx, u.ID); !errors.Is(err, auth.ErrUserNotFound) {
 		t.Fatalf("the account survived DeleteAccount: %v", err)
 	}
+
+	// The soft posture separately, since it makes its own calls.
+	other := mustSignUp(t, svc, "no-cred-store@example.com", sweepPassword)
+	if err := svc.AnonymizeAccount(ctx, other.ID, "", sweepPassword); err != nil {
+		t.Fatalf("AnonymizeAccount with neither optional store = %v, want nil", err)
+	}
+}
+
+// mustRequestReset mints a password_reset token, failing the test if the
+// address is not one the Service knows.
+func mustRequestReset(t *testing.T, svc *auth.Service, email string) string {
+	t.Helper()
+	tok, ok, err := svc.RequestPasswordReset(context.Background(), email, "203.0.113.9")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset(%q) = (_, %v, %v), want a token", email, ok, err)
+	}
+	return tok
 }
 
 // TestChangePasswordRevokesADeviceThatWasActuallyTrusted is the realism the
@@ -996,44 +1183,206 @@ func TestChangePasswordRevokesADeviceThatWasActuallyTrusted(t *testing.T) {
 	}
 }
 
-// TestTheMatrixHasNoPasskeyColumnAndThatIsDisclosed pins a GAP, not a
-// decision, so that it stays visible instead of being rediscovered.
-//
-// A [auth.Credential] registered through
-// [auth.Service.FinishPasskeyRegistration] survives every row of the table,
-// the two TERMINATION rows included: a hard DeleteAccount leaves the
-// credential rows behind, filed under a user id that no longer resolves, and
-// a later account issued that id under a non-random [auth.WithIDGenerator]
-// would inherit a working passkey it never registered. That is the identical
-// argument DeleteAccount's step 6 makes for sweeping identities.
-//
-// It is not closed here because [auth.CredentialStore] has no by-user delete
-// to call — closing it is a change to the passkey port, not to this row set.
-// Until then a deployment offering passkeys removes them from
-// [auth.WithAccountDeletionHook]. When that method lands, this test should
-// FAIL, and the right response is to give passkeys a column rather than to
-// delete the test.
-func TestTheMatrixHasNoPasskeyColumnAndThatIsDisclosed(t *testing.T) {
-	ctx := context.Background()
-	creds := memory.NewCredentialStore()
-	svc, _ := newTestService(t, auth.WithCredentialStore(creds))
+// --- the eighth column ------------------------------------------------------
 
-	u := mustSignUp(t, svc, "passkey-gap@example.com", sweepPassword)
-	registerPasskey(t, svc, u.ID, newCred('g'))
-	if rows, err := creds.ListCredentialsByUser(ctx, u.ID); err != nil || len(rows) != 1 {
-		t.Fatalf("fixture error: credentials = %v (%v), want 1", rows, err)
+// failingPasskeySweep delegates everything except the by-user credential
+// sweep, so a fail-closed failure names the passkey column and not a
+// neighbour.
+type failingPasskeySweep struct {
+	*memory.CredentialStore
+}
+
+func (failingPasskeySweep) DeleteCredentialsByUser(context.Context, string) error {
+	return errPasskeyBoom
+}
+
+// errPasskeyBoom is the failure the passkey column's fail-closed double
+// injects.
+var errPasskeyBoom = errors.New("credential store exploded")
+
+// TestSweepMatrixFailsClosedOnThePasskeySweep is the passkey column's half of
+// the rule every "swept" cell carries: a sweep that ran and errored must
+// reach the caller. Swallowing it here is the worst version of that mistake
+// in the whole table — the caller is deleting an account, the sessions and
+// verifications are already gone, and a swallowed error would report a
+// completed deletion while leaving behind the one surviving credential that
+// needs no password, no mailbox and no second factor to use.
+func TestSweepMatrixFailsClosedOnThePasskeySweep(t *testing.T) {
+	paths := []struct {
+		name string
+		run  func(f *sweepFixture) error
+	}{
+		{"DeleteAccount", func(f *sweepFixture) error {
+			return f.svc.DeleteAccount(context.Background(), f.user.ID, "", sweepPassword)
+		}},
+		{"AnonymizeAccount", func(f *sweepFixture) error {
+			return f.svc.AnonymizeAccount(context.Background(), f.user.ID, "", sweepPassword)
+		}},
 	}
 
-	if err := svc.DeleteAccount(ctx, u.ID, "", sweepPassword); err != nil {
+	for i, p := range paths {
+		t.Run(p.name, func(t *testing.T) {
+			f := newSweepFixture(t, fmt.Sprintf("pkfailclosed-%d@example.com", i))
+			f.svc = newServiceOver(t, f.store,
+				auth.WithIdentityStore(f.ids),
+				auth.WithMFAStore(f.mfa),
+				auth.WithCredentialStore(failingPasskeySweep{f.creds}))
+
+			if err := p.run(f); !errors.Is(err, errPasskeyBoom) {
+				t.Fatalf("%s with DeleteCredentialsByUser failing = %v, want the store's own error — a passkey left standing after a termination path is a way in that needs nothing else at all", p.name, err)
+			}
+			// The user row must still be there to retry against. This is the
+			// step order's promise, and it is what makes returning the error
+			// safe rather than merely honest.
+			if _, err := f.store.FindUserByID(context.Background(), f.user.ID); err != nil {
+				t.Fatalf("the account is gone after a failed passkey sweep (%v) — the sweep runs BEFORE the user row precisely so a failure leaves something to retry against", err)
+			}
+		})
+	}
+}
+
+// TestAPasskeyDoesNotOutliveTheAccountItAuthenticated is the scenario the
+// eighth column was added for, and it replaces the test that used to pin the
+// gap's absence.
+//
+// It states the harm rather than the row count: under a NON-RANDOM
+// [auth.WithIDGenerator] — a supported configuration, which is what makes
+// "ids are never reused" a property of the default generator and not of this
+// package — the id a deleted account held is handed to the next account. If
+// the credential rows survived, that account would inherit a working passkey
+// it never registered, and [auth.Service.FinishPasskeyLogin] would sign its
+// holder in with no password, no mailbox and no second factor.
+func TestAPasskeyDoesNotOutliveTheAccountItAuthenticated(t *testing.T) {
+	ctx := context.Background()
+	creds := memory.NewCredentialStore()
+
+	// An id generator that hands the SAME user id out twice — once to each
+	// SignUp below — and unique values to everything else, since sessions,
+	// verifications and credential rows all draw from the same generator. The
+	// switch is armed by the test immediately before each SignUp rather than
+	// by a call count, so the fixture does not depend on how many ids the
+	// calls in between happen to consume.
+	var handedOut int
+	giveReused := true
+	reused := "reused-user-id"
+	svc, _ := newTestService(t,
+		auth.WithCredentialStore(creds),
+		auth.WithIDGenerator(func() string {
+			handedOut++
+			if giveReused {
+				giveReused = false
+				return reused
+			}
+			return fmt.Sprintf("uid-%d", handedOut)
+		}))
+
+	first := mustSignUp(t, svc, "inheritor-1@example.com", sweepPassword)
+	if first.ID != reused {
+		t.Fatalf("fixture error: the first account got id %q, want %q", first.ID, reused)
+	}
+	registerPasskey(t, svc, first.ID, newCred('i'))
+
+	if err := svc.DeleteAccount(ctx, first.ID, "", sweepPassword); err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
 
-	rows, err := creds.ListCredentialsByUser(ctx, u.ID)
-	if err != nil {
-		t.Fatalf("ListCredentialsByUser: %v", err)
+	// The successor: a different person, the same id.
+	giveReused = true
+	second := mustSignUp(t, svc, "inheritor-2@example.com", sweepPassword)
+	if second.ID != reused {
+		t.Fatalf("fixture error: the second account got id %q, want the SAME id %q — without the reuse this test asserts nothing", second.ID, reused)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("passkeys after DeleteAccount = %d, want the 1 this DISCLOSED GAP leaves behind.\n"+
-			"If a by-user passkey sweep has since landed, this test has done its job: give passkeys a COLUMN in auth.Service.ChangePassword's matrix, fill in every row, and replace this test with those cells — do not simply delete it.", len(rows))
+
+	inherited, err := svc.ListPasskeys(ctx, second.ID)
+	if err != nil {
+		t.Fatalf("ListPasskeys: %v", err)
+	}
+	if len(inherited) != 0 {
+		t.Fatalf("the new account inherited %d passkeys it never registered: %+v", len(inherited), inherited)
+	}
+
+	// And the credential is not merely invisible to the list: the login path
+	// resolves by the AUTHENTICATOR's id, which is the route that would
+	// actually sign the wrong person in.
+	challenge := mustBeginLogin(t, svc)
+	res, err := svc.FinishPasskeyLogin(ctx, auth.VerifiedAssertion{
+		Challenge:    challenge,
+		CredentialID: credID('i'),
+		SignCount:    1,
+	}, "203.0.113.9", "agent")
+	if !errors.Is(err, auth.ErrCredentialNotFound) {
+		t.Fatalf("asserting the DELETED account's authenticator = %v, want ErrCredentialNotFound — a surviving credential row signs its holder into whoever now holds that id", err)
+	}
+	assertNoLoginResult(t, res)
+}
+
+// TestAPasskeyPlantedFromAStolenSessionIsRemovableAfterAReset pins the
+// residual the passkey column's ResetPassword cell deliberately accepts, and
+// the property that makes accepting it defensible.
+//
+// The attack is real: [auth.Service.FinishPasskeyRegistration] is step-up
+// gated only for an account with a CONFIRMED second factor, so whoever holds
+// a live session on an ordinary account can register their own authenticator.
+// The reset does not sweep it — see the matrix's "The passkey column, and why
+// ResetPassword does not sweep it" — so the owner's remedy is
+// [auth.Service.ListPasskeys] and [auth.Service.DeletePasskey], and that
+// remedy must not be refusable.
+//
+// It cannot be. [auth.Service.hasWayInBesides] counts the working password
+// the reset has just written, so [auth.ErrLastCredential] cannot fire — even
+// on an account that had NO password before and no identity, and even under
+// [auth.WithRequireVerifiedEmail](true), because the completed reset stamps
+// the address too. That last clause is the one worth a test: without the
+// stamp this would be an account holding a hash its own configuration
+// refuses, and the removal WOULD be refused as the last way in.
+func TestAPasskeyPlantedFromAStolenSessionIsRemovableAfterAReset(t *testing.T) {
+	ctx := context.Background()
+	creds := memory.NewCredentialStore()
+	svc, store := newTestService(t,
+		auth.WithCredentialStore(creds),
+		auth.WithRequireVerifiedEmail(true))
+
+	// A password-less account: nothing but the planted passkey opens it, which
+	// is the hardest case for the removal below.
+	const email = "planted@example.com"
+	user, err := store.CreateUser(ctx, auth.UserBase{ID: "planted-user", Email: email, CreatedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	planted := registerPasskey(t, svc, user.ID, newCred('x'))
+
+	// The owner recovers through the mailbox.
+	tok, ok, err := svc.RequestPasswordReset(ctx, email, "203.0.113.9")
+	if err != nil || !ok {
+		t.Fatalf("RequestPasswordReset = (_, %v, %v), want a token", ok, err)
+	}
+	if err := svc.ResetPassword(ctx, tok, sweepNextPass); err != nil {
+		t.Fatalf("ResetPassword: %v", err)
+	}
+
+	// The passkey survived, which is the cell under test rather than a
+	// surprise: TestSweepMatrix/ResetPassword says so, and this is the same
+	// claim from the attacker's side.
+	rows, err := svc.ListPasskeys(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("ListPasskeys: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != planted.ID {
+		t.Fatalf("passkeys after the reset = %+v, want the planted one — the matrix's ResetPassword row says this cell is not swept", rows)
+	}
+
+	// And it is removable, which is what makes the non-sweep a recovery
+	// procedure rather than an apology.
+	if err := svc.DeletePasskey(ctx, user.ID, planted.ID); err != nil {
+		t.Fatalf("DeletePasskey after the reset = %v, want nil — the reset wrote a working password AND certified the address, so hasWayInBesides must count it and ErrLastCredential must not fire", err)
+	}
+	if rows, err := svc.ListPasskeys(ctx, user.ID); err != nil || len(rows) != 0 {
+		t.Fatalf("passkeys after the removal = %v (%v), want none", rows, err)
+	}
+
+	// The owner is left with a way in, which is the other half of the claim:
+	// removing the attacker's credential must not have locked them out.
+	if _, _, refresh := mustLogin(t, svc, email, sweepNextPass); refresh == "" {
+		t.Fatal("the owner cannot log in after removing the planted passkey")
 	}
 }

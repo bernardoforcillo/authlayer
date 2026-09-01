@@ -747,15 +747,28 @@ func TestFinishPasskeyLoginRefusesAnUnknownCredential(t *testing.T) {
 
 // TestPasskeyCeremoniesRefuseAnAnonymizedAccount pins the DeletedAt check on
 // BOTH Finish methods, and on Begin. A non-nil DeletedAt means "no one may
-// authenticate as this account, by any route": a credential row surviving
-// anonymization is a fact about foreign keys, not about whether the account
-// exists, and a passkey is a way in that needs no password at all.
+// authenticate as this account, by any route", and that check is the
+// belt-and-braces half of the passkey column: a passkey is a way in that
+// needs no password at all, so a row that reaches a stamped account must be
+// refused on the ACCOUNT rather than on the absence of the row.
+//
+// The credential is PUT BACK after the anonymization, deliberately. Since the
+// passkey column landed, [auth.Service.AnonymizeAccount] sweeps every
+// credential itself, so the state this test is about — a stamped account with
+// a live credential row — is no longer reachable through this Service. It is
+// still reachable in the one configuration
+// [auth.Service.ChangePassword]'s matrix discloses for every optional port: a
+// second Service wired WITHOUT [auth.WithCredentialStore] over the same
+// tables closes the account and sweeps nothing, leaving exactly this row
+// behind. Planting it is how that deployment's state gets asserted here
+// rather than assumed away — and without it, this test would pass on the
+// strength of the sweep and stop covering the guard entirely.
 func TestPasskeyCeremoniesRefuseAnAnonymizedAccount(t *testing.T) {
-	svc, store, _ := newPasskeyService(t)
+	svc, store, creds := newPasskeyService(t)
 	u := mustSignUp(t, svc, "pia@example.com", validPassword)
 	ctx := context.Background()
 
-	registerPasskey(t, svc, u.ID, newCred('a'))
+	registered := registerPasskey(t, svc, u.ID, newCred('a'))
 	// Ceremonies armed while the account was live, then the account closes.
 	regChallenge, err := svc.BeginPasskeyRegistration(ctx, u.ID)
 	if err != nil {
@@ -765,6 +778,14 @@ func TestPasskeyCeremoniesRefuseAnAnonymizedAccount(t *testing.T) {
 
 	if err := svc.AnonymizeAccount(ctx, u.ID, "", validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount: %v", err)
+	}
+	// The sweep really ran — asserted before the row is planted, so the plant
+	// cannot hide a missing sweep.
+	if rows, err := creds.ListCredentialsByUser(ctx, u.ID); err != nil || len(rows) != 0 {
+		t.Fatalf("credentials after AnonymizeAccount = %v (%v), want none", rows, err)
+	}
+	if _, err := creds.CreateCredential(ctx, registered); err != nil {
+		t.Fatalf("planting the surviving credential row: %v", err)
 	}
 
 	res, err := svc.FinishPasskeyLogin(ctx, auth.VerifiedAssertion{
