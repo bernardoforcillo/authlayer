@@ -325,6 +325,16 @@ type config struct {
 	// see [WithAccountDeletionHook] and [Service.DeleteAccount], both in
 	// deletion.go. nil means no hook, which is the default.
 	accountDeletionHook func(ctx context.Context, userID string) error
+	// mfaStore is the OPTIONAL second-factor port — see [WithMFAStore] and
+	// [MFAStore]. nil means no MFA is configured, and every entry point
+	// needing it fails with [ErrMFANotConfigured] rather than
+	// dereferencing this.
+	mfaStore MFAStore
+	// mfaCipher encrypts TOTP secrets at rest — see [WithMFASecretCipher].
+	// nil means enrolment is REFUSED with [ErrMFACipherNotConfigured]
+	// rather than falling back to storing a plaintext bearer credential;
+	// auth/mfa.go's package doc carries that argument.
+	mfaCipher Cipher
 }
 
 func defaultConfig() config {
@@ -804,6 +814,55 @@ func WithLinking(m Linking) Option {
 			c.linking = m
 		default:
 			panic(fmt.Sprintf("authlayer/auth: WithLinking(%d): unknown linking mode", int(m)))
+		}
+	}
+}
+
+// WithMFAStore wires the OPTIONAL [MFAStore] port, enabling TOTP second
+// factors and recovery codes. The default is nil: a Service built without
+// this option persists no factor state at all, every account behaves
+// exactly as it did before MFA existed, and every entry point that needs
+// the port refuses with [ErrMFANotConfigured] rather than dereferencing
+// nil. A nil s is ignored, leaving the default (or a prior option) in
+// place.
+//
+// It is a separate port, not part of [Store], for the reason auth/mfa.go's
+// package doc gives: a second factor is functionality a deployment may
+// never offer, so a backend that cannot store one is still a complete
+// backend — the same test [IdentityStore] passed and account deletion
+// failed.
+//
+// Wiring the store is not sufficient on its own. Enrolment also needs
+// [WithMFASecretCipher], and refuses without it.
+func WithMFAStore(s MFAStore) Option {
+	return func(c *config) {
+		if s != nil {
+			c.mfaStore = s
+		}
+	}
+}
+
+// WithMFASecretCipher wires the [Cipher] that encrypts TOTP secrets before
+// they reach the [MFAStore], and decrypts them to validate a code. There is
+// NO DEFAULT and no fallback: a Service without one refuses to enrol a
+// factor at all, with [ErrMFACipherNotConfigured]. A nil c is ignored,
+// leaving the default (or a prior option) in place.
+//
+// The refusal is the point, and auth/mfa.go's package doc argues it in
+// full: a TOTP secret is the bearer credential the user's authenticator
+// holds, so a table of plaintext secrets is a working second-factor bypass
+// for every enrolled user the moment the database is read — which is
+// precisely the compromise the second factor was added to survive.
+// Refusing at enrolment turns a missing key into a loud failure on the
+// first attempt instead of a silent one discovered in a breach.
+//
+// authlayer ships no implementation. The algorithm is the easy half;
+// deciding where the key lives is the half that determines whether the
+// ciphertext is worth anything, and that decision is the deployment's.
+func WithMFASecretCipher(c Cipher) Option {
+	return func(cfg *config) {
+		if c != nil {
+			cfg.mfaCipher = c
 		}
 	}
 }

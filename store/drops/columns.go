@@ -69,7 +69,7 @@ func uuidIDs() idTypes { return idTypes{library: true, user: true} }
 // colSet is the set of typed drops columns for one table, derived by walking a
 // model struct's drop: tags.
 //
-// The columns are kept in four type-specific maps rather than one map of
+// The columns are kept in five type-specific maps rather than one map of
 // *pg.Column because pg.ColumnValue has unexported methods
 // (drops@v0.5.0/pg/binding.go:8): authlayer cannot construct a binding itself,
 // and the only constructor is (*pg.Col[T]).Val, which needs the concrete T.
@@ -81,8 +81,14 @@ type colSet struct {
 	ts    map[string]*pg.Col[time.Time]
 	bytes map[string]*pg.Col[[]byte]
 	i32   map[string]*pg.Col[int32]
+	// i64 holds bigint columns, declared from an int64 or *int64 field. The
+	// pointer form is nullable, exactly as *time.Time is, and it exists for
+	// auth.MFAFactor.LastStep — where nil means "this factor has
+	// authenticated no TOTP step yet", a state the replay guard acts on and
+	// which is distinct from any step number, zero included.
+	i64 map[string]*pg.Col[int64]
 	// order lists every declared tag in declaration order. It exists because
-	// the four typed maps above cannot be ranged over as one and Go map order
+	// the five typed maps above cannot be ranged over as one and Go map order
 	// is not stable, so row() needs its own iteration order. It is not what
 	// makes the INSERT correct: drops re-orders the bindings by Table.Columns()
 	// and pairs them by column identity (pg/insert.go).
@@ -111,6 +117,7 @@ func newColSet(tbl *pg.Table, model any, ids idTypes) *colSet {
 		ts:    map[string]*pg.Col[time.Time]{},
 		bytes: map[string]*pg.Col[[]byte]{},
 		i32:   map[string]*pg.Col[int32]{},
+		i64:   map[string]*pg.Col[int64]{},
 	}
 	c.walk(t, ids)
 	return c
@@ -193,10 +200,19 @@ func (c *colSet) walk(t reflect.Type, ids idTypes) {
 }
 
 func (c *colSet) add(name string, opts []string, ft reflect.Type, ids idTypes) {
-	unique := false
+	unique, primary := false, false
 	for _, o := range opts {
-		if o == "unique" {
+		switch o {
+		case "unique":
 			unique = true
+		case "pk":
+			// "pk" declares a PRIMARY KEY on a column NOT named id — a
+			// table whose natural key is a reference, such as
+			// mfa_factors.user_id, where "at most one factor per user" IS
+			// the key rather than a constraint bolted beside a surrogate
+			// one. Without it such a table would carry no primary key at
+			// all and its uniqueness rule would live only in prose.
+			primary = true
 		}
 	}
 
@@ -207,7 +223,7 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, ids idTypes) {
 			def = pg.UUID(name)
 		}
 		def = def.NotNull()
-		if name == "id" {
+		if name == "id" || primary {
 			def = def.PrimaryKey()
 		}
 		if unique {
@@ -224,11 +240,29 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, ids idTypes) {
 		c.bytes[name] = pg.Add(c.tbl, pg.Bytea(name).NotNull())
 	case ft.Kind() == reflect.Int || ft.Kind() == reflect.Int32:
 		c.i32[name] = pg.Add(c.tbl, pg.Integer(name).NotNull())
+	case ft == reflect.TypeOf((*int64)(nil)):
+		// Nullable: no NotNull, so the column can hold SQL NULL, and bind
+		// renders a nil pointer as the NULL keyword rather than a
+		// parameter — the same treatment *time.Time gets above.
+		c.i64[name] = pg.Add(c.tbl, pg.BigInt(name))
+	case ft.Kind() == reflect.Int64:
+		c.i64[name] = pg.Add(c.tbl, pg.BigInt(name).NotNull())
 	default:
 		panic(fmt.Sprintf(
 			"authlayer/store/drops: column %q has unsupported Go type %s; supported: "+
-				"string, time.Time, *time.Time (nullable), []byte, int, int32, and "+
-				"named types whose underlying type is string, int or int32", name, ft))
+				"string, time.Time, *time.Time (nullable), []byte, int, int32, int64, "+
+				"*int64 (nullable), and named types whose underlying type is string, "+
+				"int, int32 or int64", name, ft))
+	}
+	if primary && c.str[name] == nil {
+		// A "pk" option on a column this switch declared as anything but a
+		// string is ignored above, and a silently ignored key declaration
+		// is a table with no primary key and a doc comment claiming
+		// otherwise. Fail at construction instead, the way an unmappable
+		// field type already does.
+		panic(fmt.Sprintf(
+			"authlayer/store/drops: column %q carries the \"pk\" tag option but has Go "+
+				"type %s; only a string column can be declared PRIMARY KEY that way", name, ft))
 	}
 	c.order = append(c.order, name)
 }
@@ -245,6 +279,8 @@ func (c *colSet) col(tag string) *pg.Column {
 		return c.bytes[tag].Column
 	case c.i32[tag] != nil:
 		return c.i32[tag].Column
+	case c.i64[tag] != nil:
+		return c.i64[tag].Column
 	}
 	return nil
 }
@@ -279,6 +315,17 @@ func (c *colSet) bind(tag string, v any) pg.ColumnValue {
 		return col.Val(*x)
 	case time.Time:
 		return bindOne(c.ts[tag], tag, x, "timestamptz")
+	case *int64:
+		// The nullable-bigint twin of the *time.Time case above, taking
+		// the same route for the same reason: c.i64[tag] can itself be nil
+		// for an unknown tag, and Col[T] embeds *Column, so calling Expr
+		// or Val on a nil *Col[T] would nil-pointer-panic instead of
+		// reporting the missing column by name.
+		col := requireCol(c.i64[tag], tag, "bigint")
+		if x == nil {
+			return col.Expr(drops.Raw("NULL"))
+		}
+		return col.Val(*x)
 	case []byte:
 		return bindOne(c.bytes[tag], tag, x, "bytea")
 	}
@@ -295,6 +342,12 @@ func (c *colSet) bind(tag string, v any) pg.ColumnValue {
 						"integer column type", n, tag))
 			}
 			return bindOne(c.i32[tag], tag, int32(n), "integer")
+		case reflect.Int64:
+			// No range check: bigint IS int64, so every value fits. A
+			// named type whose underlying type is int64 lands here too,
+			// matching how add classifies it by Kind rather than by
+			// concrete type.
+			return bindOne(c.i64[tag], tag, rv.Int(), "bigint")
 		}
 	}
 	panic(fmt.Sprintf("authlayer/store/drops: cannot bind %T to column %q", v, tag))
