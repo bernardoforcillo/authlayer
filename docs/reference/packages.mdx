@@ -80,7 +80,8 @@ this site only summarizes:
 ```sh
 go doc ./scope          # the engine, and the Store port's contract
 go doc ./auth           # sessions, families, rotation, and what revocation does not revoke
-go doc ./auth Store     # the seven MUSTs, each with the failure it prevents
+go doc ./auth Store     # the eleven MUSTs, each with the failure it prevents
+go doc ./auth Service.ChangePassword  # the sweep matrix: eleven paths, five credential kinds
 go doc ./auth IdentityStore  # the optional port, and why DeleteIdentityIfNotLast has that shape
 go doc ./invite Store   # the four method MUSTs and four record-type ones
 go doc ./token          # why hand-rolling this JWT is safe here, and only here

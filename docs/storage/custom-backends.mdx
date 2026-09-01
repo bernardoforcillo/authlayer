@@ -40,7 +40,7 @@ connection-setup window never actually contend, which **silently weakens every
 race in the suite**.
 </Warning>
 
-### Six of the fifty-two checks are races
+### Seven of the sixty-five checks are races
 
 Because the obligations behind them are unreachable sequentially:
 
@@ -50,11 +50,14 @@ Because the obligations behind them are unreachable sequentially:
 | `CreateUser`'s one-address-one-account atomicity | two accounts sharing one address |
 | `UpdateUserEmail`'s, the same | the same, through the other door |
 | `MarkEmailVerified` racing the `UpdateUserEmail` that moves the address | an address certified that nobody proved control of |
+| a reader watching `MarkUserDeleted` | a row caught half-anonymized |
 | `CreateSuccessorSession` racing family revocation | a revoked family left with one live, rotating session |
 | concurrent revocations of one family | survivors |
 
-The middle two assert a **linearizability** property rather than a timing guess:
-the end state they reject is one no serial order of the two calls can produce.
+Three of them — the `MarkEmailVerified` one, the `MarkUserDeleted` one and the
+`CreateSuccessorSession`-versus-revocation pair — assert a **linearizability**
+property rather than a timing guess: the end state each rejects is one no
+serial order of the two calls can produce.
 
 ### Two things the suite does not do
 
@@ -167,11 +170,13 @@ that asserts nothing cannot slip in green.
 
 <Columns cols={2}>
   <Card title="authtest" icon="vial">
-    **Fifteen** non-compliant stores — one whose `MarkRotated` lets every caller
-    win, one whose `CreateUser` checks then writes non-atomically, one whose
-    `DeleteSessionsByFamily` snapshots the family before it waits — paired into
-    **nineteen** defect/check cases, each asserted to **fail** the check that
-    covers it.
+    **Twenty-eight** non-compliant stores — one whose `MarkRotated` lets every
+    caller win, one whose `CreateUser` checks then writes non-atomically, one
+    whose `DeleteSessionsByFamily` snapshots the family before it waits, one
+    whose `DeleteUser` cascades to the user's sessions, one whose
+    `MarkUserDeleted` scrubs under one lock and stamps under another — paired
+    into **thirty-three** defect/check cases, each asserted to **fail** the
+    check that covers it.
   </Card>
   <Card title="invitetest" icon="vials">
     **Thirty-four** non-compliant stores — one whose `ConsumeLink` decides under

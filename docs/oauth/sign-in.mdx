@@ -369,10 +369,17 @@ gives that account a password **and** certifies the address, after which
 `TestSignInWithLeavesTheProvisionedUserWhenTheIdentityWriteFails` pins both
 halves, so this disclosure is checked rather than asserted.
 
-Compensating would mean deleting the just-created user, and `auth.Store` has no
-method that deletes one — adding a nineteenth to a port that shipped in
-`v0.1.0` would break every third-party backend, which is the same constraint
-that made `IdentityStore` separate in the first place.
+Compensating would mean deleting the just-created user, and
+[`Store.DeleteUser`](/authentication/account-deletion) now exists to do it
+with — so the reason `SignInWith` still does not is no longer a missing
+primitive.
+
+The row is **addressable the instant `CreateUser` commits**. A concurrent
+`SignInWith`, `RequestPasswordReset` or `RequestMagicLink` at that same address
+can already have found it and acted on it by the time the identity write fails,
+so deleting it would destroy an account somebody else is legitimately using —
+strictly worse than the failure being compensated for. The compensating delete
+can also fail on its own, which turns one disclosed window into two.
 </Warning>
 
 {/* verify:stdout "<nil> true erin@example.com\n<nil> false true erin@example.com\ntrue\n<nil> true true\ntrue\ntrue" */}
