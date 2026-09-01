@@ -1845,6 +1845,34 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 			}
 			return res.User, u.ID
 		},
+		// CompleteMFA is driven end to end — enrol, confirm, a login that
+		// returns a challenge, then the exchange. It finishes with a
+		// RECOVERY code rather than a TOTP one because the code that
+		// confirmed the factor is, correctly, refused as a replay for the
+		// rest of its step, and this fixture holds the real clock.
+		"CompleteMFA": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
+			u := mustSignUp(t, svc, "scrub-mfa@example.com", validPassword)
+			secret, _, err := svc.BeginMFAEnrolment(ctx, u.ID)
+			if err != nil {
+				t.Fatalf("BeginMFAEnrolment: %v", err)
+			}
+			codes, err := svc.ConfirmMFAEnrolment(ctx, u.ID, totpCodeAt(t, secret, time.Now().UTC()))
+			if err != nil {
+				t.Fatalf("ConfirmMFAEnrolment: %v", err)
+			}
+			pending, err := svc.Login(ctx, "scrub-mfa@example.com", validPassword, "1.2.3.4", "agent")
+			if err != nil {
+				t.Fatalf("Login: %v", err)
+			}
+			if pending.MFA == nil {
+				t.Fatal("Login returned no MFA challenge for a confirmed factor")
+			}
+			res, err := svc.CompleteMFA(ctx, pending.MFA.Token, codes[0], "1.2.3.4", "agent")
+			if err != nil {
+				t.Fatalf("CompleteMFA: %v", err)
+			}
+			return res.User, u.ID
+		},
 	}
 
 	// Step 1: no user-returning method may be absent from the table above.
@@ -1883,9 +1911,14 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 	for name, drive := range drivers {
 		t.Run(name, func(t *testing.T) {
 			// newOAuthService, not newTestService: identical wiring plus an
-			// IdentityStore, which the SignInWith driver needs and the rest
-			// never touch.
-			svc, store, _ := newOAuthService(t)
+			// IdentityStore, which the SignInWith driver needs, and the
+			// optional MFA port, which the CompleteMFA driver needs. The
+			// rest of the drivers touch neither — an MFAStore holding no
+			// factor changes nothing about an ordinary login.
+			svc, store, _ := newOAuthService(t,
+				auth.WithMFAStore(memory.NewMFAStore()),
+				auth.WithMFASecretCipher(testCipher{}),
+			)
 			got, userID := drive(t, svc)
 			if got.PasswordHash != "" {
 				t.Fatalf("%s returned User.PasswordHash = %q, want empty — this is a live credential digest", name, got.PasswordHash)
