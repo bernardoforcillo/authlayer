@@ -391,6 +391,19 @@ type config struct {
 	// passkeyChallengeTTL is how long a [Challenge] stays claimable — see
 	// [WithPasskeyChallengeTTL], also in credential.go.
 	passkeyChallengeTTL time.Duration
+	// stepUpWindow is how old [Session.MFAAt] may be before
+	// [Service.RequireFreshMFA] refuses — see [WithStepUpWindow], declared
+	// in stepup.go beside the check it configures. Unlike linking and
+	// mfaEnforcement this one IS assigned by defaultConfig rather than left
+	// at its zero value, because here zero means OFF: see that option's doc
+	// for why the two stances differ.
+	stepUpWindow time.Duration
+	// trustedDeviceTTL is how long a [TrustedDevice] stays trusted — see
+	// [WithTrustedDeviceTTL], declared in trusted.go beside the feature it
+	// bounds. Assigned by defaultConfig like stepUpWindow, and for a
+	// sharper version of the same reason: here a zero value would mean a
+	// second-factor bypass that never expires.
+	trustedDeviceTTL time.Duration
 }
 
 func defaultConfig() config {
@@ -404,6 +417,8 @@ func defaultConfig() config {
 		magicLinkTTL:        defaultMagicLinkTTL,
 		mfaChallengeTTL:     defaultMFAChallengeTTL,
 		passkeyChallengeTTL: defaultPasskeyChallengeTTL,
+		stepUpWindow:        defaultStepUpWindow,
+		trustedDeviceTTL:    defaultTrustedDeviceTTL,
 		clock:               func() time.Time { return time.Now().UTC() },
 		idGen:               uid.NewV7,
 	}
@@ -1457,6 +1472,60 @@ func (s *Service) mintSignupVerification(ctx context.Context, userID, email stri
 // the package-level "Fail closed" constraint this method, like every other
 // one in this file, is held to.
 func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent string) (LoginResult, error) {
+	// One implementation, reached with no trusted device. See
+	// [Service.LoginWithTrustedDevice] for why the feature is a second entry
+	// point rather than a sixth parameter here.
+	return s.LoginWithTrustedDevice(ctx, email, plainPassword, ip, userAgent, "")
+}
+
+// LoginWithTrustedDevice is [Service.Login] — the same rate limit, the same
+// address lookup, the SAME PASSWORD CHECK, in the same order — plus one
+// thing: a deviceToken previously returned by [Service.TrustThisDevice] may
+// stand in for the account's SECOND factor, so a machine the user has
+// vouched for is not asked for a code.
+//
+// # The password is still required
+//
+// deviceToken is consulted only AFTER the password has verified and after
+// [WithRequireVerifiedEmail] has been honoured — points 5 and 6 of
+// [Service.Login]'s "Order of checks", unchanged. A device token presented
+// with the wrong password is [ErrInvalidCredentials] and the token is never
+// even looked up. A trusted device replaces the second factor and never the
+// first; auth/trusted.go's package doc states what letting it do otherwise
+// would be, and TestATrustedDeviceDoesNotSkipThePassword is the test that
+// would fail.
+//
+// # What a valid device changes, exactly
+//
+// [Service.mfaAtSignIn] is not consulted, so no [MFAChallenge] is returned;
+// the session is minted immediately with [Session.MFAAt] stamped at now, as
+// though a factor had been presented — because on this machine, once, one
+// was. The stamp is what makes the resulting session satisfy
+// [Service.RequireFreshMFA], which is the honest reading: this sign-in is
+// exactly as authenticated as one that ended in [Service.CompleteMFA].
+// [MFAStore.TouchTrustedDevice] records the use first, and a false from it
+// (the device was revoked in the meantime) falls back to the ordinary
+// challenge.
+//
+// An empty deviceToken, an unknown one, an expired one, one minted for
+// another account, and one presented to a Service holding no confirmed
+// factor for this account ALL fall through to the ordinary challenge rather
+// than refusing the sign-in — see [Service.trustedDeviceAtSignIn] for why
+// every "no" here is a fall-through. In particular a trusted device can
+// never turn [ErrMFARequired] into a session: with no confirmed factor there
+// is nothing for it to stand in for, and [WithMFAEnforcement] applies
+// exactly as it would have.
+//
+// # Why this is a second entry point and not a sixth parameter on Login
+//
+// A trusted device is meaningless without MFA, and MFA is an optional port
+// ([WithMFAStore]). Widening the signature of this package's most-called
+// method would charge every deployment that will never enable a second
+// factor for a parameter it can only ever pass "" to — the same argument
+// auth/mfa.go makes for keeping [MFAStore] off [Store]. There is no drift
+// risk in the pair, because [Service.Login] is not a copy of this method: it
+// is one line that calls it.
+func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPassword, ip, userAgent, deviceToken string) (LoginResult, error) {
 	var zero LoginResult
 
 	if ip == "" {
@@ -1505,12 +1574,39 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 		return zero, ErrEmailNotVerified
 	}
 
+	// Step 6b: the trusted device, consulted only once the password has
+	// verified — that ordering is the feature's whole safety argument, see
+	// auth/trusted.go. A valid one stands in for the second factor and for
+	// NOTHING ELSE; every other outcome is (nil, nil) and falls through to
+	// the challenge below.
+	trusted, err := s.trustedDeviceAtSignIn(ctx, u, deviceToken)
+	if err != nil {
+		return zero, err
+	}
+	if trusted != nil {
+		now := s.cfg.clock()
+		// Recorded BEFORE the session is minted, and its bool is a decision
+		// rather than bookkeeping: false means the row went between the
+		// lookup and here — a concurrent [Service.RevokeTrustedDevice] — and
+		// a revoked device must not skip a factor. Fall through to the
+		// challenge, which is the same answer a user with no device gets.
+		switch ok, terr := s.cfg.mfaStore.TouchTrustedDevice(ctx, trusted.ID, now); {
+		case terr != nil:
+			return zero, terr
+		case ok:
+			// &now is [Session.MFAAt]: this machine proved a factor when it
+			// was trusted, and this session inherits that standing — see
+			// [Service.LoginWithTrustedDevice].
+			return s.mintSession(ctx, u, ip, userAgent, &now)
+		}
+	}
+
 	// Step 7: the second factor, consulted only once the password and
 	// every check above it have passed. A confirmed factor short-circuits
 	// the mint entirely and hands back a challenge with EMPTY tokens — see
-	// mfaAtLogin, and [LoginResult.MFA] for what a caller that has never
+	// mfaAtSignIn, and [LoginResult.MFA] for what a caller that has never
 	// heard of this field gets.
-	challenge, err := s.mfaAtLogin(ctx, u)
+	challenge, err := s.mfaAtSignIn(ctx, u)
 	if err != nil {
 		return zero, err
 	}
@@ -1523,7 +1619,9 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 		return LoginResult{User: u, MFA: challenge}, nil
 	}
 
-	return s.mintSession(ctx, u, ip, userAgent)
+	// nil: a password is not a second factor, so this session has proved
+	// none. See [Session.MFAAt].
+	return s.mintSession(ctx, u, ip, userAgent, nil)
 }
 
 // mintSession is the session-issuing tail shared by [Service.Login] and
@@ -1555,7 +1653,7 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 // which is the one thing this function hard-codes the other way.
 //
 // The order inside is load-bearing, and is the order [Service.Login]'s own
-// doc describes at point 6: PasswordHash is scrubbed BEFORE the claims
+// doc describes at point 8: PasswordHash is scrubbed BEFORE the claims
 // extender runs, and [github.com/bernardoforcillo/authlayer/token.Issue]
 // runs BEFORE [Store.CreateSession], so a misconfigured signing key fails
 // without leaving an orphaned session row behind.
@@ -1567,7 +1665,17 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 // ip and userAgent are recorded on the [Session] as audit fields and are
 // not validated here; a caller that requires them non-empty checks that
 // itself, as [Service.Login] does with [ErrMissingIP].
-func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent string) (LoginResult, error) {
+//
+// mfaAt is the freshness stamp — [Session.MFAAt] — and it is a PARAMETER
+// rather than something this function decides, because only the caller knows
+// whether a second factor was actually presented. Pass &now from the two
+// paths where one was ([Service.CompleteMFA] and [Service.FinishPasskeyLogin])
+// and nil from every other. It is written in the same [Store.CreateSession]
+// INSERT as the rest of the row, deliberately: a stamp applied afterwards
+// would leave a window in which the session exists and is not yet fresh, and
+// a second failure mode in which the mint succeeds, the stamp fails, and the
+// caller is handed an error for a session that is already live.
+func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent string, mfaAt *time.Time) (LoginResult, error) {
 	var zero LoginResult
 
 	now := s.cfg.clock()
@@ -1593,9 +1701,9 @@ func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent str
 	if s.cfg.claimsExtender != nil {
 		extra = s.cfg.claimsExtender(u)
 	}
-	// Issued BEFORE CreateSession, deliberately — see "Order of checks"
-	// point 7 above: a bad signing key must fail before any Session row
-	// exists to be orphaned.
+	// Issued BEFORE CreateSession, deliberately — see [Service.Login]'s
+	// "Order of checks" point 8: a bad signing key must fail before any
+	// Session row exists to be orphaned.
 	accessToken, err := token.Issue(token.Claims{
 		Subject:   u.ID,
 		SessionID: sessionID,
@@ -1620,6 +1728,9 @@ func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent str
 		CreatedAt: now,
 		UserAgent: userAgent,
 		IP:        ip,
+		// nil unless a second factor was presented on the way here — see
+		// [Session.MFAAt] for which paths pass a stamp and which do not.
+		MFAAt: mfaAt,
 	}); err != nil {
 		return zero, err
 	}
@@ -1754,10 +1865,12 @@ func (s *Service) User(ctx context.Context, userID string) (UserBase, error) {
 }
 
 // PurgeExpired deletes every [Session] and [Verification] expired strictly
-// before `before` — both by ExpiresAt — plus, when [WithCredentialStore] is
-// wired, every passkey ceremony [Challenge] expired by the same rule, and
+// before `before` — both by ExpiresAt — plus, when [WithMFAStore] is wired,
+// every [TrustedDevice] expired by the same rule, plus, when
+// [WithCredentialStore] is wired, every passkey ceremony [Challenge], and
 // returns how many rows were removed in total across every kind. It is a
-// pass-through to [Store.PurgeExpired] and
+// pass-through to [Store.PurgeExpired],
+// [MFAStore.PurgeExpiredTrustedDevices] and
 // [CredentialStore.PurgeExpiredChallenges], matching
 // [github.com/bernardoforcillo/authlayer/invite.Service.PurgeExpired]'s own
 // relationship to its Store. It exists on Service because a caller
@@ -1805,16 +1918,30 @@ func (s *Service) User(ctx context.Context, userID string) (UserBase, error) {
 // housekeeping rather than a security boundary, but it is housekeeping with a
 // bill attached.
 //
-// A [Service] built without [WithCredentialStore] has no challenges and skips
-// the second call entirely, so its count and behaviour are exactly what they
-// were. When the port IS wired, a failure from either store is returned
+// A [Service] built without [WithCredentialStore] has no challenges, and one
+// built without [WithMFAStore] has no trusted devices; each skips its own
+// call entirely, so such a Service's count and behaviour are exactly what
+// they were. When a port IS wired, a failure from any store is returned
 // as-is, along with the count from whatever had already been purged: this
-// makes no attempt to be atomic across two ports that may be two backends,
-// and a caller must not read a non-nil error as "nothing was removed".
+// makes no attempt to be atomic across three ports that may be three
+// backends, and a caller must not read a non-nil error as "nothing was
+// removed".
+//
+// The trusted-device rows are the same kind of housekeeping as the rest: an
+// expired [TrustedDevice] is already refused by
+// [Service.LoginWithTrustedDevice] before it is ever purged, so removing it
+// reclaims storage rather than closing a door.
 func (s *Service) PurgeExpired(ctx context.Context, before time.Time) (int, error) {
 	n, err := s.store.PurgeExpired(ctx, before)
 	if err != nil {
 		return n, err
+	}
+	if s.cfg.mfaStore != nil {
+		devices, err := s.cfg.mfaStore.PurgeExpiredTrustedDevices(ctx, before)
+		if err != nil {
+			return n, err
+		}
+		n += devices
 	}
 	if s.cfg.credentialStore == nil {
 		return n, nil
@@ -2332,6 +2459,17 @@ func (s *Service) Refresh(ctx context.Context, refreshPlain string) (LoginResult
 		// signature this package does not offer today.
 		UserAgent: rotated.UserAgent,
 		IP:        rotated.IP,
+		// MFAAt: inherited too, and inherited UNCHANGED — the predecessor's
+		// instant, never now. A rotation is not a re-authentication, so it
+		// cannot prove a second factor; but it is not a de-authentication
+		// either, so dropping the stamp would make step-up unsatisfiable in
+		// practice: at the default TTLs a session is rotated every fifteen
+		// minutes, and a user who proved a factor two minutes ago would be
+		// refused because their client refreshed in between. Carrying the
+		// ORIGINAL time forward is what keeps both true — the stamp ages
+		// out exactly when it would have without the rotation. See
+		// [Session.MFAAt] and [Service.RequireFreshMFA].
+		MFAAt: rotated.MFAAt,
 	})
 	if err != nil {
 		return zero, err
@@ -2594,7 +2732,12 @@ func (s *Service) LogoutAll(ctx context.Context, userID string) error {
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeMagicLink); err != nil {
 		return err
 	}
-	return nil
+	// Every [TrustedDevice], on this method's own line — see
+	// [Service.sweepTrustedDevices] and the matrix. "Sign out everywhere" is
+	// the control a user reaches for when they believe a machine is in the
+	// wrong hands, and a device left trusted means that machine still skips
+	// the second factor on its way back in.
+	return s.sweepTrustedDevices(ctx, userID)
 }
 
 // ListSessions returns every session belonging to userID — rotated or not,
@@ -2775,6 +2918,15 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // password out-of-band, say) gets exactly that "everywhere" behaviour,
 // which is the safe direction to default to.
 //
+// Since step-up landed, that parameter carries a SECOND job: it is also the
+// session whose second-factor freshness point 5 checks. The two jobs fail in
+// the same direction, which is why one parameter can hold both — an id that
+// names nothing revokes everything AND satisfies no step-up. For an account
+// with a confirmed [MFAFactor] the out-of-band service account above
+// therefore no longer gets "everywhere", it gets [ErrStepUpRequired]: this
+// method is not reachable without a session that has recently proved a
+// factor, whatever else the caller knows.
+//
 // # What revocation does not revoke
 //
 // "Revoked" above means the [Session] row — the refresh token — is gone:
@@ -2813,20 +2965,39 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //     A mismatch is ErrInvalidCredentials — nothing is written, and next is
 //     never even validated, so a caller who does not know the current
 //     password learns nothing about next's own validity either.
-//  5. next is validated against the configured [password.Rules];
+//  5. [Service.RequireFreshMFA] — for an account holding a CONFIRMED
+//     [MFAFactor], currentSessionID must name a session of userID's that
+//     proved a second factor inside [WithStepUpWindow], or this is
+//     [ErrStepUpRequired] with nothing written. For an account with no
+//     confirmed factor it is a no-op; see that method's doc, which is where
+//     the reasoning for both halves lives. It runs AFTER point 4 so a
+//     caller who does not know the password learns nothing about what
+//     second factor the account holds.
+//  6. next is validated against the configured [password.Rules];
 //     [ErrWeakPassword] on failure.
-//  6. next is hashed and persisted via [Store.UpdateUserPassword].
-//  7. Every outstanding "password_reset", "email_change" AND "magic_link"
+//  7. next is hashed and persisted via [Store.UpdateUserPassword].
+//  8. Every outstanding "password_reset", "email_change" AND "magic_link"
 //     [Verification] for this account is invalidated, via three
 //     [Store.DeleteVerificationsByUserAndPurpose] calls — one per purpose,
 //     all fail-closed. See "The sweep matrix" and "Why these purposes, and
 //     what the sweep does not cover" below.
-//  8. Every session NOT sharing currentSessionID's family is revoked via
+//     8b. Every [TrustedDevice] on the account is revoked, via
+//     [Service.sweepTrustedDevices], on this method's own line. It spares
+//     nothing — not even the machine this call came from — unlike point 9,
+//     which spares the caller's session family: a session family is
+//     something this caller demonstrably holds, while a device token is a
+//     cookie that may have been copied off the machine whose compromise
+//     prompted the rotation. A [Service] with no [WithMFAStore] holds no
+//     devices and sweeps nothing.
+//  9. Every session NOT sharing currentSessionID's family is revoked via
 //     [Store.DeleteSessionsByFamily], one call per distinct OTHER family —
 //     the same "list, then delete per distinct family" shape
 //     [Service.LogoutAll] uses, so a rotated-but-unexpired predecessor row
 //     in another family is swept too, not just the currently-live session
 //     in that family.
+//
+// What this method does NOT touch is the account's second factor — see the
+// matrix's "Reading the matrix", which is where that empty cell is argued.
 //
 // # The sweep matrix
 //
@@ -2840,38 +3011,42 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // features filling them were built on branches that could not see each
 // other.
 //
-// The five columns are the five kinds of credential this package can hold
+// The seven columns are the seven kinds of credential this package can hold
 // for an account: three [Verification] purposes, the external [Identity],
-// and the [Session]. Every row is a path that removes at least one of them.
+// the [Session], the [TrustedDevice], and the second-factor state
+// ([MFAFactor] plus its [RecoveryCode]s, one column because nothing ever
+// removes one without the other). Every row is a path that removes at least
+// one of them.
 //
-//	Path                       | password_reset | email_change | magic_link    | identity        | session
-//	---------------------------|----------------|--------------|---------------|-----------------|----------------------
-//	ChangePassword             | swept          | swept        | swept         | not swept       | all but the caller's
-//	ResetPassword              | swept          | swept        | swept         | swept           | all
-//	LogoutAll                  | swept          | swept        | swept         | not swept       | all
-//	DeleteAccount              | swept          | swept        | swept         | swept           | all
-//	AnonymizeAccount           | swept          | swept        | swept         | swept           | all
-//	UnlinkIdentity             | not swept      | not swept    | not swept     | that provider's | all
-//	VerifyEmail (email_change) | swept          | n/a          | swept         | not swept       | not swept
-//	VerifyEmail (signup)       | not swept      | not swept    | not swept     | not swept       | not swept
-//	RedeemMagicLink            | not swept      | not swept    | burns its own | not swept       | not swept
-//	Logout                     | not swept      | not swept    | not swept     | not swept       | the presented one
-//	RevokeSession              | not swept      | not swept    | not swept     | not swept       | the named family
+//	Path                       | password_reset | email_change | magic_link    | identity        | session              | trusted device | mfa
+//	---------------------------|----------------|--------------|---------------|-----------------|----------------------|----------------|-----------
+//	ChangePassword             | swept          | swept        | swept         | not swept       | all but the caller's | all            | not swept
+//	ResetPassword              | swept          | swept        | swept         | swept           | all                  | all            | not swept
+//	LogoutAll                  | swept          | swept        | swept         | not swept       | all                  | all            | not swept
+//	DeleteAccount              | swept          | swept        | swept         | swept           | all                  | all            | swept
+//	AnonymizeAccount           | swept          | swept        | swept         | swept           | all                  | all            | swept
+//	DisableMFA                 | not swept      | not swept    | not swept     | not swept       | not swept            | all            | swept
+//	UnlinkIdentity             | not swept      | not swept    | not swept     | that provider's | all                  | not swept      | not swept
+//	VerifyEmail (email_change) | swept          | n/a          | swept         | not swept       | not swept            | not swept      | not swept
+//	VerifyEmail (signup)       | not swept      | not swept    | not swept     | not swept       | not swept            | not swept      | not swept
+//	RedeemMagicLink            | not swept      | not swept    | burns its own | not swept       | not swept            | not swept      | not swept
+//	Logout                     | not swept      | not swept    | not swept     | not swept       | the presented one    | not swept      | not swept
+//	RevokeSession              | not swept      | not swept    | not swept     | not swept       | the named family     | not swept      | not swept
 //
 // Every cell has a test, the "not swept" ones included: a cell pinning
 // deliberate non-behaviour is what stops a later "fix" from breaking a
 // legitimate flow silently, and a cell pinning a sweep is what stops the
-// next feature from filling in three columns of five.
+// next feature from filling in three columns of seven.
 //
 // # Reading the matrix
 //
-// The rows fall into four groups.
+// The rows fall into five groups.
 //
 // REMEDIATION — ChangePassword, ResetPassword, LogoutAll. Each is something
 // a user does because they believe, or have just been told, that the
 // account is at risk, so each leaves nothing armed that can quietly undo
 // it. Every sweep in these rows is fail-closed: an erroring sweep is
-// returned to the caller, never swallowed. Two cells in this group are
+// returned to the caller, never swallowed. Three cells in this group are
 // deliberately empty rather than owed:
 //
 //   - ChangePassword does not disconnect identities, and ResetPassword
@@ -2881,13 +3056,45 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //     ResetPassword's "Why an unauthenticated recovery sweeps identities".
 //   - LogoutAll does not either, for the same reason: it revokes sessions
 //     on the authority of a caller who is already signed in.
+//   - None of the three touches the MFA column, and that is the most
+//     load-bearing empty cell in the table. ChangePassword rotates the
+//     first factor and ResetPassword recovers it through the mailbox;
+//     sweeping the SECOND factor on either would mean that whoever
+//     compromised a password, or a mailbox, could strip the second factor
+//     by exercising the very flow it exists to survive. Two independent
+//     factors would collapse into one, in the attacker's favour, on the
+//     path a user takes precisely because they suspect the first has
+//     leaked. LogoutAll only ever removes access and has no business
+//     touching a credential the user still holds in their pocket.
+//     [Service.DisableMFA] is where a user turns their second factor off,
+//     and it demands the password AND a fresh second factor to do it.
+//
+// The trusted-device column, by contrast, is filled in on all three rows,
+// because it is not a credential the user holds in their pocket: it is a
+// long-lived bearer token whose only meaning is "skip the second factor",
+// sitting in a browser that may be exactly the thing that leaked.
 //
 // TERMINATION — DeleteAccount, AnonymizeAccount. These sweep every column,
 // and their verification sweep is [Store.DeleteVerificationsByUser] — by
 // USER, not by purpose — so it takes "signup" too, which no other row
 // touches. Nothing is left for a purpose-scoped list to have missed. Their
 // identity sweeps are subject to the one configuration limit
-// [Service.sweepIdentities] states.
+// [Service.sweepIdentities] states, and their MFA and trusted-device sweeps
+// to the identical limit for [WithMFAStore]. The MFA column is theirs alone
+// — [Service.DeleteAccount]'s doc, "The second-factor state goes too",
+// carries the argument for why termination sweeps what remediation must
+// not.
+//
+// TURNING THE SECOND FACTOR OFF — DisableMFA. One row, and the only one
+// whose MFA cell is the point of the call rather than a consequence of it.
+// Its trusted-device cell is the one that needed arguing: a token meaning
+// "skip the second factor" is not merely inert once there is no second
+// factor, it is a bypass waiting for the user to re-enrol, since
+// re-enrolment necessarily runs through this method. See that method's "It
+// revokes every trusted device". It sweeps no verification and no session,
+// deliberately: disabling MFA is not a statement that the mailbox or the
+// devices are compromised, and a user who turns their authenticator off
+// should not be signed out of everything for it.
 //
 // ROTATION OF WHAT A CREDENTIAL POINTS AT — UnlinkIdentity, and
 // VerifyEmail's email_change branch. Neither is a password change, and each
@@ -2914,6 +3121,27 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // destroying it on a remediation path would strand a user who remediated
 // before confirming their address, since this package exposes no resend
 // path.
+//
+// # The eighth column, which does not exist yet
+//
+// PASSKEYS have no column, and their absence is a DISCLOSED GAP rather than
+// a decision. A [Credential] registered through
+// [Service.FinishPasskeyRegistration] survives every row of this table,
+// including the two TERMINATION rows — so a hard [Service.DeleteAccount]
+// leaves the credential rows behind, filed under a user id that no longer
+// resolves, and a later account issued that same id would inherit a working
+// passkey it never registered. That is the identical argument step 6 of
+// DeleteAccount makes for sweeping identities, one credential kind later.
+//
+// It is not fixed here because [CredentialStore] has no by-user delete to
+// call: closing it means a new method on that port, both backends, and its
+// own conformance check, which is a change to a different feature's port
+// than the one this row set touches. Until then a deployment offering
+// passkeys must remove them from [WithAccountDeletionHook], exactly as a
+// deployment whose identities live behind a Service that cannot see them
+// must (see [Service.sweepIdentities]).
+// TestTheMatrixHasNoPasskeyColumnAndThatIsDisclosed pins the gap so that it
+// stays visible rather than being rediscovered.
 //
 // Every sweep in the table is SEQUENTIAL ONLY. See "Why these purposes, and
 // what the sweep does not cover" below for the deterministic demonstration
@@ -3002,6 +3230,16 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 		return ErrInvalidCredentials
 	}
 
+	// Step-up, on this method's own line — see [Service.RequireFreshMFA].
+	// After the credential check, so a caller who does not know the password
+	// is told that and learns nothing about the account's second factor;
+	// before next is validated, for the same reason that check is: a caller
+	// who cannot act learns nothing about the password they proposed. A
+	// no-op for an account with no confirmed factor.
+	if err := s.RequireFreshMFA(ctx, userID, currentSessionID); err != nil {
+		return err
+	}
+
 	if failed := password.Validate(next, s.cfg.rules); len(failed) > 0 {
 		return fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
 	}
@@ -3015,7 +3253,7 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 		return err
 	}
 
-	// Close ALL THREE token side doors — see the method doc's point 7 and
+	// Close ALL THREE token side doors — see the method doc's point 8 and
 	// "The sweep matrix". The email_change sweep is not a tidier variant of
 	// the reset one, and the magic_link sweep is not a tidier variant of
 	// either: each is a separate door, and shipping the fix for one of them
@@ -3028,6 +3266,16 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 		return err
 	}
 	if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, userID, PurposeMagicLink); err != nil {
+		return err
+	}
+
+	// The fourth side door, on this method's OWN line — see
+	// [Service.sweepTrustedDevices] and the matrix. Unlike the session sweep
+	// below it spares nothing, not even the caller's own machine: a session
+	// family is the thing this caller is demonstrably holding, while a
+	// trusted device is a cookie that may have been copied off the machine
+	// whose compromise prompted this call.
+	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
 		return err
 	}
 
@@ -3645,6 +3893,15 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 		return err
 	}
 
+	// Every [TrustedDevice], on this method's OWN line — see
+	// [Service.sweepTrustedDevices] and the matrix. A password reset is
+	// UNAUTHENTICATED recovery, where every other credential has to be
+	// assumed hostile, and a trusted device is precisely a credential the
+	// person resetting cannot see and cannot have consented to.
+	if err := s.sweepTrustedDevices(ctx, v.UserID); err != nil {
+		return err
+	}
+
 	// Remove every external identity BEFORE the sessions — see the method
 	// doc's "Why an unauthenticated recovery sweeps identities". An identity
 	// left standing is a live credential this rotation did not touch, and one
@@ -3747,6 +4004,17 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 //     never even normalized, so a caller who does not know the password
 //     learns nothing about the address they proposed either — the same
 //     stance ChangePassword takes on next.
+//     Point 2 has a second half: [Service.RequireFreshMFA] with
+//     currentSessionID, immediately after the credential check and before
+//     newEmail is even looked at. An account holding a CONFIRMED
+//     [MFAFactor] must present this call from a session of its own that
+//     proved a second factor inside [WithStepUpWindow], or this is
+//     [ErrStepUpRequired] with nothing minted; an account with no confirmed
+//     factor is unaffected. currentSessionID is the same value
+//     [Service.ChangePassword] takes, and this method takes it for the same
+//     reason that one does: arming an identifier rotation is the same kind
+//     of act as rotating the password, and [Service.VerifyEmail] redeems
+//     what this mints with no authentication whatsoever.
 //  3. newEmail is normalized (see [NormalizeEmail]) and, if that leaves it
 //     empty — a literal "", or whitespace-only input — this returns
 //     [ErrEmailRequired]. Without this, an empty newEmail minted a token
@@ -3789,7 +4057,7 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 //
 // A Store, Hasher or [token.GenerateOpaque] error at any step is returned
 // as-is.
-func (s *Service) RequestEmailChange(ctx context.Context, userID, current, newEmail string) (string, error) {
+func (s *Service) RequestEmailChange(ctx context.Context, userID, currentSessionID, current, newEmail string) (string, error) {
 	u, err := s.store.FindUserByID(ctx, userID)
 	if err != nil {
 		return "", err
@@ -3814,6 +4082,13 @@ func (s *Service) RequestEmailChange(ctx context.Context, userID, current, newEm
 	}
 	if !s.cfg.hasher.Verify(current, u.PasswordHash) {
 		return "", ErrInvalidCredentials
+	}
+
+	// Step-up, on this method's own line — see [Service.RequireFreshMFA] —
+	// and after the credential check for [Service.ChangePassword]'s reason.
+	// A no-op for an account with no confirmed factor.
+	if err := s.RequireFreshMFA(ctx, userID, currentSessionID); err != nil {
+		return "", err
 	}
 
 	normalized := NormalizeEmail(newEmail)

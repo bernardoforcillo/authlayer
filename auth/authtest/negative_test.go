@@ -86,6 +86,18 @@ func (s expiryFoldedIntoRotation) MarkRotated(_ context.Context, tokenHash strin
 	return auth.Session{}, false, auth.ErrSessionNotFound
 }
 
+// forgetsTheMFAStamp persists a session without [auth.Session.MFAAt] — the
+// single most likely way a backend author adds the column to their schema,
+// forgets it in their INSERT, and ships. Every step-up check then refuses,
+// because RequireFreshMFA reads nothing else, and every account holding a
+// second factor is locked out of changing its own password.
+type forgetsTheMFAStamp struct{ *refStore }
+
+func (s forgetsTheMFAStamp) CreateSession(ctx context.Context, sess auth.Session) (auth.Session, error) {
+	sess.MFAAt = nil
+	return s.refStore.CreateSession(ctx, sess)
+}
+
 // splitCreateUser decides ErrEmailTaken from a read, releases its lock, and
 // only then writes — the check-then-write shape [auth.Store.CreateUser]'s
 // MUST forbids for any backend whose write can fail independently of the
@@ -811,6 +823,11 @@ func TestTheContractRejectsNonCompliantStores(t *testing.T) {
 			defect:   "MarkRotated lets every caller win (sequentially, too)",
 			check:    "MarkRotated/WinsOnceThenReportsTheRotatedSession",
 			newStore: func() auth.Store { return everyCallerWins{newRefStore()} },
+		},
+		{
+			defect:   "CreateSession drops the second-factor freshness stamp",
+			check:    "CreateSession/RoundTripsTheMFAStamp",
+			newStore: func() auth.Store { return forgetsTheMFAStamp{newRefStore()} },
 		},
 		{
 			defect:   "MarkRotated refuses an expired but unrotated session",

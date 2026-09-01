@@ -1902,7 +1902,7 @@ func TestLogoutAllSweepsPendingVerificationsLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignUp: %v", err)
 	}
-	changeTok, err := svc.RequestEmailChange(ctx, res.User.ID, liveTestPassword, "attacker@evil.example")
+	changeTok, err := svc.RequestEmailChange(ctx, res.User.ID, "", liveTestPassword, "attacker@evil.example")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}
@@ -1950,7 +1950,7 @@ func TestVerifyEmailChangeSweepsResetTokensLive(t *testing.T) {
 		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
 	}
 
-	changeTok, err := svc.RequestEmailChange(ctx, res.User.ID, liveTestPassword, "live-new@example.com")
+	changeTok, err := svc.RequestEmailChange(ctx, res.User.ID, "", liveTestPassword, "live-new@example.com")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}

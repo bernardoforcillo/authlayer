@@ -45,7 +45,20 @@ func pubKey(label byte) []byte { return []byte{0xa5, 0x01, 0x02, label} }
 // finish with the challenge just minted — and returns the stored credential.
 // It is the "the application's verifier said yes" path every login test needs
 // to have happened first.
+//
+// It passes an EMPTY currentSessionID, which is correct for an account with
+// no confirmed second factor: [auth.Service.RequireFreshMFA] is a documented
+// no-op there. An account that HAS one needs registerPasskeyFrom and a
+// session that has freshly proved the factor — see
+// [auth.Service.FinishPasskeyRegistration], "It is step-up gated".
 func registerPasskey(t *testing.T, svc *auth.Service, userID string, c auth.NewCredential) auth.Credential {
+	t.Helper()
+	return registerPasskeyFrom(t, svc, userID, "", c)
+}
+
+// registerPasskeyFrom is registerPasskey with the caller's own session id,
+// for the accounts step-up actually gates.
+func registerPasskeyFrom(t *testing.T, svc *auth.Service, userID, sessionID string, c auth.NewCredential) auth.Credential {
 	t.Helper()
 	ctx := context.Background()
 	challenge, err := svc.BeginPasskeyRegistration(ctx, userID)
@@ -53,7 +66,7 @@ func registerPasskey(t *testing.T, svc *auth.Service, userID string, c auth.NewC
 		t.Fatalf("BeginPasskeyRegistration(%q): %v", userID, err)
 	}
 	c.Challenge = challenge
-	stored, err := svc.FinishPasskeyRegistration(ctx, userID, c)
+	stored, err := svc.FinishPasskeyRegistration(ctx, userID, sessionID, c)
 	if err != nil {
 		t.Fatalf("FinishPasskeyRegistration(%q): %v", userID, err)
 	}
@@ -120,7 +133,7 @@ func TestPasskeyEntryPointsRefuseWithoutACredentialStore(t *testing.T) {
 	if _, err := svc.BeginPasskeyRegistration(ctx, u.ID); !errors.Is(err, auth.ErrPasskeysNotConfigured) {
 		t.Errorf("BeginPasskeyRegistration err = %v, want ErrPasskeysNotConfigured", err)
 	}
-	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, newCred('a')); !errors.Is(err, auth.ErrPasskeysNotConfigured) {
+	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, "", newCred('a')); !errors.Is(err, auth.ErrPasskeysNotConfigured) {
 		t.Errorf("FinishPasskeyRegistration err = %v, want ErrPasskeysNotConfigured", err)
 	}
 	if _, err := svc.BeginPasskeyLogin(ctx); !errors.Is(err, auth.ErrPasskeysNotConfigured) {
@@ -214,14 +227,14 @@ func TestFinishPasskeyRegistrationRefusesEmptyFields(t *testing.T) {
 	noID := newCred('a')
 	noID.Challenge = challenge
 	noID.CredentialID = nil
-	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, noID); !errors.Is(err, auth.ErrCredentialIDRequired) {
+	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, "", noID); !errors.Is(err, auth.ErrCredentialIDRequired) {
 		t.Errorf("empty CredentialID err = %v, want ErrCredentialIDRequired", err)
 	}
 
 	noKey := newCred('a')
 	noKey.Challenge = challenge
 	noKey.PublicKey = nil
-	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, noKey); !errors.Is(err, auth.ErrPublicKeyRequired) {
+	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, "", noKey); !errors.Is(err, auth.ErrPublicKeyRequired) {
 		t.Errorf("empty PublicKey err = %v, want ErrPublicKeyRequired", err)
 	}
 
@@ -230,7 +243,7 @@ func TestFinishPasskeyRegistrationRefusesEmptyFields(t *testing.T) {
 	}
 	// Neither refusal may have burned the ceremony: both were decided before
 	// the claim, so the user's live challenge is still there to complete.
-	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, auth.NewCredential{
+	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, "", auth.NewCredential{
 		Challenge:    challenge,
 		CredentialID: credID('a'),
 		PublicKey:    pubKey('a'),
@@ -261,7 +274,7 @@ func TestFinishPasskeyRegistrationRefusesACredentialAlreadyRegistered(t *testing
 		t.Fatalf("BeginPasskeyRegistration: %v", err)
 	}
 	stolen.Challenge = challenge
-	if _, err := svc.FinishPasskeyRegistration(ctx, attacker.ID, stolen); !errors.Is(err, auth.ErrCredentialRegistered) {
+	if _, err := svc.FinishPasskeyRegistration(ctx, attacker.ID, "", stolen); !errors.Is(err, auth.ErrCredentialRegistered) {
 		t.Fatalf("second registration of the same credential id = %v, want ErrCredentialRegistered", err)
 	}
 
@@ -298,14 +311,14 @@ func TestFinishPasskeyRegistrationRefusesAnotherAccountsChallenge(t *testing.T) 
 	c := newCred('a')
 	c.Challenge = challenge
 
-	if _, err := svc.FinishPasskeyRegistration(ctx, other.ID, c); !errors.Is(err, auth.ErrChallengeUser) {
+	if _, err := svc.FinishPasskeyRegistration(ctx, other.ID, "", c); !errors.Is(err, auth.ErrChallengeUser) {
 		t.Fatalf("finishing with another account's challenge = %v, want ErrChallengeUser", err)
 	}
 	if got := len(credentialsOf(t, creds, other.ID)); got != 0 {
 		t.Fatalf("other account credential rows = %d, want 0", got)
 	}
 	// Refused before the claim, so the victim's own ceremony still completes.
-	if _, err := svc.FinishPasskeyRegistration(ctx, victim.ID, c); err != nil {
+	if _, err := svc.FinishPasskeyRegistration(ctx, victim.ID, "", c); err != nil {
 		t.Fatalf("victim's own FinishPasskeyRegistration: %v — their challenge must not have been burned", err)
 	}
 }
@@ -368,7 +381,7 @@ func TestALoginChallengeCannotCompleteARegistration(t *testing.T) {
 	c := newCred('a')
 	c.Challenge = mustBeginLogin(t, svc)
 
-	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, c); !errors.Is(err, auth.ErrChallengeCeremony) {
+	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, "", c); !errors.Is(err, auth.ErrChallengeCeremony) {
 		t.Fatalf("registration with a login challenge = %v, want ErrChallengeCeremony", err)
 	}
 	if got := len(credentialsOf(t, creds, u.ID)); got != 0 {
@@ -394,12 +407,12 @@ func TestPasskeyChallengesAreSingleUse(t *testing.T) {
 	}
 	first := newCred('a')
 	first.Challenge = regChallenge
-	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, first); err != nil {
+	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, "", first); err != nil {
 		t.Fatalf("first FinishPasskeyRegistration: %v", err)
 	}
 	second := newCred('b')
 	second.Challenge = regChallenge
-	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, second); !errors.Is(err, auth.ErrChallengeNotFound) {
+	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, "", second); !errors.Is(err, auth.ErrChallengeNotFound) {
 		t.Fatalf("reusing a registration challenge = %v, want ErrChallengeNotFound", err)
 	}
 	if got := len(credentialsOf(t, creds, u.ID)); got != 1 {
@@ -517,7 +530,7 @@ func TestPasskeyChallengesExpire(t *testing.T) {
 
 	c := newCred('b')
 	c.Challenge = regChallenge
-	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, c); !errors.Is(err, auth.ErrChallengeExpired) {
+	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, "", c); !errors.Is(err, auth.ErrChallengeExpired) {
 		t.Fatalf("expired registration challenge = %v, want ErrChallengeExpired", err)
 	}
 	res, err := svc.FinishPasskeyLogin(ctx, auth.VerifiedAssertion{
@@ -750,7 +763,7 @@ func TestPasskeyCeremoniesRefuseAnAnonymizedAccount(t *testing.T) {
 	}
 	loginChallenge := mustBeginLogin(t, svc)
 
-	if err := svc.AnonymizeAccount(ctx, u.ID, validPassword); err != nil {
+	if err := svc.AnonymizeAccount(ctx, u.ID, "", validPassword); err != nil {
 		t.Fatalf("AnonymizeAccount: %v", err)
 	}
 
@@ -769,7 +782,7 @@ func TestPasskeyCeremoniesRefuseAnAnonymizedAccount(t *testing.T) {
 
 	c := newCred('b')
 	c.Challenge = regChallenge
-	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, c); !errors.Is(err, auth.ErrUserNotFound) {
+	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, "", c); !errors.Is(err, auth.ErrUserNotFound) {
 		t.Fatalf("FinishPasskeyRegistration on an anonymized account = %v, want ErrUserNotFound", err)
 	}
 	if _, err := svc.BeginPasskeyRegistration(ctx, u.ID); !errors.Is(err, auth.ErrUserNotFound) {
@@ -934,12 +947,12 @@ func TestFinishPasskeyRegistrationConcurrentClaimsAdmitExactlyOneWinner(t *testi
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_, errA = svc.FinishPasskeyRegistration(ctx, u.ID, credA)
+		_, errA = svc.FinishPasskeyRegistration(ctx, u.ID, "", credA)
 	}()
 
 	<-gated.parked
 
-	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, credB); err != nil {
+	if _, err := svc.FinishPasskeyRegistration(ctx, u.ID, "", credB); err != nil {
 		t.Fatalf("B FinishPasskeyRegistration: %v", err)
 	}
 

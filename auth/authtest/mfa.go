@@ -59,12 +59,14 @@ type mfaCheck struct {
 }
 
 // mfaStoreContractChecks is every check [RunMFAStoreContract] runs, in
-// order: the factor record, then the recovery codes, then the obligations
-// that only appear under concurrency.
+// order: the factor record, then the recovery codes, then the trusted
+// devices (trusted.go), then the obligations that only appear under
+// concurrency.
 func mfaStoreContractChecks() []mfaCheck {
 	var all []mfaCheck
 	all = append(all, mfaFactorChecks()...)
 	all = append(all, recoveryCodeChecks()...)
+	all = append(all, trustedDeviceChecks()...)
 	all = append(all, mfaConcurrencyChecks()...)
 	return all
 }

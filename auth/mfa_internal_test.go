@@ -39,6 +39,23 @@ func (stubMFAStore) ConsumeRecoveryCode(context.Context, string, string, time.Ti
 func (stubMFAStore) ListRecoveryCodes(context.Context, string) ([]RecoveryCode, error) {
 	return nil, nil
 }
+func (stubMFAStore) CreateTrustedDevice(context.Context, TrustedDevice) (TrustedDevice, error) {
+	return TrustedDevice{}, nil
+}
+func (stubMFAStore) FindTrustedDeviceByHash(context.Context, string) (TrustedDevice, error) {
+	return TrustedDevice{}, ErrTrustedDeviceNotFound
+}
+func (stubMFAStore) ListTrustedDevices(context.Context, string) ([]TrustedDevice, error) {
+	return nil, nil
+}
+func (stubMFAStore) DeleteTrustedDevice(context.Context, string) error        { return nil }
+func (stubMFAStore) DeleteTrustedDevicesByUser(context.Context, string) error { return nil }
+func (stubMFAStore) TouchTrustedDevice(context.Context, string, time.Time) (bool, error) {
+	return false, nil
+}
+func (stubMFAStore) PurgeExpiredTrustedDevices(context.Context, time.Time) (int, error) {
+	return 0, nil
+}
 
 // stubCipher satisfies [Cipher] with an identity transform. It is a test
 // double for wiring only — never a suggestion of what a real one looks

@@ -229,8 +229,41 @@ type SignInResult struct {
 	User UserBase
 	// AccessToken and RefreshToken are exactly what a password login mints
 	// — see [LoginResult.AccessToken] and [LoginResult.RefreshToken] for
-	// their lifetimes and for how to present the refresh token.
+	// their lifetimes and for how to present the refresh token. Both are
+	// EMPTY when MFA is non-nil.
 	AccessToken, RefreshToken string
+	// MFA is non-nil when the account owes a second factor: the external
+	// identity was accepted — and linked, if this call linked it — but NO
+	// SESSION EXISTS. AccessToken and RefreshToken are both "", no
+	// [Session] row was written, and the sign-in finishes by exchanging
+	// MFA.Token, with a TOTP or recovery code, through
+	// [Service.CompleteMFA].
+	//
+	// An external provider may well have enforced a second factor of its
+	// own on its side. This package cannot see that, cannot name it, and
+	// cannot decide for a deployment whether the provider that just
+	// asserted this identity is one whose second factor the deployment
+	// trusts — so an external assertion never stands in for the factor THIS
+	// package holds. See auth/mfa_service.go's package doc, "What the
+	// second factor gates, door by door", for the whole matrix and for the
+	// one door decided the other way.
+	//
+	// # A caller written before this field existed still fails closed
+	//
+	// The reasoning is [LoginResult.MFA]'s, verbatim: code compiled against
+	// v0.1.0 reads AccessToken, gets "", and "" is not a degraded token but
+	// no token at all —
+	// [github.com/bernardoforcillo/authlayer/token.Parse] refuses it. Such
+	// a caller under-grants (its users holding a confirmed factor cannot
+	// complete an external sign-in until it is updated) rather than
+	// installing a session no second factor was ever presented for.
+	//
+	// A caller that DOES know about this field must branch on MFA != nil
+	// before touching either token: an MFA-owed sign-in is a nil error and
+	// a successful outcome that simply is not finished yet. Created stays
+	// meaningful on this path — an account provisioned by a challenged
+	// sign-in was still provisioned.
+	MFA *MFAChallenge
 }
 
 // Linking is the policy governing when an external identity may be attached

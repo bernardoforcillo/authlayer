@@ -282,6 +282,44 @@ func (s *Service) BeginPasskeyRegistration(ctx context.Context, userID string) (
 // [Credential]. It mints no session: registering a passkey is something an
 // already-authenticated user does, not a way of becoming one.
 //
+// # It is step-up gated, and that is a fix rather than a policy choice
+//
+// currentSessionID is the caller's own session — the SessionID claim off the
+// access token that authenticated this request, exactly as
+// [Service.ChangePassword] takes it — and [Service.RequireFreshMFA] must
+// pass on it. For an account with no confirmed [MFAFactor] that check is a
+// no-op and this method behaves exactly as it did before; for an account
+// that HAS one, a session that has not proved a factor inside
+// [WithStepUpWindow] gets [ErrStepUpRequired] and registers nothing.
+//
+// Without it step-up has a hole that makes its other five gates removable,
+// and it is worth spelling out because "registering a credential" does not
+// look like a sensitive action. A passkey IS a sign-in credential, and
+// [Service.FinishPasskeyLogin] deliberately stamps [Session.MFAAt] on the
+// session it mints — a passkey is a possession factor bound to hardware, see
+// auth/mfa_service.go's "What the second factor gates, door by door". So
+// whoever holds a stale, stolen session on an account with a confirmed
+// factor could, ungated: register their OWN authenticator here, sign in with
+// it, and be handed a session that is FRESH — and then perform every action
+// [Service.RequireFreshMFA] guards, without ever presenting the account's
+// second factor. On a PASSWORD-LESS account that includes
+// [Service.DeleteAccount] and [Service.AnonymizeAccount], which skip the
+// password check for an account that has none, so step-up is the only
+// credential left in those calls. This gate is what closes that loop.
+//
+// It strands nobody, for [Service.DisableMFA]'s reason verbatim: every door
+// that can mint a session for an account with a confirmed factor either
+// proves that factor or IS one, so a user who can reach this method at all
+// can reach it freshly, and a lost authenticator is answered by a recovery
+// code. A user registering their first passkey on an account with no second
+// factor is asked for nothing new.
+//
+// [Service.BeginPasskeyRegistration] is deliberately NOT gated. A challenge
+// is not a credential — it goes to the browser in the clear and grants
+// nothing at all (see that method) — so gating the inert half would buy
+// nothing and would refuse a user whose window lapses mid-ceremony. The gate
+// belongs on the call that writes a credential.
+//
 // # It verifies nothing about the ceremony
 //
 // [NewCredential] is trusted wholesale. This method checks that CredentialID
@@ -306,6 +344,11 @@ func (s *Service) BeginPasskeyRegistration(ctx context.Context, userID string) (
 //  3. The account — [ErrUserNotFound] for a row that is gone or ANONYMIZED
 //     (a non-nil [UserBase.DeletedAt]). Arming a new credential on a stamped
 //     account would hand it back, which is what that stamp forbids.
+//     3b. [Service.RequireFreshMFA] with currentSessionID — [ErrStepUpRequired]
+//     for an account with a confirmed factor whose session has not proved
+//     one recently, a no-op for every other account. It runs BEFORE point 4
+//     so a refused registration does not cost the user their ceremony, which
+//     is the same reasoning every other check above the claim follows.
 //  4. The challenge: not found, expired ([ErrChallengeExpired]), minted for a
 //     LOGIN ([ErrChallengeCeremony]), or minted for a different account
 //     ([ErrChallengeUser]) — then, and only then, BURNED. See
@@ -324,7 +367,7 @@ func (s *Service) BeginPasskeyRegistration(ctx context.Context, userID string) (
 // The returned [Credential] carries this package's own [Credential.ID], which
 // is what a "your passkeys" screen shows and what [Service.DeletePasskey]
 // takes; [Credential.LastUsedAt] is nil, because registering is not using.
-func (s *Service) FinishPasskeyRegistration(ctx context.Context, userID string, c NewCredential) (Credential, error) {
+func (s *Service) FinishPasskeyRegistration(ctx context.Context, userID, currentSessionID string, c NewCredential) (Credential, error) {
 	var zero Credential
 
 	creds, err := s.credentials()
@@ -347,6 +390,14 @@ func (s *Service) FinishPasskeyRegistration(ctx context.Context, userID string, 
 	// refuses a stamped account".
 	if u.DeletedAt != nil {
 		return zero, ErrUserNotFound
+	}
+
+	// Step-up, on this method's own line — see [Service.RequireFreshMFA] and
+	// "It is step-up gated" above. Before the challenge is claimed, so a
+	// refusal does not burn the ceremony the user is in the middle of. A
+	// no-op for an account with no confirmed factor.
+	if err := s.RequireFreshMFA(ctx, u.ID, currentSessionID); err != nil {
+		return zero, err
 	}
 
 	now := s.cfg.clock()
@@ -505,6 +556,32 @@ func (s *Service) BeginPasskeyLogin(ctx context.Context) (string, error) {
 // [WithPasskeyChallengeTTL]'s default is the shortest lifetime in this
 // package.
 //
+// # A passkey IS the second factor
+//
+// This is the ONE sign-in door that does not consult an [MFAFactor]. An
+// account holding a confirmed TOTP factor signs in here outright — no
+// [MFAChallenge], no [ErrMFARequired], not even under [EnforcementRequired]
+// — where [Service.Login], [Service.RedeemMagicLink] and
+// [Service.SignInWith] all stop and demand one.
+//
+// A passkey is a private key bound to hardware the user holds, registered to
+// THIS account through this package's own [CredentialStore] and resolvable
+// to no other. It is a possession factor by construction, and it shares no
+// channel with the password or the mailbox — which is exactly what the other
+// two doors fail: a magic link arrives where a password reset arrives, and
+// an external assertion carries no statement about what the provider
+// checked. Demanding a TOTP code on top of a passkey is a second factor
+// demanded of a second factor.
+//
+// The decision rests on the caller, and that is worth naming twice. This
+// method verifies nothing (see above), so "a passkey authenticated this" is
+// the CALLER's claim; and this package never sees the WebAuthn
+// user-verification (UV) flag, so it cannot tell a passkey unlocked with a
+// biometric or a PIN from one that merely sat plugged in. A deployment that
+// needs UV must require it in its verifier, because nothing here can.
+// auth/mfa_service.go's package doc, "What the second factor gates, door by
+// door", holds the matrix all four doors are decided in.
+//
 // # What a successful login does NOT do
 //
 // It verifies no email address ([Service.RedeemMagicLink] does, because a
@@ -574,8 +651,13 @@ func (s *Service) FinishPasskeyLogin(ctx context.Context, a VerifiedAssertion, i
 		}
 	}
 
-	// One minting path, shared with [Service.Login] — see mintSession.
-	return s.mintSession(ctx, u, ip, userAgent)
+	// One minting path, shared with [Service.Login] — see mintSession. The
+	// &now is [Session.MFAAt], and it follows from "A passkey IS the second
+	// factor" above: this login presented one, so the session it mints is
+	// FRESH for [Service.RequireFreshMFA]. Without the stamp, an account
+	// holding both a passkey and a confirmed TOTP factor could sign in here
+	// and then never satisfy step-up.
+	return s.mintSession(ctx, u, ip, userAgent, &now)
 }
 
 // ListPasskeys returns the WebAuthn credentials registered to userID, and

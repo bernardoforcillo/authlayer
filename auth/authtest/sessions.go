@@ -14,6 +14,7 @@ func sessionChecks() []check {
 		{"CreateSession/RoundTrip", checkCreateSessionRoundTrip},
 		{"CreateSession/DuplicateIDReturnsErrIDTakenAndKeepsTheRow", checkCreateSessionDuplicateID},
 		{"CreateSession/TokenHashIsUnique", checkSessionTokenHashUnique},
+		{"CreateSession/RoundTripsTheMFAStamp", checkSessionMFAAtRoundTrip},
 		{"FindSessionByHash/UnknownHashReturnsErrSessionNotFound", checkFindSessionByHashNotFound},
 		{"ListSessionsByUser/ReturnsEveryStateAndOnlyThatUser", checkListSessionsByUser},
 		{"ListSessionsByUser/UnknownUserIsEmptyNotAnError", checkListSessionsByUserEmpty},
@@ -84,6 +85,65 @@ func checkCreateSessionRoundTrip(t tb, st auth.Store) {
 	}
 	wantTimeEqual(t, "ExpiresAt", got.ExpiresAt, s.ExpiresAt)
 	wantTimeEqual(t, "CreatedAt", got.CreatedAt, s.CreatedAt)
+}
+
+// checkSessionMFAAtRoundTrip asserts [auth.Session.MFAAt] survives a store
+// round trip in BOTH states, through both read paths: a nil stamp comes back
+// nil, and a set one comes back equal to what was given.
+//
+// It is a check of its own rather than a line inside the round-trip check
+// above because the two failure directions are not symmetric and neither is
+// a cosmetic loss of a field. A backend that drops a SET stamp fails every
+// [github.com/bernardoforcillo/authlayer/auth.Service.RequireFreshMFA] — so
+// every account with a second factor is locked out of changing its own
+// password. A backend that returns a non-nil stamp for a session that never
+// proved a factor PASSES every step-up check, which is the direction that
+// hands a stolen session the account.
+func checkSessionMFAAtRoundTrip(t tb, st auth.Store) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+
+	never := mustCreateSession(t, st, newSession(newID(), newID(), at))
+	if never.MFAAt != nil {
+		t.Fatalf("CreateSession returned MFAAt = %v for a session created with none, want nil", never.MFAAt)
+	}
+	read, err := st.FindSessionByHash(ctx, never.TokenHash)
+	wantNoErr(t, "FindSessionByHash", err)
+	if read.MFAAt != nil {
+		t.Fatalf("MFAAt = %v after a round trip, want nil — a session that never proved a second factor must not read back as one that did", read.MFAAt)
+	}
+
+	proven := newSession(newID(), newID(), at)
+	provenAt := at.Add(time.Minute)
+	proven.MFAAt = &provenAt
+	created := mustCreateSession(t, st, proven)
+	if created.MFAAt == nil {
+		t.Fatalf("CreateSession dropped MFAAt; RequireFreshMFA reads nothing else, so a session that proved a factor would never be fresh")
+	}
+	wantTimeEqual(t, "CreateSession MFAAt", *created.MFAAt, provenAt)
+
+	back, err := st.FindSessionByHash(ctx, proven.TokenHash)
+	wantNoErr(t, "FindSessionByHash", err)
+	if back.MFAAt == nil {
+		t.Fatalf("FindSessionByHash dropped MFAAt")
+	}
+	wantTimeEqual(t, "FindSessionByHash MFAAt", *back.MFAAt, provenAt)
+
+	listed, err := st.ListSessionsByUser(ctx, proven.UserID)
+	wantNoErr(t, "ListSessionsByUser", err)
+	if len(listed) != 1 || listed[0].MFAAt == nil {
+		t.Fatalf("ListSessionsByUser returned %d row(s) with MFAAt = %v; RequireFreshMFA reads the stamp through THIS method", len(listed), listedMFAAt(listed))
+	}
+	wantTimeEqual(t, "ListSessionsByUser MFAAt", *listed[0].MFAAt, provenAt)
+}
+
+// listedMFAAt is a nil-safe accessor for the failure message above.
+func listedMFAAt(sessions []auth.Session) *time.Time {
+	if len(sessions) == 0 {
+		return nil
+	}
+	return sessions[0].MFAAt
 }
 
 // checkCreateSessionDuplicateID asserts a second CreateSession under an id

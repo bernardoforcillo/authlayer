@@ -2,6 +2,7 @@ package authtest
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"sync"
 	"testing"
@@ -33,12 +34,17 @@ type refMFAStore struct {
 	// speed for having exactly one copy of the data and therefore no way
 	// for two indexes to disagree.
 	codes map[string]auth.RecoveryCode
+	// devices is keyed by trusted-device id, and is scanned for a token
+	// hash for the same reason codes is scanned for a user: one copy of the
+	// data, no second index to disagree with it.
+	devices map[string]auth.TrustedDevice
 }
 
 func newRefMFAStore() *refMFAStore {
 	return &refMFAStore{
 		factors: map[string]auth.MFAFactor{},
 		codes:   map[string]auth.RecoveryCode{},
+		devices: map[string]auth.TrustedDevice{},
 	}
 }
 
@@ -167,6 +173,94 @@ func (s *refMFAStore) ListRecoveryCodes(_ context.Context, userID string) ([]aut
 		}
 	}
 	return out, nil
+}
+
+// --- trusted devices ---
+
+func (s *refMFAStore) CreateTrustedDevice(_ context.Context, d auth.TrustedDevice) (auth.TrustedDevice, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.devices[d.ID]; ok {
+		return auth.TrustedDevice{}, auth.ErrIDTaken
+	}
+	// The token-hash uniqueness MUST, expressed as a scan under the same
+	// lock as the write — store/drops has a UNIQUE constraint instead.
+	for _, existing := range s.devices {
+		if existing.TokenHash == d.TokenHash {
+			return auth.TrustedDevice{}, auth.ErrIDTaken
+		}
+	}
+	s.devices[d.ID] = d
+	return d, nil
+}
+
+func (s *refMFAStore) FindTrustedDeviceByHash(_ context.Context, tokenHash string) (auth.TrustedDevice, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, d := range s.devices {
+		if d.TokenHash == tokenHash {
+			return d, nil
+		}
+	}
+	return auth.TrustedDevice{}, auth.ErrTrustedDeviceNotFound
+}
+
+func (s *refMFAStore) ListTrustedDevices(_ context.Context, userID string) ([]auth.TrustedDevice, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]auth.TrustedDevice, 0)
+	for _, d := range s.devices {
+		if d.UserID == userID {
+			out = append(out, d)
+		}
+	}
+	return out, nil
+}
+
+func (s *refMFAStore) DeleteTrustedDevice(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.devices[id]; !ok {
+		return auth.ErrTrustedDeviceNotFound
+	}
+	delete(s.devices, id)
+	return nil
+}
+
+func (s *refMFAStore) DeleteTrustedDevicesByUser(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, d := range s.devices {
+		if d.UserID == userID {
+			delete(s.devices, id)
+		}
+	}
+	return nil
+}
+
+func (s *refMFAStore) TouchTrustedDevice(_ context.Context, id string, now time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.devices[id]
+	if !ok {
+		return false, nil
+	}
+	d.LastUsedAt = &now
+	s.devices[id] = d
+	return true, nil
+}
+
+func (s *refMFAStore) PurgeExpiredTrustedDevices(_ context.Context, before time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for id, d := range s.devices {
+		if d.ExpiresAt.Before(before) {
+			delete(s.devices, id)
+			n++
+		}
+	}
+	return n, nil
 }
 
 // ── The non-compliant doubles ───────────────────────────────────────────
@@ -428,6 +522,93 @@ func (s leakyListRecoveryCodes) ListRecoveryCodes(context.Context, string) ([]au
 	return out, nil
 }
 
+// duplicateHashTrustedDevice accepts a token hash another row already
+// holds, so two devices share one token and FindTrustedDeviceByHash returns
+// whichever the map iteration reached first — the row-order coin flip
+// auth.TrustedDevice.TokenHash's MUST exists to forbid.
+type duplicateHashTrustedDevice struct{ *refMFAStore }
+
+func (s duplicateHashTrustedDevice) CreateTrustedDevice(_ context.Context, d auth.TrustedDevice) (auth.TrustedDevice, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.devices[d.ID]; ok {
+		return auth.TrustedDevice{}, auth.ErrIDTaken
+	}
+	s.devices[d.ID] = d
+	return d, nil
+}
+
+// silentFindTrustedDevice answers an unknown hash with the zero value and a
+// nil error, so a caller is handed a device that does not exist.
+type silentFindTrustedDevice struct{ *refMFAStore }
+
+func (s silentFindTrustedDevice) FindTrustedDeviceByHash(ctx context.Context, tokenHash string) (auth.TrustedDevice, error) {
+	d, err := s.refMFAStore.FindTrustedDeviceByHash(ctx, tokenHash)
+	if errors.Is(err, auth.ErrTrustedDeviceNotFound) {
+		return auth.TrustedDevice{}, nil
+	}
+	return d, err
+}
+
+// leakyListTrustedDevices returns every user's devices rather than the one
+// asked for — which, since auth.Service.RevokeTrustedDevice's ownership
+// check IS this listing, hands one user another's devices to revoke.
+type leakyListTrustedDevices struct{ *refMFAStore }
+
+func (s leakyListTrustedDevices) ListTrustedDevices(context.Context, string) ([]auth.TrustedDevice, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]auth.TrustedDevice, 0, len(s.devices))
+	for _, d := range s.devices {
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+// globalDeleteTrustedDevicesByUser removes EVERY device in the store rather
+// than the named user's, so one account's password change revokes the whole
+// deployment's trusted devices.
+type globalDeleteTrustedDevicesByUser struct{ *refMFAStore }
+
+func (s globalDeleteTrustedDevicesByUser) DeleteTrustedDevicesByUser(context.Context, string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id := range s.devices {
+		delete(s.devices, id)
+	}
+	return nil
+}
+
+// optimisticTouchTrustedDevice reports true for a device that is not there,
+// which is exactly the answer auth.Service.LoginWithTrustedDevice reads as
+// "still trusted" for a row somebody revoked a moment ago.
+type optimisticTouchTrustedDevice struct{ *refMFAStore }
+
+func (s optimisticTouchTrustedDevice) TouchTrustedDevice(ctx context.Context, id string, now time.Time) (bool, error) {
+	if ok, err := s.refMFAStore.TouchTrustedDevice(ctx, id, now); err != nil || ok {
+		return ok, err
+	}
+	return true, nil
+}
+
+// inclusivePurgeTrustedDevices purges with <= rather than <, so a device
+// expiring exactly at the cutoff goes too — the boundary every other purge
+// in this package treats the other way.
+type inclusivePurgeTrustedDevices struct{ *refMFAStore }
+
+func (s inclusivePurgeTrustedDevices) PurgeExpiredTrustedDevices(_ context.Context, before time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for id, d := range s.devices {
+		if !d.ExpiresAt.After(before) {
+			delete(s.devices, id)
+			n++
+		}
+	}
+	return n, nil
+}
+
 // ── The harness ─────────────────────────────────────────────────────────
 
 // runMFACheck runs one check against st and reports what it complained
@@ -474,8 +655,10 @@ func TestTheReferenceMFAStorePassesTheContract(t *testing.T) {
 // failed, and every check that failed is logged so the blast radius of
 // each defect is on the record rather than inferred.
 //
-// All eight methods of the port appear here at least once: a check nobody
-// has watched fail is a check nobody knows works.
+// Thirteen of the port's fifteen methods appear here at least once: a check
+// nobody has watched fail is a check nobody knows works. The two that do not
+// are UpsertFactor's and CreateTrustedDevice's id-collision paths, each of
+// which is covered by a defect injected into a neighbouring method.
 func TestTheMFAContractRejectsNonCompliantStores(t *testing.T) {
 	cases := []struct {
 		defect   string
@@ -556,6 +739,36 @@ func TestTheMFAContractRejectsNonCompliantStores(t *testing.T) {
 			defect:   "ListRecoveryCodes returns every user's codes",
 			check:    "ListRecoveryCodes/ReturnsUsedAndUnusedForThatUserOnly",
 			newStore: func() auth.MFAStore { return leakyListRecoveryCodes{newRefMFAStore()} },
+		},
+		{
+			defect:   "CreateTrustedDevice accepts a token hash another row already holds",
+			check:    "CreateTrustedDevice/ADuplicateTokenHashIsRefused",
+			newStore: func() auth.MFAStore { return duplicateHashTrustedDevice{newRefMFAStore()} },
+		},
+		{
+			defect:   "FindTrustedDeviceByHash answers an unknown hash with the zero value and nil",
+			check:    "FindTrustedDeviceByHash/UnknownHashReturnsErrTrustedDeviceNotFound",
+			newStore: func() auth.MFAStore { return silentFindTrustedDevice{newRefMFAStore()} },
+		},
+		{
+			defect:   "ListTrustedDevices returns every user's devices",
+			check:    "ListTrustedDevices/ReturnsThatUsersDevicesOnly",
+			newStore: func() auth.MFAStore { return leakyListTrustedDevices{newRefMFAStore()} },
+		},
+		{
+			defect:   "DeleteTrustedDevicesByUser sweeps every user's devices",
+			check:    "DeleteTrustedDevicesByUser/RemovesEveryDeviceOfThatUserOnly",
+			newStore: func() auth.MFAStore { return globalDeleteTrustedDevicesByUser{newRefMFAStore()} },
+		},
+		{
+			defect:   "TouchTrustedDevice reports true for a device that is gone",
+			check:    "TouchTrustedDevice/UnknownIDIsFalseAndNotAnError",
+			newStore: func() auth.MFAStore { return optimisticTouchTrustedDevice{newRefMFAStore()} },
+		},
+		{
+			defect:   "PurgeExpiredTrustedDevices purges the row expiring exactly at the cutoff",
+			check:    "PurgeExpiredTrustedDevices/RemovesOnlyRowsExpiredBeforeTheCutoff",
+			newStore: func() auth.MFAStore { return inclusivePurgeTrustedDevices{newRefMFAStore()} },
 		},
 	}
 

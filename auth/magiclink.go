@@ -259,9 +259,11 @@ func (s *Service) RequestMagicLink(ctx context.Context, email, ip string) (strin
 // RedeemMagicLink exchanges plainToken — a "magic_link" [Verification]
 // minted by [Service.RequestMagicLink] — for a live session, and returns
 // the same [LoginResult] [Service.Login] does: a scrubbed [UserBase], a
-// signed access token and a refresh token. There is no password step and
-// nothing else is asked of the holder; presenting the token IS the
-// authentication, which is what makes everything below the shape it is.
+// signed access token and a refresh token. There is no PASSWORD step;
+// presenting the token IS the first factor, which is what makes everything
+// below the shape it is. It is not the second — an account owing one gets a
+// challenge instead of a session, exactly as it does at Login; see "A link
+// is a first factor, never a second" below.
 //
 // An unknown token is whatever [Store.FindVerificationByHash] reports
 // (ErrVerificationNotFound). A known but expired token is
@@ -368,6 +370,42 @@ func (s *Service) RequestMagicLink(ctx context.Context, email, ip string) (strin
 // Refusing here would mean refusing the one flow that can satisfy the
 // requirement.
 //
+// # A link is a first factor, never a second
+//
+// An account holding a CONFIRMED [MFAFactor] does NOT get a session here.
+// This method returns a [LoginResult] whose AccessToken and RefreshToken
+// are EMPTY and whose MFA field carries a short-lived [MFAChallenge], with
+// a nil error and no [Session] row created — the identical pending state
+// [Service.Login] returns, finished the identical way through
+// [Service.CompleteMFA]. Under [EnforcementRequired] an account with NO
+// confirmed factor is refused outright with [ErrMFARequired].
+//
+// The reason is that this package delivers a password reset to the same
+// mailbox. A link proves control of that mailbox — that is exactly what the
+// stamp above records — so counting it as the SECOND factor would mean one
+// compromised inbox both resets the password and satisfies the factor
+// guarding it. auth/mfa_service.go's package doc, "What the second factor
+// gates, door by door", carries the full argument and the matrix for the
+// other three doors.
+//
+// The check runs AFTER the claim, deliberately, and that ordering is the
+// same single-use property the section below defends: were it checked
+// before, two people presenting one link would each receive a challenge,
+// and one link would finish as two sessions. Claimed first, exactly one
+// caller reaches the challenge, and the link is spent whether or not they
+// go on to present a code. A user who cannot produce one must request
+// another link — the same cost as any other post-claim refusal here.
+//
+// It also runs after the address stamp above, which matters:
+// [Service.CompleteMFA] enforces [WithRequireVerifiedEmail] itself, so
+// under that option a link that certifies the account's current address
+// must stamp BEFORE the challenge is minted or the completion refuses the
+// challenge this call just handed out. (A link whose address no longer
+// matches the account's stamps nothing — see the two guards above — and
+// under that option its challenge is indeed unfinishable; that is the same
+// refusal such an account already meets at [Service.Login], not one this
+// ordering introduces.)
+//
 // # What redemption does not touch
 //
 // Only the presented token is claimed. Other outstanding verifications for
@@ -445,6 +483,28 @@ func (s *Service) RedeemMagicLink(ctx context.Context, plainToken, ip, userAgent
 		u.UpdatedAt = now
 	}
 
-	// One minting path, shared with [Service.Login] — see mintSession.
-	return s.mintSession(ctx, u, ip, userAgent)
+	// The second factor, consulted last and only once the link has been
+	// claimed and the account has passed every check above — this door's
+	// OWN call to mfaAtSignIn, not a guard shared with Login's. A confirmed
+	// factor short-circuits the mint entirely and hands back a challenge
+	// with EMPTY tokens; see the method doc's "A link is a first factor,
+	// never a second".
+	challenge, err := s.mfaAtSignIn(ctx, u)
+	if err != nil {
+		return zero, err
+	}
+	if challenge != nil {
+		// Deliberately NOT mintSession: no session row, no access token,
+		// no refresh token. PasswordHash is scrubbed here because this is
+		// a success path that does not go through mintSession, which is
+		// where every other return value gets scrubbed.
+		u.PasswordHash = ""
+		return LoginResult{User: u, MFA: challenge}, nil
+	}
+
+	// One minting path, shared with [Service.Login] — see mintSession. The
+	// nil is [Session.MFAAt]: a link is not a second factor, so a session
+	// minted here has proved none. An account that HAS one never reaches
+	// this line — it left with a challenge above.
+	return s.mintSession(ctx, u, ip, userAgent, nil)
 }

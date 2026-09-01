@@ -46,30 +46,116 @@
 // [Service.RedeemMagicLink], each of which already refuses purposes it does
 // not own.
 //
-// # What the second factor does not gate, in this version
+// # What the second factor gates, door by door
 //
-// [Service.Login] is the ONLY entry point that consults an [MFAFactor].
-// [Service.SignInWith] and [Service.RedeemMagicLink] mint a session
-// directly, for an account with a CONFIRMED factor as much as for one with
-// none, and [EnforcementRequired] does not refuse them either.
+// This package has FOUR ways into an account, and a second factor that
+// bounds only one of them bounds nothing: a deployment that turns MFA on
+// believing it mandatory, and offers a magic link beside it, has a second
+// factor anyone can walk around. An earlier version gated [Service.Login]
+// alone and disclosed the rest as a limitation. It is no longer a
+// limitation; every door is decided, and this is the decision:
 //
-// That is a disclosed limitation, not an oversight, and an application
-// offering more than one way in should read it as one: an account with TOTP
-// enrolled is still reachable by whoever controls its mailbox or its
-// external identity provider, so the second factor bounds the PASSWORD
-// door and no other. A deployment that needs every door gated has two
-// honest options today — do not offer the other doors to accounts with a
-// confirmed factor, or rely on the provider's own second factor on its
-// path.
+//	Door                        | An account with a CONFIRMED factor | EnforcementRequired, no confirmed factor
+//	----------------------------|------------------------------------|----------------------------------------
+//	Service.Login               | [MFAChallenge], no session         | [ErrMFARequired]
+//	Service.RedeemMagicLink     | [MFAChallenge], no session         | [ErrMFARequired]
+//	Service.SignInWith          | [MFAChallenge], no session         | [ErrMFARequired]
+//	Service.FinishPasskeyLogin  | a session outright                 | a session outright
 //
-// It is scoped this way because the answer is genuinely different per door
-// rather than merely unwritten. A magic link is itself proof of control of
-// a second channel, so demanding TOTP after one is a defensible policy and
-// not an obvious one; an external provider frequently enforces a second
-// factor of its own, and whether that counts is a decision an application
-// makes about that provider, not one this package can make for it. Both
-// belong with step-up authentication, where a caller states the assurance
-// level an operation needs, rather than being decided here for everyone.
+// Three of the four consult [Service.mfaAtSignIn]; each calls it ITSELF,
+// from its own line, rather than through one shared guard the four reach —
+// the same discipline the anonymized-account refusals follow, and for the
+// same reason: each door has its own test, and removing any one call fails
+// exactly that door's test.
+//
+// Two mutations are recorded rather than asserted. Deleting the call from
+// RedeemMagicLink failed both of that door's tests
+// (TestRedeemMagicLinkOwesTheSecondFactor and
+// TestRedeemMagicLinkRefusesWhenEnforcementRequiresAFactorNobodyHas) plus
+// the four-door pin TestEverySignInDoorsDecisionOnTheSecondFactorIsPinned,
+// and left every other door's test passing. Deleting SignInWith's rung-1
+// call while leaving rung 2's in place failed
+// TestSignInWithOwesTheSecondFactorOnTheSubjectRung and NOTHING else —
+// which is what proves the two rungs are two checks rather than one guard
+// reached twice.
+//
+// # Why a magic link is not a second factor
+//
+// A magic link proves control of a mailbox — genuinely, which is why
+// [Service.RedeemMagicLink] stamps [UserBase.EmailVerifiedAt]. But that
+// same mailbox is where [Service.RequestPasswordReset] delivers, so it is
+// already the recovery channel for the FIRST factor. Counting it as the
+// second collapses two of the three things a second factor exists to keep
+// apart: whoever reads the mailbox would hold both the way to reset the
+// password and the way past the factor guarding it. A stolen mailbox is
+// the commonest account compromise there is, and it is precisely the one
+// MFA is bought to survive.
+//
+// So a link stands in for the password, never for the factor, and a
+// redemption by an account owing one returns a challenge with empty tokens
+// exactly as Login does.
+//
+// # Why an external identity is not one either
+//
+// A provider may enforce a second factor of its own, and frequently does.
+// This package cannot see whether it did, cannot name which one, and
+// cannot know whether the deployment trusts it — the assertion
+// [Service.SignInWith] receives carries no such statement, and
+// [ExternalIdentity] has nowhere to put one. Accepting an external
+// identity as the factor would therefore mean trusting an unverifiable
+// claim nobody made.
+//
+// It is also weaker than it looks. Under [LinkVerified] or [LinkAlways] an
+// identity is attached to an existing account on the strength of a matching
+// ADDRESS, so "signed in with Google" collapses back onto the mailbox
+// argument above for any provider willing to assert the address.
+//
+// A deployment that DOES trust a particular provider's own second factor
+// has an honest way to say so, and it is not a flag on this package: run
+// [EnforcementOptional] and do not enrol those users, or gate the provider
+// at the callback, where the deployment knows which provider answered and
+// what it asserted. This package refuses to encode a trust decision it
+// cannot verify.
+//
+// # Why a passkey IS one
+//
+// [Service.FinishPasskeyLogin] is the door decided the other way. A passkey
+// is a private key bound to hardware the user holds, registered to THIS
+// account through this package's own [CredentialStore] and resolvable to no
+// other — a possession factor by construction, and one that shares no
+// channel with the password or the mailbox. Demanding a TOTP code after one
+// is a second factor demanded of a second factor; requiring nothing is the
+// common reading, and it is this package's.
+//
+// Two limits are worth stating rather than implying. First, this package
+// does not verify the assertion — see [VerifiedAssertion] — so "a passkey
+// authenticated this login" is a claim the CALLER makes; a caller that
+// fills a VerifiedAssertion in from a request body has not built a second
+// factor, it has built a sign-in-as-anyone endpoint. Second, this package
+// never sees the WebAuthn user-verification (UV) flag, so it cannot tell a
+// passkey unlocked with a biometric or a PIN from one that merely sat on a
+// plugged-in key. A deployment that needs UV must check it in the verifier
+// before calling, because nothing below this line can.
+//
+// The consequence of the decision is that a passkey login stamps
+// [Session.MFAAt] — see [Service.RequireFreshMFA] — so a passkey satisfies
+// step-up too. It has to: an account holding both a passkey and a confirmed
+// TOTP factor would otherwise sign in by passkey and then be unable to
+// change its own password, with no way to satisfy the refusal short of
+// signing in again by another door.
+//
+// # What this costs, stated plainly
+//
+// Under [EnforcementRequired], an account with no confirmed factor is now
+// refused at three doors rather than one, and [ErrMFARequired] carries no
+// user id — so an application routing such a user into enrolment must
+// resolve the account itself, from the address it already holds. That is
+// already true of Login and is not new; what IS new is that it now applies
+// to a magic link and to an external sign-in, INCLUDING one that has just
+// provisioned a brand-new account. Such an account exists, is linked, and
+// cannot sign in until it enrols. A deployment running EnforcementRequired
+// alongside external sign-up must therefore hand new users an enrolment
+// step of its own, or the sign-up dead-ends.
 //
 // # TOTP parameters are fixed, deliberately
 //
@@ -145,17 +231,21 @@ const (
 // to lose, no '+' or '/' to mangle, and no 0/O or 1/l pair to confuse.
 var recoveryCodeCodec = base32.StdEncoding.WithPadding(base32.NoPadding)
 
-// Enforcement is whether a password login MAY be completed without a second
-// factor or MUST NOT be. It governs [Service.Login] only; it never affects
-// enrolment, which an account reaches through [Service.BeginMFAEnrolment]
-// regardless.
+// Enforcement is whether a sign-in MAY be completed without a second factor
+// or MUST NOT be. It governs the three doors that consult one —
+// [Service.Login], [Service.RedeemMagicLink] and [Service.SignInWith] — and
+// not [Service.FinishPasskeyLogin], which IS a second factor; see
+// auth/mfa_service.go's package doc, "What the second factor gates, door by
+// door". It never affects enrolment, which an account reaches through
+// [Service.BeginMFAEnrolment] regardless.
 type Enforcement int
 
 const (
 	// EnforcementOptional lets an account without a confirmed [MFAFactor]
-	// log in with a password alone, and gates one that HAS a confirmed
-	// factor behind [Service.CompleteMFA]. Each account is treated
-	// according to what it has actually enrolled.
+	// sign in with a password (or a magic link, or an external identity)
+	// alone, and gates one that HAS a confirmed factor behind
+	// [Service.CompleteMFA]. Each account is treated according to what it
+	// has actually enrolled.
 	//
 	// It is deliberately the ZERO VALUE, so a Service that never calls
 	// [WithMFAEnforcement] — including one built by a route that forgets to
@@ -165,8 +255,11 @@ const (
 	// it is an entire user base refused at the door. A test pins
 	// EnforcementOptional == 0.
 	EnforcementOptional Enforcement = iota
-	// EnforcementRequired refuses any password login by an account with no
-	// CONFIRMED factor, with [ErrMFARequired].
+	// EnforcementRequired refuses any password login, magic-link redemption
+	// or external sign-in by an account with no CONFIRMED factor, with
+	// [ErrMFARequired]. It does not refuse a passkey login, which needs no
+	// other factor — see this file's package doc, "What the second factor
+	// gates, door by door".
 	//
 	// The distinct sentinel is the whole point of the mode being usable: an
 	// application catching it routes the user into enrolment, which is the
@@ -177,10 +270,10 @@ const (
 	//
 	// It does NOT retroactively invalidate anything. Sessions already
 	// issued to unenrolled accounts stay live and keep rotating through
-	// [Service.Refresh] — enforcement is checked at Login and nowhere else
-	// — so switching a deployment over is a change to how people sign in
-	// NEXT time, not a mass logout. An operator who wants both calls
-	// [Service.LogoutAll] themselves.
+	// [Service.Refresh] — enforcement is checked at the sign-in doors and
+	// nowhere else — so switching a deployment over is a change to how
+	// people sign in NEXT time, not a mass logout. An operator who wants
+	// both calls [Service.LogoutAll] themselves.
 	EnforcementRequired
 )
 
@@ -188,7 +281,9 @@ const (
 // auth/mfa.go. Compare with [errors.Is], never by string.
 var (
 	// ErrMFARequired: [WithMFAEnforcement] is [EnforcementRequired] and the
-	// account that just proved its password has no CONFIRMED [MFAFactor].
+	// account that just came through a gated sign-in door — a password
+	// login, a magic-link redemption, or an external sign-in — has no
+	// CONFIRMED [MFAFactor].
 	//
 	// It is deliberately its own sentinel rather than [ErrInvalidCredentials],
 	// and deliberately raised only AFTER the password check has passed. An
@@ -614,12 +709,17 @@ func (s *Service) CompleteMFA(ctx context.Context, challengeToken, code, ip, use
 		return zero, err
 	}
 
-	// One minting path, shared with [Service.Login] — see mintSession.
-	return s.mintSession(ctx, u, ip, userAgent)
+	// One minting path, shared with [Service.Login] — see mintSession. The
+	// &now is [Session.MFAAt]: a factor was just presented and spent, and
+	// this is the instant that makes the new session FRESH for
+	// [Service.RequireFreshMFA]. It is stamped in the same INSERT as the
+	// row, so no session of this method's ever exists unstamped.
+	return s.mintSession(ctx, u, ip, userAgent, &now)
 }
 
 // DisableMFA removes userID's second factor and every recovery code with
-// it, after proving the caller knows the account's CURRENT password.
+// it, after proving the caller knows the account's CURRENT password AND
+// holds a session that proved the factor recently.
 //
 // The password is not ceremony. Disabling MFA is the one operation that
 // makes an account strictly easier to break into, so it is the one that
@@ -627,6 +727,34 @@ func (s *Service) CompleteMFA(ctx context.Context, challengeToken, code, ip, use
 // access token or an XSS payload all carry a live session and none of them
 // carries the password. It is the same stance [Service.ChangePassword]
 // takes on the credential it replaces.
+//
+// # It also needs a FRESH second factor
+//
+// currentSessionID is the caller's own session — the SessionID claim off
+// the access token that authenticated this request, exactly as
+// [Service.ChangePassword] takes it — and [Service.RequireFreshMFA] must
+// pass on it: the session must have proved a second factor within
+// [WithStepUpWindow], or this is [ErrStepUpRequired] and nothing is
+// removed.
+//
+// Of the seven methods step-up gates, this is the one whose absence would
+// undo the other six. An attacker holding a session AND the password can,
+// without this check, simply turn the factor off and then perform every
+// other gated action unchallenged; the gate on the credential rotation
+// would be worth nothing while the gate on the credential ITSELF was
+// missing.
+//
+// It strands nobody who was not already stranded. Every door that can mint
+// a session for an account with a confirmed factor either proves that
+// factor ([Service.Login] plus [Service.CompleteMFA], a magic link or an
+// external sign-in plus the same completion) or IS one
+// ([Service.FinishPasskeyLogin]) — so a user who can reach this method at
+// all can reach it freshly. A lost authenticator is answered by a RECOVERY
+// CODE: completing a challenge with one stamps [Session.MFAAt] exactly as a
+// TOTP code does, which is what keeps "I lost my phone" a self-service
+// operation and not a support ticket. A user with neither the
+// authenticator nor a code cannot sign in in the first place, so this check
+// takes nothing further from them.
 //
 // # It clears the codes first, then the factor
 //
@@ -638,6 +766,33 @@ func (s *Service) CompleteMFA(ctx context.Context, challengeToken, code, ip, use
 // authenticator, and a retry redoes both steps cleanly), whereas deleting
 // first and failing leaves an account whose retry gets [ErrFactorNotFound]
 // and never reaches the codes at all, stranding them.
+//
+// # It revokes every trusted device
+//
+// [Service.sweepTrustedDevices] runs here too, on its own line, and this is
+// the row of the sweep matrix that needed the most argument.
+//
+// A [TrustedDevice] token means one thing and one thing only: "skip the
+// second factor". Once there is no second factor there is nothing to skip,
+// so the obvious reading is that a surviving device is merely meaningless —
+// [Service.trustedDeviceAtSignIn] refuses to consult one for an account with
+// no confirmed factor, so it grants nothing the day after this call.
+//
+// It is worse than meaningless, though, and that is why the sweep is here.
+// Re-enrolment goes DisableMFA → [Service.BeginMFAEnrolment] →
+// [Service.ConfirmMFAEnrolment] (see [ErrMFAAlreadyEnrolled], which is what
+// forces that route). Leaving the devices behind means a user who turns MFA
+// off and back on — after losing a phone, after changing authenticator apps
+// — finds every machine they ever trusted silently skipping the NEW factor,
+// a token minted against a secret that no longer exists. Whoever holds one
+// of those cookies gets the benefit of a second factor they were never
+// tested against. Sweeping here is what makes "trusted" mean "trusted for
+// the factor that is enrolled now".
+//
+// It runs BEFORE the codes and the factor for the same retry reason their
+// own order is chosen: a failure at this point leaves MFA fully on with
+// nothing trusted, which is a state the user can live in and a retry can
+// clear.
 //
 // Outstanding [MFAChallenge]s are deliberately NOT swept, because they need
 // no sweeping: [Service.CompleteMFA] loads the factor before it accepts
@@ -652,8 +807,10 @@ func (s *Service) CompleteMFA(ctx context.Context, challengeToken, code, ip, use
 // OAuth-only account cannot satisfy this check, and the honest consequence
 // is that such an account's MFA is not disableable through this method.
 // [ErrFactorNotFound] when there is nothing enrolled. Any other Store
-// failure is returned as-is.
-func (s *Service) DisableMFA(ctx context.Context, userID, currentPassword string) error {
+// failure is returned as-is, the trusted-device sweep's included: a device
+// left standing while this call reports success is a bypass armed for the
+// next enrolment, and nothing would prompt a retry.
+func (s *Service) DisableMFA(ctx context.Context, userID, currentSessionID, currentPassword string) error {
 	st, err := s.mfa()
 	if err != nil {
 		return err
@@ -674,6 +831,24 @@ func (s *Service) DisableMFA(ctx context.Context, userID, currentPassword string
 		return ErrInvalidCredentials
 	}
 
+	// Step-up, on this method's own line — see [Service.RequireFreshMFA]
+	// and "It also needs a FRESH second factor" above. After the password
+	// check, so a wrong password is reported as one. Never a no-op in
+	// practice: reaching the line below means the account holds a confirmed
+	// factor, which is exactly the case RequireFreshMFA does gate.
+	if err := s.RequireFreshMFA(ctx, userID, currentSessionID); err != nil {
+		return err
+	}
+
+	// The trusted devices, on this method's own line and BEFORE the factor
+	// goes — see the method doc, "It revokes every trusted device", for what
+	// a surviving one would mean, and why it runs first: a failure here
+	// leaves MFA fully on with nothing trusted, which is the direction a
+	// retry can fix.
+	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
+		return err
+	}
+
 	// Codes first — see the method doc for why the retry semantics decide
 	// this order.
 	if err := st.ReplaceRecoveryCodes(ctx, userID, nil); err != nil {
@@ -682,17 +857,54 @@ func (s *Service) DisableMFA(ctx context.Context, userID, currentPassword string
 	return st.DeleteFactor(ctx, userID)
 }
 
-// mfaAtLogin is [Service.Login]'s second-factor step: it returns a minted
-// [MFAChallenge] when the login must stop and be finished through
-// [Service.CompleteMFA], (nil, nil) when it may proceed to a session, and
-// an error when it must be refused outright.
+// sweepMFAState removes userID's SECOND-FACTOR state: every recovery code,
+// then the [MFAFactor] itself. It is the MFA column of
+// [Service.ChangePassword]'s sweep matrix, and only the two TERMINATION rows
+// call it — see that table for why no remediation path does.
 //
-// It runs LAST in Login's ladder, after the password and
-// [WithRequireVerifiedEmail], so nothing it reveals is reachable by a
-// caller who has not already authenticated. It is called from Login and
-// nowhere else — see this file's package doc, "What the second factor does
-// not gate, in this version", for which entry points that deliberately
-// leaves ungated and why.
+// It tolerates [ErrFactorNotFound], because "this account never enrolled" is
+// the ordinary state of most accounts and is not a failure of a sweep whose
+// job is to leave nothing behind. Every other error is returned as-is.
+//
+// The codes go first, matching [Service.DisableMFA]'s order and for the same
+// reason: a partial failure leaving the factor with no codes is a user who
+// can still authenticate, while one leaving codes with no factor is a set of
+// live credentials for a second factor that no longer exists.
+//
+// A [Service] with no [WithMFAStore] holds no factors, so it sweeps nothing
+// and reports no error — the same stated limit [Service.sweepIdentities]
+// carries for its own port.
+func (s *Service) sweepMFAState(ctx context.Context, userID string) error {
+	if s.cfg.mfaStore == nil {
+		return nil
+	}
+	if err := s.cfg.mfaStore.ReplaceRecoveryCodes(ctx, userID, nil); err != nil {
+		return err
+	}
+	if err := s.cfg.mfaStore.DeleteFactor(ctx, userID); err != nil && !errors.Is(err, ErrFactorNotFound) {
+		return err
+	}
+	return nil
+}
+
+// mfaAtSignIn is the second-factor step of every door that HAS one: it
+// returns a minted [MFAChallenge] when the sign-in must stop and be
+// finished through [Service.CompleteMFA], (nil, nil) when it may proceed to
+// a session, and an error when it must be refused outright.
+//
+// Three doors call it — [Service.Login], [Service.RedeemMagicLink] and
+// [Service.SignInWith], the last from BOTH of its rungs — and each calls it
+// on its own line rather than through a guard they share, so that removing
+// one call fails exactly one door's test. [Service.FinishPasskeyLogin]
+// deliberately does not call it at all. See this file's package doc, "What
+// the second factor gates, door by door", for the matrix and the reasoning
+// behind every cell.
+//
+// At every call site it runs LAST, after the door's own authentication has
+// already succeeded — the password and [WithRequireVerifiedEmail] at Login,
+// the claimed link at RedeemMagicLink, the resolved identity at SignInWith
+// — so nothing it reveals is reachable by a caller who has not already
+// authenticated.
 //
 // The three "may proceed" cases are worth naming, because two of them are
 // the ones that keep users out of a support queue: no [MFAStore] wired at
@@ -703,7 +915,7 @@ func (s *Service) DisableMFA(ctx context.Context, userID, currentPassword string
 // is a misconfiguration ([ErrMFANotConfigured], loud, rather than every
 // user being refused with a message about enrolling somewhere they cannot)
 // and the other two are [ErrMFARequired].
-func (s *Service) mfaAtLogin(ctx context.Context, u UserBase) (*MFAChallenge, error) {
+func (s *Service) mfaAtSignIn(ctx context.Context, u UserBase) (*MFAChallenge, error) {
 	required := s.cfg.mfaEnforcement == EnforcementRequired
 
 	if s.cfg.mfaStore == nil {

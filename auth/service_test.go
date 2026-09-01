@@ -1422,7 +1422,7 @@ func TestVerifyEmailChangeInvalidatesOutstandingResetToken(t *testing.T) {
 		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
 	}
 
-	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "wren-new@example.com")
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "", validPassword, "wren-new@example.com")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}
@@ -1480,7 +1480,7 @@ func TestVerifyEmailChangeFailsClosedWhenResetSweepFails(t *testing.T) {
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "wren3@example.com", validPassword)
 
-	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "wren3-new@example.com")
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "", validPassword, "wren3-new@example.com")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}
@@ -1510,7 +1510,7 @@ func TestVerifyEmailChangeLeavesSessionsAlone(t *testing.T) {
 	user := mustSignUp(t, svc, "xena@example.com", validPassword)
 	_, _, refresh := mustLogin(t, svc, "xena@example.com", validPassword)
 
-	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "xena-new@example.com")
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "", validPassword, "xena-new@example.com")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}
@@ -1786,6 +1786,19 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 			login, err := svc.Login(ctx, "scrub-login@example.com", validPassword, "1.2.3.4", "agent")
 			if err != nil {
 				t.Fatalf("Login: %v", err)
+			}
+			return login.User, u.ID
+		},
+		// Driven with an EMPTY device token. The point of this table is that
+		// every path handing a UserBase back scrubs it, and a trusted device
+		// changes which branch mints the session, not what the shared
+		// minting tail returns. The device-bearing branch is pinned in
+		// auth/trusted_test.go.
+		"LoginWithTrustedDevice": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
+			u := mustSignUp(t, svc, "scrub-login-device@example.com", validPassword)
+			login, err := svc.LoginWithTrustedDevice(ctx, "scrub-login-device@example.com", validPassword, "1.2.3.4", "agent", "")
+			if err != nil {
+				t.Fatalf("LoginWithTrustedDevice: %v", err)
 			}
 			return login.User, u.ID
 		},
@@ -2340,7 +2353,7 @@ func TestLogoutAllInvalidatesOutstandingResetAndEmailChangeTokens(t *testing.T) 
 	if err != nil || !ok {
 		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
 	}
-	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "attacker@evil.example")
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "", validPassword, "attacker@evil.example")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}
@@ -2417,7 +2430,7 @@ func TestLogoutAndRevokeSessionLeavePendingVerificationsAlone(t *testing.T) {
 	user := mustSignUp(t, svc, "vic@example.com", validPassword)
 	_, _, refresh := mustLogin(t, svc, "vic@example.com", validPassword)
 
-	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "vic-new@example.com")
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "", validPassword, "vic-new@example.com")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}
@@ -3517,7 +3530,7 @@ func TestChangePasswordInvalidatesOutstandingEmailChangeToken(t *testing.T) {
 	user := mustSignUp(t, svc, "iris3@example.com", validPassword)
 
 	// The attacker, holding a stolen session, arms the takeover.
-	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "attacker@evil.example")
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "", validPassword, "attacker@evil.example")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}
@@ -4221,7 +4234,7 @@ func TestResetPasswordInvalidatesOutstandingEmailChangeToken(t *testing.T) {
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "jonah2@example.com", validPassword)
 
-	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "attacker2@evil.example")
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "", validPassword, "attacker2@evil.example")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}
@@ -4281,7 +4294,7 @@ func TestRequestEmailChangeMintsRedeemableToken(t *testing.T) {
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "erin2@example.com", validPassword)
 
-	tok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "  Erin-New@Example.COM ")
+	tok, err := svc.RequestEmailChange(ctx, user.ID, "", validPassword, "  Erin-New@Example.COM ")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}
@@ -4331,7 +4344,7 @@ func TestRequestEmailChangeTakenEmailDeferredToRedemption(t *testing.T) {
 	userA := mustSignUp(t, svc, "finn@example.com", validPassword)
 	mustSignUp(t, svc, "gwen@example.com", validPassword)
 
-	tok, err := svc.RequestEmailChange(ctx, userA.ID, validPassword, "gwen@example.com")
+	tok, err := svc.RequestEmailChange(ctx, userA.ID, "", validPassword, "gwen@example.com")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v, want success — the taken-email check is deferred to redemption", err)
 	}
@@ -4360,7 +4373,7 @@ func TestRequestEmailChangeTakenEmailDeferredToRedemption(t *testing.T) {
 
 func TestRequestEmailChangeUnknownUserPropagatesNotFound(t *testing.T) {
 	svc, _ := newTestService(t)
-	_, err := svc.RequestEmailChange(context.Background(), "no-such-user-id", validPassword, "someone@example.com")
+	_, err := svc.RequestEmailChange(context.Background(), "no-such-user-id", "", validPassword, "someone@example.com")
 	if !errors.Is(err, auth.ErrUserNotFound) {
 		t.Fatalf("err = %v, want ErrUserNotFound", err)
 	}
@@ -4371,7 +4384,7 @@ func TestRequestEmailChangeSameEmailAllowed(t *testing.T) {
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "holly@example.com", validPassword)
 
-	tok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "Holly@Example.com")
+	tok, err := svc.RequestEmailChange(ctx, user.ID, "", validPassword, "Holly@Example.com")
 	if err != nil {
 		t.Fatalf("RequestEmailChange(own current address): %v, want success", err)
 	}
@@ -4394,10 +4407,10 @@ func TestRequestEmailChangeRejectsEmptyEmail(t *testing.T) {
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "ivy2@example.com", validPassword)
 
-	if _, err := svc.RequestEmailChange(ctx, user.ID, validPassword, ""); !errors.Is(err, auth.ErrEmailRequired) {
+	if _, err := svc.RequestEmailChange(ctx, user.ID, "", validPassword, ""); !errors.Is(err, auth.ErrEmailRequired) {
 		t.Fatalf("RequestEmailChange(\"\") err = %v, want ErrEmailRequired", err)
 	}
-	if _, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "   "); !errors.Is(err, auth.ErrEmailRequired) {
+	if _, err := svc.RequestEmailChange(ctx, user.ID, "", validPassword, "   "); !errors.Is(err, auth.ErrEmailRequired) {
 		t.Fatalf("RequestEmailChange(whitespace-only) err = %v, want ErrEmailRequired", err)
 	}
 
@@ -4460,7 +4473,7 @@ func TestRequestEmailChangeRequiresCurrentPassword(t *testing.T) {
 	user := mustSignUp(t, svc, "nadia@example.com", validPassword)
 	mintsAfterSignUp := store.mintCount()
 
-	tok, err := svc.RequestEmailChange(ctx, user.ID, "not-the-current-password", "attacker@evil.example")
+	tok, err := svc.RequestEmailChange(ctx, user.ID, "", "not-the-current-password", "attacker@evil.example")
 	if !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Fatalf("RequestEmailChange(wrong current password) err = %v, want ErrInvalidCredentials", err)
 	}
@@ -4504,7 +4517,7 @@ func TestRequestEmailChangeNoPasswordCredentialTreatedAsInvalid(t *testing.T) {
 		t.Fatalf("seeding CreateUser: %v", err)
 	}
 
-	if _, err := svc.RequestEmailChange(ctx, "oauth-user-2", "anything", "elsewhere@example.com"); !errors.Is(err, auth.ErrInvalidCredentials) {
+	if _, err := svc.RequestEmailChange(ctx, "oauth-user-2", "", "anything", "elsewhere@example.com"); !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Fatalf("err = %v, want ErrInvalidCredentials", err)
 	}
 	hashN, verifyN, dummyN := spy.counts()
@@ -4524,7 +4537,7 @@ func TestRequestEmailChangeChecksCredentialBeforeValidatingNewEmail(t *testing.T
 	ctx := context.Background()
 	user := mustSignUp(t, svc, "nadia2@example.com", validPassword)
 
-	_, err := svc.RequestEmailChange(ctx, user.ID, "not-the-current-password", "   ")
+	_, err := svc.RequestEmailChange(ctx, user.ID, "", "not-the-current-password", "   ")
 	if !errors.Is(err, auth.ErrInvalidCredentials) {
 		t.Fatalf("err = %v, want ErrInvalidCredentials — the credential check must run before newEmail is even normalized", err)
 	}
@@ -4843,7 +4856,7 @@ func TestWithVerificationTTLAppliesToBothVerificationPurposes(t *testing.T) {
 		t.Fatalf("signup ExpiresAt = %v, want %v", signup.ExpiresAt, want)
 	}
 
-	changeTok, err := svc.RequestEmailChange(ctx, res.User.ID, validPassword, "tilda-new@example.com")
+	changeTok, err := svc.RequestEmailChange(ctx, res.User.ID, "", validPassword, "tilda-new@example.com")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}

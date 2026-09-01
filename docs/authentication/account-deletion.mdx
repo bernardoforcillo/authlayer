@@ -7,8 +7,8 @@ Two postures, one shape.
 
 | Call | The row | Choose it when |
 |---|---|---|
-| `DeleteAccount(ctx, userID, currentPassword)` | **removed** | nothing outside authlayer holds the user id |
-| `AnonymizeAccount(ctx, userID, currentPassword)` | **kept and scrubbed** | something does — an audit trail, an order history, a foreign key |
+| `DeleteAccount(ctx, userID, currentSessionID, currentPassword)` | **removed** | nothing outside authlayer holds the user id |
+| `AnonymizeAccount(ctx, userID, currentSessionID, currentPassword)` | **kept and scrubbed** | something does — an audit trail, an order history, a foreign key |
 
 They share the re-authentication rule, the hook, the fail-safe order and the
 non-atomicity disclosure. They differ in one step: where `DeleteAccount` ends
@@ -95,11 +95,11 @@ off deleting rows.
 
 {/* verify:main */}
 ```go
-err := svc.DeleteAccount(ctx, erin.User.ID, "not-her-password")
+err := svc.DeleteAccount(ctx, erin.User.ID, "", "not-her-password")
 fmt.Println("wrong password:", errors.Is(err, auth.ErrInvalidCredentials), "hook ran:", len(cleaned) > 0)
 
 failHook = true
-err = svc.DeleteAccount(ctx, erin.User.ID, "Correct-Horse-Battery-7")
+err = svc.DeleteAccount(ctx, erin.User.ID, "", "Correct-Horse-Battery-7")
 fmt.Println("the hook's own error reaches the caller:", errors.Is(err, errBilling))
 _, err = svc.Login(ctx, "erin@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "laptop")
 fmt.Println("the account is untouched:", err)
@@ -157,7 +157,7 @@ sessions live.
 
 {/* verify:main */}
 ```go
-err = svc.DeleteAccount(ctx, erin.User.ID, "Correct-Horse-Battery-7")
+err = svc.DeleteAccount(ctx, erin.User.ID, "", "Correct-Horse-Battery-7")
 fmt.Println("deleted:", err, "hook ran first:", len(cleaned) == 1)
 
 _, err = svc.Login(ctx, "erin@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "laptop")
@@ -219,7 +219,7 @@ _, _ = svc.LinkIdentity(ctx, frank.User.ID, auth.ExternalIdentity{
 	Email: "frank@example.com", EmailVerified: true,
 })
 
-err = svc.AnonymizeAccount(ctx, frank.User.ID, "Correct-Horse-Battery-8")
+err = svc.AnonymizeAccount(ctx, frank.User.ID, "", "Correct-Horse-Battery-8")
 stamped, _ := svc.User(ctx, frank.User.ID)
 fmt.Println("anonymized:", err, "still readable by id:", stamped.ID == frank.User.ID)
 fmt.Println("scrubbed:", stamped.Email != "frank@example.com", stamped.EmailVerifiedAt == nil,

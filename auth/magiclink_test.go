@@ -1172,7 +1172,7 @@ func TestRedeemMagicLinkBurnsOnlyItsOwnToken(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("RequestPasswordReset: ok=%v err=%v", ok, err)
 	}
-	changeTok, err := svc.RequestEmailChange(ctx, user.ID, validPassword, "maja-new@example.com")
+	changeTok, err := svc.RequestEmailChange(ctx, user.ID, "", validPassword, "maja-new@example.com")
 	if err != nil {
 		t.Fatalf("RequestEmailChange: %v", err)
 	}

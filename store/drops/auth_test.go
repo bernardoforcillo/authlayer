@@ -563,8 +563,8 @@ func TestCreateSessionPropagatesTokenHashCollisionUnmapped(t *testing.T) {
 func TestFindSessionByHashScansRow(t *testing.T) {
 	now := time.Now().UTC()
 	fd := &fakeDriver{rows: &fakeRows{
-		cols: []string{"id", "user_id", "token_hash", "family_id", "expires_at", "created_at", "rotated_at", "user_agent", "ip"},
-		data: [][]any{{"sess1", "user1", "hash1", "fam1", now.Add(time.Hour), now, (*time.Time)(nil), "ua", "1.2.3.4"}},
+		cols: []string{"id", "user_id", "token_hash", "family_id", "expires_at", "created_at", "rotated_at", "user_agent", "ip", "mfa_at"},
+		data: [][]any{{"sess1", "user1", "hash1", "fam1", now.Add(time.Hour), now, (*time.Time)(nil), "ua", "1.2.3.4", (*time.Time)(nil)}},
 	}}
 	st := newAuthStore(fd)
 	got, err := st.FindSessionByHash(context.Background(), "hash1")
@@ -637,12 +637,12 @@ func TestDeleteSessionsByFamilyNoMatchesIsNotError(t *testing.T) {
 // sessionCols/sessionRow build a RETURNING-shaped result row for the
 // sessions table, matching Session's drop: tag order in auth.go.
 func sessionCols() []string {
-	return []string{"id", "user_id", "token_hash", "family_id", "expires_at", "created_at", "rotated_at", "user_agent", "ip"}
+	return []string{"id", "user_id", "token_hash", "family_id", "expires_at", "created_at", "rotated_at", "user_agent", "ip", "mfa_at"}
 }
 
 func sessionRow(rotatedAt *time.Time) []any {
 	now := time.Now().UTC()
-	return []any{"sess1", "user1", "hash1", "fam1", now.Add(time.Hour), now, rotatedAt, "ua", "1.2.3.4"}
+	return []any{"sess1", "user1", "hash1", "fam1", now.Add(time.Hour), now, rotatedAt, "ua", "1.2.3.4", (*time.Time)(nil)}
 }
 
 // markRotatedWinSQL runs a winning MarkRotated call and returns the single
