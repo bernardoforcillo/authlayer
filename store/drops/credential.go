@@ -511,6 +511,31 @@ func (st *CredentialStore) DeleteCredentialIfNotLast(ctx context.Context, userID
 	})
 }
 
+// DeleteCredentialsByUser removes every credential belonging to userID in one
+// statement:
+//
+//	DELETE FROM <credentials> WHERE user_id = $1
+//
+// Matching no rows is SUCCESS rather than auth.ErrCredentialNotFound —
+// deliberately, and the port says so: this is the primitive the two
+// TERMINATION rows of auth.Service.ChangePassword's sweep matrix call, and an
+// account deletion must not fail because the account never registered a
+// passkey. It mirrors [MFAStore.DeleteTrustedDevicesByUser] exactly.
+//
+// It is NOT the transaction [CredentialStore.DeleteCredentialIfNotLast] is,
+// and needs none: there is no reachability question here to be read under one
+// snapshot and written under another, because a caller removing the ACCOUNT
+// must remove the last credential too. One DELETE also satisfies the port's
+// "all of them, or an error" obligation for free — the statement either
+// commits every matching row or none of them, so no partial sweep can be
+// reported as success.
+func (st *CredentialStore) DeleteCredentialsByUser(ctx context.Context, userID string) error {
+	_, err := st.db.Delete(st.s.Credentials).
+		Where(st.s.credentials.eq("user_id", userID)).
+		Exec(ctx)
+	return err
+}
+
 // ── Challenges ──────────────────────────────────────────────────────────
 
 // CreateChallenge inserts c and returns it unchanged. A UserID of nil — a
