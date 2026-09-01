@@ -3,13 +3,17 @@
 // for everything it does not.
 //
 // Where service.go's methods each own one flow (sign up, log in, refresh),
-// [Service.DeleteAccount] is a CASCADE across every record kind the [Store]
-// persists, and the interesting part of it is the ORDER — see that method's
-// doc. The three by-user primitives it sequences ([Store.DeleteSessionsByUser],
-// [Store.DeleteVerificationsByUser], [Store.DeleteUser]) are deliberately
-// separate methods on the port rather than one DeleteAccount there, because
-// the order is a policy decision that belongs to this layer: see auth.go's
-// package doc, "Deletion, and why it is on this port rather than beside it".
+// [Service.DeleteAccount] is a CASCADE across every record kind this
+// package persists — the three the [Store] owns AND the external identities
+// the optional [IdentityStore] owns — and the interesting part of it is the
+// ORDER, see that method's doc. The three by-user primitives it sequences
+// ([Store.DeleteSessionsByUser], [Store.DeleteVerificationsByUser],
+// [Store.DeleteUser]) are deliberately separate methods on the port rather
+// than one DeleteAccount there, because the order is a policy decision that
+// belongs to this layer: see auth.go's package doc, "Deletion, and why it is
+// on this port rather than beside it". The identity sweep is one step in
+// that same order rather than a fifth primitive, because it reaches a
+// DIFFERENT port, which is also why nothing here is transactional.
 //
 // # Two postures, one shape
 //
@@ -118,10 +122,10 @@ func WithAccountDeletionHook(f func(ctx context.Context, userID string) error) O
 }
 
 // DeleteAccount permanently removes userID's account and everything this
-// package holds for it — every session, every verification, and the user
-// row itself — after re-authenticating the caller with currentPassword and
-// giving the application's own cleanup (see [WithAccountDeletionHook]) the
-// chance to run and to refuse.
+// package holds for it — every session, every verification, every linked
+// external identity, and the user row itself — after re-authenticating the
+// caller with currentPassword and giving the application's own cleanup (see
+// [WithAccountDeletionHook]) the chance to run and to refuse.
 //
 // This is the HARD posture: the row is gone, and the address it held is
 // free for a new sign-up immediately afterwards. Nothing keyed on the user
@@ -154,8 +158,15 @@ func WithAccountDeletionHook(f func(ctx context.Context, userID string) error) O
 //     why this is the by-USER sweep and not
 //     [Store.DeleteVerificationsByUserAndPurpose] over the three purposes
 //     this package happens to name.
-//  6. Identities — OWED, and not implemented. See "The identity sweep this
-//     does not do yet".
+//  6. Identities, when the [Service] was built with [WithIdentityStore]:
+//     every [Identity] linked to the account, via
+//     [IdentityStore.DeleteIdentity]. A linked social account is a way IN
+//     that needs no password at all, so it goes for the same reason step 5
+//     goes and before step 7 so the row outlives everything pointing at
+//     it. A Service with no identity store configured sweeps nothing here
+//     and reports no error — see [Service.sweepIdentities] for that, and
+//     for the two-Services-one-users-table configuration it cannot cover,
+//     which is this step's one stated limit.
 //  7. [Store.DeleteUser] — the user row, LAST.
 //
 // Steps 4 and 7 are the pair that matters. Sessions before the row means a
@@ -207,10 +218,10 @@ func WithAccountDeletionHook(f func(ctx context.Context, userID string) error) O
 //
 // # What is not atomic here, and why
 //
-// Steps 4 through 7 are FOUR SEPARATE STORE CALLS with no transaction
-// around them, and there cannot be one. [Store] exposes no transaction
-// (see auth.go's package doc), the identity sweep step 6 is owed may live
-// behind a DIFFERENT port with a DIFFERENT backend entirely, and the hook
+// Steps 4 through 7 are SEPARATE STORE CALLS with no transaction around
+// them, and there cannot be one. [Store] exposes no transaction (see
+// auth.go's package doc), step 6's identities live behind a DIFFERENT port
+// ([IdentityStore]) that may be a DIFFERENT backend entirely, and the hook
 // at step 3 reaches tables this package has no connection to at all. There
 // is no scope in which a single commit could cover them.
 //
@@ -219,12 +230,16 @@ func WithAccountDeletionHook(f func(ctx context.Context, userID string) error) O
 // earlier steps already removed removed. What the ORDER buys is that every
 // such partial state falls on the same side:
 //
-//   - Fail at step 5 or 7: the sessions are gone and the row is still
+//   - Fail at step 5, 6 or 7: the sessions are gone and the row is still
 //     there. The account cannot be logged into and cannot be refreshed
 //     into, and it is still present to retry the whole call against —
 //     which is safe, because steps 4 and 5 both treat "matched no rows" as
-//     success (see their own docs on [Store]) and so cost nothing the
-//     second time.
+//     success (see their own docs on [Store]) and step 6 treats a row
+//     another caller already removed as success too, so none of them costs
+//     anything the second time. A failure INSIDE step 6 can leave some of
+//     the account's identities deleted and the rest standing; each of those
+//     survivors is still a way in, which is why the error is returned
+//     rather than swallowed and why the retry above is not optional.
 //   - Fail at step 4: nothing at all has been removed. The hook has
 //     already run, which is why it must tolerate running again (see
 //     [WithAccountDeletionHook]).
@@ -252,17 +267,21 @@ func WithAccountDeletionHook(f func(ctx context.Context, userID string) error) O
 // this method: it leaves the id resolvable on purpose, and a deployment
 // that must genuinely erase the row still wants this one.
 //
-// # The identity sweep this does not do yet
+// # The identity sweep, and the one configuration it cannot reach
 //
-// Step 6 is listed and NOT implemented. OAuth identities are persisted
-// through a separate, optional port that does not exist on this branch, so
-// there is nothing here to call: a deployment that has linked social
-// identities to an account must delete them itself, from the deletion hook,
-// until that port lands and this method sweeps them between steps 5 and 7.
-// This is stated rather than silently omitted because the gap has teeth —
-// an identity row surviving its user is a credential pointing at an id that
-// no longer resolves, and a later sign-up that happens to be issued the
-// same id would inherit it.
+// Step 6 removes every [Identity] the configured [IdentityStore] holds for
+// the account. An identity row surviving its user would be a credential
+// pointing at an id that no longer resolves, and a later account issued
+// that same id would inherit it — which is why this is a sweep rather than
+// something left to the hook.
+//
+// It can only remove rows through the port THIS Service holds. A Service
+// built WITHOUT [WithIdentityStore], over a users table that some OTHER
+// Service does wire one to, sweeps nothing and reports no error: the
+// identities survive, and that deployment must delete them from the hook.
+// That is the same stated limit [Service.sweepIdentities] carries for
+// [Service.ResetPassword], and it is a property of the wiring, not of this
+// method.
 //
 // # What this does not revoke
 //
@@ -321,12 +340,15 @@ func (s *Service) DeleteAccount(ctx context.Context, userID, currentPassword str
 		return err
 	}
 
-	// Step 6, OWED: the identity sweep goes exactly here, between the
-	// verifications and the user row, once the optional identity port
-	// exists on this branch. It belongs after step 5 for the same reason
-	// step 5 follows step 4 — a linked identity is a way IN — and before
-	// step 7 so the row outlives everything that points at it. See the
-	// method doc, "The identity sweep this does not do yet".
+	// Step 6. Every linked identity, between the verifications and the
+	// user row. It belongs after step 5 for the same reason step 5 follows
+	// step 4 — a linked identity is a way IN — and before step 7 so the row
+	// outlives everything that points at it. A Service with no
+	// [WithIdentityStore] sweeps nothing here and reports no error; see
+	// [Service.sweepIdentities].
+	if err := s.sweepIdentities(ctx, userID); err != nil {
+		return err
+	}
 
 	// Step 7. The row, last.
 	return s.store.DeleteUser(ctx, userID)
@@ -368,8 +390,8 @@ func anonymizedEmail(userID string) string {
 // What survives is the id and the timestamps. What goes is everything that
 // could identify or authenticate the person: the address is replaced with an
 // undeliverable one derived from the id, the password hash is cleared, the
-// address verification is cleared, and every session and verification the
-// account held is removed. [UserBase.DeletedAt] is stamped, and from that
+// address verification is cleared, and every session, every verification and
+// every linked external identity the account held is removed. [UserBase.DeletedAt] is stamped, and from that
 // moment every authentication entry point in this package refuses the
 // account — see "Every entry point that refuses a stamped account" below,
 // which is the part of this feature that must not be got wrong.
@@ -402,8 +424,16 @@ func anonymizedEmail(userID string) string {
 //  4. [Store.DeleteSessionsByUser] — every family. ACCESS STOPS HERE.
 //  5. [Store.DeleteVerificationsByUser] — every purpose. No pending reset
 //     or email-change token may outlive the account.
-//  6. Identities — OWED, and not implemented, exactly as in DeleteAccount.
-//     See "What this branch does not sweep yet".
+//  6. Identities, when the [Service] was built with [WithIdentityStore]:
+//     every [Identity] linked to the account, via
+//     [IdentityStore.DeleteIdentity], exactly as in
+//     [Service.DeleteAccount]. This is the step that must not be skipped on
+//     the soft path: a surviving identity is a way in that needs no
+//     password, and step 7 clears the password hash — so an anonymized
+//     account whose identities survived would be MORE reachable through
+//     [Service.SignInWith] than through anything else, not less. A Service
+//     with no identity store configured sweeps nothing here and reports no
+//     error; see [Service.sweepIdentities] for that limit.
 //  7. [Store.MarkUserDeleted] — the scrub and the stamp, LAST, and as ONE
 //     atomic step: that method's own MUST is what keeps a caller from ever
 //     seeing a row stamped-but-not-scrubbed or scrubbed-but-not-stamped.
@@ -496,6 +526,34 @@ func anonymizedEmail(userID string) string {
 //     "email_change" redemption calls [Store.UpdateUserEmail], which would
 //     move a real, VERIFIED address back onto the stamped row, un-scrubbing
 //     it and taking that address out of circulation again.
+//   - [Service.RequestMagicLink] — ("", false, nil), NOT an error, for
+//     exactly the reason RequestPasswordReset returns the same thing: this
+//     method's entire shape is a promise that a caller cannot learn whether
+//     an address is registered, and a new error here would be the oracle
+//     that promise exists to close. A stamped account takes the same branch
+//     an unregistered address takes, and — with
+//     [WithMagicLinkProvisioning] enabled — is not provisioned either, so
+//     nothing is minted and nothing is created. See that method's doc for
+//     the one residual this leaves.
+//   - [Service.RedeemMagicLink] — ErrUserNotFound, AFTER the claim, so the
+//     link is burned on the way out. That is the opposite side of
+//     ResetPassword's choice above, deliberately: a "magic_link" token IS a
+//     session credential rather than the right to set one, so destroying
+//     one aimed at a closed account is remediation rather than a cost, and
+//     it needs no extra read to do it.
+//   - [Service.SignInWith] — ErrUserNotFound, on BOTH rungs of its ladder
+//     and with a separate check on each, because they reach an account two
+//     different ways: rung 1 through a linked [Identity], rung 2 through a
+//     matching address. Step 6 above has already removed the identities, so
+//     rung 1 is defence in depth; rung 2 is reachable under [LinkAlways]
+//     against a provider willing to assert the scrubbed address. Without
+//     these an anonymized account would be MORE reachable through an
+//     external provider than through any local credential, since step 7
+//     removes the password and leaves nothing else to refuse on.
+//   - [Service.LinkIdentity] — ErrUserNotFound, before the pair is even
+//     looked up, so a stamped row can never acquire a fresh credential.
+//     This one ARMS a way in rather than using one, which puts it in
+//     RequestEmailChange's category, not Login's.
 //
 // ErrUserNotFound, rather than a new sentinel, is deliberate. It is already
 // in every one of those methods' documented error sets (each of them can
@@ -531,43 +589,41 @@ func anonymizedEmail(userID string) string {
 //   - [Service.VerifyAccessToken] cannot check, because it never touches the
 //     Store — see "What this does not revoke".
 //
-// # What this branch does not sweep yet
+// # The one refusal this package cannot make
 //
-// Two pairs of authentication entry points exist in this project but not on
-// this branch, and each is OWED a DeletedAt check by whichever of the two
-// lands second:
-//
-//   - RequestMagicLink and RedeemMagicLink. A magic link is a login
-//     credential in a mailbox, so RequestMagicLink must refuse a stamped
-//     account with the same indistinguishable ("", false, nil)
-//     RequestPasswordReset uses, and RedeemMagicLink must refuse the
-//     redemption outright.
-//   - SignInWith and LinkIdentity, from the optional identity port. Both
-//     must refuse: a linked social identity is a way IN that needs no
-//     password at all, so an anonymized account with a surviving identity
-//     would be fully usable through it. That port is also what step 6 is
-//     waiting for — until it exists here, a deployment with linked
-//     identities MUST delete them from the deletion hook, or anonymization
-//     leaves the account's strongest credential untouched.
+// [Service.VerifyAccessToken] never touches the [Store], so it cannot see
+// DeletedAt at all — see "What this does not revoke" below. Every refusal
+// listed above is a refusal to MINT or ROTATE; an access token already
+// issued keeps verifying on its own signature until it expires. That is the
+// single hole in "no one may authenticate as this account, by any route",
+// it is bounded by [WithJWT]'s TTL (fifteen minutes by default), and the
+// per-request SessionID lookup that closes it is described below.
 //
 // # What is not atomic here, and why
 //
-// Steps 4 through 7 are FOUR SEPARATE STORE CALLS with no transaction around
+// Steps 4 through 7 are SEPARATE STORE CALLS with no transaction around
 // them, and there cannot be one, for exactly the reasons
 // [Service.DeleteAccount]'s "What is not atomic here, and why" gives: the
-// port exposes no transaction, the identities step 6 is owed may live behind
-// a different port and a different backend, and the hook reaches tables this
+// port exposes no transaction, step 6's identities live behind a different
+// port that may be a different backend, and the hook reaches tables this
 // package has no connection to. Step 7 is atomic WITHIN ITSELF — that is
 // [Store.MarkUserDeleted]'s MUST — but not with respect to steps 4 to 6.
 //
 // So a failure part-way is reachable, and every partial state falls on the
 // same side:
 //
-//   - Fail at step 5 or 7: the sessions are gone and the row is still there,
-//     unstamped and still holding its own address. The account cannot be
-//     logged into or refreshed into, and the whole call can simply be run
-//     again — steps 4 and 5 both treat "matched no rows" as success, and
+//   - Fail at step 5, 6 or 7: the sessions are gone and the row is still
+//     there, unstamped and still holding its own address. The account cannot
+//     be logged into or refreshed into, and the whole call can simply be run
+//     again — steps 4 and 5 both treat "matched no rows" as success, step 6
+//     treats an identity another caller already removed as success, and
 //     step 7 is idempotent for the same reason "Anonymizing twice" gives.
+//     A failure INSIDE step 6 is the one partial state worth naming: some
+//     identities gone, the rest standing, and the row not yet stamped — so
+//     the account is still refused nowhere and its surviving identities
+//     still sign in. It is an UNANONYMIZED account, which is the safe
+//     direction, and the returned error is the signal to run the call
+//     again.
 //   - Fail at step 4: nothing at all has been removed. The hook has already
 //     run, which is why it must tolerate running again.
 //
@@ -579,7 +635,7 @@ func anonymizedEmail(userID string) string {
 //
 // A second AnonymizeAccount on an already-anonymized account succeeds and
 // changes nothing meaningful. It re-runs the hook (which must tolerate that
-// — see [WithAccountDeletionHook]), sweeps two already-empty record kinds,
+// — see [WithAccountDeletionHook]), sweeps three already-empty record kinds,
 // and re-writes the same scrubbed address the row already holds, which
 // [Store.MarkUserDeleted] does not treat as a self-conflict. It also never
 // re-authenticates, because step 2's no-password branch is where an
@@ -645,10 +701,14 @@ func (s *Service) AnonymizeAccount(ctx context.Context, userID, currentPassword 
 		return err
 	}
 
-	// Step 6, OWED: the identity sweep goes exactly here, between the
-	// verifications and the stamp, once the optional identity port exists
-	// on this branch. See the method doc, "What this branch does not sweep
-	// yet" — a surviving identity is a way in that needs no password.
+	// Step 6. Every linked identity, between the verifications and the
+	// stamp — a surviving identity is a way in that needs no password, and
+	// step 7 is about to remove the password. A Service with no
+	// [WithIdentityStore] sweeps nothing here and reports no error; see
+	// [Service.sweepIdentities].
+	if err := s.sweepIdentities(ctx, userID); err != nil {
+		return err
+	}
 
 	// Step 7. The scrub and the stamp, last, and as one atomic step: the
 	// address becomes undeliverable, the credential and the verification go,

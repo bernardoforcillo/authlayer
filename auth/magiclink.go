@@ -102,6 +102,16 @@ import (
 //     branch left to distinguish, since the address is registered and a
 //     link is minted.
 //
+//     An ANONYMIZED account (a non-nil [UserBase.DeletedAt] — see
+//     [Service.AnonymizeAccount]) is refused through this same shape and
+//     for this same reason: ("", false, nil), never a new error. It is the
+//     one refusal in this method that is about the ACCOUNT rather than the
+//     address, and giving it its own error would hand an anonymous caller
+//     a way to tell "anonymized" from "never registered" — the distinction
+//     an existence oracle is made of. The check sits above the
+//     provisioning branch, so a stamped account is not handed a fresh row
+//     either, and no link is minted for it on any configuration.
+//
 //  5. Timing is the channel that remains, exactly as it does for
 //     [Service.RequestPasswordReset] — see that method's point 5 for the
 //     measured figures, the live harness that produces them, the
@@ -179,6 +189,20 @@ func (s *Service) RequestMagicLink(ctx context.Context, email, ip string) (strin
 
 	now := s.cfg.clock()
 
+	// An ANONYMIZED account is refused here, and refused the way an
+	// UNREGISTERED address is refused: the same ("", false, nil), never a
+	// new error. A distinguishable refusal would be exactly the existence
+	// oracle this method's whole shape exists to close. It also sits ABOVE
+	// the provisioning branch, so a stamped account is never handed a fresh
+	// row either — and below the clock read, so both branches have made the
+	// identical calls by the time either returns. u is the zero [UserBase]
+	// when the lookup missed, so this is only ever consulted on the known
+	// path. See [Service.AnonymizeAccount], "Every entry point that refuses
+	// a stamped account".
+	if known && u.DeletedAt != nil {
+		return "", false, nil
+	}
+
 	if !known {
 		if !s.cfg.magicLinkProvisioning {
 			return "", false, nil
@@ -255,6 +279,25 @@ func (s *Service) RequestMagicLink(ctx context.Context, email, ip string) (strin
 // after the claim (see below), so the token is burned either way. That is
 // the deliberate direction: under-granting, not leaving a claimed token
 // redeemable.
+//
+// # A stamped account, and why this one refuses after the claim
+//
+// An ANONYMIZED account (a non-nil [UserBase.DeletedAt] — see
+// [Service.AnonymizeAccount]) is refused with that same [ErrUserNotFound],
+// and it is refused AFTER the claim rather than before it. That is the
+// opposite of the choice [Service.ResetPassword] makes for its own stamped
+// check, and the difference is what the token IS. A "password_reset" token
+// grants the right to SET a credential, so refusing one before the claim
+// leaves it for a legitimate redemption that a later un-stamping might
+// permit; a "magic_link" token IS the credential, so a live one aimed at a
+// closed account is a thing worth destroying, and destroying it on the way
+// out costs nothing and needs no extra [Store.FindUserByID] to do it — the
+// account is already loaded at that point.
+//
+// AnonymizeAccount deletes every verification before it stamps, so a token
+// surviving to reach this check comes either from a request genuinely
+// concurrent with that call or from a row written around this package.
+// This is defence in depth, not the primary control.
 //
 // ip and userAgent are recorded on the new [Session] exactly as
 // [Service.Login] records its own. Unlike Login, an EMPTY ip is not
@@ -370,6 +413,20 @@ func (s *Service) RedeemMagicLink(ctx context.Context, plainToken, ip, userAgent
 	u, err := s.store.FindUserByID(ctx, v.UserID)
 	if err != nil {
 		return zero, err
+	}
+
+	// An ANONYMIZED account may not be signed into. Checked AFTER the claim
+	// deliberately — see the method doc's "A stamped account, and why this
+	// one refuses after the claim": a magic-link token IS a session
+	// credential, so burning one aimed at a closed account is remediation
+	// rather than a cost, and this needs no extra read to do it.
+	// [Service.AnonymizeAccount] deletes every verification before it
+	// stamps, so reaching this is either a token minted before the stamp in
+	// a concurrent call or a row written around this package; it is defence
+	// in depth either way. See that method's "Every entry point that
+	// refuses a stamped account".
+	if u.DeletedAt != nil {
+		return zero, ErrUserNotFound
 	}
 
 	// Redeeming this link proved control of the address it was delivered

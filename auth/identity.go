@@ -443,9 +443,9 @@ type IdentityStore interface {
 	// [IdentityStore.DeleteIdentityIfNotLast] exists because "unlink this
 	// provider" is a user-initiated removal that must never leave an account
 	// with no way in. This method is the opposite kind of operation: it is
-	// how the service RETRACTS a row it wrote itself, and how
-	// [Service.ResetPassword] sweeps identities on a credential rotation it
-	// has already committed. Neither caller is removing a way in that the
+	// how the service RETRACTS a row it wrote itself, and how the three
+	// paths in [Service.ChangePassword]'s sweep matrix that sweep
+	// identities remove them. No caller of it is removing a way in that the
 	// account is relying on:
 	//
 	//   - [Service.SignInWith]'s compensating delete removes an identity the
@@ -457,6 +457,11 @@ type IdentityStore interface {
 	//     the sweep cannot touch. See that method's doc for the one
 	//     configuration in which that password is not yet a WORKING
 	//     credential, and why it is recoverable rather than a lockout.
+	//   - [Service.DeleteAccount] and [Service.AnonymizeAccount] sweep on
+	//     the way to removing or stamping the account itself. "No way in"
+	//     is the outcome they exist to produce, so a reachability check
+	//     here would refuse the one removal that is supposed to leave
+	//     nothing behind.
 	//
 	// An application MUST NOT reach for this in place of
 	// DeleteIdentityIfNotLast on a connected-accounts screen: this method
@@ -528,11 +533,30 @@ type IdentityStore interface {
 	//   - true becoming false (the account LOSES its working password
 	//     mid-call): this method would allow the delete that locks it out.
 	//
-	// The dangerous direction is unreachable through [Service] for the hash
-	// itself: the only two paths that write a password (ChangePassword,
-	// ResetPassword) both write a freshly hashed, non-empty value, and this
-	// package offers no "remove my password" and no "delete my account" at
-	// all.
+	// The dangerous direction is HARMLESS through [Service] for the hash
+	// itself, which is a weaker statement than this doc used to make and is
+	// the true one. Three groups of methods touch the hash, and none of
+	// them produces a lockout here:
+	//
+	//   - The two that WRITE one ([Service.ChangePassword],
+	//     [Service.ResetPassword]) both write a freshly hashed, non-empty
+	//     value. Neither can turn a true into a false.
+	//   - [Service.AnonymizeAccount] genuinely does CLEAR the hash — it is
+	//     the one "remove my password" this package has — but only as part
+	//     of ending the account: it sweeps every identity first, then
+	//     stamps [UserBase.DeletedAt], after which every authentication
+	//     entry point refuses the row. An unlink racing it can pass a true
+	//     that is false by the time the delete runs, and what it leaves
+	//     behind is an account nobody may authenticate as by design. That
+	//     is the state the concurrent call was creating, not a lockout the
+	//     unlink caused.
+	//   - [Service.DeleteAccount] removes the row entirely, likewise after
+	//     sweeping the identities. There is no account left to lock out.
+	//
+	// So the guarantee survives, with a different justification: a stale
+	// true is reachable, and the only calls that make it stale are ones
+	// whose whole purpose is that the account can no longer be
+	// authenticated.
 	//
 	// Under [WithRequireVerifiedEmail](true) the verified half CAN move the
 	// other way, and this doc says so rather than pretending otherwise:
