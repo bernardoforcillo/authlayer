@@ -2376,9 +2376,16 @@ func (s createFailIdentityStore) CreateIdentity(context.Context, auth.Identity) 
 
 // TestSignInWithLeavesTheProvisionedUserWhenTheIdentityWriteFails pins the
 // window Store.CreateUser committing before IdentityStore.CreateIdentity
-// leaves open — the one this package DISCLOSES rather than closes, because
-// closing it would need a "delete this user" method on the released,
-// 18-method auth.Store port.
+// leaves open — the one this package DISCLOSES rather than closes.
+//
+// The reason is no longer a missing primitive: Store.DeleteUser exists. It is
+// that the row is ADDRESSABLE the instant CreateUser commits, so a concurrent
+// SignInWith, RequestPasswordReset or RequestMagicLink at that same address
+// can already have found it and acted on it by the time the identity write
+// fails — deleting it would then destroy an account somebody else is
+// legitimately using, which is strictly worse than the failure being
+// compensated for. The compensating delete can also fail on its own, turning
+// one disclosed window into two.
 //
 // The test exists so the disclosure is checked rather than asserted. It pins
 // both halves: the orphaned user row survives and refuses the identical

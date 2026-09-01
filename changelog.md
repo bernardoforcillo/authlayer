@@ -10,6 +10,170 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Magic links — passwordless sign-in** (`authlayer/auth`). Two new methods on
+  the existing `auth.Service`: `RequestMagicLink(ctx, email, ip) (token, ok,
+  error)` and `RedeemMagicLink(ctx, token, ip, userAgent) (LoginResult,
+  error)`, over a fourth `Verification` purpose, `magic_link`. Three options —
+  `WithMagicLinkTTL` (15 minutes), `WithMagicLinkRateLimiter` (address-keyed)
+  and `WithMagicLinkProvisioning` (off).
+
+  **The token is not a step towards a credential — it is one**, and every rule
+  here follows from that. Its default lifetime is the shortest of the four
+  purposes. `RedeemMagicLink` burns it via `Store.DeleteVerification`
+  **before** anything is issued, so two people clicking one forwarded link do
+  not both get in — and a link quoted in a reply or read out of a shared
+  mailbox is how a second click happens with no attacker doing anything
+  clever. Expiry and purpose are checked *ahead* of the burn, so neither
+  destroys the token; without the purpose check a `password_reset` token,
+  which grants only the right to *set* a password, would be exchangeable
+  directly for a live session.
+
+  `RequestMagicLink` carries `RequestPasswordReset`'s enumeration property
+  unchanged: identical call sequence, identical error set, `("", false, nil)`
+  for an unregistered address, and every branch-exclusive write's failure
+  folded into that same shape. The caller's obligation is identical too, and
+  is the one thing this package cannot enforce — **a fixed response regardless
+  of `ok`**. Re-issue invalidates the account's previous link, so at most one
+  is live, with `RequestPasswordReset`'s identical griefing cost: anyone who
+  merely knows an address can kill a victim's unclicked link by looping calls,
+  and `WithMagicLinkRateLimiter` is what bounds it. A denial from that limiter
+  returns `("", false, nil)`, never `ErrRateLimited`.
+
+  A successful redemption **stamps `EmailVerifiedAt`** when it is unset, on
+  the same argument that makes a completed reset stamp: the link was only ever
+  deliverable to the address it was minted for. Both of `ResetPassword`'s
+  guards apply — an already-verified address keeps its original timestamp, and
+  an account whose address moved since the mint is not certified at all — and
+  `RedeemMagicLink` deliberately does not consult `WithRequireVerifiedEmail`,
+  since a redemption **is** the proof that option demands.
+
+  Two exposures are stated rather than smoothed over.
+  `WithMagicLinkProvisioning(true)` lets anyone who can receive mail create an
+  account for any address they control — the exposure an open `SignUp`
+  endpoint already has, with the rate limiter as the control rather than the
+  option's absence — and it **reverses** the timing residual, since the
+  unknown branch then performs an extra `CreateUser`; the sign of the
+  difference flips, it does not disappear. No figures have been measured for
+  this flow specifically, and none of `RequestPasswordReset`'s are quoted as
+  though they had been. Separately, with provisioning on and the `users` table
+  specifically failing writes while `verifications` stays healthy, the two
+  branches are distinguishable — the fold is the better of two imperfect
+  options, not a complete answer.
+
+- **Account deletion — two postures** (`authlayer/auth`).
+  `DeleteAccount(ctx, userID, currentPassword)` removes the row;
+  `AnonymizeAccount(ctx, userID, currentPassword)` keeps it and scrubs it.
+  `UserBase` gains `DeletedAt *time.Time`, and
+  `WithAccountDeletionHook(func(ctx, userID) error)` is where the application's
+  own cleanup goes. See **Changed** for the four `auth.Store` methods and the
+  migration they require, which are breaking.
+
+  **Choose on one question: does anything outside authlayer still hold the user
+  id?** An audit trail, an order history, a foreign key. If so, removing the
+  row leaves those pointing at nothing. Either way the original address is free
+  for a new sign-up immediately, and the new account gets a **new id**.
+
+  **The hook fires first and may refuse.** It runs before any authlayer row is
+  touched, and an error from it aborts the whole call — fail closed, because a
+  half-deleted account is worse than an undeleted one. It is where your own
+  tables go, and critically the `scope` memberships authlayer cannot reach from
+  here. It must tolerate running again, and it is not told which posture is
+  running.
+
+  **The order is fail-safe and is not negotiable**: re-authenticate (or take
+  the no-password branch), the hook, `DeleteSessionsByUser` — access stops
+  here — `DeleteVerificationsByUser` (by *user*, so `signup` goes too, which no
+  other sweep in this package touches), every linked identity, then the user
+  row **last**. A failure part-way leaves an account that cannot be logged into
+  and cannot be refreshed into, and that is still there to retry the whole call
+  against. The reverse order would leave the data gone and the sessions live.
+
+  **None of it is atomic, and it cannot be**: `Store` exposes no transaction,
+  the identities live behind a different port that may be a different backend,
+  and the hook reaches tables authlayer has no connection to. What the order
+  buys is that every reachable partial state falls on the same side, and the
+  returned error is the signal to run the call again — the two by-user sweeps
+  treat "matched no rows" as success, the identity sweep treats an
+  already-removed row as success, and `MarkUserDeleted` is idempotent. A
+  `Service` with no `IdentityStore` sweeps no identities and reports no error.
+
+  **Re-authentication is required only when the account has a password.** An
+  account with none — OAuth-provisioned, or magic-link-provisioned — cannot
+  supply one and proceeds on the caller's authority. Stated plainly rather than
+  implied: not every deletion these methods perform is re-authenticated, and
+  the application is what authenticated the caller.
+
+  **A stamped account is refused by eleven authentication entry points**, each
+  carrying its own explicit check rather than sharing a guard, so that removing
+  any one of them fails exactly one test: `Login`, `Refresh`, `ChangePassword`,
+  `RequestEmailChange`, `ResetPassword`, `VerifyEmail`, `RequestPasswordReset`,
+  `RequestMagicLink`, `RedeemMagicLink`, `SignInWith` (on **both** rungs) and
+  `LinkIdentity`. `LinkIdentity` is in that list because it *arms* a way in
+  rather than using one — the scrub clears the password, so an identity linked
+  afterwards would be the account's only credential. **No new sentinel:**
+  `ErrUserNotFound` is the refusal, already in each of those methods'
+  documented error sets, with `Login` answering `ErrInvalidCredentials` after
+  `Hasher.Dummy` so a stamped account is indistinguishable in error and cost
+  from a wrong password. `RequestPasswordReset` and `RequestMagicLink` keep
+  their `("", false, nil)` and gain nothing, because a distinguishable refusal
+  there would tell an anonymous caller that a particular address had been
+  anonymized.
+
+  The scrubbed address is `deleted-<user id>@example.invalid` — derived from
+  the id, which is the only value already unique across the table, so two
+  anonymizations can never collide on `email`'s UNIQUE constraint, and under a
+  domain RFC 2606 §2 reserves so it can never be delegated.
+
+  **Neither posture revokes an access token already issued.** It is a stateless
+  signed JWT this package never looks up. A device holding one keeps working
+  for the remainder of its own TTL — 15 minutes by default — after either
+  method returns. That is the single hole in "no one may authenticate as this
+  account, by any route", it is bounded, and closing it sooner needs the
+  per-request `sid`-claim lookup already documented for `LogoutAll`.
+
+- **The sweep matrix is documented in one place** (`authlayer/auth`), on
+  `Service.ChangePassword` under *The sweep matrix*, and is the single source
+  of truth for which action destroys which credential: **eleven paths against
+  five credential kinds** — the three token purposes, the external identity and
+  the session. **Every cell has a test, the deliberate non-sweeps included.**
+  It is one table rather than a rule inferred method by method because the last
+  time it lived only as an assumption spread across five method docs, it got
+  filled in for two of its three columns and the third was a full account
+  takeover — and the columns have since grown to five while the features
+  filling them were built on branches that could not see each other.
+
+- **`examples/magiclink` and `examples/deletion` — runnable tours of both.**
+  Database-free, over `store/memory`, and asserting rather than narrating:
+  every claim panics if the code stops holding it, so a regression fails CI
+  instead of quietly making the prose wrong. Both run in CI's examples step.
+  `examples/magiclink` demonstrates the identical shape of the known and
+  unknown branches, the re-issue, the burn, the purpose check, the stamp, the
+  `ChangePassword` that disarms a parked link and the `Logout` that
+  deliberately does not, and what provisioning exposes. `examples/deletion`
+  demonstrates the hook firing first, a hook error aborting with the account
+  fully intact, a wrong password removing nothing, the hard cascade in order,
+  the identity sweep on both postures, and the access token neither posture
+  revokes.
+
+- **Documentation: two readme sections, two docs-site pages, and every count
+  re-derived.** `## Magic links` and `## Account deletion` in the readme;
+  `/authentication/magic-links` and `/authentication/account-deletion` on the
+  site, both with every Go block compiled and run by `docs/_verify` against a
+  pinned stdout. The counts this milestone moved were re-derived from source
+  rather than adjusted by eye, and corrected everywhere they appeared:
+  `auth.Store` is **twenty-two methods with eleven MUSTs** (was seven of
+  eighteen), `auth/authtest` is **sixty-five checks of which seven are races**
+  (was six of fifty-two), and its own negative controls are **twenty-eight
+  non-compliant stores in thirty-three defect/check cases** (was fifteen and
+  nineteen). Three claims were corrected rather than renumbered: "adding a
+  nineteenth method to `auth.Store` would break every third-party backend" was
+  the stated reason `IdentityStore` is a separate port, and deletion then added
+  four methods to that same port — both decisions are right, and the rule is
+  that identities are functionality and deletion is not; `SignInWith`'s
+  compensating-delete disclosure said `auth.Store` has no method that deletes a
+  user, which it now does; and the linearizability sentence in the
+  contract-suite docs named the wrong checks.
+
 - **External identities — "sign in with Google/GitHub/…"** (`authlayer/auth`).
   Four new methods on the existing `auth.Service` — `SignInWith`,
   `LinkIdentity`, `UnlinkIdentity`, `ListIdentities` — over a new `Identity`
@@ -391,6 +555,105 @@ once a 1.0 is cut. Until then, minor versions may break API.
   implemented and neither port sentence said.
 
 ### Changed
+
+- **BREAKING (Store port): four new methods on `auth.Store`.** `DeleteUser`,
+  `DeleteVerificationsByUser`, `DeleteSessionsByUser` and `MarkUserDeleted`.
+  The port shipped in `v0.1.0` with eighteen methods and now has twenty-two, so
+  **every third-party backend must grow all four to keep compiling** — a
+  compiler error naming exactly which. Both shipped backends implement them,
+  and `auth/authtest` covers each with checks a third-party backend can run
+  against itself.
+
+  This goes the **opposite way** from how `auth.IdentityStore` was added, and
+  the difference is deliberate rather than an inconsistency. Identities are
+  *functionality*: a deployment that never offers a social login never needs
+  one, and a backend that cannot store one is still a complete backend for
+  every deployment that does not — so charging every existing backend for a
+  feature most will never enable buys nothing. Deletion is not functionality in
+  that sense: every deployment eventually has to remove an account, because a
+  user asked, because a regulator requires it, or because the row is garbage,
+  so a `Store` that silently could not is not one anybody can finish deploying.
+  Putting deletion behind an optional port would have asserted the opposite.
+
+  The three record-kind deletes are **separate methods rather than one
+  `DeleteAccount`**, for the same reason the port has no transactions: a
+  `Store` is pure persistence, and the order of the cascade is a policy
+  decision belonging to the caller, which sequences it fail-safe. Four of the
+  eleven MUSTs on the port are new with them:
+
+  - `DeleteUser` removes the user row **only** and MUST NOT cascade to that
+    user's sessions or verifications. A backend whose
+    `FOREIGN KEY ... ON DELETE CASCADE` does the sweep as a side effect has
+    taken the sequencing decision away from the caller and made it
+    unobservable — a caller that skipped the sweeps entirely and one that ran
+    them in the right order look identical afterwards, against that backend and
+    no other.
+  - `DeleteVerificationsByUser` MUST filter on `userID` **alone**, never on a
+    list of purposes it knows about. `Purpose` is an open string the port
+    neither validates nor enumerates, so a fan-out over
+    `DeleteVerificationsByUserAndPurpose` does not satisfy it: no such list can
+    be complete, and a purpose added by a later flow would walk straight
+    through the sweep.
+  - `DeleteSessionsByUser` inherits **both** of `DeleteSessionsByFamily`'s
+    MUSTs unchanged, because a whole-user revocation is a superset of a family
+    one. The survivor an autocommit `DELETE` would leave on a backend whose
+    `CreateSuccessorSession` holds a row lock is a fully rotating refresh token
+    for an account whose owner has just asked for it to be deleted.
+  - `MarkUserDeleted` MUST be a **single atomic step** — all five field writes
+    landing together. The two halves fail in opposite directions and both are
+    security-relevant: *stamped but not scrubbed* leaves an account every entry
+    point already refuses while its address is still hostage and its credential
+    digest still stored, and *scrubbed but not stamped* leaves a row that
+    reports as **live** with an address derived from the user id, which is not
+    a secret — a caller who guesses it can drive a password reset against an
+    account that was supposed to be closed.
+
+  The two by-user sweeps answer a match of zero rows with `nil`; `DeleteUser`
+  answers `ErrUserNotFound`, because a caller deleting an account needs to know
+  whether there was one.
+
+- **BREAKING (schema): `users` gains a `deleted_at` column.** On PostgreSQL it
+  is `timestamptz` and nullable, and `store/drops`' `CreateSchema` emits it —
+  **on a fresh table only.** An existing deployment must run one migration by
+  hand before upgrading:
+
+  ```sql
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+  ```
+
+  (with the real table name if `WithAuthNames` moved it). `CreateSchema` can
+  self-heal a missing constraint or index, because those are statements it
+  issues separately; it **cannot** self-heal a missing column, because a column
+  lives inside the `CREATE TABLE IF NOT EXISTS` that no-ops in full against a
+  table that already exists. Run against an unmigrated table it therefore
+  **reports success while leaving the column absent** — every statement it
+  issued genuinely succeeded, and there is nothing it could return that would
+  say otherwise. The first `CreateUser` afterwards then fails with SQLSTATE
+  `42703` (`undefined_column`), because every `INSERT` names `deleted_at` and
+  so does `MarkUserDeleted`'s `UPDATE`. It fails loudly rather than degrading
+  quietly, which is the intended direction. **No `DEFAULT`**: `NULL` — not
+  anonymized — is what every existing row must hold, and a test pins that a row
+  predating the column reads back `DeletedAt` nil.
+
+- **`ChangePassword`, `ResetPassword` and `LogoutAll` now sweep `magic_link`
+  tokens too** (`authlayer/auth`), alongside the `password_reset` and
+  `email_change` purposes they already swept, and **redeeming an
+  `email_change` now sweeps pending magic links** alongside pending reset
+  tokens. Both are the same argument as before, applied to the credential the
+  milestone added: a `magic_link` token does not let its holder *set* a
+  credential, it **is** one, so a link left armed hands the account back the
+  moment a rotation finishes. The `email_change` half matters more than it
+  looks, because `RedeemMagicLink` does not refuse a link whose recorded
+  address no longer matches the account's — it merely declines to re-stamp
+  `EmailVerifiedAt` and signs the holder in anyway — so that sweep is the only
+  thing between an abandoned mailbox and a live session.
+
+  `Logout` and `RevokeSession` still sweep **nothing**, and that is a rule
+  rather than an omission: sweeping there would break "request a link on your
+  laptop, sign that laptop out, click it on your phone". All of these sweeps
+  remain **sequential-only**, with `RequestMagicLink` joining
+  `RequestPasswordReset` and `RequestEmailChange` as a call whose genuinely
+  concurrent `CreateVerification` can still mint a token that survives.
 
 - **`ResetPassword` now disconnects every external identity on the account**
   (`authlayer/auth`), and `ChangePassword` deliberately does not.

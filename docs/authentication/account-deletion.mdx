@@ -1,0 +1,381 @@
+---
+title: "Account deletion"
+description: "Hard and soft, the hook that may refuse, the order that is not negotiable, and the one thing neither posture revokes."
+---
+
+Two postures, one shape.
+
+| Call | The row | Choose it when |
+|---|---|---|
+| `DeleteAccount(ctx, userID, currentPassword)` | **removed** | nothing outside authlayer holds the user id |
+| `AnonymizeAccount(ctx, userID, currentPassword)` | **kept and scrubbed** | something does — an audit trail, an order history, a foreign key |
+
+They share the re-authentication rule, the hook, the fail-safe order and the
+non-atomicity disclosure. They differ in one step: where `DeleteAccount` ends
+with `Store.DeleteUser`, `AnonymizeAccount` ends with `Store.MarkUserDeleted`,
+which keeps the row and empties it.
+
+<Note>
+Every claim on this page is demonstrated, in order, by
+`go run ./examples/deletion`, which runs against `store/memory` and needs no
+database.
+</Note>
+
+## The hook is the boundary
+
+`auth.WithAccountDeletionHook(f)` fires **first**, before any authlayer row is
+touched, and **an error from it aborts the whole call.** Fail closed: a
+half-deleted account is worse than an undeleted one.
+
+authlayer removes what it owns — the user row, every session, every
+verification, and (with an [`IdentityStore`](/oauth/overview) wired) every
+linked identity. Everything else is yours, and the hook is where it goes: your
+own tables, and critically the [`scope`](/authorization/members) memberships
+authlayer cannot reach from here.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:decl */}
+```go
+// What the application's own cleanup returns when it could not finish.
+// Returning it is what makes the whole deletion abort.
+var errBilling = errors.New("the billing service could not be reached")
+```
+
+{/* verify:main */}
+```go
+var cleaned []string
+failHook := false
+
+key := []byte("32-bytes-or-more-from-your-vault")
+svc := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithIdentityStore(memory.NewIdentityStore()),
+	auth.WithAccountDeletionHook(func(_ context.Context, userID string) error {
+		if failHook {
+			return errBilling
+		}
+		cleaned = append(cleaned, userID)
+		return nil
+	}))
+
+ctx := context.Background()
+erin, _ := svc.SignUp(ctx, "erin@example.com", "Correct-Horse-Battery-7")
+_, _ = svc.VerifyEmail(ctx, erin.VerifyToken)
+first, _ := svc.Login(ctx, "erin@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "laptop")
+resetTok, _, _ := svc.RequestPasswordReset(ctx, "erin@example.com", "203.0.113.9")
+_, _ = svc.LinkIdentity(ctx, erin.User.ID, auth.ExternalIdentity{
+	Provider: "google", Subject: "google-subject-erin",
+	Email: "erin@example.com", EmailVerified: true,
+})
+```
+
+<Tip>
+The hook must tolerate running again. A step after it failing leaves a call the
+caller should retry, and the retry fires the hook a second time. It is also not
+told which posture is running — it is the same hook for both.
+</Tip>
+
+## A refusal changes nothing
+
+Re-authentication is required **when the account has a password**, and the
+check comes before the hook, so a wrong password does not send your application
+off deleting rows.
+
+{/* verify:main */}
+```go
+err := svc.DeleteAccount(ctx, erin.User.ID, "not-her-password")
+fmt.Println("wrong password:", errors.Is(err, auth.ErrInvalidCredentials), "hook ran:", len(cleaned) > 0)
+
+failHook = true
+err = svc.DeleteAccount(ctx, erin.User.ID, "Correct-Horse-Battery-7")
+fmt.Println("the hook's own error reaches the caller:", errors.Is(err, errBilling))
+_, err = svc.Login(ctx, "erin@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "laptop")
+fmt.Println("the account is untouched:", err)
+failHook = false
+```
+
+```
+wrong password: true hook ran: false
+the hook's own error reaches the caller: true
+the account is untouched: <nil>
+```
+
+<Warning>
+**An account with no password cannot supply one, and proceeds on the caller's
+authority.** That is an account provisioned by [`SignInWith`](/oauth/sign-in)
+or by [magic-link provisioning](/authentication/magic-links#provisioning-creates-the-account-at-request-time) —
+there is nothing to check, so nothing is checked.
+
+Stated plainly rather than implied: **not every deletion these methods perform
+is re-authenticated.** The application is what authenticated the caller in the
+first place, and it must establish that the caller owns the account before
+calling either method.
+</Warning>
+
+## The order is fail-safe, and is not negotiable
+
+<Steps>
+  <Step title="Re-authenticate">
+    Or take the no-password branch. `ErrInvalidCredentials` on a mismatch, with
+    nothing written and no hook fired.
+  </Step>
+  <Step title="The hook">
+    The only step that may refuse. Its error aborts, and reaches the caller
+    unwrapped.
+  </Step>
+  <Step title="DeleteSessionsByUser">
+    **Access stops here** — every family, current and superseded rows alike.
+  </Step>
+  <Step title="DeleteVerificationsByUser">
+    By *user*, not by purpose, so `signup` goes too — which no other path in
+    [the sweep matrix](/authentication/passwords#the-sweep-matrix) touches.
+  </Step>
+  <Step title="Every linked identity">
+    A social account is a way in that needs no password at all.
+  </Step>
+  <Step title="DeleteUser, or MarkUserDeleted">
+    The row, **last**.
+  </Step>
+</Steps>
+
+Sessions before the row means a failure part-way leaves an account that cannot
+be logged into and cannot be refreshed into — and that is still there to retry
+the whole call against. The reverse order would leave the data gone and the
+sessions live.
+
+{/* verify:main */}
+```go
+err = svc.DeleteAccount(ctx, erin.User.ID, "Correct-Horse-Battery-7")
+fmt.Println("deleted:", err, "hook ran first:", len(cleaned) == 1)
+
+_, err = svc.Login(ctx, "erin@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "laptop")
+fmt.Println("Login:", errors.Is(err, auth.ErrInvalidCredentials))
+_, err = svc.Refresh(ctx, first.RefreshToken)
+fmt.Println("the refresh token is dead:", err != nil)
+err = svc.ResetPassword(ctx, resetTok, "Anything-At-All-1!")
+fmt.Println("the pending reset token is gone:", errors.Is(err, auth.ErrVerificationNotFound))
+
+linked, _ := svc.ListIdentities(ctx, erin.User.ID)
+fmt.Println("the google identity went too:", len(linked) == 0)
+
+again, _ := svc.SignUp(ctx, "erin@example.com", "Somebody-Else-Entirely-1!")
+fmt.Println("the address is free, with a NEW id:", again.Created, again.User.ID != erin.User.ID)
+```
+
+```
+deleted: <nil> hook ran first: true
+Login: true
+the refresh token is dead: true
+the pending reset token is gone: true
+the google identity went too: true
+the address is free, with a NEW id: true true
+```
+
+<Warning>
+**None of it is atomic, and it cannot be.** `Store` exposes no transaction, the
+identities live behind a *different* port that may be a different backend
+entirely, and the hook reaches tables authlayer has no connection to at all.
+There is no scope in which one commit could cover them.
+
+What the order buys is that every reachable partial state falls on the same
+side, and the returned error is the signal to run the call again. Steps 3 and 4
+treat "matched no rows" as success, the identity sweep treats an
+already-removed row as success, and `MarkUserDeleted` is idempotent — so a
+retry after a partial failure completes rather than erroring on what is already
+done.
+
+A `Service` built with no `IdentityStore` sweeps **no identities and reports no
+error**. That is the one configuration limit on step 5: an application that
+linked identities through some other path must remove them itself.
+</Warning>
+
+## Anonymization keeps the row and empties it
+
+`MarkUserDeleted` writes five fields as one indivisible step: the address is
+replaced with an undeliverable value derived from the user's own id
+(`deleted-<id>@example.invalid`, so two of them can never collide against
+`users.email`'s `UNIQUE` constraint), the password hash is cleared,
+`EmailVerifiedAt` is cleared, and `DeletedAt` and `UpdatedAt` are stamped.
+
+{/* verify:main */}
+```go
+frank, _ := svc.SignUp(ctx, "frank@example.com", "Correct-Horse-Battery-8")
+_, _ = svc.VerifyEmail(ctx, frank.VerifyToken)
+fRefresh, _ := svc.Login(ctx, "frank@example.com", "Correct-Horse-Battery-8", "203.0.113.9", "laptop")
+_, _ = svc.LinkIdentity(ctx, frank.User.ID, auth.ExternalIdentity{
+	Provider: "google", Subject: "google-subject-frank",
+	Email: "frank@example.com", EmailVerified: true,
+})
+
+err = svc.AnonymizeAccount(ctx, frank.User.ID, "Correct-Horse-Battery-8")
+stamped, _ := svc.User(ctx, frank.User.ID)
+fmt.Println("anonymized:", err, "still readable by id:", stamped.ID == frank.User.ID)
+fmt.Println("scrubbed:", stamped.Email != "frank@example.com", stamped.EmailVerifiedAt == nil,
+	stamped.DeletedAt != nil)
+```
+
+```
+anonymized: <nil> still readable by id: true
+scrubbed: true true true
+```
+
+<Note>
+Reading the row by id is how an application discovers an account is anonymized
+at all, so `Service.User` deliberately keeps working. So does `DeleteAccount`
+against a stamped account — refusing would leave a row nothing could ever
+remove — and so does `AnonymizeAccount` itself.
+</Note>
+
+## Every authentication entry point refuses a stamped row
+
+This is the half of the feature that must not be got wrong, so it is
+enumerated rather than described. Eleven entry points, each carrying its **own
+explicit check** rather than sharing a guard, so that removing any one of them
+fails exactly one test:
+
+`Login` · `Refresh` · `ChangePassword` · `RequestEmailChange` ·
+`ResetPassword` · `VerifyEmail` · `RequestPasswordReset` · `RequestMagicLink` ·
+`RedeemMagicLink` · `SignInWith` (on **both** rungs of its ladder) ·
+`LinkIdentity`
+
+{/* verify:main */}
+```go
+_, err = svc.Login(ctx, "frank@example.com", "Correct-Horse-Battery-8", "203.0.113.9", "laptop")
+fmt.Println("Login:", errors.Is(err, auth.ErrInvalidCredentials))
+_, err = svc.Refresh(ctx, fRefresh.RefreshToken)
+fmt.Println("Refresh:", err != nil)
+err = svc.ChangePassword(ctx, frank.User.ID, "", "Correct-Horse-Battery-8", "New-Password-Entirely-1!")
+fmt.Println("ChangePassword:", errors.Is(err, auth.ErrUserNotFound))
+
+tok, ok, err := svc.RequestPasswordReset(ctx, stamped.Email, "203.0.113.9")
+fmt.Println("RequestPasswordReset stays indistinguishable:", tok == "", ok, err)
+tok, ok, err = svc.RequestMagicLink(ctx, stamped.Email, "203.0.113.9")
+fmt.Println("RequestMagicLink stays indistinguishable:  ", tok == "", ok, err)
+
+fLinked, _ := svc.ListIdentities(ctx, frank.User.ID)
+fmt.Println("the identity sweep matters MORE here:", len(fLinked) == 0)
+
+reborn, _ := svc.SignUp(ctx, "frank@example.com", "Somebody-Else-Entirely-2!")
+fmt.Println("the original address is free too:", reborn.Created, reborn.User.ID != frank.User.ID)
+```
+
+```
+Login: true
+Refresh: true
+ChangePassword: true
+RequestPasswordReset stays indistinguishable: true false <nil>
+RequestMagicLink stays indistinguishable:   true false <nil>
+the identity sweep matters MORE here: true
+the original address is free too: true true
+```
+
+`ErrUserNotFound` is the refusal, rather than a new sentinel: it is already in
+each of those methods' documented error sets, and an application already maps
+it to 404. `Login` is the exception that returns `ErrInvalidCredentials`,
+after `Hasher.Dummy`, so a stamped account is indistinguishable in both error
+and cost from a wrong password and from an unknown address.
+
+<Warning>
+The other two exceptions are the enumeration-safe pair.
+**`RequestPasswordReset` and `RequestMagicLink` keep their indistinguishable
+`("", false, nil)`** and gain no new error, because a distinguishable refusal
+there would tell an anonymous caller that a particular address had been
+anonymized — precisely the oracle those methods' shape exists to close.
+
+Ask against the **scrubbed** address to see it: the original resolves to
+nothing at all now, and would answer the same way for the ordinary
+unknown-address reason.
+</Warning>
+
+<Note>
+`LinkIdentity` is in the list because it **arms** a way in rather than using
+one, which puts it in `RequestEmailChange`'s category rather than `Login`'s.
+The identity sweep matters *more* on the soft path, not less: the scrub clears
+the password, so an identity left standing would be the account's **only**
+remaining credential — a stamped row reachable through an external provider and
+through nothing else.
+
+`Logout`, `LogoutAll`, `ListSessions` and `RevokeSession` are unguarded
+because they only ever **revoke**. None grants access, and step 3 already
+emptied the account's sessions.
+</Note>
+
+## What neither posture revokes
+
+<Warning>
+**An access token already issued.** It is a stateless signed JWT; this package
+never looks a presented one up in the `Store`, only verifies its signature and
+expiry. A device holding one keeps working for the remainder of its own TTL —
+15 minutes by default under `WithJWT` — after either method returns.
+
+That is the single hole in "no one may authenticate as this account, by any
+route". It is bounded, and the per-request `sid`-claim lookup that closes it
+sooner is described under
+[the hook for closing the gap](/authentication/sessions#the-hook-for-closing-the-gap).
+</Warning>
+
+{/* verify:main */}
+```go
+claims, err := svc.VerifyAccessToken(fRefresh.AccessToken)
+fmt.Println("a pre-anonymization access token still parses:", err, claims.Subject == frank.User.ID)
+```
+
+```
+a pre-anonymization access token still parses: <nil> true
+```
+
+{/* verify:stdout "wrong password: true hook ran: false\nthe hook's own error reaches the caller: true\nthe account is untouched: <nil>\ndeleted: <nil> hook ran first: true\nLogin: true\nthe refresh token is dead: true\nthe pending reset token is gone: true\nthe google identity went too: true\nthe address is free, with a NEW id: true true\nanonymized: <nil> still readable by id: true\nscrubbed: true true true\nLogin: true\nRefresh: true\nChangePassword: true\nRequestPasswordReset stays indistinguishable: true false <nil>\nRequestMagicLink stays indistinguishable:   true false <nil>\nthe identity sweep matters MORE here: true\nthe original address is free too: true true\na pre-anonymization access token still parses: <nil> true" */}
+
+## The storage cost
+
+`AnonymizeAccount` needs a `users.deleted_at` column. On PostgreSQL that
+arrives on a **fresh** table only — `CreateSchema` cannot add a column to a
+table that already exists, because a column lives inside the
+`CREATE TABLE IF NOT EXISTS` that no-ops in full. An existing deployment runs
+one migration by hand:
+
+```sql
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+```
+
+<Warning>
+`CreateSchema` against an unmigrated table **reports success** while leaving
+the column absent — every statement it issued genuinely succeeded. The first
+`CreateUser` afterwards then fails with SQLSTATE `42703`
+(`undefined_column`), because every `INSERT` names `deleted_at`. It fails
+loudly rather than degrading quietly, which is the intended direction.
+
+`timestamptz` and nullable, with **no `DEFAULT`** — `NULL`, not anonymized, is
+what every existing row must hold. See [Schema](/storage/schema).
+</Warning>
+
+The four methods this feature added to `auth.Store` — `DeleteUser`,
+`DeleteVerificationsByUser`, `DeleteSessionsByUser` and `MarkUserDeleted` — are
+a **breaking change** to a port that shipped with eighteen. That was chosen
+deliberately: every deployment eventually has to remove an account, so a
+`Store` that silently could not is not one anybody can finish deploying, and
+putting deletion behind an optional port would have asserted the opposite. See
+[Writing your own backend](/storage/custom-backends).
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Magic links" icon="wand-magic-sparkles" href="/authentication/magic-links">
+    Both postures sweep pending links, and one entry point refuses in silence.
+  </Card>
+  <Card title="Storage" icon="database" href="/storage/overview">
+    The eleven MUSTs, and the ones deletion added.
+  </Card>
+</Columns>

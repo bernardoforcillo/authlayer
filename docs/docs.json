@@ -65,6 +65,8 @@
           "authentication/refresh-rotation",
           "authentication/passwords",
           "authentication/email-verification",
+          "authentication/magic-links",
+          "authentication/account-deletion",
           "authentication/rate-limiting",
           "authentication/wiring"
         ]

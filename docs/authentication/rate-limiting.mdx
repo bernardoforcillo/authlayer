@@ -1,6 +1,6 @@
 ---
 title: "Rate limiting, and the bounds on enumeration safety"
-description: "Two limiters, no default, and fail-closed. Plus the measured timing channel that enumeration safety does not close, with the harness that re-derives it."
+description: "Three limiters, no default, and fail-closed. Plus the measured timing channel that enumeration safety does not close, with the harness that re-derives it."
 ---
 
 `RateLimiter` is a one-method port:
@@ -12,12 +12,13 @@ type RateLimiter interface {
 }
 ```
 
-Two options wire two different limiters:
+Three options wire three different limiters:
 
 | Option | Keyed on | Consulted by |
 |---|---|---|
-| `WithRateLimiter(l)` | **IP** | `Login` and `RequestPasswordReset` |
+| `WithRateLimiter(l)` | **IP** | `Login`, `RequestPasswordReset` and `RequestMagicLink` |
 | `WithPasswordResetRateLimiter(l)` | **email address** | `RequestPasswordReset` only |
+| `WithMagicLinkRateLimiter(l)` | **email address** | [`RequestMagicLink`](/authentication/magic-links) only |
 
 <Note>
 Keying login on IP and **never** on email is deliberate: an email-keyed bucket
@@ -134,15 +135,18 @@ limiter outage: true false
 Note that the limiter's own error propagates — it is **not** flattened into
 `ErrRateLimited`, so you can tell "too many attempts" from "my limiter is down".
 
-## The reset limiter's denial has a different shape
+## An address limiter's denial has a different shape
 
 <Warning>
-A denial from the **address-keyed** reset limiter returns the same
-`("", false, nil)` an unknown address gets, **not** `ErrRateLimited`.
+A denial from **either** address-keyed limiter — the reset one or the
+magic-link one — returns the same `("", false, nil)` an unknown address gets,
+**not** `ErrRateLimited`.
 
 That is a difference of shape, not of stance. A distinguishable error reachable
 only once enough requests for *that address* had run would itself be the
-existence oracle the method exists to close.
+existence oracle the method exists to close. The magic-link limiter's denial is
+also answered **before** the provisioning branch, so a denied request creates no
+account either.
 </Warning>
 
 {/* verify:main */}
@@ -167,11 +171,17 @@ request 2: token=false ok=false err=<nil>
 ```
 
 The second row is indistinguishable from an unknown address, which is the point.
+`WithMagicLinkRateLimiter` behaves identically, and both carry the same cost:
+the re-issue contract means anyone who merely knows an address can kill a
+victim's unclicked link by looping the call, and the address limiter is what
+bounds how often that can happen. There is **no default** — the bucket size is
+an operator decision.
 
 ## Enumeration safety is bounded, not absolute
 
-`SignUp` and `RequestPasswordReset` equalise the **sequence of calls** and the
-**set of errors** each branch can produce. **Neither equalises the wall clock.**
+`SignUp`, `RequestPasswordReset` and `RequestMagicLink` equalise the **sequence
+of calls** and the **set of errors** each branch can produce. **None of them
+equalises the wall clock.**
 
 On `RequestPasswordReset` the residual is *measured* rather than assumed, by a
 harness in the tree — so it can be re-derived and re-checked after any change:
@@ -208,7 +218,8 @@ asserting a threshold.
   <Card title="Table size no longer does" icon="check">
     `store/drops` indexes `verifications (user_id, purpose)`, so the
     invalidating `DELETE` reads your own rows rather than scanning every
-    pending token held for all users.
+    pending token held for all users. It runs on every `RequestMagicLink` as
+    well, for the same reason.
   </Card>
 </Columns>
 
@@ -233,7 +244,19 @@ against any one address — which is the resource this channel actually needs. I
 earns its keep twice over, because the re-issue behaviour it gates has a second
 cost: since each request invalidates the account's previous reset token, anyone
 who merely knows an address can kill a victim's genuine pending link by looping
-calls.
+calls. `WithMagicLinkRateLimiter` is its counterpart and carries both costs
+identically.
+
+<Note>
+**None of the figures above were measured for the magic-link flow
+specifically**, and this page does not quote the reset flow's numbers as though
+they had been. The mechanism is the same — the known branch performs the same
+two extra writes — so the same shape applies, with one reversal: with
+[`WithMagicLinkProvisioning`](/authentication/magic-links#provisioning-creates-the-account-at-request-time)
+enabled the **unknown** branch becomes the slower one, because it performs an
+extra `Store.CreateUser`. The sign of the difference flips; it does not
+disappear.
+</Note>
 
 <Warning>
 A caller can reopen the channel from outside. If your handler awaits

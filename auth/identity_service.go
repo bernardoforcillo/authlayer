@@ -174,6 +174,36 @@ func requireProviderSubject(ext ExternalIdentity) error {
 // report it to false. TestSignInWithIgnoresRequireVerifiedEmail pins both
 // halves of this so it cannot drift into an accident.
 //
+// # A stamped account is refused on both rungs, separately
+//
+// An ANONYMIZED account (a non-nil [UserBase.DeletedAt] — see
+// [Service.AnonymizeAccount]) is refused with [ErrUserNotFound], and this
+// method carries TWO checks for it rather than one, because the two rungs
+// reach an account by two different routes and a single guard placed on
+// either one would leave the other open:
+//
+//   - Rung 1, in [Service.signInLinkedIdentity], after the account is
+//     loaded and before [IdentityStore.TouchIdentity] stamps a use that is
+//     not going to happen. [Service.AnonymizeAccount] removes every linked
+//     identity before it stamps, so this rung should be unreachable for a
+//     stamped account; the check is there because "should be unreachable"
+//     is exactly the assumption that a deployment wiring two Services over
+//     one users table — only one of them holding an [IdentityStore] — makes
+//     false. See [Service.sweepIdentities] for that configuration.
+//   - Rung 2, in the existing-account branch, above the [Linking] policy.
+//     This one is genuinely reachable: an anonymized row still holds the
+//     derived scrubbed address, and under [LinkAlways] a provider willing
+//     to assert that address would otherwise link to it and sign in.
+//
+// Without both, an anonymized account would be MORE reachable through an
+// external provider than through any local credential, since the scrub
+// removes the password and leaves nothing for [Service.Login] to refuse on.
+// Two separate checks also mean a mutation that removes either one fails a
+// test naming that rung, which a shared guard could not prove.
+//
+// [Service.LinkIdentity] carries its own third check for the same reason;
+// see its "What it refuses".
+//
 // # Fail closed
 //
 // Every store error is returned as-is and no session is minted. In
@@ -243,12 +273,25 @@ func requireProviderSubject(ext ExternalIdentity) error {
 // TestSignInWithLeavesTheProvisionedUserWhenTheIdentityWriteFails pins both
 // halves, so this disclosure is checked rather than asserted.
 //
-// Compensating — deleting the just-created user — is what would close it, and
-// it is not available: [Store] has no method that deletes a user, and adding
-// one would be a nineteenth method on a port that shipped in v0.1.0, breaking
-// every third-party backend implementing it. That is the same constraint that
-// made [IdentityStore] a separate port in the first place, and it is not
-// worth breaking for a window a documented recovery already covers.
+// Compensating — deleting the just-created user — is what would close it,
+// and [Store.DeleteUser] now exists to do it with. This method still does
+// not, and the reason is no longer that the primitive is missing:
+//
+//   - The row is ADDRESSABLE the instant CreateUser commits. A concurrent
+//     [Service.SignInWith], [Service.RequestPasswordReset] or
+//     [Service.RequestMagicLink] at that same address can already have
+//     found it and acted on it — minted a verification against it, or
+//     linked a DIFFERENT external identity to it — by the time the
+//     identity write here fails. Deleting it then destroys an account
+//     somebody else is legitimately using, which is a strictly worse
+//     failure than the one being compensated for.
+//   - The compensating delete can itself fail, so it turns one disclosed
+//     window into two, and the second one hands the caller an error that
+//     describes the cleanup rather than the sign-in.
+//
+// The documented recovery above covers the window, it is pinned by a test
+// rather than asserted, and it does not depend on this method guessing
+// whether the row it created is still only its own.
 //
 // SignInResult.User never carries a live PasswordHash — see
 // [UserBase.PasswordHash]. Note that an account provisioned here has no
@@ -330,6 +373,15 @@ func (s *Service) SignInWith(ctx context.Context, req SignInRequest) (SignInResu
 	case err != nil:
 		return zero, err
 	default:
+		// Rung 2's OWN anonymized-account refusal — see the method doc, "A
+		// stamped account is refused on both rungs, separately". This is
+		// the rung reachable under [LinkAlways] against a provider willing
+		// to assert the scrubbed address a stamped row holds, and it is
+		// checked ABOVE the policy so that no [Linking] setting can allow
+		// past it.
+		if u.DeletedAt != nil {
+			return zero, ErrUserNotFound
+		}
 		// providerAsserted is passed, not just providerVerified, because the
 		// fallback rule sits ABOVE the policy — see [Service.mayLink].
 		if !s.mayLink(providerAsserted, providerVerified, u) {
@@ -398,12 +450,22 @@ func (s *Service) SignInWith(ctx context.Context, req SignInRequest) (SignInResu
 // leaves LastUsedAt stamped for a sign-in that did not complete; that is an
 // audit field erring toward over-reporting, which is the safe direction for
 // it and the only one available without a transaction across two ports.
+//
+// It carries rung 1's own ANONYMIZED-account refusal, which is a SEPARATE
+// check from rung 2's rather than a guard the two share — see
+// [Service.SignInWith]'s "A stamped account is refused on both rungs,
+// separately". It is placed after the user load and before
+// [IdentityStore.TouchIdentity], so a refused sign-in does not stamp
+// LastUsedAt for a use that did not happen.
 func (s *Service) signInLinkedIdentity(ctx context.Context, identities IdentityStore, linked Identity, req SignInRequest) (SignInResult, error) {
 	var zero SignInResult
 
 	u, err := s.store.FindUserByID(ctx, linked.UserID)
 	if err != nil {
 		return zero, err
+	}
+	if u.DeletedAt != nil {
+		return zero, ErrUserNotFound
 	}
 	if err := identities.TouchIdentity(ctx, linked.ID, s.cfg.clock()); err != nil {
 		return zero, err
@@ -548,27 +610,42 @@ func (s *Service) confirmLinkedAddress(ctx context.Context, identities IdentityS
 	return ErrLinkRequiresVerification
 }
 
-// sweepIdentities removes every external identity on userID's account. It is
-// [Service.ResetPassword]'s, and only ResetPassword's — see that method's doc
-// for why an unauthenticated recovery sweeps and an authenticated
-// [Service.ChangePassword] deliberately does not.
+// sweepIdentities removes every external identity on userID's account. It has
+// exactly three callers, and they are the three paths in
+// [Service.ChangePassword]'s sweep matrix whose identity column says "swept":
+// [Service.ResetPassword], [Service.DeleteAccount] and
+// [Service.AnonymizeAccount]. ChangePassword and [Service.LogoutAll]
+// deliberately do NOT call it — see ResetPassword's doc for why an
+// unauthenticated recovery sweeps and an authenticated rotation does not.
 //
 // The optional port being absent is not an error here, and that is the whole
 // reason this is a helper rather than a call to [Service.identities]. A
 // deployment that offers no external sign-in has no identities to sweep, and
-// turning every password reset in such a deployment into
-// [ErrOAuthNotConfigured] would break the one flow this package documents as
-// the way back into a locked-out account.
+// turning every password reset — or every account deletion — in such a
+// deployment into [ErrOAuthNotConfigured] would break the one flow this
+// package documents as the way back into a locked-out account, and would
+// make the other two unable to finish at all.
 //
 // A [Service] built WITHOUT [WithIdentityStore] over a users table that some
-// OTHER Service does wire one to is the stated limit: this sweep can only
-// remove rows through the port the Service performing the reset holds.
+// OTHER Service does wire one to is the stated limit, and it is the same
+// limit for all three callers: this sweep can only remove rows through the
+// port the Service performing the call holds. Such a deployment must delete
+// the identities itself — from [WithAccountDeletionHook] for the two
+// deletion postures, which is the hook's purpose, and by hand for
+// ResetPassword, which has no hook.
 //
 // The list and the deletes are separate calls, with the same SEQUENTIAL-ONLY
-// scope [Service.ResetPassword]'s verification sweeps disclose: an identity
-// linked by a call genuinely concurrent with this one can survive it. Closing
-// that would need a transaction the port does not offer, and the exposure is
-// bounded by the linking policy, which still applies to that concurrent call.
+// scope its callers' verification sweeps disclose: an identity linked by a
+// call genuinely concurrent with this one can survive it. Closing that would
+// need a transaction the port does not offer, and the exposure is bounded by
+// the linking policy, which still applies to that concurrent call — and, for
+// the two deletion callers, by [Service.LinkIdentity]'s and
+// [Service.SignInWith]'s own refusals once [UserBase.DeletedAt] is stamped.
+//
+// A failure partway through is returned immediately, leaving the identities
+// already deleted deleted and the rest standing. Each survivor is still a
+// way in, which is why the error is returned rather than swallowed and why
+// every caller treats it as fatal to the operation.
 //
 // [ErrIdentityNotFound] from a delete is success: another caller removed the
 // row first, which is the state this wanted.
@@ -679,6 +756,18 @@ func (s *Service) revokeEverySession(ctx context.Context, userID string) error {
 //     the link is written, so a row is never left dangling — pointing at a
 //     user that does not exist, occupying a (Provider, Subject) pair nobody
 //     can then use, and failing every sign-in that resolves it.
+//   - userID names an ANONYMIZED account (a non-nil [UserBase.DeletedAt] —
+//     see [Service.AnonymizeAccount]): the same [ErrUserNotFound], decided
+//     from the same read and before the pair is looked up at all, so a
+//     stamped row can never acquire a fresh credential. This method ARMS a
+//     way in rather than using one, which puts it in
+//     [Service.RequestEmailChange]'s category rather than
+//     [Service.Login]'s: anonymization clears the password, so an identity
+//     linked afterwards would be the account's ONLY credential and would
+//     make it fully usable again through [Service.SignInWith]. The refusal
+//     is this method's own explicit check, not one inherited from
+//     SignInWith — see that method's "A stamped account is refused on both
+//     rungs, separately" for why each entry point carries its own.
 //
 // Already linked to THIS user is not a refusal: the existing [Identity] is
 // returned unchanged with a nil error, so a retried or repeated call is a
@@ -730,8 +819,16 @@ func (s *Service) LinkIdentity(ctx context.Context, userID string, ext ExternalI
 
 	// The account is read FIRST: nothing is ever linked to a user that does
 	// not exist, not even idempotently.
-	if _, err := s.store.FindUserByID(ctx, userID); err != nil {
+	u, err := s.store.FindUserByID(ctx, userID)
+	if err != nil {
 		return zero, err
+	}
+	// An ANONYMIZED account may not ACQUIRE a credential — see the method
+	// doc, "What it refuses". Refused before the (Provider, Subject) pair is
+	// even looked up, so a stamped row cannot be armed with a way in, and
+	// not even the idempotent already-linked-to-this-user return is reached.
+	if u.DeletedAt != nil {
+		return zero, ErrUserNotFound
 	}
 
 	existing, err := identities.FindIdentityByProviderSubject(ctx, ext.Provider, ext.Subject)
@@ -823,17 +920,20 @@ func (s *Service) LinkIdentity(ctx context.Context, userID string, ext ExternalI
 //
 // # Why the other-credential state is read here and passed in
 //
-// The identity store owns `identities` and cannot see `users` or the passkey
-// tables, so this method reads the account and hands the answer down.
-// [IdentityStore]'s own doc argues why that value cannot go stale in the
-// dangerous direction for its password term: no [Service] method removes a
-// password (both writers store a freshly hashed, non-empty value, and there
-// is no "remove my password" in this package), so a true observed here cannot
-// become a false under the delete. The other direction merely refuses a
-// delete that would have been safe, which is self-correcting on retry. The
-// PASSKEY term can move the dangerous way — [Service.DeletePasskey] removes
-// one concurrently — which is the mirror-image race disclosed in full on
-// [CredentialStore.DeleteCredentialIfNotLast] and not closed here.
+// The identity store owns `identities` and cannot see `users` or the passkey tables, so this
+// method reads the account and hands the answer down. [IdentityStore]'s own
+// doc argues why that value cannot go stale in a way that HARMS: the two
+// methods that write a password ([Service.ChangePassword],
+// [Service.ResetPassword]) both store a freshly hashed, non-empty value, so
+// neither can turn a true into a false; and the two that remove one
+// ([Service.AnonymizeAccount], [Service.DeleteAccount]) are ending the
+// account outright, so the "lockout" a stale true could cause there is the
+// state those methods exist to produce. The other direction merely refuses
+// a delete that would have been safe, which is self-correcting on retry.
+//
+// The PASSKEY term can move the dangerous way — [Service.DeletePasskey]
+// removes one concurrently — which is the mirror-image race disclosed in
+// full on [CredentialStore.DeleteCredentialIfNotLast] and not closed here.
 //
 // That argument depends on the read being FRESH and being the account's real
 // state. It is performed on every call rather than cached, and the flag is
@@ -863,6 +963,49 @@ func (s *Service) LinkIdentity(ctx context.Context, userID string, ext ExternalI
 // It errs strict, which is the safe direction: an account that would in fact
 // have been fine is refused an unlink until it verifies its address, and the
 // refusal removes nothing.
+//
+// # A magic link is not counted, deliberately
+//
+// [Service.RequestMagicLink] and [Service.RedeemMagicLink] are a way into
+// an account that needs neither a password nor an identity, so a reader
+// meeting this predicate after meeting them will ask whether the
+// arithmetic should have changed. It should not, and this says so rather
+// than leaving the omission to look like an oversight.
+//
+//  1. That route is not new, and it never counted. A password-less account
+//     has ALWAYS been reachable through [Service.RequestPasswordReset]
+//     followed by [Service.ResetPassword] — that pair sets a first password
+//     on an account with none and certifies the address while doing it, and
+//     it is the documented recovery for exactly the accounts
+//     [Service.SignInWith] provisions. If a route through the mailbox
+//     counted as a surviving way in, this predicate would have been
+//     vacuously true since v0.1.0 and [ErrLastCredential] would never have
+//     fired at all. Magic links add a second door to a room that was
+//     already reachable; they do not change what the door is made of.
+//
+//  2. The question this predicate answers is what the ACCOUNT holds, not
+//     what a mailbox holder can obtain. A password hash and an [Identity]
+//     are rows that survive the delete and can be presented afterwards. A
+//     magic link does not exist until somebody asks for one, and whether
+//     asking works depends on facts this package cannot see: whether the
+//     application exposes that endpoint at all, and whether it can send
+//     mail. Answering "yes, a way in survives" on the strength of an
+//     endpoint the deployment may never have wired is the constant true
+//     that "Why the password state is read here and passed in" identifies
+//     as the lockout wearing a successful return.
+//
+//  3. The one case where it would matter is the case where it would be
+//     most wrong. An account provisioned by [Service.SignInWith] against a
+//     provider that did not assert the address verified holds an address
+//     NOBODY has proven control of. Counting a magic link there would
+//     permit removing that account's last identity and hand it to whoever
+//     holds that mailbox — a takeover, arrived at through a check that
+//     exists to prevent a lockout.
+//
+// The asymmetry with the password half is therefore not an inconsistency:
+// [Service.passwordCanAuthenticate] asks whether a STORED credential is one
+// [Service.Login] would accept, and there is no stored magic link to ask
+// the question about.
 func (s *Service) UnlinkIdentity(ctx context.Context, userID, provider string) error {
 	identities, err := s.identities()
 	if err != nil {

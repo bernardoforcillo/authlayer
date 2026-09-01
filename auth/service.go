@@ -1650,32 +1650,52 @@ func (s *Service) PurgeExpired(ctx context.Context, before time.Time) (int, erro
 // request a fresh token) rather than leaving a claimed-but-not-yet-applied
 // token redeemable by a second presentation.
 //
-// # An address rotation invalidates the reset tokens
+// # An address rotation invalidates the tokens minted for the old address
 //
 // After an "email_change" redemption — and only that branch — every
-// outstanding "password_reset" [Verification] for the account is
-// invalidated via [Store.DeleteVerificationsByUserAndPurpose], fail-closed
-// like every other sweep in this package.
+// outstanding "password_reset" AND every outstanding "magic_link"
+// [Verification] for the account is invalidated, via two
+// [Store.DeleteVerificationsByUserAndPurpose] calls, fail-closed like every
+// other sweep in this package. See [Service.ChangePassword]'s doc, "The
+// sweep matrix", for this row's place in the whole table.
 //
-// A reset token is only ever deliverable to the ONE address it was minted
-// for (that is the whole basis on which [Service.ResetPassword] treats
-// redeeming one as proof of control). Moving the account's address away
-// from there — often precisely because that mailbox is no longer
-// trustworthy — would otherwise leave a link sitting in the abandoned
-// mailbox able to reset the password of the account at its NEW address,
-// for the rest of [WithPasswordResetTTL]'s window. This is the mirror of
-// the sweep [Service.ChangePassword] and [Service.ResetPassword] already
+// Either token is only ever deliverable to the ONE address it was minted
+// for (that is the whole basis on which [Service.ResetPassword] and
+// [Service.RedeemMagicLink] treat redeeming one as proof of control).
+// Moving the account's address away from there — often precisely because
+// that mailbox is no longer trustworthy — would otherwise leave a link
+// sitting in the abandoned mailbox able to act on the account at its NEW
+// address, for the rest of that purpose's TTL. This is the mirror of the
+// sweep [Service.ChangePassword] and [Service.ResetPassword] already
 // perform in the other direction, where rotating the CREDENTIAL
 // invalidates the pending identifier change.
 //
-// The sweep does not run on the "signup" branch: that redemption certifies
-// the address the account already holds and rotates nothing, so a reset
-// token for that same mailbox is still a token for that same mailbox.
+// The "magic_link" half is the SHARPER of the two and was the later of the
+// two to land. A parked reset token in the abandoned mailbox grants the
+// right to SET a password, through a flow that then revokes every session;
+// a parked magic link IS a session, handed over by
+// [Service.RedeemMagicLink] with nothing else asked. Its window is the
+// shorter ([WithMagicLinkTTL], fifteen minutes by default, against
+// [WithPasswordResetTTL]'s hour), which narrows the exposure and does not
+// remove it — and RedeemMagicLink does not refuse a link whose
+// [Verification.Email] no longer matches the account's address; it merely
+// declines to STAMP [UserBase.EmailVerifiedAt] in that case, and signs the
+// holder in anyway. Sweeping here is what closes that, and it is the only
+// thing that does.
 //
-// Its scope is SEQUENTIAL ONLY, exactly as [Service.ChangePassword]'s doc
-// (point 6) discloses for its own: a [Service.RequestPasswordReset] whose
-// [Store.CreateVerification] is genuinely concurrent with this call can
-// still mint a token that survives it.
+// "email_change" itself is absent from this sweep and needs none: the token
+// being redeemed IS the account's email_change token, this call has already
+// burned it, and [Service.RequestEmailChange] sweeps that purpose before
+// minting, so no second one is outstanding to remove.
+//
+// Neither sweep runs on the "signup" branch: that redemption certifies the
+// address the account already holds and rotates nothing, so a token for
+// that same mailbox is still a token for that same mailbox.
+//
+// Their scope is SEQUENTIAL ONLY, exactly as [Service.ChangePassword]'s doc
+// (point 7) discloses for its own: a [Service.RequestPasswordReset] or
+// [Service.RequestMagicLink] whose [Store.CreateVerification] is genuinely
+// concurrent with this call can still mint a token that survives it.
 //
 // # What this does NOT revoke
 //
@@ -1751,11 +1771,15 @@ func (s *Service) VerifyEmail(ctx context.Context, plainToken string) (UserBase,
 		return zero, err
 	}
 	if v.Purpose == PurposeEmailChange {
-		// The identifier just moved, so every credential-recovery token
-		// issued against the OLD one has to go — see the method doc's
-		// "An address rotation invalidates the reset tokens". Fail-closed,
-		// like every other sweep in this package.
+		// The identifier just moved, so every token issued against the OLD
+		// one has to go — see the method doc's "An address rotation
+		// invalidates the tokens minted for the old address". Two purposes,
+		// two calls, each fail-closed like every other sweep in this
+		// package.
 		if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposePasswordReset); err != nil {
+			return zero, err
+		}
+		if err := s.store.DeleteVerificationsByUserAndPurpose(ctx, v.UserID, PurposeMagicLink); err != nil {
 			return zero, err
 		}
 	}
@@ -2267,13 +2291,13 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 // confirming their address, since this package exposes no resend path.
 //
 // All three sweeps carry the SAME guarantee, and it is SEQUENTIAL ONLY:
-// nothing
-// orders any of them against a concurrently-running [Service.RequestPasswordReset],
-// [Service.RequestEmailChange] or [Service.RequestMagicLink] whose own
-// [Store.CreateVerification] has
-// not yet committed — see [Service.ChangePassword]'s doc, point 6, for the
-// deterministic demonstration and for why closing that window would need a
-// transaction [Store] does not offer.
+// nothing orders any of them against a concurrently-running
+// [Service.RequestPasswordReset], [Service.RequestEmailChange] or
+// [Service.RequestMagicLink] whose own [Store.CreateVerification] has not
+// yet committed — see [Service.ChangePassword]'s doc, "Why these purposes,
+// and what the sweep does not cover", for the deterministic demonstration
+// and for why closing that window would need a transaction [Store] does not
+// offer.
 //
 // # What this does not revoke
 //
@@ -2571,36 +2595,93 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // # The sweep matrix
 //
 // This table is the whole of this package's doctrine on which actions
-// destroy which pending [Verification] tokens. It is stated here, in full,
-// because the last time it existed only as an assumption spread across five
-// method docs, it was filled in for two of its three columns and the third
-// was a full account takeover:
+// destroy which credentials, and it is the SINGLE SOURCE OF TRUTH for that
+// question: every other method's doc states its own row and points here for
+// the rest. It is stated in full, in one place, because the last time it
+// existed only as an assumption spread across five method docs it was
+// filled in for two of its three columns and the third was a full account
+// takeover — and because the columns have since grown to five while the
+// features filling them were built on branches that could not see each
+// other.
 //
-//	Remediation       | password_reset | email_change | magic_link
-//	------------------|----------------|--------------|---------------------
-//	ChangePassword    | swept          | swept        | swept
-//	ResetPassword     | swept          | swept        | swept
-//	LogoutAll         | swept          | swept        | swept
-//	Logout            | not swept      | not swept    | not swept
-//	RevokeSession     | not swept      | not swept    | not swept
-//	RedeemMagicLink   | —              | —            | burns its own token
+// The five columns are the five kinds of credential this package can hold
+// for an account: three [Verification] purposes, the external [Identity],
+// and the [Session]. Every row is a path that removes at least one of them.
 //
-// The top three rows are the REMEDIATION actions: each is something a user
-// does because they believe, or have just been told, that the account is at
-// risk. Each therefore leaves nothing armed that can quietly undo it, and
-// each sweeps fail-closed — a sweep that errors is returned to the caller,
-// never swallowed.
+//	Path                       | password_reset | email_change | magic_link    | identity        | session
+//	---------------------------|----------------|--------------|---------------|-----------------|----------------------
+//	ChangePassword             | swept          | swept        | swept         | not swept       | all but the caller's
+//	ResetPassword              | swept          | swept        | swept         | swept           | all
+//	LogoutAll                  | swept          | swept        | swept         | not swept       | all
+//	DeleteAccount              | swept          | swept        | swept         | swept           | all
+//	AnonymizeAccount           | swept          | swept        | swept         | swept           | all
+//	UnlinkIdentity             | not swept      | not swept    | not swept     | that provider's | all
+//	VerifyEmail (email_change) | swept          | n/a          | swept         | not swept       | not swept
+//	VerifyEmail (signup)       | not swept      | not swept    | not swept     | not swept       | not swept
+//	RedeemMagicLink            | not swept      | not swept    | burns its own | not swept       | not swept
+//	Logout                     | not swept      | not swept    | not swept     | not swept       | the presented one
+//	RevokeSession              | not swept      | not swept    | not swept     | not swept       | the named family
 //
-// The bottom two rows are ROUTINE, per-device actions, and their emptiness
-// is deliberate, not an omission — see [Service.Logout] and
-// [Service.RevokeSession], which each say so in their own docs. Sweeping
-// there would break a legitimate flow with no attacker in it: request a
-// link (or an email change) on a laptop, sign that laptop out, click the
-// link that arrives on a phone.
+// Every cell has a test, the "not swept" ones included: a cell pinning
+// deliberate non-behaviour is what stops a later "fix" from breaking a
+// legitimate flow silently, and a cell pinning a sweep is what stops the
+// next feature from filling in three columns of five.
 //
-// "signup" appears in no column: it grants nothing over the credential or
-// the address, and destroying it would strand a user who remediated before
-// confirming their address, since this package exposes no resend path.
+// # Reading the matrix
+//
+// The rows fall into four groups.
+//
+// REMEDIATION — ChangePassword, ResetPassword, LogoutAll. Each is something
+// a user does because they believe, or have just been told, that the
+// account is at risk, so each leaves nothing armed that can quietly undo
+// it. Every sweep in these rows is fail-closed: an erroring sweep is
+// returned to the caller, never swallowed. Two cells in this group are
+// deliberately empty rather than owed:
+//
+//   - ChangePassword does not disconnect identities, and ResetPassword
+//     does. The caller here proved they hold the current password and is
+//     performing a routine rotation; a reset is UNAUTHENTICATED recovery,
+//     where every other credential has to be assumed hostile. See
+//     ResetPassword's "Why an unauthenticated recovery sweeps identities".
+//   - LogoutAll does not either, for the same reason: it revokes sessions
+//     on the authority of a caller who is already signed in.
+//
+// TERMINATION — DeleteAccount, AnonymizeAccount. These sweep every column,
+// and their verification sweep is [Store.DeleteVerificationsByUser] — by
+// USER, not by purpose — so it takes "signup" too, which no other row
+// touches. Nothing is left for a purpose-scoped list to have missed. Their
+// identity sweeps are subject to the one configuration limit
+// [Service.sweepIdentities] states.
+//
+// ROTATION OF WHAT A CREDENTIAL POINTS AT — UnlinkIdentity, and
+// VerifyEmail's email_change branch. Neither is a password change, and each
+// invalidates exactly what its own change stranded: removing an identity
+// takes the sessions it may have minted, and moving the ADDRESS takes the
+// two purposes whose tokens are deliverable only to the old one. VerifyEmail
+// leaves sessions alone deliberately — it is unauthenticated by
+// construction, so a sign-out-everywhere effect there would be a
+// denial-of-service lever for anyone holding the link. Its email_change
+// cell is n/a rather than "not swept": the token being redeemed IS the
+// account's email_change token and this call burns it, and
+// [Service.RequestEmailChange] sweeps that purpose before minting, so no
+// second one exists.
+//
+// ROUTINE — VerifyEmail's signup branch, RedeemMagicLink, Logout,
+// RevokeSession. Their emptiness is deliberate, not an omission, and each
+// says so in its own doc. Sweeping in these rows would break legitimate
+// flows with no attacker in them: request a link on a laptop, sign that
+// laptop out, click the link that arrives on a phone; or sign in on a new
+// device and find every other device signed out.
+//
+// "signup" has no column of its own because only the two TERMINATION rows
+// touch it. It grants nothing over the credential or the address, and
+// destroying it on a remediation path would strand a user who remediated
+// before confirming their address, since this package exposes no resend
+// path.
+//
+// Every sweep in the table is SEQUENTIAL ONLY. See "Why these purposes, and
+// what the sweep does not cover" below for the deterministic demonstration
+// and for what closing that window would take.
 //
 // # Why these purposes, and what the sweep does not cover
 //
@@ -2698,7 +2779,7 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 		return err
 	}
 
-	// Close ALL THREE token side doors — see the method doc's point 6 and
+	// Close ALL THREE token side doors — see the method doc's point 7 and
 	// "The sweep matrix". The email_change sweep is not a tidier variant of
 	// the reset one, and the magic_link sweep is not a tidier variant of
 	// either: each is a separate door, and shipping the fix for one of them
@@ -3168,7 +3249,6 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 // The list and the deletes are separate calls, with the same SEQUENTIAL-ONLY
 // scope the verification sweeps have.
 //
-// These are the same two side doors [Service.ChangePassword] closes for its
 // The magic_link sweep closes the most direct door of the three. A magic
 // link is not a step towards a credential, it IS one:
 // [Service.RedeemMagicLink] exchanges it for a live session with nothing
@@ -3180,11 +3260,12 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 //
 // These are the same three side doors [Service.ChangePassword] closes for its
 // own, differently-triggered path, with the identical SEQUENTIAL-ONLY scope
-// that method's doc discloses: nothing orders either sweep against a
-// [Service.RequestPasswordReset] or [Service.RequestEmailChange] call whose
-// own [Store.CreateVerification] is genuinely concurrent with this one, and
-// a token minted by such a call can still survive and later redeem — see
-// [Service.ChangePassword]'s doc, point 6, for the deterministic
+// that method's doc discloses: nothing orders any of the three sweeps
+// against a [Service.RequestPasswordReset], [Service.RequestEmailChange] or
+// [Service.RequestMagicLink] call whose own [Store.CreateVerification] is
+// genuinely concurrent with this one, and a token minted by such a call can
+// still survive and later redeem — see [Service.ChangePassword]'s doc, "Why
+// these purposes, and what the sweep does not cover", for the deterministic
 // demonstration and why closing that window would need a transaction
 // [Store] does not offer.
 //

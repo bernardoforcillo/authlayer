@@ -101,10 +101,19 @@ rather than which code path wrote the row.
 
 ## The port is optional, and separate on purpose
 
-`auth.IdentityStore` is **not** part of `auth.Store`. That interface shipped in
-`v0.1.0`, and adding a nineteenth method to it would break every third-party
-backend the day after — so identities follow the per-concern split `invite.Store`
-already uses.
+`auth.IdentityStore` is **not** part of `auth.Store`, and identities follow the
+per-concern split `invite.Store` already uses.
+
+[Account deletion](/authentication/account-deletion) went the **other** way in
+the same milestone — four methods added straight onto the released
+`auth.Store` — so the rule at work is not "never grow a released port". It is
+this: **identities are functionality; deletion is not.** A deployment that
+never offers a social login never needs an identity row, and a backend that
+cannot store one is still a complete backend for every deployment that does
+not, so charging every existing backend for a feature most will never enable
+buys nothing. Every deployment eventually has to remove an account, so a
+`Store` that silently could not is not one anybody can finish deploying, and
+putting deletion behind an optional port would have asserted the opposite.
 
 An application that offers no external sign-in wires nothing and creates no
 table. All four methods then answer `ErrOAuthNotConfigured` rather than
