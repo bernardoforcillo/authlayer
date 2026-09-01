@@ -376,7 +376,7 @@ func TestDeleteIdentityIfNotLastRefusesTheLastWayIn(t *testing.T) {
 }
 
 // TestDeleteIdentityIfNotLastAllowsTheLastIdentityWhenTheUserHasAPassword is
-// the userHasPassword half of the predicate. The guard is on whether the
+// the userHasOtherCredential half of the predicate. The guard is on whether the
 // account stays REACHABLE, not on whether an identity survives, so a user
 // with a password may unlink their only identity.
 func TestDeleteIdentityIfNotLastAllowsTheLastIdentityWhenTheUserHasAPassword(t *testing.T) {
@@ -618,7 +618,7 @@ func (s *splitLockIdentityStore) list(userID string) []auth.Identity {
 // reachability decision happen under mu, mu is released, and the delete
 // takes a fresh acquisition. Each half is individually correct and
 // individually locked; only their SEPARATION is the bug.
-func (s *splitLockIdentityStore) DeleteIdentityIfNotLast(userID, provider string, userHasPassword bool) error {
+func (s *splitLockIdentityStore) DeleteIdentityIfNotLast(userID, provider string, userHasOtherCredential bool) error {
 	s.mu.Lock()
 	var doomed []string
 	survivors := 0
@@ -636,7 +636,7 @@ func (s *splitLockIdentityStore) DeleteIdentityIfNotLast(userID, provider string
 	if len(doomed) == 0 {
 		return auth.ErrIdentityNotFound
 	}
-	if survivors == 0 && !userHasPassword {
+	if survivors == 0 && !userHasOtherCredential {
 		return auth.ErrLastCredential
 	}
 

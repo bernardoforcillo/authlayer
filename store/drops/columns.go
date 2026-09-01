@@ -74,21 +74,31 @@ func uuidIDs() idTypes { return idTypes{library: true, user: true} }
 // (drops@v0.5.0/pg/binding.go:8): authlayer cannot construct a binding itself,
 // and the only constructor is (*pg.Col[T]).Val, which needs the concrete T.
 // pg.UUID and pg.Text both return *pg.Col[string], so a uuid column and a text
-// column live happily in the same map.
+// column live happily in the same map — and so does a NULLABLE one, since the
+// Go type a nullable string column is declared from (*string) is not the type
+// its binding carries.
 type colSet struct {
 	tbl   *pg.Table
 	str   map[string]*pg.Col[string]
 	ts    map[string]*pg.Col[time.Time]
 	bytes map[string]*pg.Col[[]byte]
 	i32   map[string]*pg.Col[int32]
-	// i64 holds bigint columns, declared from an int64 or *int64 field. The
-	// pointer form is nullable, exactly as *time.Time is, and it exists for
+	// i64 holds bigint columns. Two independent needs put them here: the
+	// pointer form is nullable, exactly as *time.Time is, for
 	// auth.MFAFactor.LastStep — where nil means "this factor has
 	// authenticated no TOTP step yet", a state the replay guard acts on and
-	// which is distinct from any step number, zero included.
+	// which is distinct from any step number, zero included; and PostgreSQL
+	// has no unsigned integer type, so a Go uint32 does not fit in `integer`
+	// — see add's reflect.Uint32 case, and [auth.Credential.SignCount].
 	i64 map[string]*pg.Col[int64]
+	// nullable records which declared columns came from a POINTER field and
+	// may therefore hold SQL NULL. bind consults it for the string family,
+	// where the binding type (string) does not itself say whether the column
+	// was declared nullable; the time family needs no equivalent because
+	// *time.Time and time.Time are distinct types bind already switches on.
+	nullable map[string]bool
 	// order lists every declared tag in declaration order. It exists because
-	// the five typed maps above cannot be ranged over as one and Go map order
+	// the typed maps above cannot be ranged over as one and Go map order
 	// is not stable, so row() needs its own iteration order. It is not what
 	// makes the INSERT correct: drops re-orders the bindings by Table.Columns()
 	// and pairs them by column identity (pg/insert.go).
@@ -112,12 +122,13 @@ func newColSet(tbl *pg.Table, model any, ids idTypes) *colSet {
 	}
 
 	c := &colSet{
-		tbl:   tbl,
-		str:   map[string]*pg.Col[string]{},
-		ts:    map[string]*pg.Col[time.Time]{},
-		bytes: map[string]*pg.Col[[]byte]{},
-		i32:   map[string]*pg.Col[int32]{},
-		i64:   map[string]*pg.Col[int64]{},
+		tbl:      tbl,
+		str:      map[string]*pg.Col[string]{},
+		ts:       map[string]*pg.Col[time.Time]{},
+		bytes:    map[string]*pg.Col[[]byte]{},
+		i32:      map[string]*pg.Col[int32]{},
+		i64:      map[string]*pg.Col[int64]{},
+		nullable: map[string]bool{},
 	}
 	c.walk(t, ids)
 	return c
@@ -230,6 +241,39 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, ids idTypes) {
 			def = def.Unique()
 		}
 		c.str[name] = pg.Add(c.tbl, def)
+	case ft == reflect.TypeOf((*string)(nil)):
+		// Nullable, exactly as the *time.Time case below is: no NotNull, so
+		// the column can hold SQL NULL, and bind renders a nil pointer as the
+		// NULL keyword rather than a parameter. It is never a primary key —
+		// a nullable key is not a key — and the id/user-id typing decision is
+		// the same one the non-nullable case makes, so a nullable reference
+		// to users.id is a uuid like every other one.
+		//
+		// [auth.Challenge.UserID] is the field this exists for: nil is "this
+		// ceremony names no account", which a login ceremony genuinely does
+		// not (see that field's doc). Storing "" instead would fail the uuid
+		// parser on every login challenge.
+		def := pg.Text(name)
+		if (libraryIDColumns[name] && ids.library) || (userIDColumns[name] && ids.user) {
+			def = pg.UUID(name)
+		}
+		if unique {
+			def = def.Unique()
+		}
+		c.str[name] = pg.Add(c.tbl, def)
+		c.nullable[name] = true
+	case ft.Kind() == reflect.Uint32:
+		// bigint, not integer: PostgreSQL has no unsigned types, and the top
+		// half of a uint32 does not fit in a signed 32-bit column. A
+		// [auth.Credential.SignCount] above 2^31 is not hypothetical — it is
+		// whatever value an authenticator reports, and this package neither
+		// chooses it nor may truncate it: a truncated counter compares wrong,
+		// and the comparison is the whole point of storing it.
+		def := pg.BigInt(name).NotNull()
+		if unique {
+			def = def.Unique()
+		}
+		c.i64[name] = pg.Add(c.tbl, def)
 	case ft == reflect.TypeOf((*time.Time)(nil)):
 		// Nullable: no NotNull, so the column can hold SQL NULL. bind renders
 		// a nil pointer as the NULL keyword rather than a parameter.
@@ -250,9 +294,9 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, ids idTypes) {
 	default:
 		panic(fmt.Sprintf(
 			"authlayer/store/drops: column %q has unsupported Go type %s; supported: "+
-				"string, time.Time, *time.Time (nullable), []byte, int, int32, int64, "+
-				"*int64 (nullable), and named types whose underlying type is string, "+
-				"int, int32 or int64", name, ft))
+				"string, *string (nullable), time.Time, *time.Time (nullable), []byte, "+
+				"int, int32, int64, *int64 (nullable), uint32, and named types whose "+
+				"underlying type is string, int, int32, int64 or uint32", name, ft))
 	}
 	if primary && c.str[name] == nil {
 		// A "pk" option on a column this switch declared as anything but a
@@ -326,6 +370,24 @@ func (c *colSet) bind(tag string, v any) pg.ColumnValue {
 			return col.Expr(drops.Raw("NULL"))
 		}
 		return col.Val(*x)
+	case *string:
+		// The nullable string family, handled exactly as *time.Time is above
+		// and for the same reason: (*pg.Col[T]).Val takes a concrete T and
+		// cannot express NULL, so a nil pointer goes through Expr with a raw
+		// NULL keyword. A *string reaching a column that was NOT declared
+		// nullable is a model/schema disagreement, not a value to coerce, so
+		// it panics with the column named rather than writing "" into a
+		// column the model says can be absent.
+		col := requireCol(c.str[tag], tag, "text/uuid")
+		if !c.nullable[tag] {
+			panic(fmt.Sprintf(
+				"authlayer/store/drops: column %q was not declared nullable, so a "+
+					"*string cannot be bound to it", tag))
+		}
+		if x == nil {
+			return col.Expr(drops.Raw("NULL"))
+		}
+		return col.Val(*x)
 	case []byte:
 		return bindOne(c.bytes[tag], tag, x, "bytea")
 	}
@@ -334,6 +396,11 @@ func (c *colSet) bind(tag string, v any) pg.ColumnValue {
 		switch rv.Kind() {
 		case reflect.String:
 			return bindOne(c.str[tag], tag, rv.String(), "text/uuid")
+		case reflect.Uint32:
+			// Widened to int64, the Go type of the bigint column add
+			// declared for it — see that case. Every uint32 fits, so unlike
+			// the Int case below there is no range check to make.
+			return bindOne(c.i64[tag], tag, int64(rv.Uint()), "bigint")
 		case reflect.Int, reflect.Int32:
 			n := rv.Int()
 			if n < math.MinInt32 || n > math.MaxInt32 {

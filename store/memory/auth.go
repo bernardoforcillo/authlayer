@@ -54,15 +54,17 @@ type AuthStore struct {
 
 // ErrTokenHashTaken reports that a Create call would have stored a second row
 // under a token hash another row of the same kind already holds — the
-// uniqueness [auth.Session.TokenHash], [auth.Verification.TokenHash] and
+// uniqueness [auth.Session.TokenHash], [auth.Verification.TokenHash],
+// [auth.Challenge.Hash] and
 // [github.com/bernardoforcillo/authlayer/invite.EmailInvite] TokenHash each
 // require of a backend.
 //
-// One error covers all three because all three columns hold the same thing —
-// a sha256 of a credential the store never sees in plaintext — and fail the
-// same way when two rows share one: the lookup that the whole redemption path
-// runs stops identifying a single row. [InviteStore.CreateEmailInvite]
-// returns it too, and a caller always knows which store it called.
+// One error covers all four because all four columns hold the same thing —
+// a sha256 of a one-time value the store never sees in plaintext — and fail
+// the same way when two rows share one: the lookup that the whole redemption
+// path runs stops identifying a single row. [InviteStore.CreateEmailInvite]
+// and [CredentialStore.CreateChallenge] return it too, and a caller always
+// knows which store it called.
 //
 // It is deliberately NOT one of authlayer/auth's or authlayer/invite's
 // sentinels, and deliberately not auth.ErrIDTaken. [auth.Store]'s error

@@ -1,5 +1,12 @@
 // Package authtest is the executable contract for
-// [github.com/bernardoforcillo/authlayer/auth.Store].
+// [github.com/bernardoforcillo/authlayer/auth.Store] and for the OPTIONAL
+// [github.com/bernardoforcillo/authlayer/auth.CredentialStore] — two ports,
+// two entry points ([RunStoreContract] and [RunCredentialStoreContract]),
+// because a backend may implement either without the other. Everything below
+// describes the Store suite; credentials.go's own docs describe the passkey
+// one, which follows the same discipline (a named check per obligation, a
+// reference implementation, and a deliberately non-compliant double proving
+// each check bites).
 //
 // auth.Store is a twenty-two-method port, and eleven of those methods carry
 // an explicit MUST — normative requirements on the implementation, not on

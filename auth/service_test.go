@@ -1873,6 +1873,22 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 			}
 			return res.User, u.ID
 		},
+		// Signed up WITH a password for RedeemMagicLink's reason: step 2
+		// asserts the Store's own copy still holds a live digest, which is
+		// what makes the empty returned value meaningful.
+		"FinishPasskeyLogin": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
+			u := mustSignUp(t, svc, "scrub-passkey@example.com", validPassword)
+			registerPasskey(t, svc, u.ID, newCred('s'))
+			res, err := svc.FinishPasskeyLogin(ctx, auth.VerifiedAssertion{
+				Challenge:    mustBeginLogin(t, svc),
+				CredentialID: credID('s'),
+				SignCount:    1,
+			}, "1.2.3.4", "agent")
+			if err != nil {
+				t.Fatalf("FinishPasskeyLogin: %v", err)
+			}
+			return res.User, u.ID
+		},
 	}
 
 	// Step 1: no user-returning method may be absent from the table above.
@@ -1911,13 +1927,15 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 	for name, drive := range drivers {
 		t.Run(name, func(t *testing.T) {
 			// newOAuthService, not newTestService: identical wiring plus an
-			// IdentityStore, which the SignInWith driver needs, and the
-			// optional MFA port, which the CompleteMFA driver needs. The
-			// rest of the drivers touch neither — an MFAStore holding no
-			// factor changes nothing about an ordinary login.
+			// IdentityStore, which the SignInWith driver needs; the optional MFA
+			// port, which CompleteMFA needs; and a CredentialStore, which
+			// FinishPasskeyLogin needs. The rest of the drivers touch none of
+			// them — an MFAStore holding no factor changes nothing about an
+			// ordinary login.
 			svc, store, _ := newOAuthService(t,
 				auth.WithMFAStore(memory.NewMFAStore()),
 				auth.WithMFASecretCipher(testCipher{}),
+				auth.WithCredentialStore(memory.NewCredentialStore()),
 			)
 			got, userID := drive(t, svc)
 			if got.PasswordHash != "" {

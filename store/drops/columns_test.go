@@ -389,3 +389,99 @@ func TestColSetRowRoundTripsANilPointer(t *testing.T) {
 		t.Fatalf("row() produced %d bindings, want 2", len(vals))
 	}
 }
+
+// uint32 maps to BIGINT, and it is the one integer width where the Go type and
+// the obvious SQL type disagree: PostgreSQL has no unsigned types, so half the
+// uint32 range does not fit in `integer`. auth.Credential.SignCount is the
+// field that needs it, and a counter stored wrong is a compare-and-set that
+// accepts what it should refuse — so this is a correctness mapping, not a
+// capacity nicety. Named uint32 types are classified by Kind here exactly as
+// named string and int types are.
+func TestColSetMapsUint32ToBigInt(t *testing.T) {
+	type Counter uint32
+	type model struct {
+		ID    string  `drop:"id"`
+		Count uint32  `drop:"count"`
+		Named Counter `drop:"named"`
+	}
+
+	cs := newColSet(pg.NewTable("t"), model{}, uuidIDs())
+	for _, tag := range []string{"count", "named"} {
+		if got := cs.col(tag).Type().TypeSQL(); got != "bigint" {
+			t.Fatalf("%s type = %q, want bigint", tag, got)
+		}
+		if !cs.col(tag).IsNotNull() {
+			t.Fatalf("%s is nullable, want NOT NULL", tag)
+		}
+	}
+
+	// The whole range binds, including values above math.MaxInt32 that an
+	// `integer` column would have rejected or an unchecked narrowing would
+	// have turned into a negative number.
+	vals := cs.row(model{ID: "i", Count: math.MaxUint32, Named: 4_000_000_000})
+	if len(vals) != 3 {
+		t.Fatalf("row() produced %d bindings, want 3", len(vals))
+	}
+}
+
+// *string is the nullable string family, declared without NOT NULL and bound
+// as the NULL keyword when nil. auth.Challenge.UserID is the field that needs
+// it: nil means "this ceremony names no account", which a login ceremony
+// genuinely does not, and "" is not a substitute — it fails a uuid column
+// outright.
+//
+// The id-column typing decision is the same one a non-nullable string gets, so
+// a nullable reference to users.id is still uuid.
+func TestColSetMapsNullableStrings(t *testing.T) {
+	type model struct {
+		ID     string  `drop:"id"`
+		UserID *string `drop:"user_id"`
+		Note   *string `drop:"note"`
+	}
+
+	cs := newColSet(pg.NewTable("t"), model{}, uuidIDs())
+	if got := cs.col("user_id").Type().TypeSQL(); got != "uuid" {
+		t.Fatalf("user_id type = %q, want uuid — nullability must not change the id typing", got)
+	}
+	if got := cs.col("note").Type().TypeSQL(); got != "text" {
+		t.Fatalf("note type = %q, want text", got)
+	}
+	for _, tag := range []string{"user_id", "note"} {
+		if cs.col(tag).IsNotNull() {
+			t.Fatalf("%s is NOT NULL; a *string column must be able to hold NULL", tag)
+		}
+	}
+
+	// Both the nil and the non-nil forms bind, and neither panics.
+	if got := len(cs.row(model{ID: "i"})); got != 3 {
+		t.Fatalf("row() with nil pointers produced %d bindings, want 3", got)
+	}
+	value := "01a05ba5-3d49-786e-a5e9-e492b0839ea4"
+	if got := len(cs.row(model{ID: "i", UserID: &value, Note: &value})); got != 3 {
+		t.Fatalf("row() with set pointers produced %d bindings, want 3", got)
+	}
+}
+
+// Binding a *string to a column the model declared as a plain string is a
+// model/schema disagreement, and coercing nil to "" there would write an empty
+// string into a column that is NOT NULL for a reason. It names the column
+// rather than nil-panicking, like every other bind failure.
+func TestColSetBindRejectsANullableValueForANonNullableColumn(t *testing.T) {
+	type model struct {
+		ID    string `drop:"id"`
+		Label string `drop:"label"`
+	}
+	cs := newColSet(pg.NewTable("t"), model{}, uuidIDs())
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("bind accepted a *string for a NOT NULL column")
+		}
+		if msg := fmt.Sprint(r); !strings.Contains(msg, "label") {
+			t.Fatalf("panic %q does not name the column", msg)
+		}
+	}()
+	var nilPtr *string
+	cs.bind("label", nilPtr)
+}

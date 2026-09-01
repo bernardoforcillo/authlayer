@@ -164,7 +164,7 @@ func (s *IdentityStore) DeleteIdentity(_ context.Context, id string) error {
 
 // DeleteIdentityIfNotLast removes every identity of userID at provider, but
 // only when the account is still reachable afterwards — either another
-// identity survives the delete or userHasPassword is true. Otherwise it
+// identity survives the delete or userHasOtherCredential is true. Otherwise it
 // returns auth.ErrLastCredential and removes NOTHING. Returns
 // auth.ErrIdentityNotFound when the user has no identity at that provider.
 //
@@ -187,7 +187,7 @@ func (s *IdentityStore) DeleteIdentity(_ context.Context, id string) error {
 // so a password-less user whose only two identities are both at provider P
 // is refused: unlinking P would take both and leave nothing, even though the
 // store holds two rows for them.
-func (s *IdentityStore) DeleteIdentityIfNotLast(_ context.Context, userID, provider string, userHasPassword bool) error {
+func (s *IdentityStore) DeleteIdentityIfNotLast(_ context.Context, userID, provider string, userHasOtherCredential bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -207,7 +207,7 @@ func (s *IdentityStore) DeleteIdentityIfNotLast(_ context.Context, userID, provi
 	if len(doomed) == 0 {
 		return auth.ErrIdentityNotFound
 	}
-	if survivors == 0 && !userHasPassword {
+	if survivors == 0 && !userHasOtherCredential {
 		return auth.ErrLastCredential
 	}
 	for _, id := range doomed {

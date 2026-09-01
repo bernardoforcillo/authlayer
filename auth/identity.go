@@ -366,17 +366,41 @@ var (
 	// [SignInResult.Created] for what that is worth to a prober, and where
 	// rate limiting belongs.
 	ErrLinkRequiresVerification = errors.New("authlayer/auth: linking this identity requires a verified email on both sides")
-	// ErrLastCredential: removing this identity would leave the account
-	// with no way in at all — no other identity, and no password credential
-	// this [Service] would actually accept. Returned by
-	// [IdentityStore.DeleteIdentityIfNotLast], which refuses the removal
-	// rather than performing it.
+	// ErrLastCredential: removing this credential would leave the account
+	// with no way in at all. Returned by
+	// [IdentityStore.DeleteIdentityIfNotLast] and
+	// [CredentialStore.DeleteCredentialIfNotLast], each of which refuses the
+	// removal rather than performing it.
 	//
-	// "Would actually accept" is the operative phrase, and it is stricter
-	// than "a password hash is stored". Under [WithRequireVerifiedEmail](true)
-	// [Service.Login] refuses an unverified account outright, so a hash on
-	// such an account is not a way in and [Service.UnlinkIdentity] does not
-	// count it as one — see [Service.passwordCanAuthenticate].
+	// # The arithmetic, which spans all three credential kinds
+	//
+	// This package can authenticate an account by exactly three things: a
+	// password credential [Service.Login] would accept, an external
+	// [Identity] resolved by [Service.SignInWith], and a [Credential] — a
+	// passkey — asserted through [Service.FinishPasskeyLogin]. "No way in at
+	// all" means none of the three, and the two removers each ask the same
+	// question about the other two kinds:
+	//
+	//   - [Service.UnlinkIdentity] refuses when no OTHER identity survives
+	//     the delete, no working password exists, and no passkey exists.
+	//   - [Service.DeletePasskey] refuses when no OTHER passkey survives the
+	//     delete, no working password exists, and no identity exists.
+	//
+	// The "other of the same kind" half is counted by the store performing
+	// the delete, atomically with it; the other two kinds are computed once
+	// by [Service.hasWayInBesides] and handed down as a parameter, because
+	// no one store can see another's tables. One function, so the two
+	// removers cannot drift into disagreeing about what a way in is.
+	//
+	// "A password credential [Service.Login] would accept" is the operative
+	// phrase and it is stricter than "a password hash is stored". Under
+	// [WithRequireVerifiedEmail](true) Login refuses an unverified account
+	// outright, so a hash on such an account is not a way in and neither
+	// remover counts it as one — see [Service.passwordCanAuthenticate].
+	//
+	// A kind whose OPTIONAL port is not wired contributes nothing to the sum:
+	// a way in this [Service] cannot reach is not one it can offer. See
+	// [Service.hasWayInBesides].
 	ErrLastCredential = errors.New("authlayer/auth: refusing to remove the account's last credential")
 	// ErrOAuthNotConfigured: an operation needing an [IdentityStore] was
 	// attempted on a [Service] built without [WithIdentityStore].
@@ -398,7 +422,7 @@ var (
 // of its own, and reports not-found and conflict conditions through the
 // sentinels above. Unlike [Store] it owns exactly one table, and in
 // particular it does NOT own `users`: [IdentityStore.DeleteIdentityIfNotLast]'s
-// userHasPassword parameter is where that boundary becomes visible, and that
+// userHasOtherCredential parameter is where that boundary becomes visible, and that
 // method's doc explains why the parameter is safe.
 type IdentityStore interface {
 	// CreateIdentity persists i and returns what was stored. Email is
@@ -483,7 +507,7 @@ type IdentityStore interface {
 	DeleteIdentity(ctx context.Context, id string) error
 	// DeleteIdentityIfNotLast removes userID's identities for provider —
 	// but ONLY if doing so leaves the account reachable, which is the case
-	// when either another identity survives the delete or userHasPassword
+	// when either another identity survives the delete or userHasOtherCredential
 	// is true. Otherwise it returns ErrLastCredential and removes nothing.
 	// Returns ErrIdentityNotFound when the user has no identity for that
 	// provider at all.
@@ -517,19 +541,23 @@ type IdentityStore interface {
 	// closed it four times; this method is shaped to make it unreachable
 	// rather than to be gotten right by whoever calls it.
 	//
-	// # Why userHasPassword is a parameter and not a lookup
+	// # Why userHasOtherCredential is a parameter and not a lookup
 	//
 	// It reads like a layering mistake — the store deciding a question it
 	// then has to be TOLD the answer to — and it is not. An IdentityStore
 	// owns the `identities` table and nothing else; `users` belongs to
-	// [Store], which may be a different backend entirely, wired separately.
-	// This port cannot read a password hash, and giving it the ability to
-	// would mean handing the identity backend the credential table.
+	// [Store] and the passkeys to [CredentialStore], which may be different
+	// backends entirely, wired separately. This port cannot read a password
+	// hash or count credentials, and giving it the ability to would mean
+	// handing the identity backend both other tables.
 	//
-	// The value the caller computes is "can this account authenticate with
-	// its password", not "is a hash stored" — see
-	// [Service.passwordCanAuthenticate] for why the two differ under
-	// [WithRequireVerifiedEmail].
+	// The value the caller computes is "can this account authenticate by
+	// something OTHER than an identity" — a working password, or a
+	// registered passkey — not "is a hash stored". See
+	// [Service.hasWayInBesides], which computes it, and [ErrLastCredential],
+	// whose arithmetic spans all three kinds; and
+	// [Service.passwordCanAuthenticate] for why "can authenticate" and "a
+	// hash is stored" differ under [WithRequireVerifiedEmail].
 	//
 	// What makes passing the value in SAFE, rather than merely necessary,
 	// is the direction the value can go stale in. The caller reads the user
@@ -537,11 +565,11 @@ type IdentityStore interface {
 	// principle invalidate it — but only one of the two directions is
 	// dangerous:
 	//
-	//   - false becoming true (the account acquires a working password
+	//   - false becoming true (the account acquires another credential
 	//     mid-call): this method refuses a delete that would in fact have
 	//     been safe. Fail-closed, self-correcting on retry.
-	//   - true becoming false (the account LOSES its working password
-	//     mid-call): this method would allow the delete that locks it out.
+	//   - true becoming false (the account LOSES the credential the value
+	//     stood on): this method would allow the delete that locks it out.
 	//
 	// The dangerous direction is HARMLESS through [Service] for the hash
 	// itself, which is a weaker statement than this doc used to make and is
@@ -568,6 +596,18 @@ type IdentityStore interface {
 	// whose whole purpose is that the account can no longer be
 	// authenticated.
 	//
+	// It IS reachable for the passkey half, and this doc discloses it rather
+	// than closing it: [Service.DeletePasskey] can remove the credential this
+	// value stood on, concurrently. That leaves an account with neither — but
+	// only if the passkey delete itself concluded the identity being removed
+	// here made it safe, which is the mirror image of this race and the one
+	// case the two guards cannot see. It is
+	// [CredentialStore.DeleteCredentialIfNotLast]'s disclosure read from the
+	// other side, and closing it needs a transaction spanning two ports that
+	// may be two backends. A user removing their last identity and their last
+	// passkey simultaneously, from two tabs, can lock themselves out; every
+	// sequential ordering of the same two operations refuses the second.
+	//
 	// Under [WithRequireVerifiedEmail](true) the verified half CAN move the
 	// other way, and this doc says so rather than pretending otherwise:
 	// [Store.UpdateUserEmail] clears EmailVerifiedAt, and
@@ -587,7 +627,7 @@ type IdentityStore interface {
 	// it must not concurrently unlink identities, and if it grows a "remove
 	// my password" feature, that feature owes the same last-credential check
 	// this method makes.
-	DeleteIdentityIfNotLast(ctx context.Context, userID, provider string, userHasPassword bool) error
+	DeleteIdentityIfNotLast(ctx context.Context, userID, provider string, userHasOtherCredential bool) error
 }
 
 // identities resolves the configured [IdentityStore], or reports
