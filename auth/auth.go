@@ -87,23 +87,33 @@
 //
 // # Verification tokens
 //
-// [Verification] covers four one-time flows that all share the same shape —
-// mint an opaque token, email or otherwise deliver it, redeem it once — so
-// they share one table rather than four: Purpose distinguishes "signup"
+// [Verification] covers five one-time flows that all share the same shape —
+// mint an opaque token, deliver it, redeem it once — so
+// they share one table rather than five: Purpose distinguishes "signup"
 // (issued before EmailVerifiedAt is set), "email_change" (redeemed to
 // overwrite UserBase.Email via [Store.UpdateUserEmail]),
-// "password_reset" (redeemed to overwrite UserBase.PasswordHash), and
+// "password_reset" (redeemed to overwrite UserBase.PasswordHash),
 // "magic_link" (redeemed for a [Session] directly, with no password step —
-// see [Service.RedeemMagicLink]). Email
+// see [Service.RedeemMagicLink]), and "mfa_challenge" (the pending half of
+// a login that owes a second factor, redeemed by [Service.CompleteMFA] —
+// the only one of the five that is never DELIVERED anywhere, since
+// [Service.Login] hands it straight back to the caller that just proved
+// the password). Email
 // carries the address the token was minted for, regardless of Purpose — see
 // that field's own doc for why it is never conditionally populated. Like
 // EmailInvite, only the token's hash is stored.
 //
-// The last two are BEARER CREDENTIALS for the account, not attestations
-// about an address, which is why both are swept by every credential
-// rotation and remediation path in this package — see
+// "password_reset" and "magic_link" are BEARER CREDENTIALS for the
+// account, not attestations about an address, which is why both are swept
+// by every credential rotation and remediation path in this package — see
 // [Service.ChangePassword]'s doc, "The sweep matrix", for the whole table
 // and for the two methods that deliberately do not sweep.
+//
+// "mfa_challenge" is neither: holding one grants nothing on its own, since
+// [Service.CompleteMFA] will not exchange it without a second factor as
+// well. That is why it is minted freely — one per pending login, with no
+// invalidation of the account's earlier challenges — where a magic link is
+// deliberately kept to one live token per account.
 //
 // # Deletion, and why it is on this port rather than beside it
 //
@@ -341,8 +351,8 @@ type Verification struct {
 	// without the constraint its result silently depends on row order rather
 	// than being well-defined.
 	TokenHash string `drop:"token_hash"`
-	// Purpose is one of "signup", "email_change", "password_reset" or
-	// "magic_link". It is
+	// Purpose is one of "signup", "email_change", "password_reset",
+	// "magic_link" or "mfa_challenge". It is
 	// a plain string, not a typed enum, matching Session and EmailInvite's
 	// stance elsewhere in this codebase: the service layer defines and
 	// validates the closed set of values it accepts, a persistence port does
