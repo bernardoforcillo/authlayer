@@ -693,6 +693,12 @@ func (s *Service) ListPasskeys(ctx context.Context, userID string) ([]Credential
 // surrogate [Credential.ID] a "your passkeys" screen shows, NOT the
 // authenticator's own credential id.
 //
+// It is one row of [Service.ChangePassword]'s sweep matrix — the mirror of
+// [Service.UnlinkIdentity], removing ONE credential and touching no other
+// column, sessions included. See that table for this row's place in it, and
+// "What this does not revoke" below for the one cell where the two mirrors
+// differ.
+//
 // It requires [WithCredentialStore]; without it the call fails with
 // [ErrPasskeysNotConfigured].
 //
@@ -776,4 +782,36 @@ func (s *Service) DeletePasskey(ctx context.Context, userID, credentialRowID str
 
 	// The decision and the delete are ONE atomic step inside the store.
 	return creds.DeleteCredentialIfNotLast(ctx, userID, credentialRowID, otherWayIn)
+}
+
+// sweepCredentials removes every passkey on userID's account. It is the
+// PASSKEY column of [Service.ChangePassword]'s sweep matrix, called on its
+// OWN LINE by each path whose cell says "swept" so that removing one call
+// fails exactly one cell's test.
+//
+// Only the two TERMINATION rows call it. No remediation path may, and the
+// matrix's "Reading the matrix" carries that argument in full — the short
+// version being that a passkey is a credential the user holds in their
+// pocket, which is the same property that keeps the MFA column empty on
+// those rows, and that an unauthenticated recovery is a flow an attacker can
+// trigger at will.
+//
+// It calls [CredentialStore.DeleteCredentialsByUser] rather than looping over
+// [Service.DeletePasskey], and the difference is the reachability guard:
+// [ErrLastCredential] is exactly the refusal that would preserve what a
+// terminating caller is destroying. See
+// [CredentialStore.DeleteCredentialsByUser], "It makes NO reachability check
+// either".
+//
+// A [Service] with no [WithCredentialStore] holds no credentials, so it
+// sweeps nothing and reports no error — the same stated limit
+// [Service.sweepIdentities] carries for its own port. A Service built without
+// the option over tables some OTHER Service does wire one to must remove the
+// rows from [WithAccountDeletionHook], exactly as such a deployment already
+// must for its identities.
+func (s *Service) sweepCredentials(ctx context.Context, userID string) error {
+	if s.cfg.credentialStore == nil {
+		return nil
+	}
+	return s.cfg.credentialStore.DeleteCredentialsByUser(ctx, userID)
 }

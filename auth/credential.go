@@ -668,6 +668,63 @@ type CredentialStore interface {
 	// passkey simultaneously, from two tabs, can lock themselves out; every
 	// sequential ordering of the same two operations refuses the second.
 	DeleteCredentialIfNotLast(ctx context.Context, userID, id string, userHasOtherCredential bool) error
+	// DeleteCredentialsByUser removes EVERY credential belonging to userID,
+	// and only that user's — never another's. Matching NO rows is SUCCESS,
+	// never ErrCredentialNotFound.
+	//
+	// It is the PASSKEY column of [Service.ChangePassword]'s sweep matrix:
+	// the primitive [Service.DeleteAccount] and [Service.AnonymizeAccount]
+	// call so that a terminated account leaves no credential row behind. A
+	// surviving row would be a working sign-in credential filed under a user
+	// id that no longer resolves, and a later account issued that same id
+	// under a non-random [WithIDGenerator] would INHERIT a passkey it never
+	// registered — the identical argument [Service.DeleteAccount]'s step 6
+	// makes for sweeping identities, one credential kind later.
+	//
+	// # It makes NO reachability check either, and MUST NOT
+	//
+	// [CredentialStore.DeleteCredentialIfNotLast] refuses to remove an
+	// account's last way in. This is the other kind of operation
+	// [CredentialStore.DeleteCredential]'s doc names, taken by user instead
+	// of by row: its callers are removing the ACCOUNT, and refusing to
+	// remove the last credential there would preserve exactly what the
+	// caller is trying to destroy — a passkey-only account would become
+	// undeletable. An application MUST NOT reach for this from a "your
+	// passkeys" screen; that screen's method is DeleteCredentialIfNotLast.
+	//
+	// Zero rows matched being success is the stance
+	// [MFAStore.DeleteTrustedDevicesByUser] and
+	// [Store.DeleteVerificationsByUser] already take, for the same reason:
+	// most accounts hold no passkey at all, and a deletion must not fail
+	// because there was nothing to sweep.
+	//
+	// # All of them, or an error
+	//
+	// A backend either removes every one of that user's rows or reports an
+	// error. Removing SOME and reporting success is the one shape this
+	// method must never have: the caller has just deleted the account's
+	// sessions and is about to delete its row, so a survivor is a live,
+	// password-less way into an account that nothing else can find any more.
+	// The conformance suite seeds three credentials for one user precisely
+	// so that a one-row implementation is caught.
+	//
+	// There is no decision here to be split from the write, so unlike
+	// DeleteCredentialIfNotLast this needs no transaction of its own: one
+	// DELETE keyed on user_id, or one acquisition of the mutex that
+	// serialises an in-process store.
+	//
+	// # Why this method could simply be added
+	//
+	// [CredentialStore] is UNRELEASED — it arrived with passkeys in this
+	// same development cycle and has no third-party implementation to break
+	// — so growing it costs nothing, and the sweep is a method on the port
+	// rather than a list-then-delete loop in [Service] like
+	// [Service.sweepIdentities]'s. That asymmetry is a fact about WHEN each
+	// port shipped, not a judgement about which shape is better: [Store] is
+	// released, which is the whole reason passkeys got a port of their own
+	// (see this file's package doc), and [IdentityStore] had already shipped
+	// by the time its own sweep was needed.
+	DeleteCredentialsByUser(ctx context.Context, userID string) error
 	// CreateChallenge persists c and returns what was stored. Returns
 	// ErrIDTaken when c.ID already identifies a row.
 	//

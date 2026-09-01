@@ -3007,31 +3007,32 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // the rest. It is stated in full, in one place, because the last time it
 // existed only as an assumption spread across five method docs it was
 // filled in for two of its three columns and the third was a full account
-// takeover — and because the columns have since grown to five while the
+// takeover — and because the columns have since grown to eight while the
 // features filling them were built on branches that could not see each
 // other.
 //
-// The seven columns are the seven kinds of credential this package can hold
+// The eight columns are the eight kinds of credential this package can hold
 // for an account: three [Verification] purposes, the external [Identity],
-// the [Session], the [TrustedDevice], and the second-factor state
-// ([MFAFactor] plus its [RecoveryCode]s, one column because nothing ever
-// removes one without the other). Every row is a path that removes at least
-// one of them.
+// the [Credential] behind a passkey, the [Session], the [TrustedDevice], and
+// the second-factor state ([MFAFactor] plus its [RecoveryCode]s, one column
+// because nothing ever removes one without the other). Every row is a path
+// that removes at least one of them.
 //
-//	Path                       | password_reset | email_change | magic_link    | identity        | session              | trusted device | mfa
-//	---------------------------|----------------|--------------|---------------|-----------------|----------------------|----------------|-----------
-//	ChangePassword             | swept          | swept        | swept         | not swept       | all but the caller's | all            | not swept
-//	ResetPassword              | swept          | swept        | swept         | swept           | all                  | all            | not swept
-//	LogoutAll                  | swept          | swept        | swept         | not swept       | all                  | all            | not swept
-//	DeleteAccount              | swept          | swept        | swept         | swept           | all                  | all            | swept
-//	AnonymizeAccount           | swept          | swept        | swept         | swept           | all                  | all            | swept
-//	DisableMFA                 | not swept      | not swept    | not swept     | not swept       | not swept            | all            | swept
-//	UnlinkIdentity             | not swept      | not swept    | not swept     | that provider's | all                  | not swept      | not swept
-//	VerifyEmail (email_change) | swept          | n/a          | swept         | not swept       | not swept            | not swept      | not swept
-//	VerifyEmail (signup)       | not swept      | not swept    | not swept     | not swept       | not swept            | not swept      | not swept
-//	RedeemMagicLink            | not swept      | not swept    | burns its own | not swept       | not swept            | not swept      | not swept
-//	Logout                     | not swept      | not swept    | not swept     | not swept       | the presented one    | not swept      | not swept
-//	RevokeSession              | not swept      | not swept    | not swept     | not swept       | the named family     | not swept      | not swept
+//	Path                       | password_reset | email_change | magic_link    | identity        | passkey    | session              | trusted device | mfa
+//	---------------------------|----------------|--------------|---------------|-----------------|------------|----------------------|----------------|-----------
+//	ChangePassword             | swept          | swept        | swept         | not swept       | not swept  | all but the caller's | all            | not swept
+//	ResetPassword              | swept          | swept        | swept         | swept           | not swept  | all                  | all            | not swept
+//	LogoutAll                  | swept          | swept        | swept         | not swept       | not swept  | all                  | all            | not swept
+//	DeleteAccount              | swept          | swept        | swept         | swept           | swept      | all                  | all            | swept
+//	AnonymizeAccount           | swept          | swept        | swept         | swept           | swept      | all                  | all            | swept
+//	DisableMFA                 | not swept      | not swept    | not swept     | not swept       | not swept  | not swept            | all            | swept
+//	UnlinkIdentity             | not swept      | not swept    | not swept     | that provider's | not swept  | all                  | not swept      | not swept
+//	DeletePasskey              | not swept      | not swept    | not swept     | not swept       | that one's | not swept            | not swept      | not swept
+//	VerifyEmail (email_change) | swept          | n/a          | swept         | not swept       | not swept  | not swept            | not swept      | not swept
+//	VerifyEmail (signup)       | not swept      | not swept    | not swept     | not swept       | not swept  | not swept            | not swept      | not swept
+//	RedeemMagicLink            | not swept      | not swept    | burns its own | not swept       | not swept  | not swept            | not swept      | not swept
+//	Logout                     | not swept      | not swept    | not swept     | not swept       | not swept  | the presented one    | not swept      | not swept
+//	RevokeSession              | not swept      | not swept    | not swept     | not swept       | not swept  | the named family     | not swept      | not swept
 //
 // Every cell has a test, the "not swept" ones included: a cell pinning
 // deliberate non-behaviour is what stops a later "fix" from breaking a
@@ -3040,14 +3041,14 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //
 // # Reading the matrix
 //
-// The rows fall into five groups.
+// The rows fall into six groups.
 //
 // REMEDIATION — ChangePassword, ResetPassword, LogoutAll. Each is something
 // a user does because they believe, or have just been told, that the
 // account is at risk, so each leaves nothing armed that can quietly undo
 // it. Every sweep in these rows is fail-closed: an erroring sweep is
-// returned to the caller, never swallowed. Three cells in this group are
-// deliberately empty rather than owed:
+// returned to the caller, never swallowed. The blanks in this group are
+// deliberate rather than owed, and there are four arguments behind them:
 //
 //   - ChangePassword does not disconnect identities, and ResetPassword
 //     does. The caller here proved they hold the current password and is
@@ -3068,6 +3069,14 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 //     touching a credential the user still holds in their pocket.
 //     [Service.DisableMFA] is where a user turns their second factor off,
 //     and it demands the password AND a fresh second factor to do it.
+//   - None of the three touches the PASSKEY column either, and that cell is
+//     the one this row set had to argue rather than default, because
+//     ResetPassword's identity cell says "swept" on an argument that looks
+//     like it should carry. It does not: a passkey is a credential the user
+//     holds in their pocket in the literal sense, so it belongs with the MFA
+//     column and not with the identity one. See "The passkey column, and why
+//     ResetPassword does not sweep it" below, which also states what that
+//     leaves standing and how an application clears it.
 //
 // The trusted-device column, by contrast, is filled in on all three rows,
 // because it is not a credential the user holds in their pocket: it is a
@@ -3079,8 +3088,10 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // USER, not by purpose — so it takes "signup" too, which no other row
 // touches. Nothing is left for a purpose-scoped list to have missed. Their
 // identity sweeps are subject to the one configuration limit
-// [Service.sweepIdentities] states, and their MFA and trusted-device sweeps
-// to the identical limit for [WithMFAStore]. The MFA column is theirs alone
+// [Service.sweepIdentities] states, their passkey sweeps
+// ([Service.sweepCredentials]) to the identical limit for
+// [WithCredentialStore], and their MFA and trusted-device sweeps to the same
+// one for [WithMFAStore]. The passkey and MFA columns are theirs alone
 // — [Service.DeleteAccount]'s doc, "The second-factor state goes too",
 // carries the argument for why termination sweeps what remediation must
 // not.
@@ -3109,6 +3120,20 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // [Service.RequestEmailChange] sweeps that purpose before minting, so no
 // second one exists.
 //
+// REMOVING ONE PASSKEY — DeletePasskey. UnlinkIdentity's mirror, and the two
+// differ in exactly one cell: an unlink revokes every session and this
+// revokes none. That method's doc argues it at length; in short, an unlink is
+// a categorical statement about a whole credential SOURCE, while this removes
+// ONE credential from an account its own guard has just confirmed stays
+// reachable without it — and a [Session] records no credential provenance, so
+// a sweep here could only be all-or-nothing. Signing a user
+// out on their phone because they tidied an old laptop off a list is not what
+// that screen says it does. "Removing a passkey signs you out everywhere"
+// composes from [Service.LogoutAll] in one line, and an application removing
+// a passkey because the DEVICE was lost should do exactly that. Its other
+// cells are empty for the ROUTINE group's reason: removing a credential the
+// account was not relying on is not a mailbox remediation event.
+//
 // ROUTINE — VerifyEmail's signup branch, RedeemMagicLink, Logout,
 // RevokeSession. Their emptiness is deliberate, not an omission, and each
 // says so in its own doc. Sweeping in these rows would break legitimate
@@ -3122,26 +3147,80 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // before confirming their address, since this package exposes no resend
 // path.
 //
-// # The eighth column, which does not exist yet
+// # The passkey column, and why ResetPassword does not sweep it
 //
-// PASSKEYS have no column, and their absence is a DISCLOSED GAP rather than
-// a decision. A [Credential] registered through
-// [Service.FinishPasskeyRegistration] survives every row of this table,
-// including the two TERMINATION rows — so a hard [Service.DeleteAccount]
-// leaves the credential rows behind, filed under a user id that no longer
-// resolves, and a later account issued that same id would inherit a working
-// passkey it never registered. That is the identical argument step 6 of
-// DeleteAccount makes for sweeping identities, one credential kind later.
+// The passkey column is filled in on the two TERMINATION rows and nowhere
+// else. The termination half needs no argument beyond the one step 6 of
+// [Service.DeleteAccount] already makes for identities: a [Credential]
+// outliving its account is a working sign-in credential filed under a user id
+// that no longer resolves, and a later account issued that id under a
+// non-random [WithIDGenerator] would inherit a passkey it never registered.
 //
-// It is not fixed here because [CredentialStore] has no by-user delete to
-// call: closing it means a new method on that port, both backends, and its
-// own conformance check, which is a change to a different feature's port
-// than the one this row set touches. Until then a deployment offering
-// passkeys must remove them from [WithAccountDeletionHook], exactly as a
-// deployment whose identities live behind a Service that cannot see them
-// must (see [Service.sweepIdentities]).
-// TestTheMatrixHasNoPasskeyColumnAndThatIsDisclosed pins the gap so that it
-// stays visible rather than being rediscovered.
+// ResetPassword is the cell that had to be argued, because that row's
+// IDENTITY cell says "swept" on the stated ground that an UNAUTHENTICATED
+// recovery must assume every other credential is hostile — and a passkey is
+// another credential on the same account. Three things stop that argument
+// carrying, and the first decides it.
+//
+// A PASSKEY IS A CREDENTIAL THE USER HOLDS IN THEIR POCKET, in the literal
+// sense the phrase means figuratively where this doc uses it of the MFA
+// column. The private key lives in an authenticator or a platform keychain
+// and does not leave it; nothing that compromises the MAILBOX — the channel
+// a reset runs on, and usually the thing the user is resetting because of —
+// yields it. Sweeping here would mean whoever holds the mailbox can strip the
+// account's most attack-resistant credential by exercising the recovery flow,
+// which is verbatim the collapse the MFA cell on this same row refuses. That
+// is where the column belongs in this table: beside the second factor, not
+// beside the identity. [Service.FinishPasskeyLogin]'s "A passkey IS the
+// second factor" reaches the same conclusion from the other end, and is why
+// that door consults no [MFAFactor] at all.
+//
+// THE RESET MAY NOT BE THE OWNER'S. Every cell on this row is a two-sided
+// bet, because ResetPassword is reachable by anyone who can read the mailbox.
+// If the person resetting is the attacker, a surviving passkey is the
+// VICTIM's last door — FinishPasskeyLogin asks for no password and consults
+// no mailbox — and sweeping would turn "the owner still has a way back" into
+// "the owner has nothing", on a path the attacker triggers at will. The
+// identity sweep does not carry that cost: ResetPassword's own doc records
+// that a swept identity relinks on the next click, because the completed
+// reset certified the address that [LinkVerified] reads.
+//
+// THE EXPLOIT THE IDENTITY SWEEP ANSWERS HAS NO PASSKEY EQUIVALENT. That
+// sweep exists because an attacker can PROVISION the link before the victim
+// ever holds the account: [Service.SignInWith]'s first rung creates an
+// account at an asserted address, so the victim's own reset is how they claim
+// an account that already had somebody else's provider attached — and there
+// was never a screen on which they could have seen it. There is no
+// unauthenticated write path to a [Credential].
+// [Service.FinishPasskeyRegistration] demands a live session for the account,
+// so every passkey on the list was armed by somebody already signed in, which
+// means the account existed, its owner can enumerate it with
+// [Service.ListPasskeys], and can remove it with [Service.DeletePasskey].
+//
+// # What the passkey column leaves standing
+//
+// An attacker who held a live session and registered their OWN authenticator
+// survives a reset. That is real, and it is a residual this decision ACCEPTS
+// rather than one it overlooks. Three properties bound it:
+//
+//   - The reset revokes every session, so no second one can be armed
+//     afterwards. The attacker's window closed with the sweep it survived.
+//   - The credential is VISIBLE. [Service.ListPasskeys] is the "your
+//     passkeys" screen's method, and an entry the user did not add is one
+//     they can recognise — unlike a provider link on an account they had not
+//     yet claimed.
+//   - It is REMOVABLE, always, immediately after a reset.
+//     [Service.DeletePasskey] refuses only when it would take the account's
+//     last way in, and [Service.hasWayInBesides] counts the working password
+//     the reset has just written; the same reset stamps
+//     [UserBase.EmailVerifiedAt], so [WithRequireVerifiedEmail] cannot make
+//     that password not count either. The removal therefore cannot be refused
+//     for the one reason it plausibly might be.
+//
+// An application whose users hold passkeys should show them that list after a
+// reset, and this package cannot do it for them. Sweeping would be the blunt
+// version of the same advice, and its cost falls on every honest user's
+// hardware key.
 //
 // Every sweep in the table is SEQUENTIAL ONLY. See "Why these purposes, and
 // what the sweep does not cover" below for the deterministic demonstration
@@ -3722,6 +3801,31 @@ func (s *Service) RequestPasswordReset(ctx context.Context, email, ip string) (s
 // trust this package's policy places in providers by configuration. Against
 // such a provider no local action recovers anything; the remedy is
 // [LinkNever], or not configuring it.
+//
+// # Why the same recovery does NOT sweep passkeys
+//
+// The row above it in the matrix says "swept" for identities and "not swept"
+// for passkeys, and the two cells are decided by different facts rather than
+// by inconsistency. A [Credential] is bound to hardware the person who
+// compromised the MAILBOX does not hold, so sweeping it here would let
+// whoever forced this reset strip the account's most attack-resistant
+// credential by exercising the recovery flow — the same collapse this
+// method's untouched MFA cell refuses. And this call is UNAUTHENTICATED, so
+// the person making it may be the attacker: a surviving passkey is then the
+// owner's last door, since [Service.FinishPasskeyLogin] asks for neither a
+// password nor a mailbox.
+//
+// The identity sweep's own exploit has no equivalent here, which is what
+// keeps the asymmetry from being a hole: an attacker can PROVISION a
+// (provider, subject) link before the victim ever holds the account, but
+// [Service.FinishPasskeyRegistration] needs a live session for the account,
+// so every passkey was armed by somebody already signed in and the owner can
+// see it on [Service.ListPasskeys] and remove it with
+// [Service.DeletePasskey] — a removal this method's own password write
+// guarantees cannot be refused as the account's last way in. See
+// [Service.ChangePassword]'s doc, "The passkey column, and why ResetPassword
+// does not sweep it", and "What the passkey column leaves standing", which is
+// the residual an application should show its users after a reset.
 //
 // The sweep runs BEFORE the session revocation below, not after. The order is
 // what makes it worth anything: an identity left live while the revocation

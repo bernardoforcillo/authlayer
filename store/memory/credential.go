@@ -237,6 +237,36 @@ func (s *CredentialStore) DeleteCredentialIfNotLast(_ context.Context, userID, i
 	return nil
 }
 
+// DeleteCredentialsByUser removes every credential belonging to userID, and
+// only that user's, under one acquisition of mu. Matching no rows is success
+// rather than auth.ErrCredentialNotFound — deliberately, and the port says
+// so: this is the primitive the two TERMINATION rows of
+// auth.Service.ChangePassword's sweep matrix call, and an account deletion
+// must not fail because the account never registered a passkey.
+//
+// It makes no reachability check at all, exactly like
+// [CredentialStore.DeleteCredential] and for the same reason: its callers are
+// removing the account, and auth.ErrLastCredential there would preserve what
+// they are trying to destroy. See
+// auth.CredentialStore.DeleteCredentialsByUser.
+//
+// The scan and the deletes are one critical section, so the port's "all of
+// them, or an error" obligation holds trivially here: a Go map delete has no
+// independent failure mode, so there is no partial state to report. Deleting
+// during the range is the same shape [CredentialStore.PurgeExpiredChallenges]
+// uses, and is defined behaviour — an entry removed before it is reached is
+// simply not produced.
+func (s *CredentialStore) DeleteCredentialsByUser(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, c := range s.credentials {
+		if c.UserID == userID {
+			delete(s.credentials, id)
+		}
+	}
+	return nil
+}
+
 // CreateChallenge stores c under its ID and returns what was stored. The id
 // check, the hash uniqueness scan and the write happen under one acquisition
 // of mu, matching [AuthStore.CreateVerification], whose duplicate-hash stance

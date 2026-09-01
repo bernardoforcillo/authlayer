@@ -41,6 +41,8 @@ func credentialContractChecks() []credentialCheck {
 		{"DeleteCredentialIfNotLast/AllowsWhenASiblingSurvives", checkDeleteIfNotLastSibling},
 		{"DeleteCredentialIfNotLast/AllowsWhenTheAccountHasAnotherCredentialKind", checkDeleteIfNotLastOtherKind},
 		{"DeleteCredentialIfNotLast/AnotherUsersCredentialIsNotFound", checkDeleteIfNotLastOtherUser},
+		{"DeleteCredentialsByUser/RemovesEveryRowOfThatUserAndNoOther", checkDeleteCredentialsByUser},
+		{"DeleteCredentialsByUser/MatchingNoRowsIsSuccess", checkDeleteCredentialsByUserNoRows},
 		{"CreateChallenge/RoundTripsBothCeremonies", checkCreateChallengeRoundTrip},
 		{"CreateChallenge/DuplicateIDIsRefused", checkCreateChallengeDuplicateID},
 		{"FindChallengeByHash/UnknownHashIsNotFound", checkFindChallengeNotFound},
@@ -540,6 +542,84 @@ func checkDeleteIfNotLastOtherUser(t tb, st auth.CredentialStore) {
 	got := loadCredential(t, st, hers.CredentialID)
 	if got.UserID != alice {
 		t.Fatalf("the other user's credential was touched: %+v", got)
+	}
+}
+
+// checkDeleteCredentialsByUser is the sweep the two TERMINATION rows of
+// auth.Service.ChangePassword's matrix depend on: EVERY credential of that
+// user goes, in one call, and nobody else's does.
+//
+// It seeds THREE credentials for the user deliberately. One would be caught
+// by nothing a by-id delete does not already cover, and two would still pass
+// a backend that removed the first row it found and then a second one on the
+// retry. Three is what makes "it removed some and reported success" — the one
+// shape auth.CredentialStore.DeleteCredentialsByUser forbids — visible in a
+// single call, and a survivor here is a live, password-less way into an
+// account whose sessions the caller has already deleted.
+func checkDeleteCredentialsByUser(t tb, st auth.CredentialStore) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+	alice, bob := newID(), newID()
+	mine := []auth.Credential{
+		mustCreateCredential(t, st, newCredential(alice, at)),
+		mustCreateCredential(t, st, newCredential(alice, at)),
+		mustCreateCredential(t, st, newCredential(alice, at)),
+	}
+	stranger := mustCreateCredential(t, st, newCredential(bob, at))
+
+	wantNoErr(t, "DeleteCredentialsByUser", st.DeleteCredentialsByUser(ctx, alice))
+
+	left, err := st.ListCredentialsByUser(ctx, alice)
+	wantNoErr(t, "ListCredentialsByUser", err)
+	if len(left) != 0 {
+		t.Fatalf("%d of the user's 3 credentials survived the sweep (%+v), want none — a passkey outliving the account it authenticates is a working sign-in credential filed under an id that no longer resolves", len(left), left)
+	}
+	// The list is not the only way back to a row: a login resolves by the
+	// AUTHENTICATOR's id, so each of the three must be unreachable that way
+	// too. A backend that unlinked rather than deleted would pass the list
+	// assertion above and still sign somebody in.
+	for i, c := range mine {
+		if _, err := st.FindCredentialByCredentialID(ctx, c.CredentialID); !errors.Is(err, auth.ErrCredentialNotFound) {
+			t.Fatalf("credential %d is still resolvable by its authenticator id: err = %v, want ErrCredentialNotFound", i, err)
+		}
+	}
+
+	theirs, err := st.ListCredentialsByUser(ctx, bob)
+	wantNoErr(t, "ListCredentialsByUser (other user)", err)
+	if len(theirs) != 1 || theirs[0].ID != stranger.ID {
+		t.Fatalf("another user's rows were swept: %+v — a by-user DELETE must not widen past its user_id", theirs)
+	}
+}
+
+// checkDeleteCredentialsByUserNoRows pins the half of the contract an account
+// deletion depends on far more often than the sweep itself: most accounts
+// hold no passkey at all, so a user with none — and a user whose credentials
+// a previous, half-finished attempt already removed — must both be SUCCESS.
+// auth.ErrCredentialNotFound here would fail the deletion of every
+// passkey-less account in a deployment that wires this port.
+func checkDeleteCredentialsByUserNoRows(t tb, st auth.CredentialStore) {
+	t.Helper()
+	ctx := context.Background()
+	at := stamp()
+	user, bystander := newID(), newID()
+	mustCreateCredential(t, st, newCredential(bystander, at))
+
+	wantNoErr(t, "DeleteCredentialsByUser for a user that never registered one",
+		st.DeleteCredentialsByUser(ctx, user))
+
+	only := mustCreateCredential(t, st, newCredential(user, at))
+	wantNoErr(t, "DeleteCredentialsByUser", st.DeleteCredentialsByUser(ctx, user))
+	wantNoErr(t, "DeleteCredentialsByUser a second time — a retried deletion runs it again",
+		st.DeleteCredentialsByUser(ctx, user))
+
+	if _, err := st.FindCredentialByCredentialID(ctx, only.CredentialID); !errors.Is(err, auth.ErrCredentialNotFound) {
+		t.Fatalf("the swept credential is still resolvable: err = %v, want ErrCredentialNotFound", err)
+	}
+	left, err := st.ListCredentialsByUser(ctx, bystander)
+	wantNoErr(t, "ListCredentialsByUser (bystander)", err)
+	if len(left) != 1 {
+		t.Fatalf("sweeping two users who hold nothing between them removed a third party's row: %+v", left)
 	}
 }
 

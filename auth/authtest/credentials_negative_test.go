@@ -167,6 +167,51 @@ func (s touchMovesTheCounter) TouchCredential(_ context.Context, id string, now 
 	return nil
 }
 
+// sweepsOneCredential removes the FIRST of a user's credentials and reports
+// success, which is what a by-user sweep written as "find the row, delete it"
+// looks like — the by-id shape copied one method along without noticing that
+// the id is now a user id and matches many rows. It is the exact defect
+// auth.CredentialStore.DeleteCredentialsByUser's "All of them, or an error"
+// forbids: the caller has just deleted the account's sessions and is about to
+// delete its row, so every survivor is a live, password-less way into an
+// account nothing else can find any more.
+type sweepsOneCredential struct{ *refCredentialStore }
+
+func (s sweepsOneCredential) DeleteCredentialsByUser(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, c := range s.credentials {
+		if c.UserID == userID {
+			delete(s.credentials, id)
+			return nil
+		}
+	}
+	return nil
+}
+
+// sweepByUserIsNotFound reports auth.ErrCredentialNotFound when a user holds
+// no credentials, treating the by-user sweep as if it were the by-id delete
+// beside it. Most accounts in a deployment hold no passkey at all, so this
+// fails the deletion of nearly every account — loudly, but only for the
+// deployments that wired the port, and only in production.
+type sweepByUserIsNotFound struct{ *refCredentialStore }
+
+func (s sweepByUserIsNotFound) DeleteCredentialsByUser(ctx context.Context, userID string) error {
+	s.mu.Lock()
+	found := false
+	for _, c := range s.credentials {
+		if c.UserID == userID {
+			found = true
+			break
+		}
+	}
+	s.mu.Unlock()
+	if !found {
+		return auth.ErrCredentialNotFound
+	}
+	return s.refCredentialStore.DeleteCredentialsByUser(ctx, userID)
+}
+
 // ── Driving a credential check and capturing its verdict ────────────────
 
 // runCredentialCheck runs one check against st and reports what it complained
@@ -256,6 +301,18 @@ func TestTheCredentialContractRejectsNonCompliantStores(t *testing.T) {
 			store: func() auth.CredentialStore { return challengeLosesTheNullUser{newRefCredentialStore()} },
 			check: "CreateChallenge/RoundTripsBothCeremonies",
 			why:   "a login challenge comes back bound to the empty-string account",
+		},
+		{
+			name:  "DeleteCredentialsByUser removes one row and reports success",
+			store: func() auth.CredentialStore { return sweepsOneCredential{newRefCredentialStore()} },
+			check: "DeleteCredentialsByUser/RemovesEveryRowOfThatUserAndNoOther",
+			why:   "a passkey outlives the account it authenticates, and a later account issued that id inherits it",
+		},
+		{
+			name:  "DeleteCredentialsByUser is not-found for a user with none",
+			store: func() auth.CredentialStore { return sweepByUserIsNotFound{newRefCredentialStore()} },
+			check: "DeleteCredentialsByUser/MatchingNoRowsIsSuccess",
+			why:   "every account that never registered a passkey becomes undeletable",
 		},
 		{
 			name:  "TouchCredential moves the counter",

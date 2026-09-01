@@ -132,6 +132,17 @@ func (s *refCredentialStore) DeleteCredentialIfNotLast(_ context.Context, userID
 	return nil
 }
 
+func (s *refCredentialStore) DeleteCredentialsByUser(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, c := range s.credentials {
+		if c.UserID == userID {
+			delete(s.credentials, id)
+		}
+	}
+	return nil
+}
+
 func (s *refCredentialStore) CreateChallenge(_ context.Context, c auth.Challenge) (auth.Challenge, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
