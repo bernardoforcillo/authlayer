@@ -59,6 +59,14 @@ import (
 //     passkey cell — AnonymizeAccount's identical one included — still
 //     passed, which is again what proves the two postures make two calls
 //     rather than reaching one shared cascade.
+//   - Rewriting [auth.Service.sweepCredentials] as a loop over
+//     [auth.Service.DeletePasskey] — the tempting reuse, since that method
+//     already removes a credential: failed
+//     TestTerminationSweepsAPasskeyOnlyAccount on BOTH postures with
+//     auth.ErrLastCredential, and both halves of the passkey fail-closed
+//     suite. That is the whole reason the sweep calls the port's unchecked
+//     by-user delete instead: a reachability guard on a termination path
+//     preserves exactly what the path is destroying.
 //
 // The passkey column is also where the deliberate non-sweeps carry the most
 // weight in this file. Eleven of the thirteen rows say "not swept" there, and
@@ -1385,4 +1393,77 @@ func TestAPasskeyPlantedFromAStolenSessionIsRemovableAfterAReset(t *testing.T) {
 	if _, _, refresh := mustLogin(t, svc, email, sweepNextPass); refresh == "" {
 		t.Fatal("the owner cannot log in after removing the planted passkey")
 	}
+}
+
+// TestTerminationSweepsAPasskeyOnlyAccount is the ErrLastCredential half of
+// the eighth column, and the one case where getting the arithmetic wrong
+// would be silent rather than loud.
+//
+// [auth.Service.hasWayInBesides] spans all three credential kinds, and
+// [auth.ErrLastCredential] is the refusal it feeds: a user may not remove the
+// credential that is the only thing opening their account. A termination path
+// must be exempt from that rule, because refusing to remove the last
+// credential there would preserve EXACTLY what the caller is destroying — and
+// would make a passkey-only account permanently undeletable, on a method
+// whose whole purpose is to honour "delete my account".
+//
+// That is why [auth.Service.sweepCredentials] calls the port's by-user delete
+// and not [auth.Service.DeletePasskey] in a loop, and this test is what would
+// catch the loop: the account below is refused its own removal first, which
+// is what makes the deletion afterwards a statement about the exemption
+// rather than about an account that had another door all along.
+func TestTerminationSweepsAPasskeyOnlyAccount(t *testing.T) {
+	ctx := context.Background()
+
+	newPasskeyOnly := func(t *testing.T, email string) (*auth.Service, *memory.AuthStore, *memory.CredentialStore, auth.UserBase, auth.Credential) {
+		t.Helper()
+		creds := memory.NewCredentialStore()
+		svc, store := newTestService(t, auth.WithCredentialStore(creds))
+		// No password hash and no identity store: the passkey is the only
+		// thing in this package that can sign this account in.
+		u, err := store.CreateUser(ctx, auth.UserBase{ID: "only-" + email, Email: email, CreatedAt: time.Now().UTC()})
+		if err != nil {
+			t.Fatalf("CreateUser: %v", err)
+		}
+		only := registerPasskey(t, svc, u.ID, newCred('z'))
+
+		// The premise, asserted rather than assumed: this credential really
+		// is the last way in, so the user cannot remove it themselves.
+		if err := svc.DeletePasskey(ctx, u.ID, only.ID); !errors.Is(err, auth.ErrLastCredential) {
+			t.Fatalf("fixture error: DeletePasskey on the only credential = %v, want ErrLastCredential — if the account had another way in, the deletion below would prove nothing", err)
+		}
+		return svc, store, creds, u, only
+	}
+
+	t.Run("DeleteAccount", func(t *testing.T) {
+		svc, store, creds, u, _ := newPasskeyOnly(t, "passkey-only-hard@example.com")
+
+		if err := svc.DeleteAccount(ctx, u.ID, "", ""); err != nil {
+			t.Fatalf("DeleteAccount on a passkey-only account = %v, want nil — ErrLastCredential must not reach a caller that is removing the account", err)
+		}
+		if rows, err := creds.ListCredentialsByUser(ctx, u.ID); err != nil || len(rows) != 0 {
+			t.Fatalf("credentials after DeleteAccount = %v (%v), want none", rows, err)
+		}
+		if _, err := store.FindUserByID(ctx, u.ID); !errors.Is(err, auth.ErrUserNotFound) {
+			t.Fatalf("the account survived DeleteAccount: %v", err)
+		}
+	})
+
+	t.Run("AnonymizeAccount", func(t *testing.T) {
+		svc, store, creds, u, _ := newPasskeyOnly(t, "passkey-only-soft@example.com")
+
+		if err := svc.AnonymizeAccount(ctx, u.ID, "", ""); err != nil {
+			t.Fatalf("AnonymizeAccount on a passkey-only account = %v, want nil", err)
+		}
+		if rows, err := creds.ListCredentialsByUser(ctx, u.ID); err != nil || len(rows) != 0 {
+			t.Fatalf("credentials after AnonymizeAccount = %v (%v), want none — the row SURVIVES this posture with its password cleared, so a passkey left behind would be the only thing able to authenticate an account the deployment has closed", rows, err)
+		}
+		stamped, err := store.FindUserByID(ctx, u.ID)
+		if err != nil {
+			t.Fatalf("FindUserByID: %v", err)
+		}
+		if stamped.DeletedAt == nil {
+			t.Fatal("the account was not stamped")
+		}
+	})
 }
