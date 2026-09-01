@@ -396,9 +396,15 @@ func (s *Service) RequestMagicLink(ctx context.Context, email, ip string) (strin
 // go on to present a code. A user who cannot produce one must request
 // another link — the same cost as any other post-claim refusal here.
 //
-// It also runs after the address stamp above, which matters: [Service.CompleteMFA]
-// enforces [WithRequireVerifiedEmail] itself, so a deployment running that
-// option would otherwise mint a challenge its own completion refuses.
+// It also runs after the address stamp above, which matters:
+// [Service.CompleteMFA] enforces [WithRequireVerifiedEmail] itself, so
+// under that option a link that certifies the account's current address
+// must stamp BEFORE the challenge is minted or the completion refuses the
+// challenge this call just handed out. (A link whose address no longer
+// matches the account's stamps nothing — see the two guards above — and
+// under that option its challenge is indeed unfinishable; that is the same
+// refusal such an account already meets at [Service.Login], not one this
+// ordering introduces.)
 //
 // # What redemption does not touch
 //
