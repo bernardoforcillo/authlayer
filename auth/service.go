@@ -398,6 +398,12 @@ type config struct {
 	// at its zero value, because here zero means OFF: see that option's doc
 	// for why the two stances differ.
 	stepUpWindow time.Duration
+	// trustedDeviceTTL is how long a [TrustedDevice] stays trusted — see
+	// [WithTrustedDeviceTTL], declared in trusted.go beside the feature it
+	// bounds. Assigned by defaultConfig like stepUpWindow, and for a
+	// sharper version of the same reason: here a zero value would mean a
+	// second-factor bypass that never expires.
+	trustedDeviceTTL time.Duration
 }
 
 func defaultConfig() config {
@@ -412,6 +418,7 @@ func defaultConfig() config {
 		mfaChallengeTTL:     defaultMFAChallengeTTL,
 		passkeyChallengeTTL: defaultPasskeyChallengeTTL,
 		stepUpWindow:        defaultStepUpWindow,
+		trustedDeviceTTL:    defaultTrustedDeviceTTL,
 		clock:               func() time.Time { return time.Now().UTC() },
 		idGen:               uid.NewV7,
 	}
@@ -1465,6 +1472,60 @@ func (s *Service) mintSignupVerification(ctx context.Context, userID, email stri
 // the package-level "Fail closed" constraint this method, like every other
 // one in this file, is held to.
 func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent string) (LoginResult, error) {
+	// One implementation, reached with no trusted device. See
+	// [Service.LoginWithTrustedDevice] for why the feature is a second entry
+	// point rather than a sixth parameter here.
+	return s.LoginWithTrustedDevice(ctx, email, plainPassword, ip, userAgent, "")
+}
+
+// LoginWithTrustedDevice is [Service.Login] — the same rate limit, the same
+// address lookup, the SAME PASSWORD CHECK, in the same order — plus one
+// thing: a deviceToken previously returned by [Service.TrustThisDevice] may
+// stand in for the account's SECOND factor, so a machine the user has
+// vouched for is not asked for a code.
+//
+// # The password is still required
+//
+// deviceToken is consulted only AFTER the password has verified and after
+// [WithRequireVerifiedEmail] has been honoured — points 5 and 6 of
+// [Service.Login]'s "Order of checks", unchanged. A device token presented
+// with the wrong password is [ErrInvalidCredentials] and the token is never
+// even looked up. A trusted device replaces the second factor and never the
+// first; auth/trusted.go's package doc states what letting it do otherwise
+// would be, and TestATrustedDeviceDoesNotSkipThePassword is the test that
+// would fail.
+//
+// # What a valid device changes, exactly
+//
+// [Service.mfaAtSignIn] is not consulted, so no [MFAChallenge] is returned;
+// the session is minted immediately with [Session.MFAAt] stamped at now, as
+// though a factor had been presented — because on this machine, once, one
+// was. The stamp is what makes the resulting session satisfy
+// [Service.RequireFreshMFA], which is the honest reading: this sign-in is
+// exactly as authenticated as one that ended in [Service.CompleteMFA].
+// [MFAStore.TouchTrustedDevice] records the use first, and a false from it
+// (the device was revoked in the meantime) falls back to the ordinary
+// challenge.
+//
+// An empty deviceToken, an unknown one, an expired one, one minted for
+// another account, and one presented to a Service holding no confirmed
+// factor for this account ALL fall through to the ordinary challenge rather
+// than refusing the sign-in — see [Service.trustedDeviceAtSignIn] for why
+// every "no" here is a fall-through. In particular a trusted device can
+// never turn [ErrMFARequired] into a session: with no confirmed factor there
+// is nothing for it to stand in for, and [WithMFAEnforcement] applies
+// exactly as it would have.
+//
+// # Why this is a second entry point and not a sixth parameter on Login
+//
+// A trusted device is meaningless without MFA, and MFA is an optional port
+// ([WithMFAStore]). Widening the signature of this package's most-called
+// method would charge every deployment that will never enable a second
+// factor for a parameter it can only ever pass "" to — the same argument
+// auth/mfa.go makes for keeping [MFAStore] off [Store]. There is no drift
+// risk in the pair, because [Service.Login] is not a copy of this method: it
+// is one line that calls it.
+func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPassword, ip, userAgent, deviceToken string) (LoginResult, error) {
 	var zero LoginResult
 
 	if ip == "" {
@@ -1511,6 +1572,33 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 
 	if s.cfg.requireVerifiedEmail && u.EmailVerifiedAt == nil {
 		return zero, ErrEmailNotVerified
+	}
+
+	// Step 6b: the trusted device, consulted only once the password has
+	// verified — that ordering is the feature's whole safety argument, see
+	// auth/trusted.go. A valid one stands in for the second factor and for
+	// NOTHING ELSE; every other outcome is (nil, nil) and falls through to
+	// the challenge below.
+	trusted, err := s.trustedDeviceAtSignIn(ctx, u, deviceToken)
+	if err != nil {
+		return zero, err
+	}
+	if trusted != nil {
+		now := s.cfg.clock()
+		// Recorded BEFORE the session is minted, and its bool is a decision
+		// rather than bookkeeping: false means the row went between the
+		// lookup and here — a concurrent [Service.RevokeTrustedDevice] — and
+		// a revoked device must not skip a factor. Fall through to the
+		// challenge, which is the same answer a user with no device gets.
+		switch ok, terr := s.cfg.mfaStore.TouchTrustedDevice(ctx, trusted.ID, now); {
+		case terr != nil:
+			return zero, terr
+		case ok:
+			// &now is [Session.MFAAt]: this machine proved a factor when it
+			// was trusted, and this session inherits that standing — see
+			// [Service.LoginWithTrustedDevice].
+			return s.mintSession(ctx, u, ip, userAgent, &now)
+		}
 	}
 
 	// Step 7: the second factor, consulted only once the password and
@@ -1777,10 +1865,12 @@ func (s *Service) User(ctx context.Context, userID string) (UserBase, error) {
 }
 
 // PurgeExpired deletes every [Session] and [Verification] expired strictly
-// before `before` — both by ExpiresAt — plus, when [WithCredentialStore] is
-// wired, every passkey ceremony [Challenge] expired by the same rule, and
+// before `before` — both by ExpiresAt — plus, when [WithMFAStore] is wired,
+// every [TrustedDevice] expired by the same rule, plus, when
+// [WithCredentialStore] is wired, every passkey ceremony [Challenge], and
 // returns how many rows were removed in total across every kind. It is a
-// pass-through to [Store.PurgeExpired] and
+// pass-through to [Store.PurgeExpired],
+// [MFAStore.PurgeExpiredTrustedDevices] and
 // [CredentialStore.PurgeExpiredChallenges], matching
 // [github.com/bernardoforcillo/authlayer/invite.Service.PurgeExpired]'s own
 // relationship to its Store. It exists on Service because a caller
@@ -1828,16 +1918,30 @@ func (s *Service) User(ctx context.Context, userID string) (UserBase, error) {
 // housekeeping rather than a security boundary, but it is housekeeping with a
 // bill attached.
 //
-// A [Service] built without [WithCredentialStore] has no challenges and skips
-// the second call entirely, so its count and behaviour are exactly what they
-// were. When the port IS wired, a failure from either store is returned
+// A [Service] built without [WithCredentialStore] has no challenges, and one
+// built without [WithMFAStore] has no trusted devices; each skips its own
+// call entirely, so such a Service's count and behaviour are exactly what
+// they were. When a port IS wired, a failure from any store is returned
 // as-is, along with the count from whatever had already been purged: this
-// makes no attempt to be atomic across two ports that may be two backends,
-// and a caller must not read a non-nil error as "nothing was removed".
+// makes no attempt to be atomic across three ports that may be three
+// backends, and a caller must not read a non-nil error as "nothing was
+// removed".
+//
+// The trusted-device rows are the same kind of housekeeping as the rest: an
+// expired [TrustedDevice] is already refused by
+// [Service.LoginWithTrustedDevice] before it is ever purged, so removing it
+// reclaims storage rather than closing a door.
 func (s *Service) PurgeExpired(ctx context.Context, before time.Time) (int, error) {
 	n, err := s.store.PurgeExpired(ctx, before)
 	if err != nil {
 		return n, err
+	}
+	if s.cfg.mfaStore != nil {
+		devices, err := s.cfg.mfaStore.PurgeExpiredTrustedDevices(ctx, before)
+		if err != nil {
+			return n, err
+		}
+		n += devices
 	}
 	if s.cfg.credentialStore == nil {
 		return n, nil

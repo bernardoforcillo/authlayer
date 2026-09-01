@@ -410,6 +410,81 @@ type MFAStore interface {
 	// use len() rather than a nil comparison. Order is likewise
 	// unspecified — sort the result if you depend on one.
 	ListRecoveryCodes(ctx context.Context, userID string) ([]RecoveryCode, error)
+
+	// --- trusted devices ---
+	//
+	// The seven methods below persist [TrustedDevice] — the long-lived
+	// bearer token that stands in for the second factor on a machine the
+	// user has vouched for. They are on THIS port rather than a new one
+	// because a trusted device is only ever "skip the second factor": a
+	// deployment with no MFA has no use for one, and a backend implementing
+	// MFA but not these would be one on which the feature silently does not
+	// exist. auth/trusted.go carries the whole design; this port stores
+	// hashes and rows and decides nothing.
+
+	// CreateTrustedDevice persists d and returns what was stored.
+	//
+	// ErrIDTaken when d.ID already identifies a row. A duplicate
+	// [TrustedDevice.TokenHash] MUST be refused too — that field's own doc
+	// carries the MUST and the reason — but the sentinel for it is
+	// deliberately unspecified, exactly as it is for [Session.TokenHash]:
+	// no caller distinguishes the two, and the service never presents a
+	// hash it did not just generate.
+	//
+	// An existing row is NEVER silently replaced or re-pointed at another
+	// user: that is how one person's cookie ends up skipping somebody
+	// else's second factor.
+	CreateTrustedDevice(ctx context.Context, d TrustedDevice) (TrustedDevice, error)
+	// FindTrustedDeviceByHash loads the device whose TokenHash equals
+	// tokenHash, returning ErrTrustedDeviceNotFound when there is none. The
+	// hash is matched byte-for-byte.
+	//
+	// It does NOT filter by user or by expiry: [Service.trustedDeviceAtSignIn]
+	// compares the row's UserID against the account whose password it just
+	// verified, and its ExpiresAt against the service clock. Folding either
+	// in here would make this method refuse for a reason it cannot report.
+	FindTrustedDeviceByHash(ctx context.Context, tokenHash string) (TrustedDevice, error)
+	// ListTrustedDevices returns every device belonging to userID — expired
+	// ones included — and only that user's. A user with none is not an
+	// error.
+	//
+	// Whether "none" comes back as an empty slice or a nil one is
+	// deliberately unspecified, as it is for ListRecoveryCodes: use len().
+	// Order is likewise unspecified.
+	ListTrustedDevices(ctx context.Context, userID string) ([]TrustedDevice, error)
+	// DeleteTrustedDevice removes the one device named by id, or returns
+	// ErrTrustedDeviceNotFound when id matches no row.
+	//
+	// It performs no ownership check and cannot: this port is never told
+	// which user is asking. [Service.RevokeTrustedDevice] establishes that
+	// before it calls here, by scanning the caller's own devices.
+	DeleteTrustedDevice(ctx context.Context, id string) error
+	// DeleteTrustedDevicesByUser removes EVERY trusted device belonging to
+	// userID, and only that user's. Matching no rows is SUCCESS, not
+	// ErrTrustedDeviceNotFound — this is the primitive every sweep in
+	// [Service.ChangePassword]'s matrix calls, and a remediation path must
+	// not fail because the account had nothing to revoke.
+	DeleteTrustedDevicesByUser(ctx context.Context, userID string) error
+	// TouchTrustedDevice stamps LastUsedAt with now for the device named by
+	// id, reporting whether a row was stamped. An unknown id is
+	// (false, nil), never an error.
+	//
+	// The bool is load-bearing rather than informational:
+	// [Service.LoginWithTrustedDevice] calls this AFTER resolving the device
+	// and BEFORE minting the session, and treats false as "this device is
+	// gone" — so a [Service.RevokeTrustedDevice] landing between the two
+	// makes the sign-in fall back to the ordinary challenge rather than skip
+	// a factor on the strength of a row that no longer exists.
+	TouchTrustedDevice(ctx context.Context, id string, now time.Time) (bool, error)
+	// PurgeExpiredTrustedDevices deletes every device whose ExpiresAt is
+	// strictly before `before`, across every user, and reports how many rows
+	// went. It is what [Service.PurgeExpired] calls, and it is housekeeping
+	// rather than a security boundary: an expired device is already refused
+	// by [Service.LoginWithTrustedDevice] long before it is purged.
+	//
+	// The cutoff is taken literally and is not clamped to the present — the
+	// same contract [Store.PurgeExpired] carries.
+	PurgeExpiredTrustedDevices(ctx context.Context, before time.Time) (int, error)
 }
 
 // mfa resolves the configured [MFAStore], or reports

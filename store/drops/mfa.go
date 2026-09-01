@@ -11,11 +11,13 @@ import (
 	"github.com/bernardoforcillo/authlayer/auth"
 )
 
-// MFANames are the two table names an MFAStore persists to. The zero value
-// defaults to "mfa_factors" and "mfa_recovery_codes".
+// MFANames are the three table names an MFAStore persists to. The zero
+// value defaults to "mfa_factors", "mfa_recovery_codes" and
+// "trusted_devices".
 type MFANames struct {
-	Factors       string // default "mfa_factors"
-	RecoveryCodes string // default "mfa_recovery_codes"
+	Factors        string // default "mfa_factors"
+	RecoveryCodes  string // default "mfa_recovery_codes"
+	TrustedDevices string // default "trusted_devices"
 }
 
 func (n MFANames) withDefaults() MFANames {
@@ -24,6 +26,9 @@ func (n MFANames) withDefaults() MFANames {
 	}
 	if n.RecoveryCodes == "" {
 		n.RecoveryCodes = "mfa_recovery_codes"
+	}
+	if n.TrustedDevices == "" {
+		n.TrustedDevices = "trusted_devices"
 	}
 	return n
 }
@@ -69,12 +74,15 @@ func WithMFATextLibraryIDs() MFAOption {
 	return func(s *mfaSettings) { s.ids = idTypes{library: false, user: false} }
 }
 
-// MFASchema holds the two second-factor tables and their derived columns:
+// MFASchema holds the three second-factor tables and their derived columns:
 //
 //	<mfa_factors>         user_id PK, secret_enc, confirmed_at, created_at,
 //	                      last_step
 //	<mfa_recovery_codes>  id PK, user_id, code_hash, used_at, created_at,
 //	                      INDEX (user_id, code_hash)
+//	<trusted_devices>     id PK, user_id, token_hash, label, created_at,
+//	                      expires_at, last_used_at, UNIQUE (token_hash),
+//	                      INDEX (user_id)
 //
 // # user_id is the factors table's PRIMARY KEY, and that is the port's rule
 //
@@ -121,8 +129,30 @@ func WithMFATextLibraryIDs() MFAOption {
 // handling is needed here beyond letting the model's own pointer types
 // through.
 //
-// [auth.MFAFactor] and [auth.RecoveryCode] are fixed shapes, unlike the
-// generic scope Store, so unlike [Schema] this type is not parameterized.
+// # UNIQUE (token_hash) on trusted_devices is the third load-bearing one
+//
+// [auth.TrustedDevice.TokenHash] carries the MUST this constraint
+// discharges, and it is the same one [AuthSchema] records for
+// sessions.token_hash: two rows sharing a hash would make
+// [MFAStore.FindTrustedDeviceByHash] return whichever the server reached
+// first, so WHICH ACCOUNT one token skips the second factor for would be
+// decided by row order. It is registered through [pg.Table.AddUnique] and
+// emitted as a guarded ALTER TABLE, matching sessions and verifications, so
+// [MFAStore.CreateSchema] can self-heal a pre-existing table that lacks it —
+// which a `unique` column tag could not, since CREATE TABLE IF NOT EXISTS
+// no-ops away entirely against a table that is already there.
+//
+// INDEX (user_id) serves [MFAStore.ListTrustedDevices] (every "your trusted
+// devices" screen, and the ownership scan
+// [auth.Service.RevokeTrustedDevice] performs on every revocation) and
+// [MFAStore.DeleteTrustedDevicesByUser] (every remediation path in
+// auth.Service.ChangePassword's sweep matrix). Without it both sequentially
+// scan a table that grows with the whole deployment's device count rather
+// than with one user's.
+//
+// [auth.MFAFactor], [auth.RecoveryCode] and [auth.TrustedDevice] are fixed
+// shapes, unlike the generic scope Store, so unlike [Schema] this type is
+// not parameterized.
 type MFASchema struct {
 	// Factors is the enrolled-TOTP-factor table. See [auth.MFAFactor] —
 	// secret_enc holds ciphertext, never a base32 secret.
@@ -131,9 +161,14 @@ type MFASchema struct {
 	// [auth.RecoveryCode] — code_hash holds a password-grade hash, never a
 	// code.
 	RecoveryCodes *pg.Table
+	// TrustedDevices is the trusted-device table. See [auth.TrustedDevice] —
+	// token_hash holds the hash of an opaque bearer token, never the token.
+	// store/drops/trusted.go holds every statement issued against it.
+	TrustedDevices *pg.Table
 
 	factors *colSet
 	codes   *colSet
+	devices *colSet
 }
 
 // NewMFASchema builds the schema for one MFA store instance.
@@ -148,26 +183,35 @@ func NewMFASchema(opts ...MFAOption) *MFASchema {
 	names := cfg.names.withDefaults()
 
 	s := &MFASchema{
-		Factors:       pg.NewTable(names.Factors),
-		RecoveryCodes: pg.NewTable(names.RecoveryCodes),
+		Factors:        pg.NewTable(names.Factors),
+		RecoveryCodes:  pg.NewTable(names.RecoveryCodes),
+		TrustedDevices: pg.NewTable(names.TrustedDevices),
 	}
-	// One idTypes for both tables, with both families always set the same
-	// way — see [WithMFATextLibraryIDs] for why these tables, like the auth
-	// and identity ones, have no text-user-id option of their own.
+	// One idTypes for all three tables, with both families always set the
+	// same way — see [WithMFATextLibraryIDs] for why these tables, like the
+	// auth and identity ones, have no text-user-id option of their own.
 	s.factors = newColSet(s.Factors, auth.MFAFactor{}, cfg.ids)
 	s.codes = newColSet(s.RecoveryCodes, auth.RecoveryCode{}, cfg.ids)
+	s.devices = newColSet(s.TrustedDevices, auth.TrustedDevice{}, cfg.ids)
 
 	s.RecoveryCodes.AddIndex(pg.NewIndex(
 		names.RecoveryCodes+"_user_id_code_hash_idx", s.RecoveryCodes,
 		s.codes.col("user_id"), s.codes.col("code_hash"),
 	))
 
+	s.TrustedDevices.AddUnique(names.TrustedDevices+"_token_hash",
+		s.devices.col("token_hash"))
+	s.TrustedDevices.AddIndex(pg.NewIndex(
+		names.TrustedDevices+"_user_id_idx", s.TrustedDevices,
+		s.devices.col("user_id"),
+	))
+
 	return s
 }
 
-// MFAStore is a drops-backed auth.MFAStore: the `mfa_factors` and
-// `mfa_recovery_codes` tables, and nothing else. It is the optional
-// second-factor port, wired with
+// MFAStore is a drops-backed auth.MFAStore: the `mfa_factors`,
+// `mfa_recovery_codes` and `trusted_devices` tables, and nothing else. It is
+// the optional second-factor port, wired with
 // [github.com/bernardoforcillo/authlayer/auth.WithMFAStore]; an application
 // offering no second factor never constructs one, and never creates the
 // tables.
@@ -177,9 +221,12 @@ func NewMFASchema(opts ...MFAOption) *MFASchema {
 //
 // Like [AuthStore], [IdentityStore] and [InviteStore] it is pure
 // persistence: it encrypts nothing, hashes nothing, mints nothing, and
-// authorizes nothing. The TOTP secret arrives already encrypted and the
-// recovery codes already hashed; a dump of these two tables yields no
-// working credential to anyone who does not also hold the cipher key.
+// authorizes nothing. The TOTP secret arrives already encrypted, the
+// recovery codes already hashed, and the trusted-device tokens already
+// hashed; a dump of these three tables yields no working credential to
+// anyone who does not also hold the cipher key.
+//
+// store/drops/trusted.go holds the seven trusted-device methods.
 type MFAStore struct {
 	db *pg.DB
 	s  *MFASchema
@@ -197,10 +244,13 @@ func NewMFAStore(db *pg.DB, opts ...MFAOption) *MFAStore {
 // or emit their own DDL.
 func (st *MFAStore) Schema() *MFASchema { return st.s }
 
-// CreateSchema issues CREATE TABLE IF NOT EXISTS for both tables, then
-// CREATE INDEX IF NOT EXISTS for the recovery-code index. Every statement
-// is idempotent, so the call is safe to re-run and self-heals a
-// pre-existing table missing the index.
+// CreateSchema issues CREATE TABLE IF NOT EXISTS for all three tables, each
+// followed by its guarded ALTER TABLE constraints — the trusted_devices
+// UNIQUE (token_hash), which CREATE TABLE carries through
+// [pg.Table.AddUnique] rather than a column tag — and then CREATE INDEX IF
+// NOT EXISTS for the recovery-code and trusted-device indexes. Every
+// statement is idempotent, so the call is safe to re-run and self-heals a
+// pre-existing table missing the constraint or an index.
 //
 // Like every other CreateSchema in this package it adds what is missing and
 // never alters what is already there, so production deployments that own
@@ -212,7 +262,7 @@ func (st *MFAStore) Schema() *MFASchema { return st.s }
 // declared, matching this codebase's other schemas — and here it is also
 // forced: [AuthStore] may be a different backend.
 func (st *MFAStore) CreateSchema(ctx context.Context) error {
-	for _, t := range []*pg.Table{st.s.Factors, st.s.RecoveryCodes} {
+	for _, t := range []*pg.Table{st.s.Factors, st.s.RecoveryCodes, st.s.TrustedDevices} {
 		if _, err := st.db.ExecExpr(ctx, pg.CreateTableIfNotExists(t)); err != nil {
 			return err
 		}

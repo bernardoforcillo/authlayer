@@ -1789,6 +1789,19 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 			}
 			return login.User, u.ID
 		},
+		// Driven with an EMPTY device token. The point of this table is that
+		// every path handing a UserBase back scrubs it, and a trusted device
+		// changes which branch mints the session, not what the shared
+		// minting tail returns. The device-bearing branch is pinned in
+		// auth/trusted_test.go.
+		"LoginWithTrustedDevice": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
+			u := mustSignUp(t, svc, "scrub-login-device@example.com", validPassword)
+			login, err := svc.LoginWithTrustedDevice(ctx, "scrub-login-device@example.com", validPassword, "1.2.3.4", "agent", "")
+			if err != nil {
+				t.Fatalf("LoginWithTrustedDevice: %v", err)
+			}
+			return login.User, u.ID
+		},
 		"Refresh": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
 			u := mustSignUp(t, svc, "scrub-refresh@example.com", validPassword)
 			_, _, refresh := mustLogin(t, svc, "scrub-refresh@example.com", validPassword)

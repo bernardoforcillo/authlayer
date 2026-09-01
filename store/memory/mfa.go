@@ -41,6 +41,13 @@ type MFAStore struct {
 	// FindIdentityByProviderSubject already make. store/drops indexes the
 	// column.
 	codes map[string]auth.RecoveryCode
+	// devices is keyed by trusted-device id. Locating one by token hash, or
+	// locating a user's, is a linear scan for the same reason codes is: one
+	// copy of the data and therefore no way for two indexes to disagree.
+	// store/drops indexes user_id and constrains token_hash UNIQUE; here
+	// CreateTrustedDevice enforces that uniqueness under the same lock as
+	// the write it guards. trusted.go holds this type's trusted-device half.
+	devices map[string]auth.TrustedDevice
 }
 
 // NewMFAStore returns an empty in-memory auth.MFAStore.
@@ -48,6 +55,7 @@ func NewMFAStore() *MFAStore {
 	return &MFAStore{
 		factors: map[string]auth.MFAFactor{},
 		codes:   map[string]auth.RecoveryCode{},
+		devices: map[string]auth.TrustedDevice{},
 	}
 }
 

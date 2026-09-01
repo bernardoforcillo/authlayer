@@ -81,7 +81,7 @@ func newLiveMFAStore(t *testing.T) (*sql.DB, *dropsstore.MFAStore) {
 func dropMFATables(t *testing.T, db *pg.DB, st *dropsstore.MFAStore) {
 	t.Helper()
 	s := st.Schema()
-	for _, tbl := range []*pg.Table{s.RecoveryCodes, s.Factors} {
+	for _, tbl := range []*pg.Table{s.TrustedDevices, s.RecoveryCodes, s.Factors} {
 		if _, err := db.ExecExpr(context.Background(), pg.DropTableIfExists(tbl)); err != nil {
 			t.Fatalf("drop %s: %v", tbl.Name(), err)
 		}
@@ -130,7 +130,7 @@ func TestMFAStoreSatisfiesTheContractLive(t *testing.T) {
 	t.Cleanup(func() { dropMFATables(t, db, st) })
 
 	s := st.Schema()
-	truncate := fmt.Sprintf("TRUNCATE %s, %s", s.Factors.Name(), s.RecoveryCodes.Name())
+	truncate := fmt.Sprintf("TRUNCATE %s, %s, %s", s.Factors.Name(), s.RecoveryCodes.Name(), s.TrustedDevices.Name())
 	authtest.RunMFAStoreContract(t, func(t *testing.T) auth.MFAStore {
 		if _, err := sqlDB.ExecContext(ctx, truncate); err != nil {
 			t.Fatalf("%s: %v", truncate, err)
@@ -772,5 +772,95 @@ func TestMFAServiceChallengeAdmitsExactlyOneSessionLive(t *testing.T) {
 	}
 	if len(sessions) != 1 {
 		t.Fatalf("sessions = %d, want exactly 1", len(sessions))
+	}
+}
+
+// liveTrustedDevice builds one unexpired trusted device for userID.
+func liveTrustedDevice(userID string, at time.Time) auth.TrustedDevice {
+	return auth.TrustedDevice{
+		ID:        uid.NewV7(),
+		UserID:    userID,
+		TokenHash: "td-" + uid.NewV7(),
+		Label:     "live device",
+		CreatedAt: at,
+		ExpiresAt: at.Add(30 * 24 * time.Hour),
+	}
+}
+
+// TestMFAStoreTrustedDeviceTokenHashIsUniqueLive proves the constraint
+// exists in the DATABASE rather than only in the reference store's scan.
+//
+// auth.TrustedDevice.TokenHash's MUST is discharged here by UNIQUE
+// (token_hash), which [MFASchema] registers through AddUnique and
+// CreateSchema emits as a guarded ALTER TABLE — a path the unit tests cannot
+// exercise at all, and the one that decides whether two rows can share a
+// token. If they could, FindTrustedDeviceByHash would return whichever the
+// server reached first, so WHICH ACCOUNT a token skips the second factor for
+// would be decided by row order.
+func TestMFAStoreTrustedDeviceTokenHashIsUniqueLive(t *testing.T) {
+	_, st := newLiveMFAStore(t)
+	ctx := context.Background()
+	at := time.Now().UTC().Truncate(time.Microsecond)
+
+	first := liveTrustedDevice(uid.NewV7(), at)
+	if _, err := st.CreateTrustedDevice(ctx, first); err != nil {
+		t.Fatalf("CreateTrustedDevice: %v", err)
+	}
+
+	clash := liveTrustedDevice(uid.NewV7(), at)
+	clash.TokenHash = first.TokenHash
+	if _, err := st.CreateTrustedDevice(ctx, clash); err == nil {
+		t.Fatalf("a second device with the same token_hash was accepted — CreateSchema did not emit UNIQUE (token_hash), so one token now resolves to whichever row the server reaches first")
+	}
+
+	got, err := st.FindTrustedDeviceByHash(ctx, first.TokenHash)
+	if err != nil {
+		t.Fatalf("FindTrustedDeviceByHash: %v", err)
+	}
+	if got.ID != first.ID {
+		t.Fatalf("the hash resolves to %s, want the original %s", got.ID, first.ID)
+	}
+}
+
+// TestMFAStoreTrustedDeviceLookupsUseTheIndexLive proves the planner
+// actually picks trusted_devices' user_id index, with a control that drops
+// it and requires the plan to degrade. It is the index behind every "your
+// trusted devices" screen, every RevokeTrustedDevice ownership scan, and
+// every sweep in auth.Service.ChangePassword's matrix.
+//
+// enable_seqscan is left alone deliberately, exactly as in
+// TestMFAStoreRecoveryCodeLookupsUseTheIndexLive: forcing the planner would
+// prove only that the index CAN be used.
+func TestMFAStoreTrustedDeviceLookupsUseTheIndexLive(t *testing.T) {
+	sqlDB, st := newLiveMFAStore(t)
+	ctx := context.Background()
+	at := time.Now().UTC().Truncate(time.Microsecond)
+	tbl := st.Schema().TrustedDevices.Name()
+
+	target := uid.NewV7()
+	for range 2 {
+		if _, err := st.CreateTrustedDevice(ctx, liveTrustedDevice(target, at)); err != nil {
+			t.Fatalf("CreateTrustedDevice: %v", err)
+		}
+	}
+	for range 400 {
+		if _, err := st.CreateTrustedDevice(ctx, liveTrustedDevice(uid.NewV7(), at)); err != nil {
+			t.Fatalf("CreateTrustedDevice: %v", err)
+		}
+	}
+	if _, err := sqlDB.ExecContext(ctx, "ANALYZE "+tbl); err != nil {
+		t.Fatalf("ANALYZE: %v", err)
+	}
+
+	byUser := fmt.Sprintf("SELECT id FROM %s WHERE user_id = $1", tbl)
+	if plan := explain(t, sqlDB, byUser, target); !strings.Contains(plan, "Index") {
+		t.Fatalf("ListTrustedDevices' filter does not use an index:\n%s", plan)
+	}
+
+	if _, err := sqlDB.ExecContext(ctx, "DROP INDEX "+tbl+"_user_id_idx"); err != nil {
+		t.Fatalf("dropping the index: %v", err)
+	}
+	if plan := explain(t, sqlDB, byUser, target); !strings.Contains(plan, "Seq Scan") {
+		t.Fatalf("with the index dropped the plan did not degrade to a sequential scan, so the earlier plan proves nothing:\n%s", plan)
 	}
 }
