@@ -1340,7 +1340,7 @@ func (s listFailIdentityStore) ListIdentitiesByUser(context.Context, string) ([]
 	return nil, errIdentityBoom
 }
 
-// unlinkFlagSpy records, in order, the userHasPassword value UnlinkIdentity
+// unlinkFlagSpy records, in order, the userHasOtherCredential value UnlinkIdentity
 // computes for each call, while still delegating to a real store so the
 // outcomes stay honest. It is how the suite pins that the flag comes from
 // the account's ACTUAL credential state rather than from a constant — the
@@ -1352,9 +1352,9 @@ type unlinkFlagSpy struct {
 	seen []bool
 }
 
-func (s *unlinkFlagSpy) DeleteIdentityIfNotLast(ctx context.Context, userID, provider string, userHasPassword bool) error {
-	s.seen = append(s.seen, userHasPassword)
-	return s.IdentityStore.DeleteIdentityIfNotLast(ctx, userID, provider, userHasPassword)
+func (s *unlinkFlagSpy) DeleteIdentityIfNotLast(ctx context.Context, userID, provider string, userHasOtherCredential bool) error {
+	s.seen = append(s.seen, userHasOtherCredential)
+	return s.IdentityStore.DeleteIdentityIfNotLast(ctx, userID, provider, userHasOtherCredential)
 }
 
 // --- the port must be configured -------------------------------------------
@@ -1778,7 +1778,7 @@ func TestUnlinkIdentityReportsAnAbsentProvider(t *testing.T) {
 
 // TestUnlinkIdentityRequiresAnExistingUser pins that the user read happens
 // and that its failure stops the call. That read is not a courtesy check: it
-// is where userHasPassword comes from, and skipping it would mean deciding
+// is where userHasOtherCredential comes from, and skipping it would mean deciding
 // the last-credential question with a value nobody looked up.
 func TestUnlinkIdentityRequiresAnExistingUser(t *testing.T) {
 	svc, _, ids := newOAuthService(t)
@@ -1856,11 +1856,11 @@ func TestUnlinkIdentityPassesTheAccountsRealPasswordState(t *testing.T) {
 	// them was computed from the account's real state at the time.
 	want := []bool{false, true, true, true}
 	if len(spy.seen) != len(want) {
-		t.Fatalf("userHasPassword calls = %v, want %v", spy.seen, want)
+		t.Fatalf("userHasOtherCredential calls = %v, want %v", spy.seen, want)
 	}
 	for i := range want {
 		if spy.seen[i] != want[i] {
-			t.Fatalf("userHasPassword call %d = %v, want %v (all: %v)", i, spy.seen[i], want[i], spy.seen)
+			t.Fatalf("userHasOtherCredential call %d = %v, want %v (all: %v)", i, spy.seen[i], want[i], spy.seen)
 		}
 	}
 }

@@ -348,7 +348,7 @@ func (st *IdentityStore) DeleteIdentity(ctx context.Context, id string) error {
 
 // DeleteIdentityIfNotLast removes every one of userID's identities at
 // provider, but only when the account stays reachable afterwards — either
-// another identity survives the delete or userHasPassword is true. Otherwise
+// another identity survives the delete or userHasOtherCredential is true. Otherwise
 // it returns auth.ErrLastCredential and removes NOTHING.
 // auth.ErrIdentityNotFound means the user had no identity at that provider at
 // all.
@@ -440,7 +440,7 @@ func (st *IdentityStore) DeleteIdentity(ctx context.Context, id string) error {
 // harmless in the only direction it can move: it adds a way in, so a delete
 // this call allowed stays safe, and a delete it refused was refused against
 // the smaller row set — fail-closed, self-correcting on retry.
-func (st *IdentityStore) DeleteIdentityIfNotLast(ctx context.Context, userID, provider string, userHasPassword bool) error {
+func (st *IdentityStore) DeleteIdentityIfNotLast(ctx context.Context, userID, provider string, userHasOtherCredential bool) error {
 	return st.db.InTx(ctx, func(txdb *pg.DB) error {
 		// Serialize this method against itself for this user, before
 		// anything is read — see "What each of the two locks does". A
@@ -477,7 +477,7 @@ func (st *IdentityStore) DeleteIdentityIfNotLast(ctx context.Context, userID, pr
 		if doomed == 0 {
 			return auth.ErrIdentityNotFound
 		}
-		if survivors == 0 && !userHasPassword {
+		if survivors == 0 && !userHasOtherCredential {
 			// Removes nothing. Returning an error rolls the transaction
 			// back, so the advisory lock and the row locks are released
 			// with the table untouched.

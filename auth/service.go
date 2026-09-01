@@ -1518,9 +1518,11 @@ func (s *Service) User(ctx context.Context, userID string) (UserBase, error) {
 }
 
 // PurgeExpired deletes every [Session] and [Verification] expired strictly
-// before `before` — both by ExpiresAt — and returns how many rows were
-// removed in total, across both kinds. It is a direct pass-through to
-// [Store.PurgeExpired], matching
+// before `before` — both by ExpiresAt — plus, when [WithCredentialStore] is
+// wired, every passkey ceremony [Challenge] expired by the same rule, and
+// returns how many rows were removed in total across every kind. It is a
+// pass-through to [Store.PurgeExpired] and
+// [CredentialStore.PurgeExpiredChallenges], matching
 // [github.com/bernardoforcillo/authlayer/invite.Service.PurgeExpired]'s own
 // relationship to its Store. It exists on Service because a caller
 // ordinarily holds only the *Service, and this package REQUIRES the
@@ -1555,8 +1557,37 @@ func (s *Service) User(ctx context.Context, userID string) (UserBase, error) {
 // deliberately not consulted here, matching invite's signature: the caller
 // scheduling this housekeeping is the one that decides its cutoff, and a
 // job that means "everything older than a week ago" says so directly.
+//
+// # The challenge table, and why this one is not optional housekeeping
+//
+// [Service.BeginPasskeyLogin] is UNAUTHENTICATED and writes one [Challenge]
+// row per call, with no rate limiter of its own (see that method). This
+// janitor is therefore the only thing bounding that table, and a deployment
+// offering passkeys that never schedules this has a table growing at whatever
+// rate a caller chooses. The rows are still inert — an expired challenge is
+// refused by both Finish methods long before it is purged — so this remains
+// housekeeping rather than a security boundary, but it is housekeeping with a
+// bill attached.
+//
+// A [Service] built without [WithCredentialStore] has no challenges and skips
+// the second call entirely, so its count and behaviour are exactly what they
+// were. When the port IS wired, a failure from either store is returned
+// as-is, along with the count from whatever had already been purged: this
+// makes no attempt to be atomic across two ports that may be two backends,
+// and a caller must not read a non-nil error as "nothing was removed".
 func (s *Service) PurgeExpired(ctx context.Context, before time.Time) (int, error) {
-	return s.store.PurgeExpired(ctx, before)
+	n, err := s.store.PurgeExpired(ctx, before)
+	if err != nil {
+		return n, err
+	}
+	if s.cfg.credentialStore == nil {
+		return n, nil
+	}
+	challenges, err := s.cfg.credentialStore.PurgeExpiredChallenges(ctx, before)
+	if err != nil {
+		return n, err
+	}
+	return n + challenges, nil
 }
 
 // VerifyEmail redeems plainToken: a "signup" token marks the account's

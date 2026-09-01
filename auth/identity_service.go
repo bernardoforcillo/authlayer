@@ -769,12 +769,13 @@ func (s *Service) LinkIdentity(ctx context.Context, userID string, ext ExternalI
 // [ErrOAuthNotConfigured].
 //
 // It refuses to remove the account's last way in: with no other identity
-// surviving the delete and no WORKING password credential, the call fails
-// with [ErrLastCredential] and removes NOTHING. That is not a formality. An
-// account with no identity and no password cannot be authenticated by
+// surviving the delete, no WORKING password credential and no passkey, the
+// call fails with [ErrLastCredential] and removes NOTHING. That is not a
+// formality. An account with none of the three cannot be authenticated by
 // anything in this package — not by [Service.Login], which refuses an empty
-// PasswordHash, and not by [Service.SignInWith], which has no link left to
-// resolve. The lockout would be permanent. [ErrIdentityNotFound] means
+// PasswordHash, not by [Service.SignInWith], which has no link left to
+// resolve, and not by [Service.FinishPasskeyLogin], which has no credential
+// to resolve. The lockout would be permanent. [ErrIdentityNotFound] means
 // there was nothing to unlink at that provider, which is a different answer
 // an application's connected-accounts screen acts on differently.
 //
@@ -820,16 +821,19 @@ func (s *Service) LinkIdentity(ctx context.Context, userID string, ext ExternalI
 // race that a "list, decide, delete" here would reopen, and that this
 // project has shipped four times elsewhere.
 //
-// # Why the password state is read here and passed in
+// # Why the other-credential state is read here and passed in
 //
-// The identity store owns `identities` and cannot see `users`, so this
-// method reads the account and hands the answer down. [IdentityStore]'s own
-// doc argues why that value cannot go stale in the dangerous direction: no
-// [Service] method removes a password (both writers store a freshly hashed,
-// non-empty value, and there is no "remove my password" and no account
-// deletion in this package), so a true observed here cannot become a false
-// under the delete. The other direction merely refuses a delete that would
-// have been safe, which is self-correcting on retry.
+// The identity store owns `identities` and cannot see `users` or the passkey
+// tables, so this method reads the account and hands the answer down.
+// [IdentityStore]'s own doc argues why that value cannot go stale in the
+// dangerous direction for its password term: no [Service] method removes a
+// password (both writers store a freshly hashed, non-empty value, and there
+// is no "remove my password" in this package), so a true observed here cannot
+// become a false under the delete. The other direction merely refuses a
+// delete that would have been safe, which is self-correcting on retry. The
+// PASSKEY term can move the dangerous way — [Service.DeletePasskey] removes
+// one concurrently — which is the mirror-image race disclosed in full on
+// [CredentialStore.DeleteCredentialIfNotLast] and not closed here.
 //
 // That argument depends on the read being FRESH and being the account's real
 // state. It is performed on every call rather than cached, and the flag is
@@ -838,12 +842,23 @@ func (s *Service) LinkIdentity(ctx context.Context, userID string, ext ExternalI
 //
 // # The question asked is "can it authenticate", not "is a hash stored"
 //
-// [Service.passwordCanAuthenticate] answers it, and the difference is not
+// [Service.hasWayInBesides] answers it — the SAME arithmetic
+// [Service.DeletePasskey] uses with the other kind excluded, so the two
+// removers cannot drift into disagreeing about what a way in is. Its password
+// term is [Service.passwordCanAuthenticate], and the difference is not
 // academic. Under [WithRequireVerifiedEmail](true), [Service.Login] refuses
 // an unverified account outright: a stored hash on such an account opens
 // nothing, so counting it as a way in would let this method remove the only
 // door that does open. The predicate reads the same option Login reads, so
 // the two cannot disagree about what a working credential is.
+//
+// The arithmetic now spans all three credential kinds, and here that is a
+// RELAXATION rather than a tightening: an account holding one identity and
+// one passkey but no password used to be refused this unlink, and is not any
+// more, because the passkey is a genuine way in and refusing was simply
+// wrong. A [Service] wired without [WithCredentialStore] cannot see passkeys
+// and behaves exactly as it did before — see [Service.hasWayInBesides], "An
+// unwired optional port contributes nothing".
 //
 // It errs strict, which is the safe direction: an account that would in fact
 // have been fine is refused an unlink until it verifies its address, and the
@@ -855,19 +870,23 @@ func (s *Service) UnlinkIdentity(ctx context.Context, userID, provider string) e
 	}
 
 	// Read the credential state fresh, immediately before the delete: see
-	// "Why the password state is read here and passed in", and
+	// "Why the other-credential state is read here and passed in", and
 	// [IdentityStore.DeleteIdentityIfNotLast]'s own staleness argument,
 	// which this ordering is what makes true. The question asked of the
-	// account is whether it can AUTHENTICATE, not whether a hash is stored —
-	// see [Service.passwordCanAuthenticate].
+	// account is whether it can AUTHENTICATE by some OTHER kind, not whether
+	// a hash is stored — see [Service.hasWayInBesides].
 	u, err := s.store.FindUserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	otherWayIn, err := s.hasWayInBesides(ctx, u, kindIdentity)
 	if err != nil {
 		return err
 	}
 
 	// The delete comes first, so a refusal — ErrLastCredential or
 	// ErrIdentityNotFound — reaches the caller having changed nothing at all.
-	if err := identities.DeleteIdentityIfNotLast(ctx, userID, provider, s.passwordCanAuthenticate(u)); err != nil {
+	if err := identities.DeleteIdentityIfNotLast(ctx, userID, provider, otherWayIn); err != nil {
 		return err
 	}
 
