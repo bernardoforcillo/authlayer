@@ -13,6 +13,11 @@ same authz logic in every project.
 > and [external identities](#oauth): "sign in with Google/GitHub/…", linked
 > to a local account through an optional port. authlayer stores **no**
 > provider tokens and runs no part of the OAuth dance itself.
+> Milestone 3 adds [magic links](#magic-links) — passwordless sign-in, where
+> the emailed token *is* the credential — and
+> [account deletion](#account-deletion) in a hard and a soft posture. The
+> soft one needs a new `users.deleted_at` column, and both need four new
+> methods on `auth.Store`; see `changelog.md` for the migration.
 
 ```sh
 go get github.com/bernardoforcillo/authlayer
