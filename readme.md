@@ -2769,6 +2769,7 @@ go test ./... -count=1          # database-free
 golangci-lint run ./...         # v2 required; the config is .golangci.yml
 go run ./examples/basic && go run ./examples/auth && go run ./examples/reset
 go run ./examples/oauth && go run ./examples/magiclink && go run ./examples/deletion
+go run ./docs/_verify           # every Go sample under docs/, compiled and run
 ```
 
 `.golangci.yml` is a v2 config and runs clean at zero issues. It lints the

@@ -124,7 +124,7 @@ jobs:
       - name: test (race)
         run: go test -race ./... -count=1
 
-      # The readme's own Checks list ends with these four, and they are the
+      # The readme's own Checks list ends with these six, and they are the
       # only thing that proves the documented entry points still run rather
       # than merely still compile. Output is discarded; a non-zero exit is
       # the signal.
@@ -136,6 +136,15 @@ jobs:
           go run ./examples/oauth > /dev/null
           go run ./examples/magiclink > /dev/null
           go run ./examples/deletion > /dev/null
+
+      # The docs site claims every Go sample on it is executed. Until this
+      # step existed that was true only as of whenever someone last ran the
+      # harness by hand, which is not a guarantee. It compiles and runs every
+      # fenced go block under docs/, compares each page against the stdout
+      # that page pins, fails on an unmarked fence, and reconciles docs.json
+      # against the tree in three directions.
+      - name: docs samples
+        run: go run ./docs/_verify
 
       # The lane where several of this project's Criticals were actually
       # found. A CI that stops before it would not protect the thing that
