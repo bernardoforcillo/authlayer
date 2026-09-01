@@ -1,0 +1,315 @@
+---
+title: "Magic links"
+description: "Passwordless sign-in. The token is not a step towards a credential — it is one, and every rule on this page follows from that."
+---
+
+Two methods, and one fact that decides everything else about them.
+
+{/* verify:skip a two-line shape sketch, with no svc or ctx in scope; both calls are compiled and run further down this page */}
+```go
+token, ok, err := svc.RequestMagicLink(ctx, "dana@example.com", ip)
+// deliver the link to that address if ok; return a FIXED response either way
+result, err := svc.RedeemMagicLink(ctx, token, ip, userAgent) // a live session
+```
+
+<Warning>
+**A magic link is a login credential sitting in a mailbox.** Its holder
+exchanges it for a live session through `RedeemMagicLink` with nothing else
+asked of them — no password, no second factor, no prior session. A
+`password_reset` token grants the right to *set* a credential; a `signup` or
+`email_change` token attests something about an address. This one **is** the
+credential.
+</Warning>
+
+Everything below follows from that: the shortest TTL of the four purposes, the
+burn that happens before anything is issued, and the fact that every
+remediation path in the package sweeps it.
+
+<Note>
+Every claim on this page is demonstrated, in order, by
+`go run ./examples/magiclink`, which runs against `store/memory` and needs no
+database.
+</Note>
+
+## Requesting one is enumeration-safe, and that costs you something
+
+`RequestMagicLink` is byte-identical in shape to
+[`RequestPasswordReset`](/authentication/passwords#requestpasswordreset-never-errors-on-an-unknown-address):
+same `(token, ok, nil)` on every branch, same call sequence, same error set. An
+unregistered address is **not** an error.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+key := []byte("32-bytes-or-more-from-your-vault")
+svc := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithMagicLinkTTL(15*time.Minute))
+
+ctx := context.Background()
+dana, _ := svc.SignUp(ctx, "dana@example.com", "Correct-Horse-Battery-7")
+// dana never clicks her signup mail.
+
+known, ok, err := svc.RequestMagicLink(ctx, "dana@example.com", "203.0.113.9")
+fmt.Println("known:  ", known != "", ok, err)
+
+unknown, ok, err := svc.RequestMagicLink(ctx, "nobody@example.com", "203.0.113.9")
+fmt.Println("unknown:", unknown != "", ok, err)
+
+_, _, err = svc.RequestMagicLink(ctx, "dana@example.com", "")
+fmt.Println("empty ip:", errors.Is(err, auth.ErrMissingIP))
+```
+
+```
+known:   true true <nil>
+unknown: false false <nil>
+empty ip: true
+```
+
+<Warning>
+**Your handler must return a fixed response — same status, same body shape —
+regardless of `ok`.** `ok` decides whether to send mail and nothing else.
+Surfacing it, or the token's presence, to an unauthenticated requester reopens
+the existence oracle this shape exists to close, and it is the one thing
+authlayer cannot enforce from here.
+
+An [anonymized account](/authentication/account-deletion) takes that same
+branch, with that same `("", false, nil)`, for exactly that reason: a
+distinguishable refusal would tell an anonymous caller that a particular
+address had once had an account.
+</Warning>
+
+`ip` must be non-empty — a blank one would collapse every caller that omits it
+into one shared rate-limit bucket, so it is `ErrMissingIP` rather than a
+tolerated "unknown". `RedeemMagicLink` deliberately does **not** refuse an
+empty `ip`: it consults no limiter, and its `ip` is an audit field only.
+
+### Re-issuing kills the previous link
+
+Each request invalidates the account's previous `magic_link` token, so at most
+one is live at a time. That carries the same griefing consequence
+`RequestPasswordReset` does: anyone who merely knows an address can kill a
+victim's unclicked link by looping the call.
+
+{/* verify:main */}
+```go
+link, _, _ := svc.RequestMagicLink(ctx, "dana@example.com", "203.0.113.9")
+_, err = svc.RedeemMagicLink(ctx, known, "203.0.113.9", "phone")
+fmt.Println("the first link is dead:", errors.Is(err, auth.ErrVerificationNotFound))
+```
+
+```
+the first link is dead: true
+```
+
+`auth.WithMagicLinkRateLimiter(l)` is what bounds it, keyed by the normalized
+address — the counterpart to `WithPasswordResetRateLimiter`. A denial from it
+returns `("", false, nil)`, **never** `ErrRateLimited`, because a
+distinguishable rate-limit error is itself an oracle once enough requests for
+that address have run. See [Rate limiting](/authentication/rate-limiting).
+
+## Redemption burns the token before it issues anything
+
+`Store.DeleteVerification` runs **first**, before the user is even loaded. That
+ordering is the whole reason two people clicking the same link do not both get
+in — and a link forwarded, quoted in a reply, or read out of a shared mailbox
+is exactly how a second click happens with no attacker doing anything clever.
+
+{/* verify:main */}
+```go
+session, err := svc.RedeemMagicLink(ctx, link, "203.0.113.9", "phone")
+fmt.Println("signed in with no password:", err, session.AccessToken != "")
+
+_, err = svc.RedeemMagicLink(ctx, link, "203.0.113.9", "phone")
+fmt.Println("the same link twice:", errors.Is(err, auth.ErrVerificationNotFound))
+
+resetTok, _, _ := svc.RequestPasswordReset(ctx, "dana@example.com", "203.0.113.9")
+_, err = svc.RedeemMagicLink(ctx, resetTok, "203.0.113.9", "phone")
+fmt.Println("a reset token here:", errors.Is(err, auth.ErrVerificationPurpose))
+```
+
+```
+signed in with no password: <nil> true
+the same link twice: true
+a reset token here: true
+```
+
+<Note>
+The **purpose check runs before the burn**, so a wrongly-presented token is not
+destroyed — and, critically, a lower-privileged credential never becomes a
+session. Without it a `password_reset` token, which grants only the right to
+*set* a password, would be exchangeable directly for a live session here.
+Expiry is checked before the burn for the same reason.
+
+`RedeemMagicLink` returns the same `LoginResult`
+[`Login`](/authentication/login) does. It is the only difference between them
+that matters: there was no password step.
+</Note>
+
+## A redemption certifies the address
+
+A magic link is only ever *deliverable* to the address it was minted for, so
+redeeming one is proof of control of that address — the same argument that
+makes [a completed reset stamp](/authentication/passwords#a-completed-reset-also-verifies-the-address).
+So a magic link is also the way into an account that never clicked its signup
+mail.
+
+{/* verify:main */}
+```go
+after, _ := svc.User(ctx, dana.User.ID)
+fmt.Println("dana was unverified:", dana.User.EmailVerifiedAt == nil)
+fmt.Println("the redemption certified her:", after.EmailVerifiedAt != nil)
+```
+
+```
+dana was unverified: true
+the redemption certified her: true
+```
+
+The two guards `ResetPassword` applies apply here too. An **already-verified**
+address keeps its original timestamp, because that field records when control
+was first proven and a routine sign-in must not move an audit value forward.
+An account whose address **moved** since the link was minted is not certified
+at all — the sign-in still succeeds and certifies nothing, and
+`MarkEmailVerified` re-checks that atomically rather than trusting the caller.
+
+<Tip>
+`RedeemMagicLink` does not consult `WithRequireVerifiedEmail`. That option
+demands proof of address control before a login is honoured, and a redemption
+**is** that proof, so refusing here would refuse the one flow that can satisfy
+the requirement.
+</Tip>
+
+## A parked link does not survive a `ChangePassword`
+
+The side door, and the most direct of the three
+[the sweep matrix](/authentication/passwords#the-sweep-matrix) covers. An
+attacker parks a link for a victim's address and waits. The victim notices
+something and changes their password — the one thing a user does on suspecting
+compromise. If that left the parked link armed, it would hand the account
+straight back for the rest of its TTL, with no password needed.
+
+{/* verify:main */}
+```go
+parked, _, _ := svc.RequestMagicLink(ctx, "dana@example.com", "198.51.100.66")
+c, _ := svc.VerifyAccessToken(session.AccessToken)
+_ = svc.ChangePassword(ctx, dana.User.ID, c.SessionID,
+	"Correct-Horse-Battery-7", "Changed-Horse-Battery-2!")
+_, err = svc.RedeemMagicLink(ctx, parked, "198.51.100.66", "attacker")
+fmt.Println("the parked link was swept:", errors.Is(err, auth.ErrVerificationNotFound))
+
+survivor, _, _ := svc.RequestMagicLink(ctx, "dana@example.com", "203.0.113.9")
+_ = svc.Logout(ctx, session.RefreshToken)
+phone, err := svc.RedeemMagicLink(ctx, survivor, "203.0.113.9", "phone")
+fmt.Println("a Logout does not sweep it:", err, phone.AccessToken != "")
+```
+
+```
+the parked link was swept: true
+a Logout does not sweep it: <nil> true
+```
+
+`ChangePassword`, `ResetPassword`, `LogoutAll`, both
+[deletion postures](/authentication/account-deletion) and an `email_change`
+redemption all sweep pending magic links. `Logout` and `RevokeSession`
+deliberately do not: they are per-device and routine, and sweeping there would
+break the flow the second half above demonstrates — request a link on a laptop,
+sign that laptop out, click it on a phone.
+
+<Warning>
+That sweep is **sequential-only**, exactly as the others are. A
+`RequestMagicLink` whose own `Store.CreateVerification` is genuinely concurrent
+with the `ChangePassword` mints a token that survives it. See
+[Every sweep is sequential-only](/authentication/passwords#every-sweep-is-sequential-only).
+</Warning>
+
+## Provisioning creates the account at request time
+
+`auth.WithMagicLinkProvisioning(true)` makes an unrecognised address create the
+account rather than fall through. It is **off by default**.
+
+{/* verify:main */}
+```go
+open := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithMagicLinkProvisioning(true))
+
+newcomer, ok, _ := open.RequestMagicLink(ctx, "newcomer@example.com", "203.0.113.9")
+fmt.Println("an address nobody registered:", ok, newcomer != "")
+
+minted, _ := open.RedeemMagicLink(ctx, newcomer, "203.0.113.9", "phone")
+fmt.Println("verified on redemption:", minted.User.EmailVerifiedAt != nil)
+
+_, _, _ = open.RequestMagicLink(ctx, "never-clicks@example.com", "203.0.113.9")
+_, err = open.Login(ctx, "never-clicks@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "laptop")
+fmt.Println("a provisioned account holds no password:", errors.Is(err, auth.ErrInvalidCredentials))
+```
+
+```
+an address nobody registered: true true
+verified on redemption: true
+a provisioned account holds no password: true
+```
+
+<Warning>
+Stated plainly: with provisioning on, **anyone who can receive mail can create
+an account for any address they control.** That is the exposure an open
+`SignUp` endpoint already has, and the rate limiter is the control — not the
+option's absence.
+
+A provisioned account holds **no password credential at all**, and asking for a
+link proves nothing about an address; only redeeming one does. So a request
+nobody clicks leaves an unverified, credential-less row sitting there.
+[`ResetPassword`](/authentication/passwords) is how such an account gets a
+password.
+</Warning>
+
+{/* verify:stdout "known:   true true <nil>\nunknown: false false <nil>\nempty ip: true\nthe first link is dead: true\nsigned in with no password: <nil> true\nthe same link twice: true\na reset token here: true\ndana was unverified: true\nthe redemption certified her: true\nthe parked link was swept: true\na Logout does not sweep it: <nil> true\nan address nobody registered: true true\nverified on redemption: true\na provisioned account holds no password: true" */}
+
+## The timing channel, and the reversal provisioning causes
+
+`RequestMagicLink` equalises the *sequence of calls* and the *set of errors*
+each branch can produce. It does not equalise the wall clock: the known branch
+performs two extra writes the unknown branch does not, so the mechanism is
+exactly the one measured for `RequestPasswordReset` on
+[Rate limiting](/authentication/rate-limiting#enumeration-safety-is-bounded-not-absolute).
+
+<Note>
+**No figures have been measured for the magic-link flow specifically**, and
+this page does not quote the reset flow's numbers as though they had been. The
+same shape applies, with one reversal: with `WithMagicLinkProvisioning`
+enabled, the **unknown** branch becomes the slower one, because it performs an
+extra `Store.CreateUser`. The sign of the difference flips; it does not
+disappear.
+
+One asymmetry belongs to this method alone. With provisioning on and the users
+table specifically failing writes while verifications stays healthy, an unknown
+address returns `("", false, nil)` — the fold — while a known address still
+returns `(token, true, nil)`. During such an outage, and only then, the two
+branches are distinguishable. Propagating `CreateUser`'s error would be
+distinguishable too, so the fold is the better of two imperfect options rather
+than a complete answer.
+</Note>
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Account deletion" icon="user-slash" href="/authentication/account-deletion">
+    The two postures, and why both sweep pending links.
+  </Card>
+  <Card title="Rate limiting" icon="gauge" href="/authentication/rate-limiting">
+    Both address-keyed limiters, and the measured residual.
+  </Card>
+</Columns>

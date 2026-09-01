@@ -1,13 +1,15 @@
 ---
 title: "The authentication core"
-description: "What auth owns — the user record, its password credential, revocable sessions, and one-time tokens — and the four boundaries it deliberately does not cross."
+description: "What auth owns — the user record, its password credential, revocable sessions, one-time tokens, and the two ways an account ends — and the four boundaries it deliberately does not cross."
 ---
 
 `auth` owns identity: the user record, its password credential, revocable
-server-side sessions, and the one-time tokens that confirm an address or reset a
-password. It sits on two smaller packages — `token`, which mints the opaque
-refresh tokens and the HS256 access tokens, and `password`, the hashing port
-with a bcrypt default.
+server-side sessions, the one-time tokens that confirm an address, reset a
+password or [sign someone in without one](/authentication/magic-links), and
+the [two postures](/authentication/account-deletion) an account can end in. It
+sits on two smaller packages — `token`, which mints the opaque refresh tokens
+and the HS256 access tokens, and `password`, the hashing port with a bcrypt
+default.
 
 {/* verify:import */}
 ```go
@@ -52,9 +54,10 @@ and why `BOB@example.com` cannot become a second account.
     yours.
   </Accordion>
   <Accordion title="No email delivery" icon="envelope">
-    `SignUp`, `RequestPasswordReset` and `RequestEmailChange` each return a
-    plaintext token **exactly once**. Putting it in a message is entirely
-    yours, the same division [`invite`](/invitations/overview) draws.
+    `SignUp`, `RequestPasswordReset`, `RequestEmailChange` and
+    `RequestMagicLink` each return a plaintext token **exactly once**. Putting
+    it in a message is entirely yours, the same division
+    [`invite`](/invitations/overview) draws.
   </Accordion>
   <Accordion title="No user profile" icon="user">
     The `Store` persists `auth.UserBase` and nothing else — id, normalized
@@ -78,7 +81,7 @@ load-bearing for a flow it implements. That is also what keeps this library's
 migrations from ever owning a column your product's shape decides.
 </Note>
 
-## Four lifetimes, one option each
+## Five lifetimes, one option each
 
 | Token | Minted by | Default TTL | Option |
 |---|---|---|---|
@@ -86,11 +89,15 @@ migrations from ever owning a column your product's shape decides.
 | refresh (session) | `Login`, `Refresh` | 30 days | `WithRefreshTTL` |
 | `signup`, `email_change` | `SignUp`, `RequestEmailChange` | 24 hours | `WithVerificationTTL` |
 | `password_reset` | `RequestPasswordReset` | 1 hour | `WithPasswordResetTTL` |
+| `magic_link` | `RequestMagicLink` | 15 min | `WithMagicLinkTTL` |
 
-The defaults differ on purpose. The signup window is generous because mail that
-arrives late must not force a whole new sign-up; the reset window is short
-because a reset link grants a full **credential change** rather than an "I own
-this address" attestation.
+The defaults rank the tokens by what holding one gets you. The signup window is
+generous because mail that arrives late must not force a whole new sign-up; the
+reset window is short because a reset link grants a full **credential change**
+rather than an "I own this address" attestation; and the
+[magic-link](/authentication/magic-links) window is the shortest of all,
+because that token is not a step towards a credential — it **is** one, exchanged
+for a live session with nothing else asked.
 
 <Tip>
 Every one of these **ignores a non-positive duration** and keeps its default,
@@ -99,8 +106,8 @@ rather than minting a token that has already expired.
 
 <Warning>
 Shortening the verification TTL also shortens how long an `email_change` token
-stays armed — and that is the strongest of the three, because `VerifyEmail`
-redeems it with no authentication at all. See
+stays armed — and that is the strongest of the address-change tokens, because
+`VerifyEmail` redeems it with no authentication at all. See
 [Email verification and change](/authentication/email-verification).
 </Warning>
 
@@ -108,7 +115,10 @@ redeems it with no authentication at all. See
 
 <ResponseField name="UserBase" type="struct">
   `ID`, `Email` (always normalized, unique), `EmailVerifiedAt *time.Time`,
-  `PasswordHash`, `CreatedAt`, `UpdatedAt`. An **empty** `PasswordHash` is a
+  `PasswordHash`, `CreatedAt`, `UpdatedAt`, `DeletedAt *time.Time`. A non-nil
+  `DeletedAt` is the [anonymization](/authentication/account-deletion) stamp,
+  and means no one may authenticate as this account by any route. An **empty**
+  `PasswordHash` is a
   real, supported state — an account with no password credential — not a
   zero-value accident; it is what
   [an externally-provisioned account](/oauth/connected-accounts) holds.
@@ -125,7 +135,8 @@ redeems it with no authentication at all. See
 
 <ResponseField name="Verification" type="struct">
   A one-time hashed token: `ID`, `UserID`, `TokenHash`, `Purpose` (`signup`,
-  `email_change`, `password_reset`), `Email`, `ExpiresAt`, `CreatedAt`. `Email`
+  `email_change`, `password_reset`, `magic_link`), `Email`, `ExpiresAt`,
+  `CreatedAt`. `Email`
   is **always** populated and always normalized, whatever the purpose — a
   completed reset compares it against the account's current address before
   certifying anything.
@@ -137,8 +148,10 @@ Two programs in the module cover this whole section end to end, against
 `store/memory`, with no database:
 
 ```sh
-go run ./examples/auth    # sign up, verify, log in, org, invite, refresh, log out
-go run ./examples/reset   # the password lifecycle and the email change
+go run ./examples/auth       # sign up, verify, log in, org, invite, refresh, log out
+go run ./examples/reset      # the password lifecycle and the email change
+go run ./examples/magiclink  # passwordless sign-in, and what a parked link survives
+go run ./examples/deletion   # the two removal postures, and the ordering rules
 ```
 
 {/* verify:stdout "<nil> true bob@example.com" */}
@@ -157,5 +170,11 @@ go run ./examples/reset   # the password lifecycle and the email change
   </Card>
   <Card title="Refresh rotation" icon="rotate" href="/authentication/refresh-rotation">
     Reuse detection and family revocation.
+  </Card>
+  <Card title="Magic links" icon="wand-magic-sparkles" href="/authentication/magic-links">
+    Passwordless sign-in, and why the token IS the credential.
+  </Card>
+  <Card title="Account deletion" icon="user-slash" href="/authentication/account-deletion">
+    Hard and soft, the hook, and the order that is not negotiable.
   </Card>
 </Columns>

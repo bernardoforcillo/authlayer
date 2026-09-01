@@ -3,7 +3,7 @@ title: "Email verification and change"
 description: "One table, three purposes. Confirming an address, moving one — which requires the current password — and the uniqueness check that deliberately happens at redemption."
 ---
 
-Three one-time flows share the same shape — mint an opaque token, deliver it,
+Four one-time flows share the same shape — mint an opaque token, deliver it,
 redeem it once — so they share one `Verification` table. `Purpose`
 distinguishes them:
 
@@ -12,6 +12,11 @@ distinguishes them:
 | `signup` | `SignUp` | `VerifyEmail` | 24 h |
 | `email_change` | `RequestEmailChange` | `VerifyEmail` | 24 h |
 | `password_reset` | `RequestPasswordReset` | `ResetPassword` | 1 h |
+| [`magic_link`](/authentication/magic-links) | `RequestMagicLink` | `RedeemMagicLink` | 15 min |
+
+The first three attest something about an address or grant the right to *set* a
+credential. `magic_link` **is** a credential, which is why its window is the
+shortest and why every remediation path sweeps it.
 
 Only the token's **hash** is stored, exactly as for a
 [refresh token](/authentication/sessions) and an
@@ -59,9 +64,10 @@ one-time: true
 
 <Warning>
 Presenting the **wrong kind** of token is `ErrVerificationPurpose` — a
-`password_reset` token at `VerifyEmail`, say. An **expired** one is
-`ErrVerificationExpired`, checked *before* the claim, so the token is not burned
-by its own expiry check.
+`password_reset` token at `VerifyEmail`, or at
+[`RedeemMagicLink`](/authentication/magic-links), say. An **expired** one is
+`ErrVerificationExpired`. Both are checked *before* the claim, so neither burns
+the token.
 </Warning>
 
 ## Changing an address requires the current password
@@ -153,10 +159,19 @@ before anything is minted.
 ## The mirror sweep
 
 Redeeming an `email_change` invalidates the account's outstanding
-`password_reset` tokens. A reset link is deliverable to exactly one address, so
-moving the account away from that address — often precisely because the mailbox
-is no longer trustworthy — must not leave a link sitting in the abandoned
-mailbox able to reset the credential of the account at its new one.
+`password_reset` **and** [`magic_link`](/authentication/magic-links) tokens.
+Either is deliverable to exactly one address, so moving the account away from
+that address — often precisely because the mailbox is no longer trustworthy —
+must not leave one sitting in the abandoned mailbox able to act on the account
+at its new one.
+
+<Warning>
+The magic-link half matters more than it looks. `RedeemMagicLink` does **not**
+refuse a link whose recorded address no longer matches the account's — it
+merely declines to re-stamp `EmailVerifiedAt`, and signs the holder in anyway.
+This sweep is the only thing standing between the abandoned mailbox and a live
+session.
+</Warning>
 
 <Note>
 That redemption does **not** revoke sessions. `VerifyEmail` is unauthenticated
@@ -174,7 +189,7 @@ same mailbox is still a token for that same mailbox.
 
 <Warning>
 This sweep is **sequential-only**, exactly as
-[`ChangePassword`'s](/authentication/passwords#both-sweeps-are-sequential-only)
+[`ChangePassword`'s](/authentication/passwords#every-sweep-is-sequential-only)
 is. A `RequestPasswordReset` whose `Store.CreateVerification` is genuinely
 concurrent with the redemption can still mint a token that survives it.
 </Warning>
@@ -198,8 +213,11 @@ behaviour safe.
 authlayer exposes **no** "resend the verification email" call. Under
 `WithRequireVerifiedEmail(true)`, the way back in for an account whose signup
 mail was lost is a completed
-[password reset](/authentication/passwords#a-completed-reset-also-verifies-the-address),
-which stamps `EmailVerifiedAt` when it is not already set.
+[password reset](/authentication/passwords#a-completed-reset-also-verifies-the-address)
+or a redeemed [magic link](/authentication/magic-links) — each stamps
+`EmailVerifiedAt` when it is not already set, on the same argument, and
+`RedeemMagicLink` deliberately does not consult `WithRequireVerifiedEmail` at
+all, since refusing there would refuse the one flow that can satisfy it.
 </Warning>
 
 ## Next
