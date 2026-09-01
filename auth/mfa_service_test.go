@@ -1394,3 +1394,47 @@ func TestMFAEntryPointsRefuseWithoutAStore(t *testing.T) {
 		t.Fatalf("DisableMFA = %v, want ErrMFANotConfigured", err)
 	}
 }
+
+// TestOtherSignInDoorsAreNotGatedByMFA pins a DISCLOSED LIMITATION rather
+// than a property: Login is the only entry point that consults a factor, so
+// an account with TOTP enrolled is still reachable through a magic link or
+// an external provider. auth/mfa_service.go's package doc argues why that
+// is scoped out rather than forgotten — the right answer differs per door,
+// and both belong with step-up authentication.
+//
+// The test exists so the limitation cannot change silently in either
+// direction: whoever gates these doors will fail here and be sent to the
+// doc that has to change with them.
+func TestOtherSignInDoorsAreNotGatedByMFA(t *testing.T) {
+	ids := memory.NewIdentityStore()
+	f := newMFAService(t,
+		auth.WithIdentityStore(ids),
+		auth.WithLinking(auth.LinkAlways),
+		auth.WithMFAEnforcement(auth.EnforcementRequired),
+	)
+	ctx := context.Background()
+	enrolConfirmed(t, f, "yusuf@example.com")
+
+	// The password door IS gated.
+	loginOwingMFA(t, f, "yusuf@example.com")
+
+	magic, ok, err := f.svc.RequestMagicLink(ctx, "yusuf@example.com", "1.2.3.4")
+	if err != nil || !ok {
+		t.Fatalf("RequestMagicLink: ok=%v err=%v", ok, err)
+	}
+	res, err := f.svc.RedeemMagicLink(ctx, magic, "1.2.3.4", "agent")
+	if err != nil {
+		t.Fatalf("RedeemMagicLink: %v", err)
+	}
+	if res.MFA != nil || res.AccessToken == "" {
+		t.Fatalf("RedeemMagicLink now returns a challenge (mfa=%v); update auth/mfa_service.go's \"What the second factor does not gate\" section with it", res.MFA)
+	}
+
+	ext, err := f.svc.SignInWith(ctx, signInReq(googleExt("yusuf@example.com", true)))
+	if err != nil {
+		t.Fatalf("SignInWith: %v", err)
+	}
+	if ext.AccessToken == "" || ext.RefreshToken == "" {
+		t.Fatal("SignInWith no longer mints a session outright for an account with a confirmed factor; update the same section with whatever it does instead")
+	}
+}

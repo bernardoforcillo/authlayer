@@ -46,6 +46,31 @@
 // [Service.RedeemMagicLink], each of which already refuses purposes it does
 // not own.
 //
+// # What the second factor does not gate, in this version
+//
+// [Service.Login] is the ONLY entry point that consults an [MFAFactor].
+// [Service.SignInWith] and [Service.RedeemMagicLink] mint a session
+// directly, for an account with a CONFIRMED factor as much as for one with
+// none, and [EnforcementRequired] does not refuse them either.
+//
+// That is a disclosed limitation, not an oversight, and an application
+// offering more than one way in should read it as one: an account with TOTP
+// enrolled is still reachable by whoever controls its mailbox or its
+// external identity provider, so the second factor bounds the PASSWORD
+// door and no other. A deployment that needs every door gated has two
+// honest options today — do not offer the other doors to accounts with a
+// confirmed factor, or rely on the provider's own second factor on its
+// path.
+//
+// It is scoped this way because the answer is genuinely different per door
+// rather than merely unwritten. A magic link is itself proof of control of
+// a second channel, so demanding TOTP after one is a defensible policy and
+// not an obvious one; an external provider frequently enforces a second
+// factor of its own, and whether that counts is a decision an application
+// makes about that provider, not one this package can make for it. Both
+// belong with step-up authentication, where a caller states the assurance
+// level an operation needs, rather than being decided here for everyone.
+//
 // # TOTP parameters are fixed, deliberately
 //
 // Six digits, a thirty-second period, HMAC-SHA-1, and one step of skew
@@ -664,7 +689,10 @@ func (s *Service) DisableMFA(ctx context.Context, userID, currentPassword string
 //
 // It runs LAST in Login's ladder, after the password and
 // [WithRequireVerifiedEmail], so nothing it reveals is reachable by a
-// caller who has not already authenticated.
+// caller who has not already authenticated. It is called from Login and
+// nowhere else — see this file's package doc, "What the second factor does
+// not gate, in this version", for which entry points that deliberately
+// leaves ungated and why.
 //
 // The three "may proceed" cases are worth naming, because two of them are
 // the ones that keep users out of a support queue: no [MFAStore] wired at
