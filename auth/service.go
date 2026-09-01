@@ -3124,9 +3124,9 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 // differ in exactly one cell: an unlink revokes every session and this
 // revokes none. That method's doc argues it at length; in short, an unlink is
 // a categorical statement about a whole credential SOURCE, while this removes
-// ONE credential out of a set whose other members its own guard has just
-// confirmed are still working — and a [Session] records no credential
-// provenance, so a sweep here could only be all-or-nothing. Signing a user
+// ONE credential from an account its own guard has just confirmed stays
+// reachable without it — and a [Session] records no credential provenance, so
+// a sweep here could only be all-or-nothing. Signing a user
 // out on their phone because they tidied an old laptop off a list is not what
 // that screen says it does. "Removing a passkey signs you out everywhere"
 // composes from [Service.LogoutAll] in one line, and an application removing

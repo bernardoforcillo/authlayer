@@ -238,13 +238,19 @@ func newSweepFixture(t *testing.T, email string) *sweepFixture {
 	// The second-factor state and the two trusted devices are seeded
 	// STRAIGHT INTO THE STORE, and the factor is left UNCONFIRMED.
 	//
-	// Both choices keep the eleven pre-existing rows meaning exactly what
-	// they meant before this column existed. An unconfirmed factor gates
+	// Both choices keep every row that predates the MFA columns meaning
+	// exactly what it meant before they existed. An unconfirmed factor gates
 	// nothing anywhere in this package — [auth.Service.RequireFreshMFA] is a
 	// documented no-op for it — so every path below behaves as it always
 	// did, and a fixture that confirmed one would instead be testing the
-	// step-up ladder in eleven places at once. Nothing under test here reads
-	// ConfirmedAt: the sweeps are unconditional by construction.
+	// step-up ladder in thirteen places at once. Nothing under test here
+	// reads ConfirmedAt: the sweeps are unconditional by construction.
+	//
+	// Since the passkey column landed, leaving the factor UNCONFIRMED is a
+	// requirement rather than a preference:
+	// [auth.Service.FinishPasskeyRegistration] IS step-up gated, so the two
+	// registrations below would fail with auth.ErrStepUpRequired against a
+	// confirmed factor and the fixture would never arm its eighth column.
 	//
 	// The realism the shortcut gives up is bought back by
 	// TestChangePasswordRevokesADeviceThatWasActuallyTrusted, which mints a
@@ -660,9 +666,9 @@ func sweepMatrix() []sweepRow {
 			// unlink revokes every session and this revokes none. That is
 			// argued on the method — an unlink is a categorical statement
 			// about a whole credential SOURCE, while this removes one
-			// credential out of a set whose other members are still working,
-			// and a Session records no credential provenance for a narrower
-			// sweep to use. Signing a user out on their phone because they
+			// credential from an account its own guard has just confirmed
+			// stays reachable without it, and a Session records no credential
+			// provenance for a narrower sweep to use. Signing a user out on their phone because they
 			// tidied an old laptop off a list is not what that screen says it
 			// does.
 			signup: survives, reset: survives, change: survives, magic: survives,
