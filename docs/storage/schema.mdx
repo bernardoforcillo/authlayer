@@ -1,19 +1,21 @@
 ---
 title: "The schema"
-description: "Eleven tables across five independent stores, printed from the code that defines them — and which constraint or index is load-bearing rather than decorative."
+description: "Sixteen tables across six independent stores, printed from the code that defines them — and which constraint or index is load-bearing rather than decorative."
 ---
 
-Five stores own eleven tables between them, and none of them declares a foreign
+Six stores own sixteen tables between them, and none of them declares a foreign
 key to another store's table — not to a users table from the RBAC side, which
 authlayer does not own, not between the three auth tables, and not from
 `identities` to `users` (that one is also forced: the auth store may be an
-entirely different backend). The one foreign key in the package stays inside
-the store that owns both its ends: `api_keys` to `service_accounts`.
+entirely different backend). Every foreign key in the package stays inside the
+store that owns both its ends: `api_keys` to `service_accounts`, and the five
+OAuth tables to one another.
 
 <Note>
 The column lists below are **printed by a program the documentation gate runs**,
 straight out of `dropsstore.NewSchema`, `NewAuthSchema`, `NewInviteSchema`,
-`NewAPIKeySchema` and `NewIdentitySchema`. They cannot drift from the code.
+`NewAPIKeySchema`, `NewIdentitySchema` and `NewOAuthSchema`. They cannot drift
+from the code.
 </Note>
 
 {/* verify:import */}
@@ -287,7 +289,7 @@ needed. See [addresses are normalized](/invitations/email-invites#addresses-are-
 Rows written by **v0.1.0**, which normalized nothing, may hold non-normalized
 addresses; the changelog carries the one-time migration.
 
-{/* verify:stdout "organizations\n  id PK\n  owner_id\n  created_at\n  updated_at\n  name\n  slug UNIQUE\n  indexes: 0\norganization_members\n  container_id\n  user_id\n  role_key\n  joined_at\n  PRIMARY KEY [container_id user_id]\n  indexes: 0\norganization_roles\n  id PK\n  container_id\n  key\n  name\n  permissions\n  created_at\n  UNIQUE [container_id key] as organization_roles_container_key\n  indexes: 0\nusers\n  id PK\n  email UNIQUE\n  email_verified_at NULL\n  password_hash\n  created_at\n  updated_at\n  deleted_at NULL\n  UNIQUE [email] as users_email_key\n  indexes: 0\nsessions\n  id PK\n  user_id\n  token_hash\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  user_agent\n  ip\n  mfa_at NULL\n  UNIQUE [token_hash] as sessions_token_hash\n  indexes: 1\nverifications\n  id PK\n  user_id\n  token_hash\n  purpose\n  email\n  expires_at\n  created_at\n  UNIQUE [token_hash] as verifications_token_hash\n  indexes: 1\norganization_invites\n  id PK\n  container_id\n  email\n  role_key\n  token_hash\n  invited_by\n  expires_at\n  created_at\n  UNIQUE [container_id email] as organization_invites_container_email\n  UNIQUE [token_hash] as organization_invites_token_hash\n  indexes: 0\norganization_invite_links\n  id PK\n  container_id\n  code\n  role_key\n  created_by\n  max_uses\n  use_count\n  expires_at NULL\n  revoked_at NULL\n  created_at\n  UNIQUE [code] as organization_invite_links_code\n  indexes: 0\nservice_accounts\n  id PK\n  container_id\n  name\n  description\n  created_by\n  created_at\n  updated_at\n  disabled_at NULL\n  indexes: 1\napi_keys\n  id PK\n  service_account_id\n  container_id\n  name\n  prefix\n  token_hash UNIQUE\n  permissions\n  expires_at NULL\n  last_used_at NULL\n  created_by\n  created_at\n  revoked_at NULL\n  indexes: 2\napi_keys.service_account_id -> service_accounts ON DELETE CASCADE\nidentities\n  id PK\n  user_id\n  provider\n  subject\n  email\n  created_at\n  last_used_at NULL\n  UNIQUE [provider subject] as identities_provider_subject\n  indexes: 1" */}
+{/* verify:stdout "organizations\n  id PK\n  owner_id\n  created_at\n  updated_at\n  name\n  slug UNIQUE\n  indexes: 0\norganization_members\n  container_id\n  user_id\n  role_key\n  joined_at\n  PRIMARY KEY [container_id user_id]\n  indexes: 0\norganization_roles\n  id PK\n  container_id\n  key\n  name\n  permissions\n  created_at\n  UNIQUE [container_id key] as organization_roles_container_key\n  indexes: 0\nusers\n  id PK\n  email UNIQUE\n  email_verified_at NULL\n  password_hash\n  created_at\n  updated_at\n  deleted_at NULL\n  UNIQUE [email] as users_email_key\n  indexes: 0\nsessions\n  id PK\n  user_id\n  token_hash\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  user_agent\n  ip\n  mfa_at NULL\n  UNIQUE [token_hash] as sessions_token_hash\n  indexes: 1\nverifications\n  id PK\n  user_id\n  token_hash\n  purpose\n  email\n  expires_at\n  created_at\n  UNIQUE [token_hash] as verifications_token_hash\n  indexes: 1\norganization_invites\n  id PK\n  container_id\n  email\n  role_key\n  token_hash\n  invited_by\n  expires_at\n  created_at\n  UNIQUE [container_id email] as organization_invites_container_email\n  UNIQUE [token_hash] as organization_invites_token_hash\n  indexes: 0\norganization_invite_links\n  id PK\n  container_id\n  code\n  role_key\n  created_by\n  max_uses\n  use_count\n  expires_at NULL\n  revoked_at NULL\n  created_at\n  UNIQUE [code] as organization_invite_links_code\n  indexes: 0\nservice_accounts\n  id PK\n  container_id\n  name\n  description\n  created_by\n  created_at\n  updated_at\n  disabled_at NULL\n  indexes: 1\napi_keys\n  id PK\n  service_account_id\n  container_id\n  name\n  prefix\n  token_hash UNIQUE\n  permissions\n  expires_at NULL\n  last_used_at NULL\n  created_by\n  created_at\n  revoked_at NULL\n  indexes: 2\napi_keys.service_account_id -> service_accounts ON DELETE CASCADE\nidentities\n  id PK\n  user_id\n  provider\n  subject\n  email\n  created_at\n  last_used_at NULL\n  UNIQUE [provider subject] as identities_provider_subject\n  indexes: 1\noauth_clients\n  id PK\n  container_id NULL\n  name\n  secret_hash\n  public\n  redirect_uris\n  grant_types\n  scopes\n  service_account_id NULL\n  permissions\n  created_by NULL\n  created_at\n  updated_at\n  disabled_at NULL\n  indexes: 1\noauth_grants\n  id PK\n  client_id\n  user_id\n  container_id\n  scope\n  permissions\n  created_at\n  expires_at NULL\n  last_used_at NULL\n  revoked_at NULL\n  indexes: 2\noauth_codes\n  id PK\n  code_hash UNIQUE\n  client_id\n  grant_id\n  redirect_uri\n  code_challenge\n  expires_at\n  created_at\n  redeemed_at NULL\n  indexes: 2\noauth_device_authorizations\n  id PK\n  device_code_hash UNIQUE\n  user_code UNIQUE\n  client_id\n  scope\n  status\n  grant_id NULL\n  interval\n  last_polled_at NULL\n  expires_at\n  created_at\n  indexes: 1\noauth_refresh_tokens\n  id PK\n  token_hash UNIQUE\n  grant_id\n  client_id\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  indexes: 3\noauth_grants.client_id -> oauth_clients ON DELETE CASCADE\noauth_codes.client_id -> oauth_clients ON DELETE CASCADE\noauth_codes.grant_id -> oauth_grants ON DELETE CASCADE\noauth_device_authorizations.client_id -> oauth_clients ON DELETE CASCADE\noauth_refresh_tokens.grant_id -> oauth_grants ON DELETE CASCADE\noauth_refresh_tokens.client_id -> oauth_clients ON DELETE CASCADE\ndevice grant_id has a foreign key: false\npublic: boolean redirect_uris: jsonb" */}
 
 ## The service-account tables
 
@@ -409,6 +411,131 @@ index scan, with a control that drops the index and requires the plan to
 degrade — an index the planner ignores is not an index.
 </Note>
 
+## The OAuth tables
+
+{/* verify:main */}
+```go
+oa := dropsstore.NewOAuthSchema()
+for _, t := range []*pg.Table{oa.Clients, oa.Grants, oa.Codes, oa.DeviceAuthorizations, oa.RefreshTokens} {
+	describe(t)
+}
+for _, ref := range []struct{ t *pg.Table; col string }{
+	{oa.Grants, "client_id"}, {oa.Codes, "client_id"}, {oa.Codes, "grant_id"},
+	{oa.DeviceAuthorizations, "client_id"}, {oa.RefreshTokens, "grant_id"}, {oa.RefreshTokens, "client_id"},
+} {
+	fk := ref.t.Col(ref.col).ForeignKey()
+	fmt.Printf("%s.%s -> %s ON DELETE %s\n", ref.t.Name(), ref.col, fk.Target.Table().Name(), fk.OnDelete)
+}
+fmt.Println("device grant_id has a foreign key:", oa.DeviceAuthorizations.Col("grant_id").ForeignKey() != nil)
+fmt.Println("public:", oa.Clients.Col("public").Type().TypeSQL(), "redirect_uris:", oa.Clients.Col("redirect_uris").Type().TypeSQL())
+```
+
+```
+oauth_clients
+  id PK
+  container_id NULL
+  name
+  secret_hash
+  public
+  redirect_uris
+  grant_types
+  scopes
+  service_account_id NULL
+  permissions
+  created_by NULL
+  created_at
+  updated_at
+  disabled_at NULL
+  indexes: 1
+oauth_grants
+  id PK
+  client_id
+  user_id
+  container_id
+  scope
+  permissions
+  created_at
+  expires_at NULL
+  last_used_at NULL
+  revoked_at NULL
+  indexes: 2
+oauth_codes
+  id PK
+  code_hash UNIQUE
+  client_id
+  grant_id
+  redirect_uri
+  code_challenge
+  expires_at
+  created_at
+  redeemed_at NULL
+  indexes: 2
+oauth_device_authorizations
+  id PK
+  device_code_hash UNIQUE
+  user_code UNIQUE
+  client_id
+  scope
+  status
+  grant_id NULL
+  interval
+  last_polled_at NULL
+  expires_at
+  created_at
+  indexes: 1
+oauth_refresh_tokens
+  id PK
+  token_hash UNIQUE
+  grant_id
+  client_id
+  family_id
+  expires_at
+  created_at
+  rotated_at NULL
+  indexes: 3
+oauth_grants.client_id -> oauth_clients ON DELETE CASCADE
+oauth_codes.client_id -> oauth_clients ON DELETE CASCADE
+oauth_codes.grant_id -> oauth_grants ON DELETE CASCADE
+oauth_device_authorizations.client_id -> oauth_clients ON DELETE CASCADE
+oauth_refresh_tokens.grant_id -> oauth_grants ON DELETE CASCADE
+oauth_refresh_tokens.client_id -> oauth_clients ON DELETE CASCADE
+device grant_id has a foreign key: false
+public: boolean redirect_uris: jsonb
+```
+
+<Warning>
+**The four UNIQUEs are load-bearing** — `code_hash`, `device_code_hash`,
+`user_code`, `token_hash`. Each discharges the MUST `sessions.token_hash`
+carries: the three compare-and-sets (`RedeemCode`, `SetDeviceStatus`,
+`MarkRefreshRotated`) are single-winner only if a hash identifies at most one
+row. All four are declared **inline** through the records' own `,unique` tag
+options, so `CreateSchema` cannot self-heal them onto a pre-existing table.
+
+**Every reference is a cascading foreign key**, because every table is owned
+by this one store. They are what make `CreateGrant`, `CreateCode`,
+`CreateDeviceAuthorization` and `CreateRefreshToken` refuse a row naming no
+client or no grant (a foreign-key violation, classified as `ErrClientNotFound`
+or `ErrGrantNotFound`), and they back the two atomic cascades —
+`DeleteClient` and `RevokeGrant` delete their dependents explicitly inside one
+transaction, with the constraints as the backstop.
+`oauth_device_authorizations.grant_id` deliberately has **no** foreign key: it
+is `NULL` until approval and its row is inert once the grant is gone.
+
+**`redirect_uris`, `grant_types` and `scopes` are `jsonb`** — one array each.
+They are application-shaped lists no query filters on, so a child table per
+list would be three joins on every client load, and a `text[]` is a driver
+type `database/sql` cannot scan into a Go slice. A nil list is written as
+`[]`, never `NULL`. `container_id`, `service_account_id` and `created_by` are
+nullable because an application-level or dynamically registered client has
+none of them and `""` is not a `uuid`; `ListClients("")` queries
+`container_id IS NULL`.
+</Warning>
+
+The nine indexes serve `ListClients` (`container_id`), `ListGrantsByUser`
+(`user_id`), `DeleteRefreshFamily` (`family_id`), and the client and grant
+cascades (`client_id`, `grant_id` on each dependent table). The four UNIQUE
+columns are the lookup keys every token path uses and need no separate index.
+
 ## Column types
 
 Every id column is a PostgreSQL `uuid` **by default** — including the ones
@@ -416,9 +543,11 @@ holding a user id, since authlayer mints those too. See
 [Ids](/concepts/ids) for the options that retype them, and for the deployment
 failure that only shows up against a real database.
 
-Timestamps are `timestamptz`-shaped; the three nullable ones above
-(`email_verified_at`, `deleted_at`, `rotated_at`, plus a link's `expires_at` and
-`revoked_at`) are the only columns that may hold `NULL`.
+Timestamps are `timestamptz`-shaped. The columns marked `NULL` above are the
+only ones that may hold it: the nullable stamps (`email_verified_at`,
+`deleted_at`, `rotated_at`, a link's `expires_at` and `revoked_at`, and their
+OAuth counterparts), and the three ids an application-level OAuth client
+leaves empty.
 
 `users.deleted_at` is the anonymization stamp — `NULL` on every ordinary
 account. It arrives on a **fresh** table only: `CreateSchema` self-heals a

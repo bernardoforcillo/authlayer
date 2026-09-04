@@ -1,0 +1,208 @@
+---
+title: "Device flow"
+description: "RFC 8628 for an agent with no browser: a device code it polls with, a user code a person types, a consent screen, and the four polling answers as sentinels."
+---
+
+An agent on a machine with no browser — a CLI, a build runner, a headless MCP
+host — cannot be redirected. RFC 8628 gives it a **device code** to poll with
+and a **user code** a person types into a consent screen somewhere else. When
+the person approves, the next poll returns tokens; the tokens are
+[delegated](/agents/delegation) — the person's, capped.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/apikey"
+	"github.com/bernardoforcillo/authlayer/oauth"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+	"github.com/bernardoforcillo/authlayer/token"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{
+	"project": {"read", "deploy", "delete"},
+}), memory.New[org.Organization, org.Member]())
+signer, _ := token.HS256([]byte("a-32-byte-secret-for-the-example!"))
+now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+as := oauth.New(memory.NewOAuthStore(), svc.Service, signer,
+	oauth.WithIssuer("https://auth.example"),
+	oauth.WithClock(func() time.Time { return now }))
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+_, _ = svc.AddMember(owner, "bob", org.RoleAdmin)
+bob := org.WithOrg(org.WithSubject(context.Background(), "bob"), acme.ID)
+
+// A public client: no secret. PKCE and a person's approval are all it has.
+cli, secret, _ := as.CreateClient(owner, oauth.ClientSpec{
+	Name: "cli-agent", Public: true,
+	GrantTypes: []string{oauth.GrantDeviceCode, oauth.GrantRefreshToken},
+})
+fmt.Println("public client:", cli.Public, secret == "")
+```
+
+```
+public client: true true
+```
+
+## 1. The agent begins
+
+{/* verify:main */}
+```go
+dr, err := as.BeginDeviceAuthorization(context.Background(), cli.ID, "project:read project:deploy")
+userCode := regexp.MustCompile(`^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$`)
+fmt.Println("begun:", err, userCode.MatchString(dr.UserCode), len(dr.DeviceCode), dr.ExpiresIn, dr.Interval)
+```
+
+```
+begun: <nil> true 64 600 5
+```
+
+`DeviceResponse` has RFC 8628 §3.2's JSON names. `VerificationURI` is left
+empty — this package knows no URLs — so set it, and optionally
+`VerificationURIComplete`, before serialising. The user code is eight letters
+from the RFC's §6.1 alphabet `BCDFGHJKLMNPQRSTVWXZ` (no vowels, so no words;
+no `0/O/1/I` confusion), shown `XXXX-XXXX` and stored without the dash. The
+device code is 32 random bytes, returned once and stored as its hash.
+
+<Warning>
+**Rate limit the endpoint that takes the user code** (RFC 8628 §5.1). A user
+code is the one credential here a person could type by mistake, and the
+alphabet's 20⁸ ≈ 2.6 × 10¹⁰ codes are only unguessable in ten minutes if the
+consent screen refuses to be a guessing oracle.
+</Warning>
+
+## 2. The agent polls; the person approves
+
+`PollDevice` authenticates the client on every poll — a confidential device
+client needs its secret here — and answers with one of the four RFC 8628 §3.5
+sentinels until the person decides.
+
+{/* verify:main */}
+```go
+_, err = as.PollDevice(context.Background(), cli.ID, "", dr.DeviceCode)
+fmt.Println("before approval:", errors.Is(err, oauth.ErrAuthorizationPending))
+_, err = as.PollDevice(context.Background(), cli.ID, "", dr.DeviceCode)
+fmt.Println("polled again inside the interval:", errors.Is(err, oauth.ErrSlowDown))
+
+// The consent screen: what the person typed, normalised.
+pending, client, err := as.DeviceByUserCode(context.Background(), " "+strings.ToLower(dr.UserCode)+" ")
+fmt.Println("consent screen:", err, client.Name, pending.Scope, pending.Status)
+
+// Bob approves — with a cap of project:read only, though he holds far more.
+err = as.ApproveDevice(bob, dr.UserCode, oauth.Approval{
+	Permissions: map[string][]access.Action{"project": {"read"}},
+})
+fmt.Println("approved:", err)
+```
+
+```
+before approval: true
+polled again inside the interval: true
+consent screen: <nil> cli-agent project:read project:deploy pending
+approved: <nil>
+```
+
+`ApproveDevice` reads the user and the container from the context, runs the
+[delegation guard](/agents/delegation#every-mint-is-an-escalation-guard),
+creates the `Grant`, and moves the authorization from *pending* to *approved*
+through the store's compare-and-set. If that transition is lost — a
+concurrent denial got there first — the grant just created is revoked again
+and `ErrDeviceNotPending` comes back, so a lost race leaves no live
+delegation behind.
+
+## 3. The next poll mints — once
+
+{/* verify:main */}
+```go
+now = now.Add(6 * time.Second) // past the interval
+tokens, err := as.PollDevice(context.Background(), cli.ID, "", dr.DeviceCode)
+fmt.Println("tokens:", err, tokens.TokenType, tokens.Scope, tokens.RefreshToken != "")
+
+now = now.Add(6 * time.Second)
+_, err = as.PollDevice(context.Background(), cli.ID, "", dr.DeviceCode)
+fmt.Println("polled again after redemption:", errors.Is(err, oauth.ErrInvalidGrant))
+
+p, _ := as.Authenticate(context.Background(), tokens.AccessToken)
+agent := apikey.WithPrincipal(context.Background(), p)
+read, _ := svc.Can(agent, "project", "read")
+del, _ := svc.Can(agent, "project", "delete")
+bobDel, _ := svc.Can(bob, "project", "delete")
+fmt.Println("principal:", p.Kind, p.ID, p.ClientID == cli.ID, p.GrantID != "")
+fmt.Println("agent read / agent delete / bob delete:", read, del, bobDel)
+```
+
+```
+tokens: <nil> Bearer project:read project:deploy true
+polled again after redemption: true
+principal: delegated bob true true
+agent read / agent delete / bob delete: true false true
+```
+
+The redemption moves *approved* to *redeemed* through the compare-and-set, so
+however many polls race, one device code mints exactly once. The token's
+subject is **bob**, its actor the client, and the cap removes what bob himself
+could do — see [Delegation](/agents/delegation) for what happens when bob's
+role changes.
+
+## Denial, expiry, and the polling answers
+
+| The poll gets | When | Client should |
+|---|---|---|
+| `ErrAuthorizationPending` | the person has not decided | wait `Interval` seconds and poll again |
+| `ErrSlowDown` | it polled sooner than `Interval` after its last poll — the poll is stamped, so polling faster only lengthens the wait | add five seconds to its interval |
+| `ErrAccessDenied` | the person denied | stop |
+| `ErrExpiredToken` | the code expired before a decision — `WithDeviceTTL`, ten minutes | start over |
+| `ErrInvalidGrant` | unknown device code (wrapping `ErrDeviceNotFound`), already redeemed, or issued to another client | stop |
+
+{/* verify:main */}
+```go
+dr, _ = as.BeginDeviceAuthorization(context.Background(), cli.ID, "")
+_ = as.DenyDevice(bob, dr.UserCode)
+_, err = as.PollDevice(context.Background(), cli.ID, "", dr.DeviceCode)
+fmt.Println("denied:", errors.Is(err, oauth.ErrAccessDenied))
+err = as.ApproveDevice(bob, dr.UserCode, oauth.Approval{})
+fmt.Println("approving after a denial:", errors.Is(err, oauth.ErrDeviceNotPending))
+
+dr, _ = as.BeginDeviceAuthorization(context.Background(), cli.ID, "")
+now = now.Add(11 * time.Minute)
+_, _, err = as.DeviceByUserCode(context.Background(), dr.UserCode)
+fmt.Println("expired on the consent screen:", errors.Is(err, oauth.ErrExpiredToken))
+_, err = as.PollDevice(context.Background(), cli.ID, "", dr.DeviceCode)
+fmt.Println("expired at the poll:", errors.Is(err, oauth.ErrExpiredToken))
+```
+
+```
+denied: true
+approving after a denial: true
+expired on the consent screen: true
+expired at the poll: true
+```
+
+`DenyDevice` needs no permission — refusing needs none — and records the
+subject on the `DeviceDenied` event when there is one.
+
+{/* verify:stdout "public client: true true\nbegun: <nil> true 64 600 5\nbefore approval: true\npolled again inside the interval: true\nconsent screen: <nil> cli-agent project:read project:deploy pending\napproved: <nil>\ntokens: <nil> Bearer project:read project:deploy true\npolled again after redemption: true\nprincipal: delegated bob true true\nagent read / agent delete / bob delete: true false true\ndenied: true\napproving after a denial: true\nexpired on the consent screen: true\nexpired at the poll: true" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Delegation" icon="hand-holding" href="/agents/delegation">
+    What the cap is, where it comes from, and why it follows the human.
+  </Card>
+  <Card title="Introspection & revocation" icon="ban" href="/agents/introspection-and-revocation">
+    Refreshing the agent's token, and disconnecting it.
+  </Card>
+</Columns>

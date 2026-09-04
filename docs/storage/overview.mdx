@@ -1,17 +1,18 @@
 ---
 title: "Storage"
-description: "Five independent Store ports, two shipped backends, and one discipline: a store is pure persistence that never authorizes anything."
+description: "Six independent Store ports, two shipped backends, and one discipline: a store is pure persistence that never authorizes anything."
 ---
 
-authlayer has **five** persistence ports, and they are independent. You can
+authlayer has **six** persistence ports, and they are independent. You can
 implement one and not the others, and the two shipped backends implement all
-five.
+six.
 
 | Port | Holds | Methods |
 |---|---|---|
 | `scope.Store[C, M]` | containers, members, custom roles, a transaction | composed from `ContainerStore`, `MemberStore`, `RoleStore` |
 | `invite.Store` | email invitations and links | 13 |
 | `apikey.Store` | [service accounts](/service-accounts/overview) and their keys | 14 |
+| `oauth.Store` | [OAuth clients, grants, codes, device authorizations, refresh tokens](/agents/overview) | 24 |
 | `auth.Store` | users, sessions, verifications | 18 |
 | `auth.IdentityStore` | [external identities](/oauth/overview) — **optional** | 6 |
 
@@ -270,7 +271,7 @@ library's boundary on its users' behalf.
 
 ## They are executable, not just prose
 
-The two **strict** ports ship their contract as a runnable suite, so a
+The **strict** ports ship their contract as a runnable suite, so a
 third-party backend author can check their work. `auth.IdentityStore` does not
 have one — its obligations are covered by `store/memory`'s and `store/drops`'
 own tests, including a live concurrency test for the atomicity MUST above:
@@ -279,6 +280,8 @@ own tests, including a live concurrency test for the atomicity MUST above:
 ```go
 authtest.RunStoreContract(t, newStore)   // 52 checks, 6 of them races
 invitetest.RunStoreContract(t, newStore) // 46 checks, 8 of them races
+apikeytest.RunStoreContract(t, newStore) // 37 checks, 4 of them races
+oauthtest.RunStoreContract(t, newStore)  // 70 checks, 8 of them races
 ```
 
 See [Writing your own backend](/storage/custom-backends).
@@ -293,7 +296,7 @@ See [Writing your own backend](/storage/custom-backends).
     The production wiring, in full, imports included.
   </Card>
   <Card title="The schema" icon="table" href="/storage/schema">
-    Nine tables, and which constraint is load-bearing.
+    Sixteen tables, and which constraint is load-bearing.
   </Card>
   <Card title="Custom backends" icon="plug" href="/storage/custom-backends">
     Running the two contract suites.

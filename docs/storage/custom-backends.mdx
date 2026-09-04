@@ -1,15 +1,15 @@
 ---
 title: "Writing your own backend"
-description: "The three strict ports ship their contract as an executable suite, races included — because prose and two in-tree implementations are not something a third party can test against."
+description: "The four strict ports ship their contract as an executable suite, races included — because prose and two in-tree implementations are not something a third party can test against."
 ---
 
-`auth.Store`, `invite.Store` and `apikey.Store` carry obligations that, when
+`auth.Store`, `invite.Store`, `apikey.Store` and `oauth.Store` carry obligations that, when
 violated, reopen a specific security hole rather than merely narrowing a race.
 Until these suites existed those obligations were enforced by prose and by the
 two backends this repository happens to ship; a third-party author had no way
 to check their work.
 
-All three suites are ordinary Go tests. Write one per backend.
+All four suites are ordinary Go tests. Write one per backend.
 
 ## The auth contract
 
@@ -214,9 +214,55 @@ hash comes back as — `apikey.Store` classifies an id collision (`ErrIDTaken`)
 but no hash collision, and the two shipped backends answer differently on
 purpose.
 
+## The oauth contract
+
+Fourteen MUSTs, each with a check and a deliberately non-compliant double.
+Four are uniqueness constraints on the record types — a code hash, a
+device-code hash, a user code, a refresh-token hash — each of which defeats a
+single-winner property *with no atomicity defect at all*. Three are
+compare-and-sets: `RedeemCode`, `SetDeviceStatus`, `MarkRefreshRotated`, with
+expiry asserted **not** to be part of the predicate. Two are atomic cascades:
+`DeleteClient` removing everything of the client, `RevokeGrant` deleting the
+grant's refresh tokens with the stamp. Five are referential refusals on the
+creates.
+
+{/* verify:skip a test function needing a *testing.T; the identical call is compiled and run by store/memory/oauth_test.go and by store/drops' integration lane */}
+```go
+import "github.com/bernardoforcillo/authlayer/oauth/oauthtest"
+
+func TestMyStoreSatisfiesTheOAuthContract(t *testing.T) {
+	oauthtest.RunStoreContract(t, func(t *testing.T) oauth.Store {
+		return myStoreWithEmptyTables(t) // called once per check
+	})
+}
+```
+
+The factory must hand back a store with **no** rows of any of the five kinds.
+Every id — record, container, client, grant, family, user — is UUIDv7; hashes
+and user codes are unique per call unless a check is forcing a collision. Warm
+your pool to `oauthtest.RaceGoroutines` connections.
+
+### Eight of the seventy checks are races
+
+Exactly one winner among concurrent redemptions of one code, concurrent
+transitions of one device authorization (half approving, half denying), and
+concurrent rotations of one refresh token; one among concurrent creates of one
+code hash, one refresh-token hash and one user code; one among concurrent
+deletes of one client; and the cascade as a **linearizability** property — a
+`CreateGrant` racing the `DeleteClient` of its client, never the client gone
+and the grant present. The compare-and-set checks assert what
+`auth.Store.MarkRotated`'s does: a lost race is `(row, false, nil)`, never an
+error, and the winner's stamp is the one instant every caller raced with.
+
+### What it deliberately does not assert
+
+List order, empty-slice-versus-nil, and **which error** a rejected duplicate
+hash or user code comes back as — `oauth.Store` classifies an id collision
+(`ErrIDTaken`) and nothing else.
+
 ## A contract suite that passes everything is worthless
 
-All three suites are themselves tested against deliberately broken stores, so
+All four suites are themselves tested against deliberately broken stores, so
 a check that asserts nothing cannot slip in green.
 
 <Columns cols={2}>
@@ -243,6 +289,13 @@ a check that asserts nothing cannot slip in green.
     into **thirty-seven** cases, one per check, with the same
     no-check-without-a-control test.
   </Card>
+  <Card title="oauthtest" icon="terminal">
+    **Seventy** cases, one per check — a `RedeemCode` that wins on every call,
+    a `MarkRefreshRotated` that folds expiry into its predicate, a
+    `RevokeGrant` that leaves the grant's refresh tokens behind, a
+    `DeleteClient` that deletes the dependents, releases the lock, then the
+    client — each asserted to **fail** the check that covers it.
+  </Card>
 </Columns>
 
 ## What a backend still owes beyond the suites
@@ -253,8 +306,8 @@ generic not-found, `ErrUserNotFound` rather than `sql.ErrNoRows`, and so on —
 the engine branches on those, and no contract suite can tell you that your
 `SELECT` returned the wrong error *type* for a case it never exercises.
 
-`go doc ./scope Store`, `go doc ./auth Store`, `go doc ./invite Store` and
-`go doc ./apikey Store` document each method's contract, and they are the
+`go doc ./scope Store`, `go doc ./auth Store`, `go doc ./invite Store`,
+`go doc ./apikey Store` and `go doc ./oauth Store` document each method's contract, and they are the
 reference.
 </Note>
 

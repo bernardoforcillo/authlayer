@@ -15,6 +15,7 @@ import (
 
 	"github.com/bernardoforcillo/authlayer/apikey"
 	"github.com/bernardoforcillo/authlayer/invite"
+	"github.com/bernardoforcillo/authlayer/oauth"
 	"github.com/bernardoforcillo/authlayer/org"
 	"github.com/bernardoforcillo/authlayer/store/memory"
 )
@@ -25,6 +26,7 @@ import (
 scopeStore := memory.New[org.Organization, org.Member]() // scope.Store
 inviteStore := memory.NewInviteStore()                   // invite.Store
 apiKeyStore := memory.NewAPIKeyStore()                   // apikey.Store
+oauthStore := memory.NewOAuthStore()                     // oauth.Store
 authStore := memory.NewAuthStore()                       // auth.Store
 identityStore := memory.NewIdentityStore()               // auth.IdentityStore
 
@@ -34,6 +36,7 @@ ksvc := apikey.New(svc.Service, apiKeyStore)
 
 ctx := org.WithSubject(context.Background(), "alice")
 acme, err := svc.CreateOrganization(ctx, "Acme", "acme")
+var _ oauth.Store = oauthStore
 fmt.Println(err, acme.Name, isvc != nil, ksvc != nil, authStore != nil, identityStore != nil)
 ```
 
@@ -41,7 +44,7 @@ fmt.Println(err, acme.Name, isvc != nil, ksvc != nil, authStore != nil, identity
 <nil> Acme true true true true
 ```
 
-All five are generic-free to construct except `memory.New`, which takes the same
+All six are generic-free to construct except `memory.New`, which takes the same
 container and member type parameters your `scope.Service` uses. The identity
 store is [optional](/oauth/overview) — wire it with
 `auth.WithIdentityStore(identityStore)` only if you offer external sign-in.
@@ -61,6 +64,12 @@ Every uniqueness constraint its ports describe.
     either `Create*` as `apikey.ErrIDTaken`, a key naming no account as
     `apikey.ErrServiceAccountNotFound`, and `DeleteServiceAccount`'s cascade
     under one acquisition of the mutex.
+  </Card>
+  <Card title="oauth.Store" icon="terminal">
+    All fourteen MUSTs: a colliding code, device-code or refresh-token hash as
+    `memory.ErrTokenHashTaken`, a colliding user code as
+    `memory.ErrUserCodeTaken`, the three compare-and-sets, the two cascades and
+    the referential refusals, each under one acquisition of the mutex.
   </Card>
   <Card title="invite.Store" icon="envelope">
     `EmailInvite.TokenHash` (also `memory.ErrTokenHashTaken` — same column

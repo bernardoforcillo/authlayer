@@ -124,7 +124,7 @@ jobs:
       - name: test (race)
         run: go test -race ./... -count=1
 
-      # The readme's own Checks list ends with these seven, and they are the
+      # The readme's own Checks list ends with these nine, and they are the
       # only thing that proves the documented entry points still run rather
       # than merely still compile. Output is discarded; a non-zero exit is
       # the signal.
@@ -138,6 +138,7 @@ jobs:
           go run ./examples/deletion > /dev/null
           go run ./examples/hooks > /dev/null
           go run ./examples/apikey > /dev/null
+          go run ./examples/agents > /dev/null
 
       # The docs site claims every Go sample on it is executed. Until this
       # step existed that was true only as of whenever someone last ran the

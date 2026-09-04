@@ -121,6 +121,57 @@ authentication was refused* and only `Authenticate` raises them; a `Store`
 returns the row and the service reads the timestamps. The last two are
 argument errors raised before any store is touched.
 
+## `oauth` — twenty-eight
+
+Not exported by `scope`. `ErrEmptyPermissions` **is** `apikey.ErrEmptyPermissions`,
+aliased. Denials are not re-declared: a management or consent call the actor
+may not make is `scope.ErrForbidden` or `scope.ErrNotMember`, and minting above
+one's standing is `scope.ErrPrivilegeEscalation` — none of which reaches a token
+endpoint.
+
+For these the table carries a fourth column: the RFC 6749 §5.2 (or RFC 8628 §3.5,
+RFC 6750 §3.1, RFC 7591 §3.2.2) `error` code `oauth.ErrorCode(err)` returns
+beside the status, for the JSON body your token endpoint writes. The walk is in
+precedence order, so a wrapped chain answers for its most specific member.
+
+| Error | Meaning | `error` code | Suggested status |
+|---|---|---|---|
+| `ErrInvalidToken` | `Authenticate` refused the access token — wraps the cause: a signer sentinel, `ErrGrantRevoked`, `ErrGrantExpired`, `ErrGrantNotFound`, `ErrClientDisabled`, `ErrClientNotFound`, or a token that is not this package's | `invalid_token` (RFC 6750) | 401 |
+| `ErrInvalidClient` | Client authentication failed — unknown id, wrong or missing secret, a secret from a public client — or, **wrapped**, a bound service account that is not a member, missing or disabled | `invalid_client` | 401 |
+| `ErrClientDisabled` | The client's `DisabledAt` is set | `invalid_client` | 401 |
+| `ErrAuthorizationPending` | The device authorization awaits the user; poll again | `authorization_pending` | 400 |
+| `ErrSlowDown` | Polled inside the interval; add five seconds | `slow_down` | 400 |
+| `ErrAccessDenied` | The user denied the device authorization | `access_denied` | 400 |
+| `ErrExpiredToken` | The device code expired before the user decided | `expired_token` | 400 |
+| `ErrCodeReused` | An authorization code was presented twice — **the grant is revoked** | `invalid_grant` | 400 |
+| `ErrTokenReuse` | A rotated refresh token was presented again — **family and grant revoked**. Alone, the revocation succeeded; joined, it did not | `invalid_grant` | 400 |
+| `ErrPKCEMismatch` | `S256(code_verifier)` is not the challenge, or the verifier is malformed | `invalid_grant` | 400 |
+| `ErrGrantRevoked` | The grant's `RevokedAt` is set | `invalid_grant` | 400 |
+| `ErrGrantExpired` | The grant's `ExpiresAt` is not in the future | `invalid_grant` | 400 |
+| `ErrInvalidGrant` | The code, refresh token or device code is unknown (wrapping `ErrCodeNotFound`, `ErrRefreshNotFound`, `ErrDeviceNotFound`), expired, spent, issued to another client, or presented with the wrong redirect URI | `invalid_grant` | 400 |
+| `ErrInvalidScope` | A scope the client may not request or the server does not know; or no scope at all with a scope map set | `invalid_scope` | 400 |
+| `ErrUnauthorizedClient` | The client does not hold that grant type | `unauthorized_client` | 400 |
+| `ErrInvalidRedirectURI` | Not registered (exact match), or not an absolute fragment-free URI on a permitted scheme at registration | `invalid_redirect_uri` (RFC 7591; `invalid_request` at the authorization endpoint) | 400 |
+| `ErrPKCERequired` | No `S256` challenge — absent, `plain`, or malformed | `invalid_request` | 400 |
+| `ErrInvalidClientMetadata` | A `ClientSpec` or registration this package cannot honour | `invalid_client_metadata` (RFC 7591) | 400 |
+| `ErrEmptyPermissions` | A cap compiled to nothing — refused rather than stored as *no cap* | `invalid_scope` | 400 |
+| `ErrRegistrationDisabled` | `RegisterClient` without `WithDynamicRegistration(true)` | `invalid_request` | 403 |
+| `ErrDeviceNotPending` | Already approved, denied or redeemed — or the compare-and-set lost | `invalid_request` | 409 |
+| `ErrIDTaken` | A `Create*` was given an id that already identifies a row of that kind | `server_error` | 409 |
+| `ErrClientNotFound` | No client with that id — or one in another container than the ctx one | `invalid_request` | 404 |
+| `ErrGrantNotFound` | No grant with that id | `invalid_request` | 404 |
+| `ErrDeviceNotFound` | No device authorization with that code | `invalid_request` | 404 |
+| `ErrCodeNotFound` | No authorization code with that hash — wrapped in `ErrInvalidGrant` at the token endpoint | `invalid_grant` | 404 |
+| `ErrRefreshNotFound` | No refresh token with that hash — wrapped in `ErrInvalidGrant` at the token endpoint | `invalid_grant` | 404 |
+| `ErrIssuerRequired` | Minting on a `Service` built without `WithIssuer` — a wiring bug | `server_error` | 500 |
+
+<Note>
+The token endpoints never show a client a not-found: they wrap it in
+`ErrInvalidGrant`, because RFC 6749 does not tell a client whether its code was
+unknown or spent. `Introspect` returns **no error at all** for an invalid token
+— see [Introspection & revocation](/agents/introspection-and-revocation).
+</Note>
+
 ## `auth` — twenty-four
 
 Eighteen belong to the password-and-session core. The six for
@@ -240,7 +291,8 @@ differently on purpose:
 
 | Case | `store/memory` | `store/drops` |
 |---|---|---|
-| duplicate `token_hash` (session, verification, invite, API key) | `memory.ErrTokenHashTaken` | the driver's unique violation |
+| duplicate `token_hash` (session, verification, invite, API key, authorization code, device code, refresh token) | `memory.ErrTokenHashTaken` | the driver's unique violation |
+| duplicate device-flow `user_code` | `memory.ErrUserCodeTaken` | the driver's unique violation |
 | duplicate `(container_id, email)` invite | `memory.ErrInviteEmailTaken` | the driver's unique violation |
 | duplicate link `code` | `memory.ErrLinkCodeTaken` | the driver's unique violation |
 

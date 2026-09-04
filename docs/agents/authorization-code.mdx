@@ -1,0 +1,230 @@
+---
+title: "Authorization code + PKCE"
+description: "The browser flow for a third-party or MCP client: a stateless validation for the consent screen, a single-use code bound to an S256 challenge, and a replay that revokes the grant."
+---
+
+The authorization-code grant is OAuth 2.1's browser flow: the client sends the
+person to your consent screen, the person approves, the browser is redirected
+back with a **code**, and the client exchanges the code for tokens — proving,
+with PKCE, that it is the same client that started. This package makes S256
+PKCE **mandatory for every client**, confidential ones included; `plain` and
+absent are refused.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/apikey"
+	"github.com/bernardoforcillo/authlayer/oauth"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+	"github.com/bernardoforcillo/authlayer/token"
+)
+```
+
+{/* verify:decl */}
+```go
+// What the client does before opening the browser: a verifier it keeps, and
+// the S256 challenge it sends (RFC 7636).
+func pkce(verifier string) (challenge string) {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{
+	"project": {"read", "deploy", "delete"},
+}), memory.New[org.Organization, org.Member]())
+signer, _ := token.HS256([]byte("a-32-byte-secret-for-the-example!"))
+now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+as := oauth.New(memory.NewOAuthStore(), svc.Service, signer,
+	oauth.WithIssuer("https://auth.example"),
+	oauth.WithClock(func() time.Time { return now }))
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+
+web, secret, _ := as.CreateClient(owner, oauth.ClientSpec{
+	Name:         "web app",
+	GrantTypes:   []string{oauth.GrantAuthorizationCode, oauth.GrantRefreshToken},
+	RedirectURIs: []string{"https://app.example/cb"},
+	Scopes:       []string{"project:read"},
+})
+verifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk" // 43-128 unreserved characters
+```
+
+## 1. Begin: validate for the consent screen
+
+`BeginAuthorization` is **stateless** — nothing is written, and no subject is
+needed, since the person may not have signed in yet. It returns the request
+normalised (the redirect URI filled in when the client has exactly one; the
+scope de-duplicated) and the client, so the screen can show its name.
+
+{/* verify:main */}
+```go
+req := oauth.AuthorizationRequest{
+	ClientID: web.ID, Scope: "project:read", State: "xyz",
+	CodeChallenge: pkce(verifier), CodeChallengeMethod: "S256",
+}
+norm, client, err := as.BeginAuthorization(context.Background(), req)
+fmt.Println("begin:", err, client.Name, norm.RedirectURI, norm.State)
+
+bad := req
+bad.CodeChallengeMethod = "plain"
+_, _, err = as.BeginAuthorization(context.Background(), bad)
+fmt.Println("plain PKCE:", errors.Is(err, oauth.ErrPKCERequired))
+bad = req
+bad.RedirectURI = "https://app.example/cb/../evil"
+_, _, err = as.BeginAuthorization(context.Background(), bad)
+fmt.Println("unregistered redirect:", errors.Is(err, oauth.ErrInvalidRedirectURI))
+bad = req
+bad.Scope = "project:delete"
+_, _, err = as.BeginAuthorization(context.Background(), bad)
+fmt.Println("scope outside the client's list:", errors.Is(err, oauth.ErrInvalidScope))
+```
+
+```
+begin: <nil> web app https://app.example/cb xyz
+plain PKCE: true
+unregistered redirect: true
+scope outside the client's list: true
+```
+
+<Warning>
+**Two refusals must not redirect.** An unknown client and an unregistered
+redirect URI are answered on your own page (RFC 6749 §4.1.2.1) — an
+unregistered redirect URI is exactly the thing not to send a response to.
+Every other refusal may redirect with the `error` code
+[`ErrorCode`](/agents/introspection-and-revocation#the-error-table) gives.
+Redirect URIs are exact-match only: absolute, no fragment, and `http` only on
+a loopback host.
+</Warning>
+
+## 2. Approve: the person consents
+
+`Approve` re-validates (the request may have been tampered with between the
+two calls, or the client disabled), runs the
+[delegation guard](/agents/delegation#every-mint-is-an-escalation-guard),
+creates the `Grant`, and mints a sixty-second code bound to the redirect URI
+and the challenge. The plaintext comes back **once**; redirect the browser to
+`norm.RedirectURI` with it and `norm.State`.
+
+{/* verify:main */}
+```go
+code, err := as.Approve(owner, norm, oauth.Approval{
+	Permissions: map[string][]access.Action{"project": {"read"}},
+})
+fmt.Println("approved:", err, len(code))
+```
+
+```
+approved: <nil> 64
+```
+
+## 3. Exchange: the client redeems
+
+{/* verify:main */}
+```go
+x := oauth.CodeExchange{ClientID: web.ID, ClientSecret: secret, Code: code,
+	RedirectURI: "https://app.example/cb", CodeVerifier: verifier}
+tokens, err := as.ExchangeCode(context.Background(), x)
+fmt.Println("exchanged:", err, tokens.TokenType, tokens.Scope, tokens.RefreshToken != "")
+
+p, _ := as.Authenticate(context.Background(), tokens.AccessToken)
+app := apikey.WithPrincipal(context.Background(), p)
+read, _ := svc.Can(app, "project", "read")
+del, _ := svc.Can(app, "project", "delete")
+fmt.Println("principal:", p.Kind, p.ID, "read", read, "delete", del)
+```
+
+```
+exchanged: <nil> Bearer project:read true
+principal: delegated alice read true delete false
+```
+
+The code is redeemed through the store's compare-and-set
+(`Store.RedeemCode`), so exactly one exchange of a code ever mints. Then, in
+order: the code must have been issued to this client, must not be expired
+(checked **after** the redemption, so an expired code is consumed too), the
+redirect URI must match when present, and `S256(verifier)` must equal the
+challenge — compared in constant time.
+
+<Note>
+OAuth 2.1 §4.1.3 drops `redirect_uri` from the token request — PKCE is what
+binds the code to the client that asked — so an **empty** `RedirectURI` is
+accepted; a present, different one is `ErrInvalidGrant`.
+</Note>
+
+## A replayed code revokes the grant
+
+A code presented twice means the code leaked — through a log, a referrer, a
+compromised browser — and the party that got there first may have been the
+thief. OAuth 2.1 §4.1.2 says to revoke, and this package does: the replay is
+`ErrCodeReused` **and the grant is revoked**, so the tokens the first exchange
+produced stop refreshing at once and stop verifying within an access-token
+lifetime. A code presented by a *different* client gets the same revocation.
+
+{/* verify:main */}
+```go
+_, err = as.ExchangeCode(context.Background(), x)
+fmt.Println("replayed:", errors.Is(err, oauth.ErrCodeReused))
+_, err = as.Authenticate(context.Background(), tokens.AccessToken)
+fmt.Println("the first exchange's token:", errors.Is(err, oauth.ErrInvalidToken), errors.Is(err, oauth.ErrGrantRevoked))
+_, err = as.Refresh(context.Background(), web.ID, secret, tokens.RefreshToken)
+fmt.Println("its refresh token:", errors.Is(err, oauth.ErrInvalidGrant))
+
+// A wrong verifier is refused, and the code is consumed by the attempt.
+code, _ = as.Approve(owner, norm, oauth.Approval{})
+x.Code, x.CodeVerifier = code, "not-the-verifier-not-the-verifier-not-the-verifier"
+_, err = as.ExchangeCode(context.Background(), x)
+fmt.Println("wrong verifier:", errors.Is(err, oauth.ErrPKCEMismatch))
+x.CodeVerifier = verifier
+_, err = as.ExchangeCode(context.Background(), x)
+fmt.Println("the right verifier, after a failed attempt:", errors.Is(err, oauth.ErrCodeReused))
+```
+
+```
+replayed: true
+the first exchange's token: true true
+its refresh token: true
+wrong verifier: true
+the right verifier, after a failed attempt: true
+```
+
+## What is refused, and in which order
+
+| Step | Condition | Error |
+|---|---|---|
+| client auth | unknown id, wrong or missing secret, a secret from a public client | `ErrInvalidClient` |
+| | disabled client | `ErrClientDisabled` |
+| | no `authorization_code` grant type | `ErrUnauthorizedClient` |
+| redeem | unknown code | `ErrInvalidGrant` wrapping `ErrCodeNotFound` |
+| | already redeemed — **grant revoked** | `ErrCodeReused` |
+| | issued to another client — **grant revoked** | `ErrInvalidGrant` |
+| | expired (sixty seconds, `WithCodeTTL`) | `ErrInvalidGrant` |
+| | redirect URI present and different | `ErrInvalidGrant` |
+| PKCE | verifier malformed or `S256` not the challenge | `ErrPKCEMismatch` |
+| grant | revoked / expired since approval | `ErrGrantRevoked` / `ErrGrantExpired` |
+
+{/* verify:stdout "begin: <nil> web app https://app.example/cb xyz\nplain PKCE: true\nunregistered redirect: true\nscope outside the client's list: true\napproved: <nil> 64\nexchanged: <nil> Bearer project:read true\nprincipal: delegated alice read true delete false\nreplayed: true\nthe first exchange's token: true true\nits refresh token: true\nwrong verifier: true\nthe right verifier, after a failed attempt: true" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Discovery & registration" icon="compass" href="/agents/discovery-and-registration">
+    How an MCP client finds the endpoints and registers itself.
+  </Card>
+  <Card title="Delegation" icon="hand-holding" href="/agents/delegation">
+    The cap, the scope map, and the human's current standing.
+  </Card>
+</Columns>

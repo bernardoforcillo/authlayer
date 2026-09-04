@@ -10,6 +10,99 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Agents & machine clients — an OAuth 2.1 authorization server as a
+  library** (`authlayer/oauth`). No HTTP, no handlers: `oauth.New(store,
+  authority, signer, opts...)` over a narrow `Authority` interface
+  `*scope.Service` satisfies, and every call returns the struct an endpoint
+  serialises. Three grants, one delegation model. `ClientCredentials` mints
+  a token whose `sub` is the service account a confidential client is bound
+  to — an ordinary member, so `Can` resolves its role as for an API key; no
+  refresh token, per RFC 6749 §4.4.3. The device grant
+  (`BeginDeviceAuthorization`, `DeviceByUserCode`, `ApproveDevice`,
+  `DenyDevice`, `PollDevice` with `ErrAuthorizationPending`, `ErrSlowDown`,
+  `ErrAccessDenied`, `ErrExpiredToken` — RFC 8628, user codes from its §6.1
+  alphabet) and the authorization-code grant (`BeginAuthorization`,
+  `Approve`, `ExchangeCode` — PKCE **S256 mandatory for every client**,
+  `plain` refused) produce **delegated** tokens: `sub` the user, `act.sub`
+  the client (RFC 8693), bound to a `Grant` — one user's consent to one
+  client in one container, the row `ListGrants` shows and `RevokeGrant`
+  (grantor only) revokes. `Authenticate` yields an `apikey.Principal` —
+  `KindDelegated` with `ClientID`, `GrantID` and the grant's cap, or
+  `KindServiceAccount` — and `apikey.WithPrincipal` installs the cap, so the
+  engine intersects it with the user's **current** standing at every check:
+  demote the human and the agent is demoted, without a token changing hands.
+
+  **Every mint is an escalation guard.** A delegation cap must sit within
+  the grantor's capped standing; a client-credentials cap within the service
+  account's role, re-checked at every mint; and where an administrator
+  mints, the client's whole power within that administrator's own capped
+  standing — `scope.ErrPrivilegeEscalation` in every case. A capped approver
+  asking for no cap gets the grant capped to their own capped standing.
+  `WithScopeMap` turns approved scope strings into the cap (the union of
+  each scope's grants, compiled at `New`, which panics on an undeclared
+  pair), publishes the keys as `scopes_supported`, and refuses an unknown or
+  empty scope set. `ErrEmptyPermissions` **is** `apikey.ErrEmptyPermissions`.
+
+  Refresh tokens are opaque, hashed, and rotated through the store's
+  compare-and-set; a replay deletes the family **and revokes the grant**
+  with `ErrTokenReuse` (alone, the revocation succeeded; joined, it did not
+  — `auth.ErrTokenReuse`'s rule). A code presented twice is `ErrCodeReused`
+  **and revokes the grant** (OAuth 2.1 §4.1.2); a code or refresh token
+  presented by another client gets the same revocation. `Revoke` is RFC 7009
+  — an unknown token succeeds, another client's is refused, a JWT already
+  issued is never recalled and `WithAccessTTL` (ten minutes) is why.
+  `Introspect` is RFC 7662 and **never errors for an invalid token**;
+  it answers for refresh tokens too. `WithOfflineVerification` skips the one
+  store read `Authenticate` makes, at a stated latency of one access-token
+  lifetime; the cap travels signed in the token (`ext.permissions`) so the
+  principal is the same either way. `WithIssuer` is **required** —
+  `ErrIssuerRequired` on every mint without it — and `Authenticate` checks
+  `iss`, `aud` (`WithAudience`) and that the token is one of this package's:
+  a session JWT from the same signer is refused.
+
+  Clients are managed under the container's `service_account:*` grants
+  (`CreateClient`, `RotateClientSecret`, `DisableClient`/`EnableClient`,
+  `UpdateClientRedirectURIs`, `ListClients`, `DeleteClient` with an atomic
+  cascade); secrets are 32 random bytes compared in constant time against
+  their sha256, not bcrypt, and the doc says why. `RegisterClient` is RFC
+  7591 dynamic registration — application-level, never `client_credentials`,
+  off unless `WithDynamicRegistration(true)`. `ServerMetadata` (RFC 8414)
+  and `ProtectedResourceMetadata` (RFC 9728) are structs with JSON tags.
+  `ErrorCode(err)` maps every sentinel to its RFC 6749 §5.2 code and a
+  status, walked in precedence order so a wrapped chain answers for its most
+  specific member; the readme's Errors table gains that column. Twenty-eight
+  sentinels, one of them (`ErrInvalidClientMetadata`, RFC 7591's
+  `invalid_client_metadata`) beyond the specification's list. Hooks in
+  scope's shape, fourteen kinds, `Detail` a closed vocabulary. Options
+  `WithClock`, `WithIDGenerator`, `WithHooks`, `WithIssuer`, `WithAudience`,
+  `WithAccessTTL`, `WithRefreshTTL`, `WithCodeTTL`, `WithDeviceTTL`,
+  `WithDeviceInterval`, `WithGrantTTL`, `WithDynamicRegistration`,
+  `WithServiceAccounts`, `WithScopeMap`, `WithOfflineVerification`.
+
+  `oauth.Store` is a new port — twenty-four methods over `Client`, `Grant`,
+  `AuthorizationCode`, `DeviceAuthorization`, `RefreshToken` — with
+  fourteen MUSTs: four uniqueness constraints on the record types, the three
+  compare-and-sets `RedeemCode`, `SetDeviceStatus` and `MarkRefreshRotated`
+  (expiry deliberately **not** in the predicate), two atomic cascades
+  (`DeleteClient`, `RevokeGrant`), and the referential refusals on every
+  create. `store/memory.NewOAuthStore()` is the reference implementation
+  (`memory.ErrUserCodeTaken` joins `ErrTokenHashTaken`);
+  `store/drops.NewOAuthStore(db, opts...)` (`OAuthNames`, `WithOAuthNames`,
+  `WithOAuthTextLibraryIDs`, `WithOAuthTextUserIDs`, `CreateSchema`) owns
+  `oauth_clients`, `oauth_grants`, `oauth_codes`,
+  `oauth_device_authorizations` and `oauth_refresh_tokens` — the four
+  UNIQUEs inline, six cascading foreign keys between the five, nine indexes,
+  `public` as `boolean`, the three string lists as `jsonb`, NULL
+  `container_id`/`service_account_id`/`created_by` for an application-level
+  client, and the compare-and-sets as one `UPDATE … WHERE … IS NULL
+  RETURNING` each, exactly `AuthStore.MarkRotated`'s shape. The column
+  mapper learns `bool` and `json.RawMessage` for it. `oauth/oauthtest.
+  RunStoreContract` is the port's contract as an executable suite — seventy
+  checks, eight of them races, each with a non-compliant double proving it
+  bites — and both backends run it, drops in the live lane. `examples/agents`
+  is the ninth runnable tour; the docs site gains an "Agents & machine
+  clients" group of seven pages.
+
 - **`token.Signer`, EdDSA and the JWKS** (`authlayer/token`). A `Signer`
   interface — `Issue(claims, ttl)`, `Parse(raw)`, `Alg()` — with two
   constructors and **one algorithm each**. `HS256(keys...)` is the released
