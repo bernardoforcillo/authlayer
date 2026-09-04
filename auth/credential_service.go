@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/bernardoforcillo/authlayer/token"
@@ -405,7 +406,7 @@ func (s *Service) FinishPasskeyRegistration(ctx context.Context, userID, current
 		return zero, err
 	}
 
-	return creds.CreateCredential(ctx, Credential{
+	created, err := creds.CreateCredential(ctx, Credential{
 		ID:           s.cfg.idGen(),
 		UserID:       u.ID,
 		CredentialID: c.CredentialID,
@@ -417,6 +418,13 @@ func (s *Service) FinishPasskeyRegistration(ctx context.Context, userID, current
 		// LastUsedAt stays nil: this credential was registered, not used.
 		// nil is how a caller tells the two apart.
 	})
+	if err != nil {
+		return zero, err
+	}
+	if err := s.emit(ctx, Event{Kind: PasskeyRegistered, UserID: u.ID, SessionID: currentSessionID}); err != nil {
+		return zero, err
+	}
+	return created, nil
 }
 
 // BeginPasskeyLogin starts a WebAuthn authentication ceremony and returns the
@@ -609,8 +617,19 @@ func (s *Service) FinishPasskeyLogin(ctx context.Context, a VerifiedAssertion, i
 	// The whole resolution path: the account is whatever this row names. See
 	// [Credential.CredentialID]'s uniqueness MUST for what makes that a fact
 	// rather than a coin flip over row order.
+	// failed is the [LoginFailed] emission for the refusals below that are
+	// about the assertion rather than about the store: the IP and user
+	// agent, a UserID once one is resolved, a word from the closed
+	// vocabulary.
+	failed := func(userID, detail string, err error) error {
+		return s.emitFailure(ctx, Event{Kind: LoginFailed, UserID: userID, IP: ip, UserAgent: userAgent, Detail: detail}, err)
+	}
+
 	cred, err := creds.FindCredentialByCredentialID(ctx, a.CredentialID)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrCredentialNotFound):
+		return zero, failed("", DetailPasskeyUnknown, err)
+	case err != nil:
 		return zero, err
 	}
 
@@ -627,6 +646,11 @@ func (s *Service) FinishPasskeyLogin(ctx context.Context, a VerifiedAssertion, i
 
 	now := s.cfg.clock()
 	if err := s.claimChallenge(ctx, creds, a.Challenge, CeremonyLogin, nil, now); err != nil {
+		if errors.Is(err, ErrChallengeNotFound) || errors.Is(err, ErrChallengeExpired) || errors.Is(err, ErrChallengeCeremony) {
+			// The credential resolved to an account and the ceremony did
+			// not hold up: a failed attempt on a known account.
+			return zero, failed(u.ID, DetailPasskeyChallengeInvalid, err)
+		}
 		return zero, err
 	}
 
@@ -647,7 +671,7 @@ func (s *Service) FinishPasskeyLogin(ctx context.Context, a VerifiedAssertion, i
 			// The store refused a counter that did not increase. Refuse the
 			// LOGIN — this is the only clone detection in the package, and
 			// signing in anyway would discard it.
-			return zero, ErrClonedAuthenticator
+			return zero, failed(u.ID, DetailClonedAuthenticator, ErrClonedAuthenticator)
 		}
 	}
 
@@ -657,7 +681,7 @@ func (s *Service) FinishPasskeyLogin(ctx context.Context, a VerifiedAssertion, i
 	// FRESH for [Service.RequireFreshMFA]. Without the stamp, an account
 	// holding both a passkey and a confirmed TOTP factor could sign in here
 	// and then never satisfy step-up.
-	return s.mintSession(ctx, u, ip, userAgent, &now)
+	return s.mintSession(ctx, u, ip, userAgent, &now, DetailPasskey)
 }
 
 // ListPasskeys returns the WebAuthn credentials registered to userID, and
@@ -781,7 +805,10 @@ func (s *Service) DeletePasskey(ctx context.Context, userID, credentialRowID str
 	}
 
 	// The decision and the delete are ONE atomic step inside the store.
-	return creds.DeleteCredentialIfNotLast(ctx, userID, credentialRowID, otherWayIn)
+	if err := creds.DeleteCredentialIfNotLast(ctx, userID, credentialRowID, otherWayIn); err != nil {
+		return err
+	}
+	return s.emit(ctx, Event{Kind: PasskeyDeleted, UserID: userID})
 }
 
 // sweepCredentials removes every passkey on userID's account. It is the

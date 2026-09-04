@@ -1,0 +1,261 @@
+---
+title: "Introspection & revocation"
+description: "Refresh rotation with reuse detection, RFC 7662 introspection that never errors for an invalid token, RFC 7009 revocation, what a JWT cannot do, and the error table."
+---
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/oauth"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+	"github.com/bernardoforcillo/authlayer/token"
+)
+```
+
+{/* verify:decl */}
+```go
+const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+func authorize(as *oauth.Service, user context.Context, c oauth.Client, secret string) oauth.TokenResponse {
+	sum := sha256.Sum256([]byte(verifier))
+	req := oauth.AuthorizationRequest{ClientID: c.ID, Scope: "project:read",
+		CodeChallenge: base64.RawURLEncoding.EncodeToString(sum[:]), CodeChallengeMethod: "S256"}
+	code, err := as.Approve(user, req, oauth.Approval{})
+	if err != nil {
+		panic(err)
+	}
+	tokens, err := as.ExchangeCode(context.Background(), oauth.CodeExchange{
+		ClientID: c.ID, ClientSecret: secret, Code: code, CodeVerifier: verifier})
+	if err != nil {
+		panic(err)
+	}
+	return tokens
+}
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{"project": {"read"}}),
+	memory.New[org.Organization, org.Member]())
+signer, _ := token.HS256([]byte("a-32-byte-secret-for-the-example!"))
+now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+store := memory.NewOAuthStore()
+as := oauth.New(store, svc.Service, signer,
+	oauth.WithIssuer("https://auth.example"),
+	oauth.WithClock(func() time.Time { return now }))
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+web, secret, _ := as.CreateClient(owner, oauth.ClientSpec{
+	Name: "agent", GrantTypes: []string{oauth.GrantAuthorizationCode, oauth.GrantRefreshToken},
+	RedirectURIs: []string{"https://app.example/cb"},
+})
+first := authorize(as, owner, web, secret)
+```
+
+## Refresh: rotation and reuse
+
+Refresh tokens are opaque (`token.GenerateOpaque`), stored as their sha256, and
+**rotated** on every use through the store's compare-and-set — exactly
+`auth.Store.MarkRotated`'s contract, and for the same reason: however many
+callers present one token at once, exactly one wins.
+
+{/* verify:main */}
+```go
+second, err := as.Refresh(context.Background(), web.ID, secret, first.RefreshToken)
+fmt.Println("refreshed:", err, second.RefreshToken != first.RefreshToken)
+```
+
+```
+refreshed: <nil> true
+```
+
+A rotated token presented again is a **replay** — a client retrying with a
+stale token, or an attacker replaying a stolen one, and this package cannot
+tell which — so it is treated as a compromise: the whole family is deleted,
+**the grant is revoked**, and the caller gets `ErrTokenReuse`.
+
+{/* verify:main */}
+```go
+_, err = as.Refresh(context.Background(), web.ID, secret, first.RefreshToken)
+fmt.Println("replay:", errors.Is(err, oauth.ErrTokenReuse))
+_, err = as.Refresh(context.Background(), web.ID, secret, second.RefreshToken)
+fmt.Println("the current token, after the replay:", errors.Is(err, oauth.ErrInvalidGrant))
+_, err = as.Authenticate(context.Background(), second.AccessToken)
+fmt.Println("the access token, after the replay:", errors.Is(err, oauth.ErrGrantRevoked))
+```
+
+```
+replay: true
+the current token, after the replay: true
+the access token, after the replay: true
+```
+
+<Warning>
+**`ErrTokenReuse` must be tested first.** Returned alone, the revocation
+succeeded. Joined with another error, it did not, and the family may still be
+live — the alarm is never lost to the failure of the response to it, exactly
+as with `auth.ErrTokenReuse`.
+</Warning>
+
+Expiry is checked **after** the rotation, so an expired token is consumed and a
+later replay of it is still detected. A token presented by another client
+gets the same revocation and `ErrInvalidGrant`.
+
+## Introspection never errors for an invalid token
+
+`Introspect` is RFC 7662. An unparseable, forged, expired, revoked or unknown
+token is `{"active": false}` and **no error** — the RFC says so, and a resource
+server asking about a token it was handed must not learn anything a forger
+could not. It answers for refresh tokens too.
+
+{/* verify:main */}
+```go
+live := authorize(as, owner, web, secret)
+in, err := as.Introspect(context.Background(), live.AccessToken)
+fmt.Println("live:", err, in.Active, in.Subject, in.ClientID == web.ID, in.Scope, in.TokenType, in.Act != nil)
+in, err = as.Introspect(context.Background(), live.RefreshToken)
+fmt.Println("refresh token:", err, in.Active, in.TokenType)
+in, err = as.Introspect(context.Background(), "garbage")
+fmt.Println("garbage:", err, in.Active)
+in, err = as.Introspect(context.Background(), second.AccessToken)
+fmt.Println("revoked:", err, in.Active)
+b, _ := json.Marshal(in)
+fmt.Println(string(b))
+```
+
+```
+live: <nil> true alice true project:read Bearer true
+refresh token: <nil> true refresh_token
+garbage: <nil> false
+revoked: <nil> false
+{"active":false}
+```
+
+<Warning>
+RFC 7662 §2.1 requires the **caller** to be authenticated: introspection is for
+resource servers, and an open introspection endpoint is a token-validity
+oracle. `Introspect` takes no client credentials — that authentication is
+yours.
+</Warning>
+
+## Revocation is RFC 7009
+
+`Revoke(ctx, clientID, secret, token)`: the client authenticates and names a
+token of its own.
+
+| Token | Effect |
+|---|---|
+| a refresh token | its whole family is deleted and its grant revoked |
+| a delegated access token | its grant is revoked |
+| a client-credentials access token | nothing — it is bound to no grant; it expires |
+| an unknown or malformed token | **success** — the RFC says so, and "unknown" would be a validity oracle |
+| a token issued to a **different** client | `ErrInvalidGrant`, and nothing is revoked |
+
+{/* verify:main */}
+```go
+err = as.Revoke(context.Background(), web.ID, secret, live.RefreshToken)
+_, verr := as.Authenticate(context.Background(), live.AccessToken)
+fmt.Println("revoked by refresh token:", err, errors.Is(verr, oauth.ErrGrantRevoked))
+fmt.Println("unknown token:", as.Revoke(context.Background(), web.ID, secret, "no-such-token"))
+other, otherSecret, _ := as.CreateClient(owner, oauth.ClientSpec{
+	Name: "other", GrantTypes: []string{oauth.GrantAuthorizationCode}, RedirectURIs: []string{"https://o.example/cb"},
+})
+mine := authorize(as, owner, web, secret)
+err = as.Revoke(context.Background(), other.ID, otherSecret, mine.AccessToken)
+_, verr = as.Authenticate(context.Background(), mine.AccessToken)
+fmt.Println("another client's token:", errors.Is(err, oauth.ErrInvalidGrant), verr)
+```
+
+```
+revoked by refresh token: <nil> true
+unknown token: <nil>
+another client's token: true <nil>
+```
+
+Users disconnect apps with `ListGrants` and `RevokeGrant` — see
+[Connected apps](/agents/delegation#connected-apps).
+
+## What a JWT cannot do
+
+None of the above recalls an access token already issued: it is a signed
+statement, and it cannot be unsaid. What makes revocation effective anyway is
+the one store read `Authenticate` makes — the grant for a delegated token, the
+client for a machine one — refusing a revoked grant or a disabled client at
+once. `WithAccessTTL` is ten minutes by default, and this is why.
+
+### Offline verification
+
+`WithOfflineVerification` skips that read. A resource server that is not the
+authorization server, holding only the JWKS, verifies the signature and the
+claims and builds the same principal — the cap travels **in the token**,
+signed, as `ext.permissions` — and buys, in exchange, a stated latency: a
+revoked grant is honoured until the access token expires. Refresh still checks
+everything, so no client outlives its grant by more than one access-token
+lifetime.
+
+{/* verify:main */}
+```go
+offline := oauth.New(store, svc.Service, signer, oauth.WithIssuer("https://auth.example"), oauth.WithOfflineVerification())
+p, err := offline.Authenticate(context.Background(), second.AccessToken) // revoked above
+fmt.Println("offline, after revocation:", err, p.Kind, p.Permissions == nil)
+```
+
+```
+offline, after revocation: <nil> delegated true
+```
+
+## The error table
+
+`ErrorCode(err)` maps every sentinel to the `error` code an OAuth error
+response carries and a suggested status, walked in precedence order so a
+wrapped chain answers for its most specific member. You write the JSON body;
+this package never has to. The full table, with meanings, is on the
+[Errors](/reference/errors) page.
+
+{/* verify:main */}
+```go
+for _, e := range []error{
+	oauth.ErrInvalidClient, oauth.ErrTokenReuse, oauth.ErrAuthorizationPending, oauth.ErrSlowDown,
+	oauth.ErrPKCERequired, errors.Join(oauth.ErrInvalidGrant, oauth.ErrCodeNotFound),
+	errors.Join(oauth.ErrInvalidToken, oauth.ErrGrantRevoked), errors.New("something else"),
+} {
+	code, status := oauth.ErrorCode(e)
+	fmt.Printf("%-24s %d\n", code, status)
+}
+```
+
+```
+invalid_client           401
+invalid_grant            400
+authorization_pending    400
+slow_down                400
+invalid_request          400
+invalid_grant            400
+invalid_token            401
+server_error             500
+```
+
+{/* verify:stdout "refreshed: <nil> true\nreplay: true\nthe current token, after the replay: true\nthe access token, after the replay: true\nlive: <nil> true alice true project:read Bearer true\nrefresh token: <nil> true refresh_token\ngarbage: <nil> false\nrevoked: <nil> false\n{\"active\":false}\nrevoked by refresh token: <nil> true\nunknown token: <nil>\nanother client's token: true <nil>\noffline, after revocation: <nil> delegated true\ninvalid_client           401\ninvalid_grant            400\nauthorization_pending    400\nslow_down                400\ninvalid_request          400\ninvalid_grant            400\ninvalid_token            401\nserver_error             500" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Errors" icon="triangle-exclamation" href="/reference/errors">
+    Every `oauth` sentinel, its error code, and a suggested status.
+  </Card>
+  <Card title="Discovery & registration" icon="compass" href="/agents/discovery-and-registration">
+    RFC 8414, RFC 9728, the JWKS, and dynamic registration.
+  </Card>
+</Columns>

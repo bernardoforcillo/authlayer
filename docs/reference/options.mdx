@@ -62,8 +62,33 @@ falling back to a default — construction **panics**: `scope.New` when
 <ResponseField name="WithJWT(keys [][]byte, ttl time.Duration)" type="Option" default="no keys, 15 min">
   The HS256 signing keys and the access-token TTL. `Issue` always signs with
   `keys[0]`; `Parse` tries every key, which is how a signing key rotates. Every
-  key must be **at least 32 bytes**. Without this option, `Login` and
-  `VerifyAccessToken` fail closed with `token.ErrKeyTooShort`.
+  key must be **at least 32 bytes**. It is `WithSigner` with a `token.HS256`
+  signer built from the keys — the two fill one slot and the **last applied
+  wins**. Without either, `Login` and `VerifyAccessToken` fail closed with
+  `token.ErrKeyTooShort`.
+</ResponseField>
+
+<ResponseField name="WithSigner(s token.Signer)" type="Option" default="none">
+  The `token.Signer` that mints and verifies every access token — a
+  `token.EdDSA` signer, typically, when a party that is not this `Service`
+  must verify its tokens. See
+  [EdDSA and the JWKS](/authentication/access-tokens#eddsa-and-the-jwks). The
+  TTL is not part of the signer: set it with `WithAccessTTL`. A `nil` signer is
+  ignored. `Service.Signer()` hands the configured value back.
+</ResponseField>
+
+<ResponseField name="WithAccessTTL(d time.Duration)" type="Option" default="15 min">
+  The access-token lifetime, the same value `WithJWT`'s second argument sets —
+  for a `WithSigner` deployment that has no HMAC keys to pass. Shortening it
+  narrows the window a revoked session's token keeps verifying, without closing
+  it.
+</ResponseField>
+
+<ResponseField name="WithHooks(h ...Hook)" type="Option" default="none">
+  Append [lifecycle hooks](/authentication/hooks). **Accumulates** across
+  calls, as `scope.WithHooks` does; `nil` hooks are skipped. Hooks fire after
+  the mutation and before the return, and an error propagates — with the
+  change already made.
 </ResponseField>
 
 <ResponseField name="WithRefreshTTL(d time.Duration)" type="Option" default="30 days">
@@ -207,9 +232,129 @@ independently; `invite` does **not** read `Policy`.
   source of unguessability for every credential the service mints.
 </ResponseField>
 
+## `apikey`
+
+An `apikey.Service` and the `scope.Service` it wraps are configured
+independently; like `invite`, `apikey` does **not** read `Policy`, and its
+escalation guards are always strict.
+
+<ResponseField name="WithClock(now func() time.Time)" type="Option" default="time.Now().UTC()">
+  Every stamp — created, updated, expiry, revocation, last-used, events — and
+  `Authenticate`'s expiry test.
+</ResponseField>
+
+<ResponseField name="WithIDGenerator(gen func() string)" type="Option" default="UUIDv7">
+  Ids for service accounts and keys. Against `store/drops` a non-UUID
+  generator needs `WithAPIKeyTextLibraryIDs()` — see [Ids](/concepts/ids).
+</ResponseField>
+
+<ResponseField name="WithHooks(hooks ...Hook)" type="Option" default="none">
+  Lifecycle hooks, appended in order. A hook error is returned to the caller
+  — for `Authenticate`, instead of the principal.
+</ResponseField>
+
+<ResponseField name="WithKeyPrefix(prefix string)" type="Option" default='"sk_"'>
+  The plaintext prefix. Not checked on authentication — the hash is — so
+  changing it does not invalidate keys minted under the old one. An empty
+  prefix is ignored.
+</ResponseField>
+
+Per key, at `CreateKey`:
+
+<ResponseField name="WithExpiry(at time.Time)" type="KeyOption" default="never">
+  Valid strictly before `at`; an instant not after now is `ErrInvalidExpiry`.
+</ResponseField>
+
+<ResponseField name="WithPermissions(grants map[string][]access.Action)" type="KeyOption" default="the whole role">
+  A [cap](/service-accounts/restricted-permissions), never a grant: must be
+  within the account's role and the actor's own capped standing.
+</ResponseField>
+
+## `oauth`
+
+An `oauth.Service` reads permissions through its `Authority` — the
+`*scope.Service` — and nothing else; like `apikey`, its escalation guards are
+always strict.
+
+<ResponseField name="WithIssuer(issuer string)" type="Option" default="none — required">
+  The `iss` of every minted token and what `Authenticate` requires. **Every
+  mint fails with `ErrIssuerRequired` without it**: a delegated token that
+  names no server would verify at any deployment sharing the key.
+</ResponseField>
+
+<ResponseField name="WithAudience(aud ...string)" type="Option" default="none minted, none checked">
+  The `aud` of every minted token; a presented token must carry at least one.
+  Set it the moment two resource servers share an issuer.
+</ResponseField>
+
+<ResponseField name="WithClock(now func() time.Time)" type="Option" default="time.Now().UTC()">
+  Every stamp and every expiry test. The signer keeps its own clock for
+  `iat`/`exp`.
+</ResponseField>
+
+<ResponseField name="WithIDGenerator(gen func() string)" type="Option" default="UUIDv7">
+  Ids for clients, grants, codes, device authorizations, refresh tokens and
+  every token's `jti`. Against `store/drops` a non-UUID generator needs
+  `WithOAuthTextLibraryIDs()` — see [Ids](/concepts/ids).
+</ResponseField>
+
+<ResponseField name="WithHooks(hooks ...Hook)" type="Option" default="none">
+  Lifecycle hooks, appended in order; a hook error is returned to the caller,
+  joined onto a refusal.
+</ResponseField>
+
+<ResponseField name="WithAccessTTL(d)" type="Option" default="10 minutes">
+  Short, because a JWT cannot be recalled — see
+  [what a JWT cannot do](/agents/introspection-and-revocation#what-a-jwt-cannot-do).
+</ResponseField>
+
+<ResponseField name="WithRefreshTTL(d)" type="Option" default="30 days">
+  Rotation issues a fresh lifetime, so an active client never expires and an
+  idle one does.
+</ResponseField>
+
+<ResponseField name="WithCodeTTL(d)" type="Option" default="60 seconds">
+  How long an authorization code is redeemable — RFC 6749 §4.1.2's ceiling.
+</ResponseField>
+
+<ResponseField name="WithDeviceTTL(d)" type="Option" default="10 minutes">
+  How long a device authorization waits for the user.
+</ResponseField>
+
+<ResponseField name="WithDeviceInterval(d)" type="Option" default="5 seconds">
+  The minimum polling interval advertised and enforced (`ErrSlowDown`). Whole
+  seconds; under one second is ignored.
+</ResponseField>
+
+<ResponseField name="WithGrantTTL(d)" type="Option" default="0 — until revoked">
+  How long a delegation grant lives from approval.
+</ResponseField>
+
+<ResponseField name="WithDynamicRegistration(on bool)" type="Option" default="false">
+  Enable `RegisterClient` (RFC 7591). Harmless in itself — a client has no
+  power until a user approves it — but a surface you should choose to expose.
+</ResponseField>
+
+<ResponseField name="WithServiceAccounts(st apikey.Store)" type="Option" default="nil">
+  Lets `CreateClient` and `ClientCredentials` refuse a bound service account
+  that is missing or disabled. Without it the account's **membership** is still
+  checked at every mint; `DisableServiceAccount` is simply invisible.
+</ResponseField>
+
+<ResponseField name="WithScopeMap(m map[string]map[string][]access.Action)" type="Option" default="nil — scopes are opaque">
+  Translates scope strings into the [delegation cap](/agents/delegation#the-scope-map)
+  and publishes the keys as `scopes_supported`. Compiled at `New`, which
+  **panics** on an undeclared pair.
+</ResponseField>
+
+<ResponseField name="WithOfflineVerification()" type="Option" default="off">
+  `Authenticate` skips its one store read. A revoked grant or disabled client
+  is then honoured until the access token expires — one `WithAccessTTL`.
+</ResponseField>
+
 ## `store/drops`
 
-Four separate option types, one per store, because the four stores are
+Six separate option types, one per store, because the six stores are
 independent.
 
 | Option | Type | Effect |
@@ -220,6 +365,12 @@ independent.
 | `WithInviteNames(InviteNames{...})` | `InviteOption` | Rename the two invitation tables |
 | `WithInviteTextLibraryIDs()` | `InviteOption` | Retype the invitation `id` and `container_id` |
 | `WithInviteTextUserIDs()` | `InviteOption` | Retype `invited_by`, `created_by` |
+| `WithAPIKeyNames(APIKeyNames{...})` | `APIKeyOption` | Rename `service_accounts`, `api_keys` |
+| `WithAPIKeyTextLibraryIDs()` | `APIKeyOption` | Retype `id`, `container_id`, `service_account_id` |
+| `WithAPIKeyTextUserIDs()` | `APIKeyOption` | Retype `created_by` on both tables |
+| `WithOAuthNames(OAuthNames{...})` | `OAuthOption` | Rename the five OAuth tables |
+| `WithOAuthTextLibraryIDs()` | `OAuthOption` | Retype every OAuth `id`, `container_id`, `service_account_id`, `client_id`, `grant_id`, `family_id` |
+| `WithOAuthTextUserIDs()` | `OAuthOption` | Retype `oauth_grants.user_id`, `oauth_clients.created_by` |
 | `WithAuthNames(AuthNames{...})` | `AuthOption` | Rename `users`, `sessions`, `verifications` |
 | `WithAuthTextLibraryIDs()` | `AuthOption` | Retype **all five** auth id columns together |
 | `WithIdentityNames(IdentityNames{...})` | `IdentityOption` | Rename `identities` |

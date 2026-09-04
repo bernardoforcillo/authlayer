@@ -146,8 +146,8 @@ func TestColSetSplitsLibraryIDsFromUserIDs(t *testing.T) {
 // mean "both families uuid". If it ever drifted, every caller who passes no
 // option at all would silently get text columns.
 func TestUUIDIDsIsBothFamiliesUUID(t *testing.T) {
-	if got := (uuidIDs()); got != (idTypes{library: true, user: true}) {
-		t.Fatalf("uuidIDs() = %+v, want both families uuid", got)
+	if got := uuidIDs(); !got.library || !got.user || got.extraLibrary != nil {
+		t.Fatalf("uuidIDs() = %+v, want both families uuid and no extra columns", got)
 	}
 }
 

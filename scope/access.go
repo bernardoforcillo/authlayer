@@ -22,6 +22,16 @@ const (
 	// the merged surface for those checks to resolve to anything but
 	// ErrForbidden.
 	ResourceInvite = "invite"
+	// ResourceServiceAccount is the control resource for service accounts
+	// and their API keys: create (add a service account to the container),
+	// read (list service accounts and their keys), update (enable, disable,
+	// change role, mint and revoke keys), delete (remove one, keys and all).
+	// As with invite, the engine itself checks nothing against it — a
+	// service account is an ordinary member whose id happens to be minted
+	// by the apikey package — but that package's checks are declared against
+	// it, so it must be on the merged surface for them to resolve to
+	// anything but ErrForbidden.
+	ResourceServiceAccount = "service_account"
 )
 
 // Actions used by the control statements. Applications are free to declare
@@ -57,6 +67,7 @@ const (
 //	member:            create, update, delete
 //	role:              create, update, delete
 //	invite:            create, read, delete
+//	service_account:   create, read, update, delete
 //
 // It is exported so an application can inspect the reserved surface — for
 // instance to render a role editor — and so a caller assembling statements by
@@ -72,12 +83,20 @@ const (
 // to check — so invite:create/read/delete exist for the invite package's own
 // mint/list/revoke handlers to check with Authorize, the same way
 // containerResource:update/delete exist for an application's own handlers.
+// service_account is declared on the same terms, for the apikey package's
+// own create/list/update/delete handlers.
+//
+// Because the built-in admin role is derived from the merged surface, every
+// resource added here widens admin the moment a version declaring it is
+// adopted — invite did so in 0.1.0, service_account does so now. Define a
+// custom role if admin must not manage service accounts.
 func ControlStatements(containerResource string) map[string][]access.Action {
 	return map[string][]access.Action{
-		containerResource: {ActionUpdate, ActionDelete},
-		ResourceMember:    {ActionCreate, ActionUpdate, ActionDelete},
-		ResourceRole:      {ActionCreate, ActionUpdate, ActionDelete},
-		ResourceInvite:    {ActionCreate, ActionRead, ActionDelete},
+		containerResource:      {ActionUpdate, ActionDelete},
+		ResourceMember:         {ActionCreate, ActionUpdate, ActionDelete},
+		ResourceRole:           {ActionCreate, ActionUpdate, ActionDelete},
+		ResourceInvite:         {ActionCreate, ActionRead, ActionDelete},
+		ResourceServiceAccount: {ActionCreate, ActionRead, ActionUpdate, ActionDelete},
 	}
 }
 

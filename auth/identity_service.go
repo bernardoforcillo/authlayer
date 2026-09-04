@@ -469,6 +469,19 @@ func (s *Service) SignInWith(ctx context.Context, req SignInRequest) (SignInResu
 		}
 	}
 
+	// The rung's events, once the identity row is known to stand: a
+	// [SignedUp] for an account this call brought into existence, then the
+	// [IdentityLinked] both rungs owe for the row they wrote. After
+	// confirmLinkedAddress, deliberately — a retracted link is not a link.
+	if created {
+		if err := s.emit(ctx, Event{Kind: SignedUp, UserID: u.ID, IP: req.IP, UserAgent: req.UserAgent, Detail: DetailExternalIdentity}); err != nil {
+			return zero, err
+		}
+	}
+	if err := s.emit(ctx, Event{Kind: IdentityLinked, UserID: u.ID, IP: req.IP, UserAgent: req.UserAgent}); err != nil {
+		return zero, err
+	}
+
 	// The second factor, consulted last — the ADDRESS rung's own call to
 	// mfaAtSignIn, separate from rung 1's rather than a guard the two share,
 	// exactly as each rung carries its own anonymized-account refusal. A
@@ -483,12 +496,15 @@ func (s *Service) SignInWith(ctx context.Context, req SignInRequest) (SignInResu
 		// Deliberately NOT mintSession, so this line is the only thing
 		// scrubbing the credential digest off the record handed back.
 		u.PasswordHash = ""
+		if err := s.emit(ctx, Event{Kind: MFAChallenged, UserID: u.ID, IP: req.IP, UserAgent: req.UserAgent}); err != nil {
+			return zero, err
+		}
 		return SignInResult{Created: created, User: u, MFA: challenge}, nil
 	}
 
 	// nil: an external assertion is not a second factor — see
 	// [SignInResult.MFA]. An account holding one left with a challenge.
-	minted, err := s.mintSession(ctx, u, req.IP, req.UserAgent, nil)
+	minted, err := s.mintSession(ctx, u, req.IP, req.UserAgent, nil, DetailExternalIdentity)
 	if err != nil {
 		return zero, err
 	}
@@ -549,12 +565,15 @@ func (s *Service) signInLinkedIdentity(ctx context.Context, identities IdentityS
 		// Deliberately NOT mintSession, so this line is the only thing
 		// scrubbing the credential digest off the record handed back.
 		u.PasswordHash = ""
+		if err := s.emit(ctx, Event{Kind: MFAChallenged, UserID: u.ID, IP: req.IP, UserAgent: req.UserAgent}); err != nil {
+			return zero, err
+		}
 		return SignInResult{Created: false, User: u, MFA: challenge}, nil
 	}
 
 	// nil: an external assertion is not a second factor — see
 	// [SignInResult.MFA]. An account holding one left with a challenge.
-	minted, err := s.mintSession(ctx, u, req.IP, req.UserAgent, nil)
+	minted, err := s.mintSession(ctx, u, req.IP, req.UserAgent, nil, DetailExternalIdentity)
 	if err != nil {
 		return zero, err
 	}
@@ -928,7 +947,7 @@ func (s *Service) LinkIdentity(ctx context.Context, userID string, ext ExternalI
 		return zero, err
 	}
 
-	return identities.CreateIdentity(ctx, Identity{
+	written, err := identities.CreateIdentity(ctx, Identity{
 		ID:        s.cfg.idGen(),
 		UserID:    userID,
 		Provider:  ext.Provider,
@@ -938,6 +957,13 @@ func (s *Service) LinkIdentity(ctx context.Context, userID string, ext ExternalI
 		// LastUsedAt stays nil: this link was made without a sign-in, and
 		// nil is how a caller tells the two apart.
 	})
+	if err != nil {
+		return zero, err
+	}
+	if err := s.emit(ctx, Event{Kind: IdentityLinked, UserID: userID}); err != nil {
+		return zero, err
+	}
+	return written, nil
 }
 
 // UnlinkIdentity removes userID's identities at provider — every row for
@@ -1118,7 +1144,10 @@ func (s *Service) UnlinkIdentity(ctx context.Context, userID, provider string) e
 
 	// The credential is gone; now take back what it minted. See "Why the
 	// sessions go too".
-	return s.revokeEverySession(ctx, userID)
+	if err := s.revokeEverySession(ctx, userID); err != nil {
+		return err
+	}
+	return s.emit(ctx, Event{Kind: IdentityUnlinked, UserID: userID})
 }
 
 // ListIdentities returns the external accounts linked to userID, and only

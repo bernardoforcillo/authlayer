@@ -1,6 +1,7 @@
 package dropsstore
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"reflect"
@@ -37,9 +38,10 @@ import (
 // see [WithAuthTextLibraryIDs].
 var (
 	libraryIDColumns = map[string]bool{
-		"id":           true,
-		"parent_id":    true,
-		"container_id": true,
+		"id":                 true,
+		"parent_id":          true,
+		"container_id":       true,
+		"service_account_id": true,
 	}
 	userIDColumns = map[string]bool{
 		"user_id":    true,
@@ -59,6 +61,19 @@ type idTypes struct {
 	library bool
 	// user covers userIDColumns — the ids a consumer supplies.
 	user bool
+	// extraLibrary names further columns of ONE schema that hold
+	// library-minted ids and follow `library`, beyond the global list. It
+	// exists for the oauth tables, whose client_id, grant_id and family_id
+	// are minted by oauth.Service's generator — and it is per schema rather
+	// than a global entry because sessions.family_id, an auth column with
+	// the same name, is text and may be empty; retyping it globally would
+	// break every session insert.
+	extraLibrary map[string]bool
+}
+
+// isLibraryID reports whether name holds a library-minted id under ids.
+func (ids idTypes) isLibraryID(name string) bool {
+	return libraryIDColumns[name] || ids.extraLibrary[name]
 }
 
 // uuidIDs is the default every schema constructor starts from: both families
@@ -91,6 +106,14 @@ type colSet struct {
 	// has no unsigned integer type, so a Go uint32 does not fit in `integer`
 	// — see add's reflect.Uint32 case, and [auth.Credential.SignCount].
 	i64 map[string]*pg.Col[int64]
+	// bools holds boolean columns, and jsonb the jsonb ones — both added
+	// for the oauth tables, where a client is public or not and its three
+	// string lists (redirect URIs, grant types, scopes) are one jsonb
+	// array each: an application-shaped list with no query of its own, for
+	// which a child table would be three joins on every client load and a
+	// text[] a driver type database/sql cannot scan into a Go slice.
+	bools map[string]*pg.Col[bool]
+	jsonb map[string]*pg.Col[json.RawMessage]
 	// nullable records which declared columns came from a POINTER field and
 	// may therefore hold SQL NULL. bind consults it for the string family,
 	// where the binding type (string) does not itself say whether the column
@@ -128,6 +151,8 @@ func newColSet(tbl *pg.Table, model any, ids idTypes) *colSet {
 		bytes:    map[string]*pg.Col[[]byte]{},
 		i32:      map[string]*pg.Col[int32]{},
 		i64:      map[string]*pg.Col[int64]{},
+		bools:    map[string]*pg.Col[bool]{},
+		jsonb:    map[string]*pg.Col[json.RawMessage]{},
 		nullable: map[string]bool{},
 	}
 	c.walk(t, ids)
@@ -230,7 +255,7 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, ids idTypes) {
 	switch {
 	case ft.Kind() == reflect.String:
 		def := pg.Text(name)
-		if (libraryIDColumns[name] && ids.library) || (userIDColumns[name] && ids.user) {
+		if (ids.isLibraryID(name) && ids.library) || (userIDColumns[name] && ids.user) {
 			def = pg.UUID(name)
 		}
 		def = def.NotNull()
@@ -254,7 +279,7 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, ids idTypes) {
 		// not (see that field's doc). Storing "" instead would fail the uuid
 		// parser on every login challenge.
 		def := pg.Text(name)
-		if (libraryIDColumns[name] && ids.library) || (userIDColumns[name] && ids.user) {
+		if (ids.isLibraryID(name) && ids.library) || (userIDColumns[name] && ids.user) {
 			def = pg.UUID(name)
 		}
 		if unique {
@@ -291,12 +316,20 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, ids idTypes) {
 		c.i64[name] = pg.Add(c.tbl, pg.BigInt(name))
 	case ft.Kind() == reflect.Int64:
 		c.i64[name] = pg.Add(c.tbl, pg.BigInt(name).NotNull())
+	case ft.Kind() == reflect.Bool:
+		c.bools[name] = pg.Add(c.tbl, pg.Boolean(name).NotNull())
+	case ft == reflect.TypeOf(json.RawMessage(nil)):
+		// NOT NULL like every other non-pointer column; a store that maps a
+		// nil Go slice onto it writes the JSON it means ("[]", say), never
+		// NULL, so a row always holds a document.
+		c.jsonb[name] = pg.Add(c.tbl, pg.JSONB(name).NotNull())
 	default:
 		panic(fmt.Sprintf(
 			"authlayer/store/drops: column %q has unsupported Go type %s; supported: "+
 				"string, *string (nullable), time.Time, *time.Time (nullable), []byte, "+
-				"int, int32, int64, *int64 (nullable), uint32, and named types whose "+
-				"underlying type is string, int, int32, int64 or uint32", name, ft))
+				"int, int32, int64, *int64 (nullable), uint32, bool, json.RawMessage, "+
+				"and named types whose underlying type is string, int, int32, int64, "+
+				"uint32 or bool", name, ft))
 	}
 	if primary && c.str[name] == nil {
 		// A "pk" option on a column this switch declared as anything but a
@@ -325,6 +358,10 @@ func (c *colSet) col(tag string) *pg.Column {
 		return c.i32[tag].Column
 	case c.i64[tag] != nil:
 		return c.i64[tag].Column
+	case c.bools[tag] != nil:
+		return c.bools[tag].Column
+	case c.jsonb[tag] != nil:
+		return c.jsonb[tag].Column
 	}
 	return nil
 }
@@ -390,6 +427,11 @@ func (c *colSet) bind(tag string, v any) pg.ColumnValue {
 		return col.Val(*x)
 	case []byte:
 		return bindOne(c.bytes[tag], tag, x, "bytea")
+	case json.RawMessage:
+		// Listed before the Kind switch below: a json.RawMessage is a
+		// slice of bytes by Kind, and add declared it a jsonb column, not
+		// a bytea one.
+		return bindOne(c.jsonb[tag], tag, x, "jsonb")
 	}
 
 	if rv := reflect.ValueOf(v); rv.IsValid() {
@@ -415,6 +457,8 @@ func (c *colSet) bind(tag string, v any) pg.ColumnValue {
 			// matching how add classifies it by Kind rather than by
 			// concrete type.
 			return bindOne(c.i64[tag], tag, rv.Int(), "bigint")
+		case reflect.Bool:
+			return bindOne(c.bools[tag], tag, rv.Bool(), "boolean")
 		}
 	}
 	panic(fmt.Sprintf("authlayer/store/drops: cannot bind %T to column %q", v, tag))

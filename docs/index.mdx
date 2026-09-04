@@ -1,7 +1,7 @@
 ---
 title: "authlayer"
 sidebarTitle: "Introduction"
-description: "Reusable authentication and authorization for Go — scope RBAC, invitations, and a session core you import rather than deploy."
+description: "Reusable authentication and authorization for Go — scope RBAC, invitations, service accounts, an OAuth 2.1 authorization server for agents, and a session core you import rather than deploy."
 ---
 
 authlayer is a Go **library**. You import it, hand it a store, and call it from
@@ -18,8 +18,11 @@ string:
     Users, password credentials, revocable server-side sessions with
     refresh-token rotation and reuse detection, email verification, the password
     lifecycle, [magic links](/authentication/magic-links),
-    [external identities](/oauth/overview), and
-    [account deletion](/authentication/account-deletion).
+    [external identities](/oauth/overview),
+    [account deletion](/authentication/account-deletion),
+    [service accounts with API keys](/service-accounts/overview), and an
+    [OAuth 2.1 authorization server](/agents/overview) for agents and machine
+    clients whose tokens never exceed the human behind them.
   </Card>
 </Columns>
 
@@ -54,13 +57,15 @@ your application authlayer replaces:
     `UserBase.ID`. That is what keeps authlayer's migrations from ever owning
     a column your product's shape decides.
   </Accordion>
-  <Accordion title="It does not run the OAuth dance, or store a provider's tokens" icon="right-to-bracket">
+  <Accordion title="It is not an OAuth client, and does not store a provider's tokens" icon="right-to-bracket">
     [External identities](/oauth/overview) are shipped — "sign in with
     Google/GitHub/…", linked to a local account. But authlayer never redirects a
-    browser, never exchanges an authorization code, and is not an API client:
-    you run the dance and hand over the result. An identity row holds
-    `(provider, subject, email)` and two timestamps, with **no token column** of
-    any kind.
+    browser to a provider, never exchanges a code *at Google*, and is not an
+    API client: you run that dance and hand over the result. An identity row
+    holds `(provider, subject, email)` and two timestamps, with **no token
+    column** of any kind. It **is** an [authorization server](/agents/overview)
+    for your own agents and machine clients — the other side of the dance —
+    and there, too, you own every endpoint.
   </Accordion>
 </AccordionGroup>
 
@@ -99,6 +104,6 @@ The UUIDv7 generator behind every id authlayer mints is written out in
     Scopes, statements, roles, and the two enforcement points.
   </Card>
   <Card title="Storage" icon="database" href="/storage/overview">
-    The four `Store` ports, the shipped backends, and the schema.
+    The six `Store` ports, the shipped backends, and the schema.
   </Card>
 </Columns>

@@ -330,3 +330,80 @@ func TestUnionAcceptsTheZeroPermission(t *testing.T) {
 		t.Fatal("unioning the zero permission dropped a grant")
 	}
 }
+
+func TestIntersectKeepsOnlyTheSharedGrants(t *testing.T) {
+	ac := New(NewStatements(map[string][]Action{
+		"doc": {"read", "write"}, "billing": {"read"},
+	}))
+	a := mustPerm(t, ac, map[string][]Action{"doc": {"read", "write"}})
+	b := mustPerm(t, ac, map[string][]Action{"doc": {"read"}, "billing": {"read"}})
+
+	got := a.Intersect(b)
+	if !got.Allows("doc", "read") {
+		t.Fatal("intersection dropped a grant both inputs hold")
+	}
+	if got.Allows("doc", "write") || got.Allows("billing", "read") {
+		t.Fatal("intersection kept a grant only one input holds")
+	}
+	// The meet is below both inputs — the property the permission cap
+	// relies on: intersecting can only ever remove.
+	if !got.SubsetOf(a) || !got.SubsetOf(b) {
+		t.Fatal("intersection is not a subset of both inputs")
+	}
+	// Inputs are immutable.
+	if !a.Allows("doc", "write") || !b.Allows("billing", "read") {
+		t.Fatal("Intersect mutated an argument")
+	}
+}
+
+func TestIntersectWithFullIsIdentity(t *testing.T) {
+	ac := New(NewStatements(map[string][]Action{
+		"doc": {"read", "write"}, "billing": {"read"},
+	}))
+	a := mustPerm(t, ac, map[string][]Action{"doc": {"write"}, "billing": {"read"}})
+
+	got := a.Intersect(ac.Full())
+	if !got.SubsetOf(a) || !a.SubsetOf(got) {
+		t.Fatal("a ∩ Full must equal a")
+	}
+	if !ac.Full().Intersect(ac.Full()).IsFull() {
+		t.Fatal("Full ∩ Full must be Full")
+	}
+}
+
+// The precondition is the same one Union and SubsetOf carry, but this method
+// has no error to return, so a permission from another Statements — whose
+// bits mean different pairs here — yields the zero Permission rather than a
+// reinterpreted one. Denying is the only safe answer for a method whose two
+// callers both use it to REMOVE grants.
+func TestIntersectWithAForeignPermissionFailsClosed(t *testing.T) {
+	parent := New(NewStatements(map[string][]Action{"org": {"admin"}}))
+	child := New(NewStatements(map[string][]Action{"team": {"read"}}))
+
+	foreign := mustPerm(t, parent, map[string][]Action{"org": {"admin"}})
+	local := mustPerm(t, child, map[string][]Action{"team": {"read"}})
+
+	// Same bit index (0) set on both sides: a raw AND would grant team:read.
+	got := local.Intersect(foreign)
+	if !got.IsZero() || got.Allows("team", "read") {
+		t.Fatal("Intersect reinterpreted a foreign permission's bits instead of denying")
+	}
+	if got.IsFull() {
+		t.Fatal("the zero result must not report IsFull")
+	}
+}
+
+func TestIntersectWithTheZeroPermissionIsZero(t *testing.T) {
+	ac := New(NewStatements(map[string][]Action{"doc": {"read"}}))
+	granted := mustPerm(t, ac, map[string][]Action{"doc": {"read"}})
+
+	if got := granted.Intersect(Permission{}); !got.IsZero() || got.Allows("doc", "read") {
+		t.Fatal("p ∩ zero must grant nothing")
+	}
+	if got := (Permission{}).Intersect(granted); !got.IsZero() {
+		t.Fatal("zero ∩ p must grant nothing")
+	}
+	if !(Permission{}).Intersect(Permission{}).IsZero() {
+		t.Fatal("zero ∩ zero must grant nothing")
+	}
+}

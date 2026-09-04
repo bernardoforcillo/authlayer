@@ -18,6 +18,10 @@ same authz logic in every project.
 > [account deletion](#account-deletion) in a hard and a soft posture. The
 > soft one needs a new `users.deleted_at` column, and both need four new
 > methods on `auth.Store`; see `changelog.md` for the migration.
+> Milestone 4 adds [service accounts & API keys](#service-accounts--api-keys)
+> and [agents & machine clients](#agents--machine-clients) — an OAuth 2.1
+> authorization server as a library, whose delegated tokens never exceed the
+> human behind them. authlayer is still not an OAuth *client*.
 
 ```sh
 go get github.com/bernardoforcillo/authlayer
@@ -38,8 +42,10 @@ RBAC engine pulls in `drops`, and `pgx/v5` comes with the PostgreSQL store.
   [Policy](#policy) · [Hooks & events](#hooks--events) · [Options](#options)
 - [Query-level filtering](#query-level-filtering) · [Storage](#storage) ·
   [Custom scopes](#custom-scopes) · [Nested scopes](#nested-scopes)
-- [Invitations](#invitations) · [Authentication](#authentication) ·
-  [Magic links](#magic-links) · [OAuth](#oauth) ·
+- [Invitations](#invitations) ·
+  [Service accounts & API keys](#service-accounts--api-keys) ·
+  [Agents & machine clients](#agents--machine-clients) ·
+  [Authentication](#authentication) · [Magic links](#magic-links) · [OAuth](#oauth) ·
   [Account deletion](#account-deletion) · [Errors](#errors) ·
   [Packages](#packages)
 
@@ -178,6 +184,7 @@ the engine enforces on its own operations:
 | `member`       | `create`, `update`, `delete` | `AddMember`, `ChangeMemberRole`, `RemoveMember` |
 | `role`         | `create`, `update`, `delete` | `CreateRole`, `UpdateRole`, `DeleteRole` |
 | `invite`       | `create`, `read`, `delete` | the [`invite`](#invitations) package's own mint/list/revoke calls — the engine itself checks none of it |
+| `service_account` | `create`, `read`, `update`, `delete` | the [`apikey`](#service-accounts--api-keys) package's own calls — likewise declared here, checked there |
 
 `organization:update` / `organization:delete` are declared so your own "rename
 the org" and "delete the org" handlers have something to check with `Authorize`,
@@ -541,10 +548,10 @@ owe the engine is the right sentinel error when a lookup finds nothing —
 `ErrNotMember` rather than a generic not-found — because the engine branches on
 those. Each method's contract is documented on the interface.
 
-`invite.Store` and `auth.Store` are separate ports with the same discipline,
-and so is the optional `auth.IdentityStore` behind
-[external identities](#oauth) — a fourth port rather than five more methods on
-`auth.Store`, which is released. Both backends implement all four.
+`invite.Store`, `apikey.Store`, `oauth.Store` and `auth.Store` are separate
+ports with the same discipline, and so is the optional `auth.IdentityStore`
+behind [external identities](#oauth) — a port of its own rather than six more
+methods on `auth.Store`, which is released. Both backends implement all six.
 `auth.Store` is the strictest of them:
 eleven of its twenty-two methods carry an explicit **MUST**, each naming the
 failure it prevents. They are not all the same kind of obligation, and the
@@ -676,9 +683,10 @@ An in-process, generic store backed by maps. Zero dependencies, concurrency
 safe, and the reference implementation of the contract — use it for development,
 tests, and examples. It does not enforce uniqueness of your own fields (a slug,
 say), and its `WithTx` approximates a transaction by snapshot-and-restore under
-a mutex. `memory.NewInviteStore()`, `memory.NewAuthStore()` and
-`memory.NewIdentityStore()` are the `invite.Store`, `auth.Store` and
-`auth.IdentityStore` counterparts. The auth one enforces every uniqueness
+a mutex. `memory.NewInviteStore()`, `memory.NewAPIKeyStore()`,
+`memory.NewOAuthStore()`, `memory.NewAuthStore()` and
+`memory.NewIdentityStore()` are the `invite.Store`, `apikey.Store`,
+`oauth.Store`, `auth.Store` and `auth.IdentityStore` counterparts. The auth one enforces every uniqueness
 constraint its port describes — one account per normalized email, no id
 collision on any `Create*`, and the `token_hash` uniqueness `auth.Store`
 requires of a backend on both `Session` and `Verification`, reported as
@@ -697,6 +705,12 @@ A collision gets a backend-level error rather than a port sentinel because
 the same cases with the driver's own unique violation. Both stores satisfy
 every atomicity MUST their ports state by holding one mutex for each method's
 entire body, so no check-then-write can be split by a concurrent call.
+
+`memory.NewOAuthStore()` enforces every MUST `oauth.Store` states the same
+way — the four uniqueness constraints (a colliding hash is
+`memory.ErrTokenHashTaken`, a colliding user code `memory.ErrUserCodeTaken`),
+the three compare-and-sets, the two cascades and the referential refusals,
+each under one acquisition of its mutex.
 
 `memory.NewIdentityStore()` follows the same discipline and enforces both of
 its port's uniqueness rules — `Identity.ID` and the `(Provider, Subject)` pair.
@@ -1034,6 +1048,98 @@ rather than unlimited, one that stores an invited address verbatim — paired
 into forty-seven defect/check cases, each asserted to **fail** the check
 that covers it. A further test fails if a check is ever added without a control,
 so a check that asserts nothing cannot slip in green.
+
+### Writing your own `apikey.Store`
+
+`apikey.Store`'s three **MUST**s — `Key.TokenHash` unique across every row,
+`DeleteServiceAccount`'s cascade atomic with the delete, `CreateKey` refusing a
+key naming no account — ship as an executable suite too, built the same way
+and placed the same way:
+
+```go
+import "github.com/bernardoforcillo/authlayer/apikey/apikeytest"
+
+func TestMyStoreSatisfiesTheAPIKeyContract(t *testing.T) {
+    apikeytest.RunStoreContract(t, func(t *testing.T) apikey.Store {
+        return myStoreWithEmptyTables(t)   // called once per check
+    })
+}
+```
+
+The factory must hand back a store with **no** service accounts and no keys
+in it, and may register teardown with `t.Cleanup` or call `t.Skip`. Ids,
+container ids and creator ids are UUIDv7, and token hashes are unique per
+call unless a check is deliberately forcing a collision, so the suite runs
+unchanged against a backend that types its id columns as `uuid`. Warm your
+pool to `apikeytest.RaceGoroutines` connections first, for the reason given
+above.
+
+Four of the thirty-seven checks are races: one winner among concurrent
+creates of one token hash, one among concurrent creates of one account id,
+one among concurrent deletes of one account, and the cascade as a
+*linearizability* property — a `CreateKey` racing the `DeleteServiceAccount`
+of its account, after which the store must be in a state some serial order
+could have produced, never the account gone and the key present. That last
+one catches a grossly non-atomic cascade every time and a subtly non-atomic
+one only sometimes, for the reason `ConsumeLink`'s races do; against
+`store/drops` the property is carried by one transaction plus an
+`ON DELETE CASCADE` backstop, against `store/memory` by one mutex
+acquisition. Points the port leaves unspecified — list order,
+empty-slice-versus-nil, and *which error* a rejected duplicate hash comes
+back as — are not asserted.
+
+The suite's own tests include thirty-seven deliberately non-compliant stores,
+one per check — one that lets two keys share a hash, one that writes a key for
+an account that does not exist, one whose cascade deletes the keys, releases
+the lock, then the account — each asserted to **fail** the check that covers
+it, and a further test fails if a check is ever added without a control.
+
+### Writing your own `oauth.Store`
+
+`oauth.Store`'s fourteen **MUST**s — four uniqueness constraints on the
+record types, three compare-and-sets, two atomic cascades, five referential
+refusals — ship as an executable suite too, built the same way and placed the
+same way:
+
+```go
+import "github.com/bernardoforcillo/authlayer/oauth/oauthtest"
+
+func TestMyStoreSatisfiesTheOAuthContract(t *testing.T) {
+    oauthtest.RunStoreContract(t, func(t *testing.T) oauth.Store {
+        return myStoreWithEmptyTables(t)   // called once per check
+    })
+}
+```
+
+The factory must hand back a store with **no** rows of any of the five kinds,
+and may register teardown with `t.Cleanup` or call `t.Skip`. Every id — of a
+record, a container, a client, a grant, a family, a user — is UUIDv7, and
+hashes and user codes are unique per call unless a check is forcing a
+collision. Warm your pool to `oauthtest.RaceGoroutines` connections first.
+
+Eight of the seventy checks are races: exactly one winner among concurrent
+redemptions of one code, concurrent transitions of one device authorization
+(half approving, half denying), and concurrent rotations of one refresh
+token; one among concurrent creates of one code hash, one refresh-token hash
+and one user code; one among concurrent deletes of one client; and the
+cascade as a *linearizability* property — a `CreateGrant` racing the
+`DeleteClient` of its client, after which the store must be in a state some
+serial order could have produced, never the client gone and the grant
+present. The two compare-and-set checks that matter most assert what
+`auth.Store.MarkRotated`'s does: a lost race is `(row, false, nil)`, never an
+error, and the winner's stamp is the one instant every caller raced with.
+Expiry is asserted **not** to be part of either predicate, so an expired code
+or token is consumed and a replay of it still detected. Points the port leaves
+unspecified — list order, empty-slice-versus-nil, and *which error* a
+rejected duplicate hash or user code comes back as — are not asserted.
+
+The suite's own tests include seventy deliberately non-compliant stores, one
+per check — one whose `RedeemCode` wins on every call, one that folds expiry
+into `MarkRefreshRotated`'s predicate, one whose `RevokeGrant` leaves the
+grant's refresh tokens behind, one whose `DeleteClient` deletes the
+dependents, releases the lock, then the client — each asserted to **fail**
+the check that covers it, and a further test fails if a check is ever added
+without a control.
 
 ## Custom scopes
 
@@ -1377,12 +1483,392 @@ acceptance needs to hand one back. Like `Standing` and `HasPermission`, neither
 reads anything from the context nor checks that the caller is entitled to
 ask — do not expose either directly to end users.
 
+## Service accounts & API keys
+
+`apikey` gives a scope **non-human members**. A `ServiceAccount` is an
+ordinary membership whose id the package mints rather than your users table;
+a `Key` is a bearer credential that authenticates as it. From the moment the
+account is admitted the engine treats it exactly like a person — the same
+role resolution, the same [escalation guard](#the-privilege-escalation-guard),
+the same [query guards](#query-level-filtering) — and nothing in `scope`
+knows the difference.
+
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{"project": {"read", "deploy"}}),
+    memory.New[org.Organization, org.Member]())
+keys := apikey.New(svc.Service, memory.NewAPIKeyStore()) // .Service: the embedded *scope.Service
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+_, _ = svc.CreateRole(owner, "deployer", "Deployer", map[string][]access.Action{"project": {"read", "deploy"}})
+
+sa, _ := keys.CreateServiceAccount(owner, "ci", "deploys main", "deployer") // a member now
+key, plaintext, _ := keys.CreateKey(owner, sa.ID, "github",                 // plaintext returned ONCE
+    apikey.WithPermissions(map[string][]access.Action{"project": {"read"}}))
+
+p, _ := keys.Authenticate(context.Background(), plaintext) // no subject needed: the key IS the credential
+asKey := apikey.WithPrincipal(context.Background(), p)     // subject + org + cap on one context
+ok, _ := svc.Can(asKey, "project", "read")   // true  — in the role and in the cap
+ok, _ = svc.Can(asKey, "project", "deploy")  // false — in the role, removed by the cap
+_ = keys.RevokeKey(owner, key.ID)
+```
+
+`store/memory`'s `NewAPIKeyStore` is the dev/test `apikey.Store`;
+`store/drops` ships `dropsstore.NewAPIKeyStore(db)` with its own
+`CreateSchema` — two tables, `service_accounts` and `api_keys` (see
+[`store/drops`](#storedrops)). `examples/apikey` is the runnable tour.
+
+**Minting.** The plaintext is `sk_` followed by the url-safe base64 of 32
+bytes from `crypto/rand` — 46 characters — and `CreateKey` returns it exactly
+once. Only `token.HashOpaque(plaintext)` is stored, so a database leak cannot
+be replayed into a working key; `Key.Prefix` keeps `sk_` plus eight characters
+in clear so a management screen can show `sk_ab12cd34…`. `WithExpiry` makes a
+key valid strictly before an instant (one not after now is
+`ErrInvalidExpiry`); `WithKeyPrefix` on the service changes the prefix, which
+is never checked on authentication — the hash is — so existing keys survive
+it.
+
+**Restricted permissions, and the cap.** `WithPermissions` restricts a key to
+a set narrower than its account's role. It is a *cap*, never a grant: the
+key's effective standing is `role ∩ cap`, enforced by
+`scope.WithPermissionCap`, which the engine applies *after* owner bypass,
+inherited standing and role lookup — so it can only ever remove, and a capped
+owner is not elevated. Minting is guarded twice: the cap must be within the
+account's role (a cap outside it would intersect to less than it claims and
+mislead whoever reads it back) *and* within the actor's own capped standing,
+both with `scope.ErrPrivilegeEscalation`. An *unrestricted* key is guarded the
+same way — holding a key is holding the account's standing, so minting one is
+treated like `AddMember`: an admin cannot mint a full key for an owner-role
+account. A cap that compiles to nothing is `ErrEmptyPermissions`, because the
+stored encoding cannot tell an empty cap from no cap and such a key would
+authenticate as the whole role. The cap is intersected at every check, never
+copied onto the key, so lowering the account's role lowers every key with it.
+The paths that honour the cap are exactly the ones that resolve the *context
+subject* — `Can`, `Authorize`, every escalation guard (scope's, invite's and
+apikey's), `PermissionGuard`; the explicit-user-id methods `HasPermission`,
+`Standing`, `RolePermissions` and `ContainersWith` read nothing from the
+context by contract, the cap included, and say so.
+`scope.Service.CapStanding(ctx, perms, elevated)` is the one exported
+definition of the rule — role ∩ cap, elevated only if the cap is Full *in this
+scope's space* — for a package that resolves an actor through `Standing` and
+must apply what the engine applies.
+
+**Authenticating.** `Authenticate(ctx, plaintext)` hashes, looks up by hash,
+and refuses in this order: `ErrKeyNotFound`, `ErrKeyRevoked`, `ErrKeyExpired`
+(valid strictly before `ExpiresAt`), `ErrServiceAccountNotFound` (a key that
+outlived its account, which the store's cascade MUST prevents),
+`ErrServiceAccountDisabled`. It reads no subject and no container: the
+container comes from the key. On success it decodes the key's cap against the
+scope's own statements into `Principal.Permissions`, stamps `LastUsedAt`
+through `Store.TouchKey` — *best-effort*: a touch failure is reported on the
+`KeyAuthenticated` event as `touch_failed` and the principal is returned all
+the same, because a bookkeeping hiccup must not lock every automated client
+out — and returns a `Principal{Kind, ID, ContainerID, KeyID, ClientID,
+GrantID, Permissions, AuthenticatedAt}`. `WithPrincipal(ctx, p)` installs
+`scope.WithSubject(p.ID)`, `scope.WithScope(p.ContainerID)`, the cap when
+`p.Permissions` is set, and the principal itself (`PrincipalFrom`). `Kind` is
+a string — `service_account` from this package; `user` and `delegated` are
+declared for the oauth package to populate, as are `ClientID` and `GrantID`.
+The refusal reason is disclosed on purpose: the caller already holds a
+256-bit random plaintext that cannot be enumerated, so "revoked" rather than
+"unknown" gives an attacker nothing and an operator the diagnosis.
+
+**Revocation, expiry, disable.** `RevokeKey` stamps `RevokedAt` and is
+idempotent; the row stays for audit until `PurgeExpired(ctx, before)` removes
+keys expired *or* revoked strictly before the cutoff — a cron-only call that
+spans every container and checks nothing, like invite's.
+`DisableServiceAccount` refuses every key of the account and lets none be
+minted while the membership and keys are untouched, so
+`EnableServiceAccount` restores it exactly: the move for "something leaked
+and we do not yet know which key". `DeleteServiceAccount` removes the
+membership, then the record and every key together.
+
+**What is NOT atomic.** An account spans two stores that may not share a
+database — its record in `apikey.Store`, its membership in `scope.Store` —
+and there is no cross-store transaction, exactly as
+[invitation acceptance](#invitations) has none. Each two-store method orders
+its halves so a failure between them leaves the *inert* shape behind.
+`CreateServiceAccount` writes the record FIRST, then
+`scope.Service.GrantMembership`: a record with no membership has no standing,
+gets no key (`CreateKey` resolves its role and finds `ErrNotMember`) and
+authenticates nothing, whereas a membership with no record would be a phantom
+member with a role that every roster reports. If the grant fails the record
+is deleted again, best-effort, and on a second failure both errors come back
+joined. `DeleteServiceAccount` removes the membership FIRST — from that
+instant the account has no standing anywhere — then the record and keys,
+atomically in `apikey.Store`. On a [nested scope](#nested-scopes) under the
+default `MembersFromParent`, `GrantMembership` refuses a subject with no
+parent standing, which a freshly minted id never has: `CreateServiceAccount`
+on a team fails with `scope.ErrNotParentMember` and cleans up, and this
+package makes no attempt to admit the account to the parent for you.
+
+**Authorization of the management calls.** Every call reads the subject and
+container from the context and checks the `service_account` control resource
+through `scope.Service.Authorize`: `create` for `CreateServiceAccount` (plus
+the escalation guard on the role), `read` for `ListServiceAccounts` and
+`ListKeys`, `update` for enable/disable, `ChangeServiceAccountRole`,
+`CreateKey` and `RevokeKey`, `delete` for `DeleteServiceAccount`. Two calls
+delegate the membership half to scope and so need scope's grants as well:
+`ChangeServiceAccountRole` runs `ChangeMemberRole` (`member:update`, guard),
+`DeleteServiceAccount` runs `RemoveMember` (`member:delete`, target-rank
+guard). A cross-tenant id is reported as not-found, as `invite` does.
+
+**Every `admin` gains `service_account:*` on adoption.** `ControlStatements`
+now declares `service_account: create, read, update, delete`, and `admin` is
+derived from the merged surface — the same widening `invite:*` caused in
+0.1.0, landing on existing installations with no code change and no
+migration to notice. Define a custom role if `admin` must not manage service
+accounts. `member` still holds nothing.
+
+**Hooks** mirror scope's exactly — `Hook`, `Event`, `HookFunc`, `WithHooks`,
+fired after the change and before the return, a hook error returned to the
+caller (for `Authenticate`, *instead of* the principal; on a refusal, joined
+onto the sentinel so `errors.Is` still holds). `Event.Detail` is a fixed
+vocabulary, never free text and never a plaintext. `scope` emits its own
+`MemberAdded` for the membership half with `ActorID` equal to the *account*
+id (see [Hooks & events](#hooks--events) on `GrantMembership`);
+`ServiceAccountCreated` from this package carries the real actor.
+
+**`scope` primitives exported for this package.** `WithPermissionCap` /
+`PermissionCapFrom` on a private key of `scope`'s own;
+`Service.CapStanding`; `Service.Access()`, so a sibling package compiles and
+decodes permissions in the *same* statement space the engine decides in (a
+cap built against any other intersects to nothing —
+`access.Permission.Intersect` fails closed rather than reinterpret bits); and
+`access.Permission.Intersect` itself, the meet of two permissions, with the
+same same-Statements precondition as `Union` and `SubsetOf`.
+
+## Agents & machine clients
+
+`oauth` makes an authlayer application an **OAuth 2.1 authorization server as
+a library** — no HTTP, no handlers; you own every endpoint and serialise the
+structs it returns. It exists so agents (CLIs, MCP clients, automation) and
+machine clients authenticate against every product the same way, with tokens
+that **never carry more power than the human or service account behind
+them**. `examples/agents` is the runnable tour.
+
+```go
+as := oauth.New(memory.NewOAuthStore(), svc.Service, signer, // signer: auth.Service.Signer(), or token.EdDSA
+    oauth.WithIssuer("https://auth.example"),
+    oauth.WithScopeMap(map[string]map[string][]access.Action{"project:read": {"project": {"read"}}}))
+
+// A machine client bound to a service account (RFC 6749 §4.4).
+cc, secret, _ := as.CreateClient(admin, oauth.ClientSpec{Name: "ci bot",
+    GrantTypes: []string{oauth.GrantClientCredentials}, ServiceAccountID: sa.ID})
+tokens, _ := as.ClientCredentials(ctx, cc.ID, secret, "")
+p, _ := as.Authenticate(ctx, tokens.AccessToken)   // apikey.Principal{Kind: service_account, ID: sa.ID, ...}
+
+// An agent with no browser (RFC 8628): a person approves a code, capped.
+cli, _, _ := as.CreateClient(admin, oauth.ClientSpec{Name: "cli-agent", Public: true,
+    GrantTypes: []string{oauth.GrantDeviceCode, oauth.GrantRefreshToken}})
+dr, _ := as.BeginDeviceAuthorization(ctx, cli.ID, "project:read")   // show dr.UserCode
+_ = as.ApproveDevice(bob, dr.UserCode, oauth.Approval{Permissions: map[string][]access.Action{"project": {"read"}}})
+tokens, _ = as.PollDevice(ctx, cli.ID, "", dr.DeviceCode)
+p, _ = as.Authenticate(ctx, tokens.AccessToken)     // Kind: delegated, ID: "bob", ClientID: cli.ID, GrantID, Permissions
+ok, _ := svc.Can(apikey.WithPrincipal(ctx, p), "project", "delete") // false — bob could, the cap cannot
+```
+
+**The model: delegation never exceeds the human.** Three grants, one
+delegation model. A *client-credentials* token acts **as** the service account
+— `sub` is the account's id, an ordinary member, so `Can` resolves its role
+exactly as for an API key. The *device* and *authorization-code* grants
+produce **delegated** tokens (RFC 8693 `act`): `sub` is the user who
+approved, `act.sub` is the client, and the token is bound to a `Grant` — one
+user's consent to one client in one container, the row a "connected apps"
+screen lists. A delegated token authenticates as `apikey.KindDelegated` with
+the grant's permission cap, `apikey.WithPrincipal` installs that cap through
+`scope.WithPermissionCap`, and the engine intersects it with the user's
+**current** standing at every check. Nothing is copied onto the token that the
+engine would later have to trust: demote the human and the agent is demoted
+with them; remove the human and the agent has no standing; no token changes
+hands. Every mint is an escalation guard — a delegation cap must sit within
+the grantor's capped standing, a client-credentials cap within the service
+account's role (re-checked at every mint, so lowering the role lowers the
+client), and where an administrator mints, the client's whole power within
+that administrator's own capped standing, so a restricted API key cannot
+register a client that exceeds the key. `scope.ErrPrivilegeEscalation` in
+every case; a cap compiling to nothing is `ErrEmptyPermissions` (the same
+value as `apikey`'s) rather than stored as *no cap*. An approver who is
+themselves capped — an agent approving a further delegation — and asks for no
+cap gets the grant capped to their own capped standing: a delegation never
+exceeds its grantor.
+
+**The three grants.** *Client credentials*: `CreateClient` (needs
+`service_account:update`, like minting a key) binds a confidential client to
+a service account, optionally capped; `ClientCredentials(ctx, id, secret,
+scope)` mints — no refresh token, as RFC 6749 §4.4.3 says. The secret is 32
+random bytes compared in constant time against its sha256, not bcrypt: bcrypt
+slows a guess at a *low-entropy* password, a 256-bit string cannot be guessed
+at any speed, and every token request would pay bcrypt's cost. *Device
+authorization*: `BeginDeviceAuthorization` mints a device code (hashed) and an
+eight-letter user code from the RFC 8628 alphabet `BCDFGHJKLMNPQRSTVWXZ`,
+shown `XXXX-XXXX`; `DeviceByUserCode` resolves what a person typed (dashes,
+case) for the consent screen; `ApproveDevice` / `DenyDevice` move the row
+through the store's compare-and-set; `PollDevice` answers with the four RFC
+8628 sentinels — `ErrAuthorizationPending`, `ErrSlowDown` (polled inside the
+interval), `ErrAccessDenied`, `ErrExpiredToken` — and on approval redeems
+*once*, however many polls race. *Authorization code + PKCE*:
+`BeginAuthorization` validates statelessly for the consent screen (exact-match
+redirect URI, S256 challenge — `plain` and absent are `ErrPKCERequired` for
+every client, not only public ones); `Approve` re-validates, creates the grant
+and mints a sixty-second code bound to the redirect URI and the challenge;
+`ExchangeCode` redeems through the store's compare-and-set, verifies the
+verifier in constant time, and mints. A code presented **twice** is
+`ErrCodeReused` **and the grant is revoked** (OAuth 2.1 §4.1.2) — a replayed
+code leaked, and the party that got there first may have been the thief; a
+code presented by another client gets the same revocation. Every approval is
+a new grant, revocable on its own: two devices approving one client are two
+consents.
+
+**Scopes, and the cap.** `WithScopeMap` translates OAuth scope strings into
+RBAC permissions — each key a scope a client may request, each value the
+grants it stands for, compiled against the engine's own statements at `New`
+(an undeclared pair panics there, as a mis-declared role does). An approved
+scope set becomes the cap — the union of its entries — so an agent's requested
+scopes bound what it may do without the application writing permission maths,
+and the keys are published as `scopes_supported`. `Approval.Permissions`
+overrides it with an explicit cap; with no map and no explicit cap the grant
+carries the user's whole standing, as it stands at each check. With a map
+configured every requested scope must be a key of it (`ErrInvalidScope`), and
+an empty scope set is refused rather than minted as a token that may do
+nothing. A client's `Scopes` list further narrows what *it* may request.
+
+**Refresh, rotation, reuse.** Refresh tokens are opaque
+(`token.GenerateOpaque`), stored as their sha256, and rotated on every use
+through `Store.MarkRefreshRotated`'s compare-and-set — exactly
+`auth.Store.MarkRotated`'s contract. A rotated token presented again is a
+replay this package cannot tell from a race, so it is treated as a compromise:
+the whole family is deleted, **the grant is revoked**, and the caller gets
+`ErrTokenReuse` — alone, the revocation succeeded; joined with another error it
+did not, so test with `errors.Is` first, as with `auth.ErrTokenReuse`. A token
+presented by the wrong client gets the same revocation. Expiry is checked
+*after* the rotation, so an expired token is consumed and a later replay of it
+still detected.
+
+**Revocation, and what a JWT cannot do.** `Revoke(ctx, clientID, secret,
+token)` is RFC 7009: a refresh token revokes its family and its grant; a
+delegated access token revokes its grant; a client-credentials token has no
+grant and expires; an **unknown token succeeds**, because the RFC says so and
+a revocation endpoint that said "unknown" would be a validity oracle; another
+client's token is `ErrInvalidGrant` and nothing is revoked. Users disconnect
+apps with `ListGrants` (their own, across containers) and `RevokeGrant` (only
+the grantor — an owner revoking someone else's consent is `ErrForbidden`;
+administrators revoke a client's every grant by disabling or deleting it).
+None of this recalls an access token already issued: it is a signed JWT, and
+the `Authenticate` that checks it does one store read — the grant for a
+delegated token, the client for a machine one — and refuses a revoked grant
+or a disabled client at once. `WithOfflineVerification` skips that read for a
+store-free hot path and buys, in exchange, a stated latency: a revoked grant
+is honoured until the access token expires — `WithAccessTTL`, ten minutes by
+default, and the reason it is short. The cap travels **in the token**, signed
+(`ext.permissions`), so offline verification yields the same principal; it is
+still intersected with the current standing at every check.
+
+**Verification.** `Authenticate(ctx, raw)` parses through the signer — pass
+`auth.Service.Signer()` so session tokens and agent tokens verify in one
+place, and prefer `token.EdDSA` the moment anything that is not this process
+must verify — checks `iss` against `WithIssuer` (**required**: an empty issuer
+fails every mint with `ErrIssuerRequired`, because a delegated token that
+names no server would verify at any deployment sharing the key) and `aud`
+against `WithAudience` when set, and refuses anything that is not one of this
+package's tokens — a session JWT signed by the same signer has a `sid` and no
+`client_id`, and is a different credential for a different door. Every refusal
+is `ErrInvalidToken` wrapping the cause. `Introspect` is RFC 7662 and **never
+errors for an invalid token**: unparseable, forged, expired, revoked or unknown
+is `{active: false}` — a resource server asking about a token it was handed
+must not learn anything a forger could not — and it answers for refresh tokens
+too (`token_type: "refresh_token"`). Authenticate the introspection *caller*
+yourself; the RFC requires it and an open endpoint is an oracle.
+
+**Discovery, and registration.** `ServerMetadata(issuer, Endpoints{...})` is
+the RFC 8414 document — `response_types_supported ["code"]`, the four grant
+types, `code_challenge_methods_supported ["S256"]` and nothing else, the three
+`token_endpoint_auth_methods_supported`, the scope map's keys, and each
+optional endpoint only when you name it — and `ProtectedResourceMetadata`
+the RFC 9728 one a resource serves so an MCP client that hits it first learns
+where to go. Both are structs with JSON tags; the JWKS is the signer's own
+(`token.PublicKeySetter`). `RegisterClient` is RFC 7591 dynamic registration
+for the client that registers itself: application-level (no container, no
+creator), public when `token_endpoint_auth_method` is `none`, never
+`client_credentials`, and refused outright with `ErrRegistrationDisabled`
+unless `WithDynamicRegistration(true)` — an open registration endpoint is
+harmless in itself (a client has no power until a user approves it) but a
+surface you should choose to expose.
+
+**Clients.** A client is a credential of an organization, or of one of its
+service accounts, and is managed under the same `service_account:*` grants:
+`CreateClient`, `RotateClientSecret`, `DisableClient` / `EnableClient`,
+`UpdateClientRedirectURIs` (`update`), `ListClients` (`read`), `DeleteClient`
+(`delete`, and every grant, code, device authorization and refresh token of
+the client goes with it, atomically). A cross-tenant id is `ErrClientNotFound`,
+as `apikey` does. Redirect URIs are exact-match only, absolute, without a
+fragment, and `http` only on a loopback host (OAuth 2.1 §8.4.2). Disabling a
+client refuses every token endpoint and every consent, and `Authenticate`
+refuses its machine tokens at once; its delegated access tokens live out their
+TTL. `ErrorCode(err)` maps every sentinel to the RFC 6749 §5.2 error code and
+a suggested status — the table is under [Errors](#errors) — so you write the
+JSON body and this package never has to.
+
+**Options.** `WithClock`, `WithIDGenerator`, `WithHooks`, `WithIssuer`
+(required), `WithAudience`, `WithAccessTTL` (10m), `WithRefreshTTL` (30d),
+`WithCodeTTL` (60s), `WithDeviceTTL` (10m), `WithDeviceInterval` (5s),
+`WithGrantTTL` (0 — until revoked), `WithDynamicRegistration` (off),
+`WithServiceAccounts(apikey.Store)` (so a disabled or deleted account refuses
+its clients; without it the account's *membership* is still checked at every
+mint), `WithScopeMap`, `WithOfflineVerification`.
+
+**Hooks** mirror scope's exactly — `Hook`, `Event`, `HookFunc`, `WithHooks`,
+fired after the change, an error returned to the caller, joined onto a
+refusal: `ClientCreated`, `ClientRegistered`, `ClientDisabled`,
+`ClientEnabled`, `ClientDeleted`, `GrantCreated`, `GrantRevoked` (`Detail`:
+`user`, `client`, `code_replayed`, `refresh_replayed`, `wrong_client`,
+`approval_lost`), `TokenIssued` (`Detail` = the grant type),
+`TokenRefreshed`, `TokenReuseDetected`, `DeviceApproved`, `DeviceDenied`,
+`TokenAuthenticated`, `AuthenticationFailed` (`Detail` = why). `Detail` is a
+closed vocabulary, never a token.
+
+**Storage.** `oauth.Store` is a new port of twenty-four methods over five
+records, with fourteen **MUST**s: four uniqueness constraints on the record
+types (a code hash, a device-code hash, a user code, a refresh-token hash —
+each defeats a single-winner property *with no atomicity defect at all*),
+three compare-and-sets (`RedeemCode`, `SetDeviceStatus`,
+`MarkRefreshRotated`), two atomic cascades (`DeleteClient`, `RevokeGrant`
+deleting the grant's refresh tokens with the stamp), and the referential
+refusals on every create. `memory.NewOAuthStore()` is the reference
+implementation; `dropsstore.NewOAuthStore(db, opts...)` owns `oauth_clients`,
+`oauth_grants`, `oauth_codes`, `oauth_device_authorizations` and
+`oauth_refresh_tokens` — the four UNIQUEs inline, six cascading foreign keys
+(every reference between the five, all owned by the one store), nine indexes,
+`public` as `boolean`, the three string lists as `jsonb`, and NULL
+`container_id` / `service_account_id` / `created_by` for an application-level
+client — with `OAuthNames`, `WithOAuthNames`, `WithOAuthTextLibraryIDs`,
+`WithOAuthTextUserIDs` and its own `CreateSchema`.
+`oauth/oauthtest.RunStoreContract` is the port's contract as an executable
+suite — see [Writing your own `oauth.Store`](#writing-your-own-oauthstore).
+`PurgeExpired(ctx, before)` sweeps expired codes, device authorizations and
+refresh tokens and dead grants with what hangs off them; cron-only, like the
+others.
+
+**What is NOT here.** Endpoints, a consent screen, a token store for clients,
+and any HTTP at all: every call above is what a handler makes after decoding a
+request, and the structs it returns are the response bodies. No
+`private_key_jwt` or mTLS client authentication — a secret, or none. No
+`plain` PKCE, no implicit grant, no token exchange (RFC 8693's *grant*; its
+`act` claim is used). No nested delegation: `token.Actor` does not nest, and an
+agent approving for another agent gets a grant capped to its own capped
+standing rather than a chain. Authenticating the introspection caller and rate
+limiting the user-code endpoint (RFC 8628 §5.1) are yours. And a JWT already
+issued is never recalled — see the TTL.
+
 ## Authentication
 
 `auth` owns identity: the user record, its password credential, revocable
 server-side sessions, and the one-time tokens that confirm an address or reset
 a password. It sits on two smaller packages — [`token`](token/), which mints
-the opaque refresh tokens and the HS256 access tokens, and
+the opaque refresh tokens and the access tokens (HS256 over a shared secret
+by default, or [EdDSA with a published JWKS](#the-jwt-and-why-hand-rolling-it-is-defensible)
+when something that is not the issuer must verify them), and
 [`password`](password/), the hashing port with a bcrypt default. Together they
 replace the sign-up, login and refresh-rotation code an application would
 otherwise write by hand.
@@ -1416,6 +1902,15 @@ prints the same kind of trace:
 
 ```sh
 go run ./examples/reset
+```
+
+[`examples/hooks`](examples/hooks/main.go) prints every [lifecycle
+event](#hooks) a `Service` emits while a user signs up, fails a login, signs
+in, refreshes, replays a stolen token and signs out — against an EdDSA signer,
+whose JWKS it then publishes and verifies from the other side:
+
+```sh
+go run ./examples/hooks
 ```
 
 ### Sign-up, verification, login
@@ -1480,7 +1975,7 @@ rather than a tolerated "unknown".
 
 | Token | Minted by | TTL | Option |
 |---|---|---|---|
-| access | `Login`, `Refresh` | 15 min default | `WithJWT` |
+| access | `Login`, `Refresh` | 15 min default | `WithJWT`, or `WithAccessTTL` beside `WithSigner` |
 | refresh (session) | `Login`, `Refresh` | 30 days default | `WithRefreshTTL` |
 | `signup`, `email_change` | `SignUp`, `RequestEmailChange` | 24 hours default | `WithVerificationTTL` |
 | `password_reset` | `RequestPasswordReset` | 1 hour default | `WithPasswordResetTTL` |
@@ -1589,7 +2084,8 @@ superuser console, never a per-request handler. The cutoff is literal: a
 
 ### Verifying an access token
 
-`WithJWT` already holds the keys, so verification is a method rather than
+The `Service` already holds the signer — the HS256 keys `WithJWT` was given,
+or whatever `WithSigner` supplied — so verification is a method rather than
 something you re-wire with a second copy of the key material:
 
 ```go
@@ -1600,13 +2096,17 @@ u, _ := svc.User(ctx, claims.Subject)
 fmt.Println(u.Email, u.PasswordHash == "") // bob@example.com true
 ```
 
-It tries every key in the list, not just the signing key, which is what makes
+It tries every key in the list, not just the signing key — and an EdDSA
+signer accepts its verifiers as well as its signing key — which is what makes
 a rotation transparent to tokens already in flight. Failures are
 [`token`](token/)'s own sentinels — `ErrMalformedToken`,
 `ErrUnsupportedAlgorithm`, `ErrInvalidSignature`, `ErrExpiredToken`,
-`ErrKeyTooShort` — unwrapped, so you can tell an expired token from a forged
-one; a `Service` built without `WithJWT` returns `ErrKeyTooShort` here exactly
-as `Login` fails closed on the same misconfiguration. `claims.SessionID` is
+`ErrKeyTooShort`, and `ErrUnknownKey` from an EdDSA signer — unwrapped, so you
+can tell an expired token from a forged one; a `Service` built without
+`WithJWT` or `WithSigner` returns `ErrKeyTooShort` here exactly as `Login`
+fails closed on the same misconfiguration. `svc.Signer()` hands the configured
+signer back, so a sibling package that must mint tokens this `Service` accepts
+signs with the same key material rather than a second copy. `claims.SessionID` is
 what `ChangePassword` wants for its `currentSessionID`, which is the pairing
 most handlers need:
 
@@ -1965,6 +2465,77 @@ exception is *shape*, not stance: a denial from either address-keyed limiter
 requests for *that* address had run would itself be the existence oracle the
 method exists to close.
 
+### Hooks
+
+`auth.WithHooks` has exactly the shape of [`scope.WithHooks`](#hooks--events):
+a `Hook` with one `On(ctx, Event) error` method, a `HookFunc` adapter, an
+`Event` with a `Kind`, and the same rule about when it fires — **after** the
+mutation is applied and **before** the method returns, in registration order,
+on the caller's goroutine, first error stops the chain.
+
+```go
+audit := auth.HookFunc(func(ctx context.Context, e auth.Event) error {
+    return auditLog.Write(ctx, e.Kind, e.UserID, e.SessionID, e.IP, e.Detail) // never the address
+})
+svc := auth.New(store, auth.WithJWT([][]byte{key}, 15*time.Minute), auth.WithHooks(audit))
+```
+
+Twenty-four kinds, and the table is the contract. `UserID` is on every event
+but two; the other fields are set where the entry point had them.
+
+| Kind | Emitted by | Also carries |
+|---|---|---|
+| `SignedUp` | `SignUp` (created branch **only**), `SignInWith` when it provisions | `Detail` — the door |
+| `EmailVerified` / `EmailChanged` | `VerifyEmail` — both purposes / the `email_change` one, before its `EmailVerified` | — |
+| `LoggedIn` | every path that **mints a session**: `Login`, `LoginWithTrustedDevice`, `CompleteMFA`, `RedeemMagicLink`, `SignInWith`, `FinishPasskeyLogin` | `SessionID`, `IP`, `UserAgent`, `Detail` — `password`, `trusted_device`, `mfa`, `magic_link`, `external_identity`, `passkey` |
+| `LoginFailed` | `Login` (unknown, anonymized, no password, wrong password, unverified, MFA required), `CompleteMFA` (bad code), `FinishPasskeyLogin` (unknown credential, bad challenge, cloned authenticator) | `IP`, `UserAgent`, `Detail` — why; `UserID` **empty** for `unknown_user` and `passkey_unknown_credential` |
+| `MFAChallenged` | `Login`, `RedeemMagicLink`, `SignInWith` stopping at a challenge | `IP`, `UserAgent` |
+| `SessionRefreshed` | `Refresh`, once the successor is persisted | `SessionID` — the **new** one |
+| `TokenReuseDetected` | `Refresh` on a replay, **after** the family is revoked; `Logout` of a superseded token | `SessionID` — the replayed one; `Detail` `reuse` |
+| `LoggedOut` / `LoggedOutAll` / `SessionRevoked` | `Logout` / `LogoutAll` / `RevokeSession` | `SessionID` on the first and third |
+| `PasswordChanged` / `PasswordReset` | `ChangePassword` / `ResetPassword` | `SessionID` — the caller's, on change |
+| `MagicLinkRedeemed` | `RedeemMagicLink`, before the second factor is consulted | `IP`, `UserAgent` |
+| `IdentityLinked` / `IdentityUnlinked` | `LinkIdentity` and both row-writing rungs of `SignInWith` / `UnlinkIdentity` | — |
+| `MFAEnrolled` / `MFADisabled` | `ConfirmMFAEnrolment` / `DisableMFA` | `SessionID` on disable |
+| `PasskeyRegistered` / `PasskeyDeleted` | `FinishPasskeyRegistration` / `DeletePasskey` | `SessionID` on register |
+| `DeviceTrusted` / `TrustedDeviceRevoked` | `TrustThisDevice` / `RevokeTrustedDevice` | `SessionID` on trust |
+| `AccountDeleted` / `AccountAnonymized` | `DeleteAccount` / `AnonymizeAccount`, as the **last** step | `SessionID` — the caller's |
+
+`Detail` is a **closed vocabulary**, exported as `auth.Detail*` constants —
+never free text and never an address. **`LoginFailed` carries the attempted IP
+and not the attempted email**, not in `Detail` and not anywhere: a failed-login
+log keyed by address is a list of which addresses exist, and this package will
+not build one. The hook runs *after* `Hasher.Dummy` on the branches that call
+it, so it does not itself separate "unknown" from "wrong password" — unless it
+does different work per `Detail`. Keep a `LoginFailed` hook constant-shape.
+
+**What deliberately emits nothing.** The enumeration-hardened request paths —
+`SignUp`'s duplicate-address branch, `RequestPasswordReset`,
+`RequestMagicLink` (provisioning or not) and `RequestEmailChange` — emit **no
+event on either branch**. Each is built so its store calls, error set and
+returned shape are identical whether or not the address is registered, and a
+hook is a caller-visible side effect whose cost is whatever you put in it:
+firing one on the known branch alone reopens the oracle by timing, firing one
+on both hands the application a known/unknown flag it must then be trusted
+never to act on. Neither is this package's to risk. Log those *requests* at
+your own handler, where you already know you must answer uniformly; the
+*redemptions* are not hardened and do emit. One consequence stated rather than
+hidden: an account `RequestMagicLink` provisions gets no `SignedUp` — its first
+event is the `MagicLinkRedeemed` that signs it in.
+
+**A hook error aborts the call with the change already made.** Nothing in
+`auth` runs inside a transaction a hook could roll back, so for `Login` a
+failing `LoggedIn` hook leaves a live `Session` whose refresh token the caller
+never received (it ages out with the refresh TTL, or falls to `LogoutAll`), and
+for `SignUp` a real account whose verification token was never handed back.
+Keep non-retryable side effects out of hooks and return `nil` for best-effort
+work. On a **failure** event — `LoginFailed`, `TokenReuseDetected` — the
+method was already returning an error and the hook's does not replace it: the
+caller gets both joined, so `errors.Is` still matches `ErrInvalidCredentials`
+or `ErrTokenReuse`. A `Service` with no hooks, or whose hooks return `nil`, is
+observably identical to one built before hooks existed — no Store-call
+sequence and no error changed.
+
 ### The JWT, and why hand-rolling it is defensible
 
 The two classic JWT vulnerabilities — `alg: none`, and RS256/HS256 confusion
@@ -1976,8 +2547,23 @@ or decodes a payload; every other value, a missing field and a lower-case
 `hs256` included, is rejected through that one line with
 `ErrUnsupportedAlgorithm`. There is no `none` branch to reach and no second
 algorithm to confuse it with. That single check is the whole justification for
-not taking a dependency — and it is why generalising this package to a second
-algorithm would bring both vulnerabilities back.
+not taking a dependency.
+
+The package does offer a second algorithm, and the argument survives only
+because of *where* the choice is made. `token.Signer` is the interface —
+`Issue`, `Parse`, `Alg` — and it has two constructors, `token.HS256(keys...)`
+and `token.EdDSA(kid, priv, verifiers)`. The algorithm is fixed by the caller,
+once, in the constructor, and never read from a token: an HS256 signer refuses
+a token whose header says `EdDSA`, an EdDSA signer refuses one that says
+`HS256`, both refuse `none`, each through the same one-line equality check
+against its own literal. Handing an Ed25519 public key to an HS256 signer as
+an HMAC secret is impossible by type, and the reverse forgery — an HMAC
+computed with the public key's bytes under a header claiming `EdDSA` — fails at
+the EdDSA signer on signature length before verification is attempted. What
+the package still does not have, and must not grow, is a parser that reads
+`alg` and picks a signer from it: *that* is the dispatch both attacks need, and
+a `Signer` that accepted both algorithms would be exactly it. A third algorithm
+is a third constructor, never a second branch in an existing `Parse`.
 
 The same reasoning covers the key. An empty or undersized HMAC key is `alg:
 none` reached through the key parameter instead of the header — the realistic
@@ -2013,6 +2599,55 @@ fmt.Println(c.Extra["plan"], c.Extra["sub"]) // pro victim
 ```
 
 The extender's `"sub"` lands at `ext.sub` and the real subject is untouched.
+
+**EdDSA, and the JWKS.** HS256 verification needs the signing secret, so it
+fits exactly one deployment shape: the party that mints a token is the only
+party that checks it. As soon as anything *else* must verify — another
+service, an agent acting for a user, an MCP client, a gateway in front of the
+application — sharing the secret makes every verifier an issuer.
+`token.EdDSA` is for that case. The private key stays with the issuer; `kid`
+names it in every token's header; `verifiers` are additional public keys, by
+kid, accepted on `Parse` for rotation. `Parse` *requires* a `kid` naming a key
+the signer holds — `ErrUnknownKey` otherwise — and checks the signature only
+against that one key, never against every key in turn. `auth.WithSigner`
+replaces `WithJWT` (the last of the two applied wins) and `auth.WithAccessTTL`
+carries the TTL `WithJWT`'s second argument used to:
+
+```go
+_, priv, _ := ed25519.GenerateKey(rand.Reader) // from your key store, in production
+signer, err := token.EdDSA("2026-09", priv, nil)
+fmt.Println(err, signer.Alg()) // <nil> EdDSA
+
+svc := auth.New(memory.NewAuthStore(),
+    auth.WithSigner(signer),            // instead of WithJWT
+    auth.WithAccessTTL(15*time.Minute)) // the TTL WithJWT carried
+
+// Serve this at your jwks_uri. HS256 has nothing to publish, so the method
+// lives on the concrete EdDSA type, reached through the assertion.
+jwks := svc.Signer().(token.PublicKeySetter).PublicKeySet()
+
+// The other party: a verify-only Signer built from the published document.
+// It accepts the issuer's tokens and its Issue always fails — it holds nothing
+// it could sign with.
+keys, _ := jwks.PublicKeys()
+verifier, _ := token.EdDSAVerifier(keys)
+```
+
+The JWKS is RFC 7517 with RFC 8037's Octet Key Pair: `kty` `OKP`, `crv`
+`Ed25519`, `use` `sig`, `alg` `EdDSA`, the signing key first and verifiers
+sorted by `kid`. `JWKS.PublicKeys` refuses a document it does not fully
+understand rather than skipping a key — a verifier that silently dropped one
+would refuse every token signed under it with `ErrUnknownKey` and nothing
+would say why.
+
+`token.Claims` also carries the OAuth-shaped claims RFC 9068 and RFC 8693 name
+— `Issuer` (`iss`), `Audience` (`aud`, a type that reads a string or an array
+and writes a bare string for one recipient), `ID` (`jti`), `ClientID`,
+`Scope`, and `Actor` (`act`, the party acting on behalf of `Subject` in a
+delegated token). All are `omitempty` and none is interpreted by this package:
+a caller that sets none of them gets byte-for-byte the payload it got before
+they existed, which is pinned by test. They exist for the OAuth server that
+sits on `Signer()`.
 
 ### Wiring `auth`, `org` and `invite` together
 
@@ -2645,7 +3280,7 @@ matches.
 
 `invite` adds seven sentinels of its own — not exported by `scope`, and not
 aliased anywhere, since invitations are a separate package with its own
-failure modes:
+failure modes (`apikey`'s eight follow further down):
 
 | Error | Meaning | Suggested status |
 |---|---|---|
@@ -2669,6 +3304,77 @@ rather than a lookup miss, and only the service layer raises them: a link's
 that step to also report which of three conditions applied would require a
 second, separate read, which is exactly the race atomicity rules out — and
 `JoinViaLink` re-reads the link afterwards to tell them apart.
+
+[`apikey`](#service-accounts--api-keys) adds eight. Denials are not
+re-declared: a management call the actor may not make is `scope.ErrForbidden`
+(or `scope.ErrNotMember`), and minting above one's standing is
+`scope.ErrPrivilegeEscalation`.
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrServiceAccountNotFound` | No service account with that id — or one in *another* container than the one on the context | 404 |
+| `ErrKeyNotFound` | No key with that id or token hash — or, from the management calls, one in another container | 404 |
+| `ErrKeyRevoked` | The key's `RevokedAt` is set | 401 |
+| `ErrKeyExpired` | The key's `ExpiresAt` is not in the future | 401 |
+| `ErrServiceAccountDisabled` | The key is live but its account is disabled; also refused by `CreateKey` | 401 (403 from `CreateKey`) |
+| `ErrIDTaken` | A `Create*` was given an id that already identifies a row of that kind | 409 |
+| `ErrEmptyPermissions` | `WithPermissions` compiled to a set granting nothing — refused rather than stored as *no cap* | 400 |
+| `ErrInvalidExpiry` | `WithExpiry` named an instant not after now | 400 |
+
+The first two are raised by the `Store` on any lookup, update or delete that
+matches no row — and by the service, deliberately, for a record in another
+container. The middle three are raised only by `Authenticate`; a `Store`
+returns the row and the service reads the timestamps. The last two are
+argument errors raised before any store is touched.
+
+[`oauth`](#agents--machine-clients) adds twenty-eight, and for these the
+table carries a fourth column: the RFC 6749 §5.2 (or RFC 8628 §3.5, RFC 6750
+§3.1, RFC 7591 §3.2.2) `error` code `oauth.ErrorCode(err)` returns beside
+the status, for the JSON body your token endpoint writes. The walk is in
+precedence order, so a wrapped chain answers for its most specific member —
+`ErrInvalidGrant` wrapping `ErrCodeNotFound` is `invalid_grant`,
+`ErrInvalidToken` wrapping `ErrGrantRevoked` is `invalid_token`. Denials are
+not re-declared: a management or consent call the actor may not make is
+`scope.ErrForbidden` or `scope.ErrNotMember`, minting above one's standing is
+`scope.ErrPrivilegeEscalation`, and those never reach a token endpoint.
+`ErrEmptyPermissions` **is** `apikey.ErrEmptyPermissions`, aliased.
+
+| Error | Meaning | `error` code | Suggested status |
+|---|---|---|---|
+| `ErrInvalidToken` | `Authenticate` refused the access token — wraps the cause: a signer sentinel, `ErrGrantRevoked`, `ErrGrantExpired`, `ErrGrantNotFound`, `ErrClientDisabled`, `ErrClientNotFound`, or a token that is not this package's | `invalid_token` (RFC 6750 — the `WWW-Authenticate` challenge) | 401 |
+| `ErrInvalidClient` | Client authentication failed: unknown id, wrong or missing secret, a secret from a public client — or, wrapped, a bound service account that is not a member, missing or disabled | `invalid_client` | 401 |
+| `ErrClientDisabled` | The client's `DisabledAt` is set | `invalid_client` | 401 |
+| `ErrAuthorizationPending` | The device authorization awaits the user; poll again | `authorization_pending` | 400 |
+| `ErrSlowDown` | Polled inside the interval; add five seconds | `slow_down` | 400 |
+| `ErrAccessDenied` | The user denied the device authorization | `access_denied` | 400 |
+| `ErrExpiredToken` | The device code expired before the user decided | `expired_token` | 400 |
+| `ErrCodeReused` | An authorization code was presented twice; **the grant is revoked** | `invalid_grant` | 400 |
+| `ErrTokenReuse` | A rotated refresh token was presented again; **family and grant revoked**. Alone, the revocation succeeded; joined, it did not | `invalid_grant` | 400 |
+| `ErrPKCEMismatch` | `S256(code_verifier)` is not the challenge, or the verifier is malformed | `invalid_grant` | 400 |
+| `ErrGrantRevoked` | The grant's `RevokedAt` is set | `invalid_grant` | 400 |
+| `ErrGrantExpired` | The grant's `ExpiresAt` is not in the future | `invalid_grant` | 400 |
+| `ErrInvalidGrant` | The code, refresh token or device code is unknown (wrapping `ErrCodeNotFound`, `ErrRefreshNotFound`, `ErrDeviceNotFound`), expired, spent, issued to another client, or presented with the wrong redirect URI | `invalid_grant` | 400 |
+| `ErrInvalidScope` | A scope the client may not request, or the server does not know; or no scope at all with a scope map set | `invalid_scope` | 400 |
+| `ErrUnauthorizedClient` | The client does not hold that grant type | `unauthorized_client` | 400 |
+| `ErrInvalidRedirectURI` | Not registered (exact match), or not an absolute fragment-free URI on a permitted scheme at registration | `invalid_redirect_uri` (RFC 7591; `invalid_request` at the authorization endpoint) | 400 |
+| `ErrPKCERequired` | No `S256` challenge — absent, `plain`, or malformed | `invalid_request` | 400 |
+| `ErrInvalidClientMetadata` | A `ClientSpec` or registration this package cannot honour — unknown grant type, public + `client_credentials`, `client_credentials` without an account, no redirect URI for `authorization_code`, rotating a public client's secret | `invalid_client_metadata` (RFC 7591) | 400 |
+| `ErrEmptyPermissions` | A cap compiled to nothing — refused rather than stored as *no cap* | `invalid_scope` | 400 |
+| `ErrRegistrationDisabled` | `RegisterClient` without `WithDynamicRegistration(true)` | `invalid_request` | 403 |
+| `ErrDeviceNotPending` | The authorization was already approved, denied or redeemed — or the compare-and-set lost | `invalid_request` | 409 |
+| `ErrIDTaken` | A `Create*` was given an id that already identifies a row of that kind | `server_error` | 409 |
+| `ErrClientNotFound` | No client with that id — or one in another container than the ctx one | `invalid_request` | 404 |
+| `ErrGrantNotFound` | No grant with that id | `invalid_request` | 404 |
+| `ErrDeviceNotFound` | No device authorization with that code | `invalid_request` | 404 |
+| `ErrCodeNotFound` | No authorization code with that hash — wrapped in `ErrInvalidGrant` at the token endpoint | `invalid_grant` | 404 |
+| `ErrRefreshNotFound` | No refresh token with that hash — wrapped in `ErrInvalidGrant` at the token endpoint | `invalid_grant` | 404 |
+| `ErrIssuerRequired` | Minting on a `Service` built without `WithIssuer` — a wiring bug | `server_error` | 500 |
+
+The five not-founds are raised by the `Store` on any lookup, update or delete
+that matches no row, and `ErrClientNotFound` also by the management calls,
+deliberately, for a client in another container. The token endpoints never
+show a client a not-found: they wrap it in `ErrInvalidGrant`, because RFC 6749
+does not tell a client whether its code was unknown or spent.
 
 [`auth`](#authentication) adds twenty-four, split the same way — some raised by
 the `Store` on a lookup or a constraint, the rest by the service. Eighteen
@@ -2717,20 +3423,23 @@ The remaining six are the [external-identity](#oauth) surface's own, raised by
 | `ErrProviderSubjectRequired` | An `ExternalIdentity` arrived with a blank or whitespace-only `Provider` or `Subject`. Refused before any store is touched, by both entry points | 400 |
 | `ErrOAuthNotConfigured` | An external-identity method was called on a `Service` built without `WithIdentityStore` — a wiring bug, not caller input | 500 |
 
-[`token`](token/) adds six. The first four are what a caller gets from
-`Parse` for a bad token. The last two report a bad *key or TTL* rather than a
-bad token — but only `ErrInvalidTTL` is confined to `Issue`. `Parse` checks
-every key's length before it looks at the token at all and refuses the whole
-call with `ErrKeyTooShort` if any one of them is short, so a misconfigured
-`Service` surfaces that on the request path, not only at startup:
+[`token`](token/) adds eight. The first five are what a caller gets from
+`Parse` — the free function or a `Signer`'s — for a bad token. The last three
+report bad *key material or TTL* rather than a bad token — but only
+`ErrInvalidTTL` is confined to `Issue`. `Parse` checks every key's length
+before it looks at the token at all and refuses the whole call with
+`ErrKeyTooShort` if any one of them is short, so a misconfigured `Service`
+surfaces that on the request path, not only at startup:
 
 | Error | Meaning | Suggested status |
 |---|---|---|
 | `ErrMalformedToken` | Not a valid JWS compact serialization — wrong segment count, non-canonical base64, or a segment that is not JSON | 401 |
-| `ErrUnsupportedAlgorithm` | The header's `alg` is not exactly `"HS256"`. Returned before any signature is verified | 401 |
-| `ErrInvalidSignature` | No key in the list produced a matching signature | 401 |
+| `ErrUnsupportedAlgorithm` | The header's `alg` is not exactly the parser's own — `"HS256"` at `Parse` and the `HS256` signer, `"EdDSA"` at the `EdDSA` signer. Returned before any signature is verified, and before an EdDSA signer reads the `kid` | 401 |
+| `ErrUnknownKey` | An `EdDSA` signer was presented a token with no `kid`, or a `kid` naming no key it holds. After the `alg` check, before any signature is verified | 401 |
+| `ErrInvalidSignature` | No key in the list produced a matching signature — or, at an EdDSA signer, the signature is not 64 bytes or does not verify under the named key | 401 |
 | `ErrExpiredToken` | The signature verified but `exp` is not in the future — checked after verification, so it cannot probe for a valid signature on forged claims | 401 |
-| `ErrKeyTooShort` | An HMAC key under 32 bytes was passed to `Issue`, or appears anywhere in `Parse`'s key list | 500 |
+| `ErrKeyTooShort` | An HMAC key under 32 bytes was passed to `Issue` or `HS256`, or appears anywhere in `Parse`'s key list; also a `Service` with neither `WithJWT` nor `WithSigner` | 500 |
+| `ErrInvalidKey` | Key material handed to `EdDSA`, `EdDSAVerifier` or `JWKS.PublicKeys` is unusable — an empty `kid`, a wrong-length Ed25519 key, two different keys under one `kid`, a JWK of a shape this package does not publish. Also what a verify-only signer's `Issue` returns | 500 |
 | `ErrInvalidTTL` | `Issue` was given a zero or negative ttl | 500 |
 
 `password` defines no sentinels: `Validate` returns the names of the failed
@@ -2747,16 +3456,23 @@ rules and `Verify` returns a bool, so there is nothing to compare with
 | [`team`](team/) | Team RBAC nested inside `org` via `scope.WithParent` — the worked example of [nesting](#nested-scopes). |
 | [`invite`](invite/) | [Invitations](#invitations) — email tokens and reusable links admitting a user with no standing yet, via `scope.Service.GrantMembership`. |
 | [`invite/invitetest`](invite/invitetest/) | `invite.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-invitestore) and run it. Test-only; imports `testing`. |
+| [`apikey`](apikey/) | [Service accounts & API keys](#service-accounts--api-keys) — non-human members and the keys that authenticate as them, capped with `scope.WithPermissionCap`. |
+| [`apikey/apikeytest`](apikey/apikeytest/) | `apikey.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-apikeystore) and run it. Test-only; imports `testing`. |
+| [`oauth`](oauth/) | [Agents & machine clients](#agents--machine-clients) — an OAuth 2.1 authorization server as a library: clients, client credentials, device authorization, authorization code + PKCE, delegated tokens capped to the human behind them, refresh rotation, introspection, revocation, discovery metadata, dynamic registration. |
+| [`oauth/oauthtest`](oauth/oauthtest/) | `oauth.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-oauthstore) and run it. Test-only; imports `testing`. |
 | [`auth`](auth/) | [Authentication](#authentication) — `Service`, its `Store` port, and the user/session/verification records. Sign-up, login, email verification, refresh rotation, and the password lifecycle. Also the optional `IdentityStore` port and the four [external-identity](#oauth) methods. |
 | [`auth/authtest`](auth/authtest/) | `auth.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-authstore) and run it. Test-only; imports `testing`. |
-| [`token`](token/) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled, [single-algorithm](#the-jwt-and-why-hand-rolling-it-is-defensible) HS256 JWT. Standard library only. |
+| [`token`](token/) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled JWT behind one `Signer` interface with [one algorithm per constructor](#the-jwt-and-why-hand-rolling-it-is-defensible): `HS256` over a shared secret, `EdDSA` with a published JWKS for verifiers that are not the issuer. Standard library only. |
 | [`password`](password/) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` for a strength policy. The only package that pulls in `golang.org/x/crypto`. |
-| [`store/memory`](store/memory/) | In-memory `scope.Store`, `invite.Store`, `auth.Store` and `auth.IdentityStore` for dev, tests, and examples. |
-| [`store/drops`](store/drops/) | PostgreSQL stores built on drops — RBAC (composite-key membership), invitations, the three auth tables, and the [`identities`](#the-identities-table) table. |
+| [`store/memory`](store/memory/) | In-memory `scope.Store`, `invite.Store`, `apikey.Store`, `oauth.Store`, `auth.Store` and `auth.IdentityStore` for dev, tests, and examples. |
+| [`store/drops`](store/drops/) | PostgreSQL stores built on drops — RBAC (composite-key membership), invitations, service accounts and keys, the five OAuth tables, the three auth tables, and the [`identities`](#the-identities-table) table. |
 | [`examples/basic`](examples/basic/) | Runnable, database-free tour of the RBAC half. |
 | [`examples/auth`](examples/auth/) | Runnable, database-free tour of `auth` + `org` + `invite` wired together. |
 | [`examples/reset`](examples/reset/) | Runnable, database-free tour of [the password lifecycle](#the-password-lifecycle) — `RequestPasswordReset`, `ResetPassword`, `RequestEmailChange`. |
 | [`examples/oauth`](examples/oauth/) | Runnable, database-free tour of [external identities](#oauth) — the ladder, the linking policy, the explicit link, and the last-credential guard. |
+| [`examples/hooks`](examples/hooks/) | Runnable, database-free tour of [lifecycle hooks](#hooks) and an [EdDSA signer](#the-jwt-and-why-hand-rolling-it-is-defensible) — every event a sign-up-to-sign-out flow emits, then the JWKS published and verified from the other side. |
+| [`examples/apikey`](examples/apikey/) | Runnable, database-free tour of [service accounts & API keys](#service-accounts--api-keys) — mint, cap, authenticate, revoke, disable, cascade delete. |
+| [`examples/agents`](examples/agents/) | Runnable, database-free tour of [agents & machine clients](#agents--machine-clients) — client credentials, the device flow approved with a cap, refresh replay, an MCP-style client through PKCE, introspection, discovery. |
 
 Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
 
@@ -2769,6 +3485,8 @@ go test ./... -count=1          # database-free
 golangci-lint run ./...         # v2 required; the config is .golangci.yml
 go run ./examples/basic && go run ./examples/auth && go run ./examples/reset
 go run ./examples/oauth && go run ./examples/magiclink && go run ./examples/deletion
+go run ./examples/hooks && go run ./examples/apikey
+go run ./examples/agents
 go run ./docs/_verify           # every Go sample under docs/, compiled and run
 ```
 
@@ -2786,9 +3504,10 @@ module.
 
 `internal/uid` is not importable — it is the RFC 9562 UUIDv7 generator
 authlayer uses for every id it mints (containers, roles, users, sessions,
-verifications), written out rather than depended on so the module stays at
-three requirements. `scope.WithIDGenerator` and `auth.WithIDGenerator` override
-it — see [Ids](#ids) for what `store/drops` needs when you do.
+verifications, invites, service accounts, keys, clients, grants), written out
+rather than depended on so the module stays at three requirements.
+`scope.WithIDGenerator`, `auth.WithIDGenerator`, `apikey.WithIDGenerator` and
+`oauth.WithIDGenerator` override it — see [Ids](#ids) for what `store/drops` needs when you do.
 
 ### Ids
 
@@ -2813,6 +3532,8 @@ scopeSt := dropsstore.New[org.Organization, org.Member](db,
     dropsstore.WithTextLibraryIDs(), dropsstore.WithTextUserIDs())
 inviteSt := dropsstore.NewInviteStore(db,
     dropsstore.WithInviteTextLibraryIDs(), dropsstore.WithInviteTextUserIDs())
+oauthSt := dropsstore.NewOAuthStore(db,
+    dropsstore.WithOAuthTextLibraryIDs(), dropsstore.WithOAuthTextUserIDs())
 authSt := dropsstore.NewAuthStore(db, dropsstore.WithAuthTextLibraryIDs())
 
 orgSvc := org.New(ac, scopeSt, org.WithIDGenerator(newID))
@@ -2827,7 +3548,12 @@ user table — and on their own they do nothing for `WithIDGenerator`:
 `New[...](db, WithTextUserIDs())` with a ULID generator still fails on the
 first write. The auth store has no text-*user*-id option at all;
 `WithAuthTextLibraryIDs` moves its `user_id` columns along with `users.id`,
-since it owns the table they reference. The identity store is the same shape
+since it owns the table they reference. `WithOAuthTextLibraryIDs` moves every
+reference between the five OAuth tables — `client_id`, `grant_id`,
+`family_id` — with the tables' own ids, plus `container_id` and
+`service_account_id`, so it must be passed alongside the scope and API-key
+options; `WithOAuthTextUserIDs` moves `oauth_grants.user_id` and
+`oauth_clients.created_by`. The identity store is the same shape
 for the same reason: `WithIdentityTextLibraryIDs()` moves `identities.id` and
 `identities.user_id` together, and must be passed **alongside**
 `WithAuthTextLibraryIDs()`, since the second of those columns references
@@ -2855,8 +3581,11 @@ created, or retype the columns in your own migration.
 
 Milestone 2 is complete: [invitations](#invitations),
 [authentication](#authentication) and [external identities](#oauth) have all
-shipped. Two things this library deliberately does not do, and has no plan to:
-run an OAuth dance, and store a provider's tokens.
+shipped, and Milestone 4 adds [service accounts](#service-accounts--api-keys)
+and an [OAuth 2.1 authorization server](#agents--machine-clients) for agents
+and machine clients. Two things this library deliberately does not do, and
+has no plan to: act as an OAuth *client* — run a provider's dance — and store
+a provider's tokens.
 
 One known gap inside what did ship: an account provisioned by an external
 sign-in has [no password](#an-account-provisioned-here-has-no-password), and

@@ -95,17 +95,96 @@ atomicity rules out. `JoinViaLink` re-reads the link afterwards to tell them
 apart.
 </Note>
 
+## `apikey` — eight
+
+Not exported by `scope`, and not aliased anywhere. Denials are **not**
+re-declared: a management call the actor may not make is `scope.ErrForbidden`
+(or `scope.ErrNotMember`), and minting above one's standing is
+`scope.ErrPrivilegeEscalation`.
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrServiceAccountNotFound` | No service account with that id — or one in **another** container than the one on the context | 404 |
+| `ErrKeyNotFound` | No key with that id or token hash — or, from the management calls, one in another container | 404 |
+| `ErrKeyRevoked` | The key's `RevokedAt` is set | 401 |
+| `ErrKeyExpired` | The key's `ExpiresAt` is not in the future | 401 |
+| `ErrServiceAccountDisabled` | The key is live but its account is disabled; also refused by `CreateKey` | 401 (403 from `CreateKey`) |
+| `ErrIDTaken` | A `Create*` was given an id that already identifies a row of that kind | 409 |
+| `ErrEmptyPermissions` | `WithPermissions` compiled to a set granting nothing — refused rather than stored as *no cap* | 400 |
+| `ErrInvalidExpiry` | `WithExpiry` named an instant not after now | 400 |
+
+The first two are raised by the `Store` on any lookup, update or delete that
+matches no row — **and also by the service layer, deliberately** — for a
+record that exists in another container, so a cross-tenant id is
+indistinguishable from a missing one. The middle three describe *why an
+authentication was refused* and only `Authenticate` raises them; a `Store`
+returns the row and the service reads the timestamps. The last two are
+argument errors raised before any store is touched.
+
+## `oauth` — twenty-eight
+
+Not exported by `scope`. `ErrEmptyPermissions` **is** `apikey.ErrEmptyPermissions`,
+aliased. Denials are not re-declared: a management or consent call the actor
+may not make is `scope.ErrForbidden` or `scope.ErrNotMember`, and minting above
+one's standing is `scope.ErrPrivilegeEscalation` — none of which reaches a token
+endpoint.
+
+For these the table carries a fourth column: the RFC 6749 §5.2 (or RFC 8628 §3.5,
+RFC 6750 §3.1, RFC 7591 §3.2.2) `error` code `oauth.ErrorCode(err)` returns
+beside the status, for the JSON body your token endpoint writes. The walk is in
+precedence order, so a wrapped chain answers for its most specific member.
+
+| Error | Meaning | `error` code | Suggested status |
+|---|---|---|---|
+| `ErrInvalidToken` | `Authenticate` refused the access token — wraps the cause: a signer sentinel, `ErrGrantRevoked`, `ErrGrantExpired`, `ErrGrantNotFound`, `ErrClientDisabled`, `ErrClientNotFound`, or a token that is not this package's | `invalid_token` (RFC 6750) | 401 |
+| `ErrInvalidClient` | Client authentication failed — unknown id, wrong or missing secret, a secret from a public client — or, **wrapped**, a bound service account that is not a member, missing or disabled | `invalid_client` | 401 |
+| `ErrClientDisabled` | The client's `DisabledAt` is set | `invalid_client` | 401 |
+| `ErrAuthorizationPending` | The device authorization awaits the user; poll again | `authorization_pending` | 400 |
+| `ErrSlowDown` | Polled inside the interval; add five seconds | `slow_down` | 400 |
+| `ErrAccessDenied` | The user denied the device authorization | `access_denied` | 400 |
+| `ErrExpiredToken` | The device code expired before the user decided | `expired_token` | 400 |
+| `ErrCodeReused` | An authorization code was presented twice — **the grant is revoked** | `invalid_grant` | 400 |
+| `ErrTokenReuse` | A rotated refresh token was presented again — **family and grant revoked**. Alone, the revocation succeeded; joined, it did not | `invalid_grant` | 400 |
+| `ErrPKCEMismatch` | `S256(code_verifier)` is not the challenge, or the verifier is malformed | `invalid_grant` | 400 |
+| `ErrGrantRevoked` | The grant's `RevokedAt` is set | `invalid_grant` | 400 |
+| `ErrGrantExpired` | The grant's `ExpiresAt` is not in the future | `invalid_grant` | 400 |
+| `ErrInvalidGrant` | The code, refresh token or device code is unknown (wrapping `ErrCodeNotFound`, `ErrRefreshNotFound`, `ErrDeviceNotFound`), expired, spent, issued to another client, or presented with the wrong redirect URI | `invalid_grant` | 400 |
+| `ErrInvalidScope` | A scope the client may not request or the server does not know; or no scope at all with a scope map set | `invalid_scope` | 400 |
+| `ErrUnauthorizedClient` | The client does not hold that grant type | `unauthorized_client` | 400 |
+| `ErrInvalidRedirectURI` | Not registered (exact match), or not an absolute fragment-free URI on a permitted scheme at registration | `invalid_redirect_uri` (RFC 7591; `invalid_request` at the authorization endpoint) | 400 |
+| `ErrPKCERequired` | No `S256` challenge — absent, `plain`, or malformed | `invalid_request` | 400 |
+| `ErrInvalidClientMetadata` | A `ClientSpec` or registration this package cannot honour | `invalid_client_metadata` (RFC 7591) | 400 |
+| `ErrEmptyPermissions` | A cap compiled to nothing — refused rather than stored as *no cap* | `invalid_scope` | 400 |
+| `ErrRegistrationDisabled` | `RegisterClient` without `WithDynamicRegistration(true)` | `invalid_request` | 403 |
+| `ErrDeviceNotPending` | Already approved, denied or redeemed — or the compare-and-set lost | `invalid_request` | 409 |
+| `ErrIDTaken` | A `Create*` was given an id that already identifies a row of that kind | `server_error` | 409 |
+| `ErrClientNotFound` | No client with that id — or one in another container than the ctx one | `invalid_request` | 404 |
+| `ErrGrantNotFound` | No grant with that id | `invalid_request` | 404 |
+| `ErrDeviceNotFound` | No device authorization with that code | `invalid_request` | 404 |
+| `ErrCodeNotFound` | No authorization code with that hash — wrapped in `ErrInvalidGrant` at the token endpoint | `invalid_grant` | 404 |
+| `ErrRefreshNotFound` | No refresh token with that hash — wrapped in `ErrInvalidGrant` at the token endpoint | `invalid_grant` | 404 |
+| `ErrIssuerRequired` | Minting on a `Service` built without `WithIssuer` — a wiring bug | `server_error` | 500 |
+
+<Note>
+The token endpoints never show a client a not-found: they wrap it in
+`ErrInvalidGrant`, because RFC 6749 does not tell a client whether its code was
+unknown or spent. `Introspect` returns **no error at all** for an invalid token
+— see [Introspection & revocation](/agents/introspection-and-revocation).
+</Note>
+
 ## `auth` — twenty-four
 
 Eighteen belong to the password-and-session core. The six for
 [external identities](/oauth/overview) follow in their own table below.
 
-Neither [magic links](/authentication/magic-links) nor
-[account deletion](/authentication/account-deletion) added a sentinel, which is
-deliberate rather than an oversight: both reuse the ones already in their
-methods' documented error sets, so no caller's error handling changes, and — for
-the two enumeration-safe request methods — a *new* error would itself have been
-the oracle their shape exists to close.
+Neither [magic links](/authentication/magic-links), nor
+[account deletion](/authentication/account-deletion), nor
+[lifecycle hooks](/authentication/hooks) added a sentinel, which is deliberate
+rather than an oversight: all reuse the ones already in their methods'
+documented error sets, so no caller's error handling changes, and — for the
+enumeration-safe request methods — a *new* error would itself have been the
+oracle their shape exists to close. A hook's own error is propagated as-is, or
+joined to the refusal it accompanied.
 
 | Error | Meaning | Suggested status |
 |---|---|---|
@@ -173,26 +252,29 @@ written pointing at a user that does not exist.
 exist?" for a caller who should not be asking.
 </Note>
 
-## `token` — six
+## `token` — eight
 
-The first four are what a caller gets from `Parse` for a bad token. The last two
-report a bad **key or TTL** rather than a bad token — but only `ErrInvalidTTL`
-is confined to `Issue`.
+The first five are what a caller gets from `Parse` — the free function or a
+`Signer`'s — for a bad token. The last three report bad **key material or
+TTL** rather than a bad token — but only `ErrInvalidTTL` is confined to
+`Issue`.
 
 | Error | Meaning | Suggested status |
 |---|---|---|
 | `ErrMalformedToken` | Not a valid JWS compact serialization — wrong segment count, non-canonical base64, or a segment that is not JSON | 401 |
-| `ErrUnsupportedAlgorithm` | The header's `alg` is not exactly `"HS256"`. Returned **before** any signature is verified | 401 |
-| `ErrInvalidSignature` | No key in the list produced a matching signature | 401 |
+| `ErrUnsupportedAlgorithm` | The header's `alg` is not exactly the parser's own — `"HS256"` at `Parse` and the `HS256` signer, `"EdDSA"` at the `EdDSA` signer. Returned **before** any signature is verified, and before an EdDSA signer reads the `kid` | 401 |
+| `ErrUnknownKey` | An `EdDSA` signer was presented a token with no `kid`, or a `kid` naming no key it holds. After the `alg` check, **before** any signature is verified | 401 |
+| `ErrInvalidSignature` | No key in the list produced a matching signature — or, at an EdDSA signer, the signature is not 64 bytes or does not verify under the named key | 401 |
 | `ErrExpiredToken` | The signature verified but `exp` is not in the future — checked **after** verification, so it cannot probe for a valid signature on forged claims | 401 |
-| `ErrKeyTooShort` | An HMAC key under 32 bytes was passed to `Issue`, or appears anywhere in `Parse`'s key list | 500 |
+| `ErrKeyTooShort` | An HMAC key under 32 bytes was passed to `Issue` or `HS256`, or appears anywhere in `Parse`'s key list; also a `Service` with neither `WithJWT` nor `WithSigner` | 500 |
+| `ErrInvalidKey` | Key material handed to `EdDSA`, `EdDSAVerifier` or `JWKS.PublicKeys` is unusable — an empty `kid`, a wrong-length Ed25519 key, two different keys under one `kid`, a JWK of a shape this package does not publish. Also what a verify-only signer's `Issue` returns | 500 |
 | `ErrInvalidTTL` | `Issue` was given a zero or negative ttl | 500 |
 
 `Parse` checks every key's length **before** it looks at the token at all and
 refuses the whole call if any one of them is short — so a misconfigured
 `Service` surfaces `ErrKeyTooShort` on the request path, not only at startup.
 `auth.Service.VerifyAccessToken` hands these back **unwrapped**, so you can tell
-an expired token from a forged one.
+an expired token from a forged one, and an unknown key from either.
 
 ## `password` — none
 
@@ -209,7 +291,8 @@ differently on purpose:
 
 | Case | `store/memory` | `store/drops` |
 |---|---|---|
-| duplicate `token_hash` (session, verification, invite) | `memory.ErrTokenHashTaken` | the driver's unique violation |
+| duplicate `token_hash` (session, verification, invite, API key, authorization code, device code, refresh token) | `memory.ErrTokenHashTaken` | the driver's unique violation |
+| duplicate device-flow `user_code` | `memory.ErrUserCodeTaken` | the driver's unique violation |
 | duplicate `(container_id, email)` invite | `memory.ErrInviteEmailTaken` | the driver's unique violation |
 | duplicate link `code` | `memory.ErrLinkCodeTaken` | the driver's unique violation |
 
