@@ -59,6 +59,14 @@ func MembershipGuard(junction *pg.Table, subjectCol, containerCol, resourceConta
 // qualifying containers renders as a false predicate, so the query returns
 // nothing rather than everything.
 //
+// A permission cap on the context ([WithPermissionCap]) is honoured: the
+// effective standing in every container is role ∩ cap, so when the cap does
+// not itself allow every requested action the subject qualifies nowhere and
+// the predicate is false — no rows, whatever their roles grant. When the cap
+// does allow them, the containers are exactly those [Service.ContainersWith]
+// names, since role ∩ cap allows an action precisely when both do. A capped
+// owner gets no owner bypass here either, matching [Service.Can].
+//
 // The predicate is resolved per query, which costs one round trip for the
 // subject's standings plus one role lookup per distinct (container, role key)
 // pair that names a custom role — a custom role is per-container, so the same
@@ -79,6 +87,14 @@ func (s *Service[C, M, PC, PM]) PermissionGuard(
 		subject, ok := SubjectFrom(ctx)
 		if !ok {
 			return nil, pg.ErrSubjectMissing
+		}
+		// role ∩ cap allows the actions iff both do, so a cap that refuses
+		// them refuses them in every container at once — including one the
+		// subject owns, since a capped owner is not elevated. pg.In of an
+		// empty list is the false predicate, the same fail-closed shape the
+		// no-qualifying-containers case below already takes.
+		if cap, capped := PermissionCapFrom(ctx); capped && !cap.Allows(resource, actions...) {
+			return pg.In(col, []string{}), nil
 		}
 		ids, err := s.ContainersWith(ctx, subject, resource, actions...)
 		if err != nil {

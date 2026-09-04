@@ -159,7 +159,7 @@ func (s *Service[C, M, PC, PM]) ListRoles(ctx context.Context) ([]RoleView, erro
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.standing(ctx, containerID, actor); err != nil {
+	if _, err := s.standingCapped(ctx, containerID, actor); err != nil {
 		return nil, err
 	}
 
