@@ -490,7 +490,12 @@ func (s *Service) DeleteAccount(ctx context.Context, userID, currentSessionID, c
 	}
 
 	// Step 7. The row, last.
-	return s.store.DeleteUser(ctx, userID)
+	if err := s.store.DeleteUser(ctx, userID); err != nil {
+		return err
+	}
+	// [AccountDeleted], after the row: the id on the event resolves to
+	// nothing any more, which is the fact the hook is being told.
+	return s.emit(ctx, Event{Kind: AccountDeleted, UserID: userID, SessionID: currentSessionID})
 }
 
 // anonymizedEmailPrefix and anonymizedEmailDomain spell the scrubbed
@@ -912,5 +917,8 @@ func (s *Service) AnonymizeAccount(ctx context.Context, userID, currentSessionID
 	// Step 7. The scrub and the stamp, last, and as one atomic step: the
 	// address becomes undeliverable, the credential and the verification go,
 	// and DeletedAt is what every entry point above then refuses on.
-	return s.store.MarkUserDeleted(ctx, userID, anonymizedEmail(userID), s.cfg.clock())
+	if err := s.store.MarkUserDeleted(ctx, userID, anonymizedEmail(userID), s.cfg.clock()); err != nil {
+		return err
+	}
+	return s.emit(ctx, Event{Kind: AccountAnonymized, UserID: userID, SessionID: currentSessionID})
 }

@@ -409,6 +409,10 @@ type config struct {
 	// sharper version of the same reason: here a zero value would mean a
 	// second-factor bypass that never expires.
 	trustedDeviceTTL time.Duration
+	// hooks are the lifecycle observers [WithHooks] registered, run in
+	// order by [Service.emit] after each mutation — see hooks.go. nil means
+	// none, and emit is then a no-op.
+	hooks []Hook
 }
 
 func defaultConfig() config {
@@ -1388,7 +1392,17 @@ func (s *Service) SignUp(ctx context.Context, email, plainPassword string) (Sign
 		// they have proven nothing about; handing them that account's id,
 		// CreatedAt and EmailVerifiedAt would answer "is this address
 		// registered?" outright.
+		//
+		// And NO event — see [WithHooks], "What deliberately emits
+		// nothing". A hook is a caller-visible side effect, and firing one
+		// on this branch, or only on the other, is the asymmetry every
+		// section above exists to remove.
 		return SignUpResult{Created: false}, nil
+	}
+	// [SignedUp] fires on this branch only: the account exists, its
+	// verification is minted, and the only thing left is to hand both back.
+	if err := s.emit(ctx, Event{Kind: SignedUp, UserID: user.ID, Detail: DetailPassword}); err != nil {
+		return SignUpResult{}, err
 	}
 	return SignUpResult{Created: true, User: user, VerifyToken: plainToken}, nil
 }
@@ -1581,12 +1595,22 @@ func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPasswo
 		}
 	}
 
+	// failed is the [LoginFailed] emission every refusal below goes
+	// through: the IP, the user agent, a UserID where one is known, a word
+	// from the closed vocabulary — and never the address. It runs AFTER the
+	// Dummy call on the branches that make one, so the hook's own cost is
+	// not what separates them; see [Hook] for the obligation that leaves on
+	// the hook.
+	failed := func(userID, detail string, err error) error {
+		return s.emitFailure(ctx, Event{Kind: LoginFailed, UserID: userID, IP: ip, UserAgent: userAgent, Detail: detail}, err)
+	}
+
 	normalized := NormalizeEmail(email)
 	u, err := s.store.FindUserByEmail(ctx, normalized)
 	switch {
 	case errors.Is(err, ErrUserNotFound):
 		s.cfg.hasher.Dummy(plainPassword)
-		return zero, ErrInvalidCredentials
+		return zero, failed("", DetailUnknownUser, ErrInvalidCredentials)
 	case err != nil:
 		return zero, err
 	}
@@ -1599,19 +1623,19 @@ func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPasswo
 	// guard several paths reach.
 	if u.DeletedAt != nil {
 		s.cfg.hasher.Dummy(plainPassword)
-		return zero, ErrInvalidCredentials
+		return zero, failed(u.ID, DetailAccountAnonymized, ErrInvalidCredentials)
 	}
 
 	if u.PasswordHash == "" {
 		s.cfg.hasher.Dummy(plainPassword)
-		return zero, ErrInvalidCredentials
+		return zero, failed(u.ID, DetailNoPassword, ErrInvalidCredentials)
 	}
 	if !s.cfg.hasher.Verify(plainPassword, u.PasswordHash) {
-		return zero, ErrInvalidCredentials
+		return zero, failed(u.ID, DetailWrongPassword, ErrInvalidCredentials)
 	}
 
 	if s.cfg.requireVerifiedEmail && u.EmailVerifiedAt == nil {
-		return zero, ErrEmailNotVerified
+		return zero, failed(u.ID, DetailEmailNotVerified, ErrEmailNotVerified)
 	}
 
 	// Step 6b: the trusted device, consulted only once the password has
@@ -1637,7 +1661,7 @@ func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPasswo
 			// &now is [Session.MFAAt]: this machine proved a factor when it
 			// was trusted, and this session inherits that standing — see
 			// [Service.LoginWithTrustedDevice].
-			return s.mintSession(ctx, u, ip, userAgent, &now)
+			return s.mintSession(ctx, u, ip, userAgent, &now, DetailTrustedDevice)
 		}
 	}
 
@@ -1648,6 +1672,11 @@ func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPasswo
 	// heard of this field gets.
 	challenge, err := s.mfaAtSignIn(ctx, u)
 	if err != nil {
+		if errors.Is(err, ErrMFARequired) {
+			// The password verified and the policy refused: a failed
+			// attempt on a known account, reported as one.
+			return zero, failed(u.ID, DetailMFARequired, err)
+		}
 		return zero, err
 	}
 	if challenge != nil {
@@ -1656,12 +1685,15 @@ func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPasswo
 		// the one success path that does not go through mintSession, which
 		// is where every other return value gets scrubbed.
 		u.PasswordHash = ""
+		if err := s.emit(ctx, Event{Kind: MFAChallenged, UserID: u.ID, IP: ip, UserAgent: userAgent}); err != nil {
+			return zero, err
+		}
 		return LoginResult{User: u, MFA: challenge}, nil
 	}
 
 	// nil: a password is not a second factor, so this session has proved
 	// none. See [Session.MFAAt].
-	return s.mintSession(ctx, u, ip, userAgent, nil)
+	return s.mintSession(ctx, u, ip, userAgent, nil, DetailPassword)
 }
 
 // mintSession is the session-issuing tail shared by [Service.Login] and
@@ -1715,7 +1747,14 @@ func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPasswo
 // would leave a window in which the session exists and is not yet fresh, and
 // a second failure mode in which the mint succeeds, the stamp fails, and the
 // caller is handed an error for a session that is already live.
-func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent string, mfaAt *time.Time) (LoginResult, error) {
+//
+// door is the [Event.Detail] of the [LoggedIn] event this emits once the row
+// is persisted — which of the six sign-in paths the caller is — so an audit
+// hook sees "password" or "passkey" rather than having to infer it. The
+// emission is the LAST thing here: a hook error reaches the caller with the
+// session already live and its refresh token never delivered, which is the
+// consequence [Hook]'s doc asks a hook author to design for.
+func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent string, mfaAt *time.Time, door string) (LoginResult, error) {
 	var zero LoginResult
 
 	now := s.cfg.clock()
@@ -1775,6 +1814,9 @@ func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent str
 		return zero, err
 	}
 
+	if err := s.emit(ctx, Event{Kind: LoggedIn, UserID: u.ID, SessionID: sessionID, IP: ip, UserAgent: userAgent, Detail: door}); err != nil {
+		return zero, err
+	}
 	return LoginResult{User: u, AccessToken: accessToken, RefreshToken: refreshPlain}, nil
 }
 
@@ -2231,6 +2273,17 @@ func (s *Service) VerifyEmail(ctx context.Context, plainToken string) (UserBase,
 		return zero, err
 	}
 	u.PasswordHash = ""
+
+	// [EmailChanged] first when the address moved, then [EmailVerified] on
+	// both branches — the order the Store writes ran in.
+	if v.Purpose == PurposeEmailChange {
+		if err := s.emit(ctx, Event{Kind: EmailChanged, UserID: v.UserID}); err != nil {
+			return zero, err
+		}
+	}
+	if err := s.emit(ctx, Event{Kind: EmailVerified, UserID: v.UserID}); err != nil {
+		return zero, err
+	}
 	return u, nil
 }
 
@@ -2457,7 +2510,13 @@ func (s *Service) Refresh(ctx context.Context, refreshPlain string) (LoginResult
 		if derr := s.store.DeleteSessionsByFamily(ctx, rotated.FamilyID); derr != nil {
 			return zero, fmt.Errorf("%w: %w", ErrTokenReuse, derr)
 		}
-		return zero, ErrTokenReuse
+		// The family is gone: [TokenReuseDetected], after the revocation
+		// and only after it — a revocation that failed above returned
+		// without an event, and its error says so.
+		return zero, s.emitFailure(ctx, Event{
+			Kind: TokenReuseDetected, UserID: rotated.UserID, SessionID: rotated.ID,
+			IP: rotated.IP, UserAgent: rotated.UserAgent, Detail: DetailReuse,
+		}, ErrTokenReuse)
 	}
 
 	// Step 4: this caller won. Mint the successor.
@@ -2557,6 +2616,14 @@ func (s *Service) Refresh(ctx context.Context, refreshPlain string) (LoginResult
 		return zero, ErrSessionRevoked
 	}
 
+	// [SessionRefreshed]: the successor is persisted. IP and UserAgent are
+	// the inherited ones — see the note on the row above.
+	if err := s.emit(ctx, Event{
+		Kind: SessionRefreshed, UserID: rotated.UserID, SessionID: successorID,
+		IP: rotated.IP, UserAgent: rotated.UserAgent,
+	}); err != nil {
+		return zero, err
+	}
 	return LoginResult{User: u, AccessToken: accessToken, RefreshToken: refreshPlainNew}, nil
 }
 
@@ -2668,18 +2735,24 @@ func (s *Service) Logout(ctx context.Context, refreshPlain string) error {
 		if err := s.store.DeleteSessionsByFamily(ctx, sess.FamilyID); err != nil {
 			return err
 		}
-		return nil
+		// The same event [Service.Refresh] emits for the same signal: a
+		// superseded token was presented and the family is gone.
+		return s.emit(ctx, Event{
+			Kind: TokenReuseDetected, UserID: sess.UserID, SessionID: sess.ID,
+			IP: sess.IP, UserAgent: sess.UserAgent, Detail: DetailReuse,
+		})
 	}
 	if err := s.store.DeleteSession(ctx, sess.ID); err != nil {
 		if errors.Is(err, ErrSessionNotFound) {
 			// Raced with something else that deleted it first (another
 			// Logout call for the same token, a family revocation, ...) —
-			// still idempotent from this caller's point of view.
+			// still idempotent from this caller's point of view. Nothing
+			// changed here, so nothing is emitted.
 			return nil
 		}
 		return err
 	}
-	return nil
+	return s.emit(ctx, Event{Kind: LoggedOut, UserID: sess.UserID, SessionID: sess.ID, IP: sess.IP, UserAgent: sess.UserAgent})
 }
 
 // LogoutAll revokes every session belonging to userID, across every
@@ -2816,7 +2889,10 @@ func (s *Service) LogoutAll(ctx context.Context, userID string) error {
 	// the control a user reaches for when they believe a machine is in the
 	// wrong hands, and a device left trusted means that machine still skips
 	// the second factor on its way back in.
-	return s.sweepTrustedDevices(ctx, userID)
+	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
+		return err
+	}
+	return s.emit(ctx, Event{Kind: LoggedOutAll, UserID: userID})
 }
 
 // ListSessions returns every session belonging to userID — rotated or not,
@@ -2947,7 +3023,10 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) e
 			if sess.FamilyID == "" {
 				return fmt.Errorf("%w: ListSessionsByUser returned the named Session with no FamilyID, leaving no family to revoke", ErrStoreContract)
 			}
-			return s.store.DeleteSessionsByFamily(ctx, sess.FamilyID)
+			if err := s.store.DeleteSessionsByFamily(ctx, sess.FamilyID); err != nil {
+				return err
+			}
+			return s.emit(ctx, Event{Kind: SessionRevoked, UserID: userID, SessionID: sessionID, IP: sess.IP, UserAgent: sess.UserAgent})
 		}
 	}
 	return ErrSessionNotFound
@@ -3461,7 +3540,7 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 			return err
 		}
 	}
-	return nil
+	return s.emit(ctx, Event{Kind: PasswordChanged, UserID: userID, SessionID: currentSessionID})
 }
 
 // RequestPasswordReset begins a password-reset flow for email: for a known,
@@ -4120,7 +4199,7 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 			return err
 		}
 	}
-	return nil
+	return s.emit(ctx, Event{Kind: PasswordReset, UserID: v.UserID})
 }
 
 // RequestEmailChange mints an "email_change" [Verification] bound to
