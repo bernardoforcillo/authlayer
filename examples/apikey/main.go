@@ -119,7 +119,10 @@ func main() {
 	must(err)
 	pf, err := keySvc.Authenticate(ctx, full)
 	must(err)
-	report("unrestricted key project:deploy", can(orgSvc, apikey.WithPrincipal(ctx, pf), "project", "deploy"), true)
+	asFull := apikey.WithPrincipal(ctx, pf)
+	report("unrestricted key project:deploy", can(orgSvc, asFull, "project", "deploy"), true)
+	// ... and never more than the role: a deployer cannot manage members.
+	report("unrestricted key member:create", can(orgSvc, asFull, org.ResourceMember, org.ActionCreate), false)
 
 	// -- 7. Revoke ---------------------------------------------------------
 	step("revoke")
