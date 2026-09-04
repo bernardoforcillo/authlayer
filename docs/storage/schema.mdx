@@ -1,17 +1,19 @@
 ---
 title: "The schema"
-description: "Nine tables across four independent stores, printed from the code that defines them — and which constraint or index is load-bearing rather than decorative."
+description: "Eleven tables across five independent stores, printed from the code that defines them — and which constraint or index is load-bearing rather than decorative."
 ---
 
-Four stores own nine tables between them, and none of them declares a foreign
-key — not to a users table from the RBAC side, which authlayer does not own, not
-between the three auth tables, and not from `identities` to `users` (that one is
-also forced: the auth store may be an entirely different backend).
+Five stores own eleven tables between them, and none of them declares a foreign
+key to another store's table — not to a users table from the RBAC side, which
+authlayer does not own, not between the three auth tables, and not from
+`identities` to `users` (that one is also forced: the auth store may be an
+entirely different backend). The one foreign key in the package stays inside
+the store that owns both its ends: `api_keys` to `service_accounts`.
 
 <Note>
 The column lists below are **printed by a program the documentation gate runs**,
-straight out of `dropsstore.NewSchema`, `NewAuthSchema`, `NewInviteSchema` and
-`NewIdentitySchema`. They cannot drift from the code.
+straight out of `dropsstore.NewSchema`, `NewAuthSchema`, `NewInviteSchema`,
+`NewAPIKeySchema` and `NewIdentitySchema`. They cannot drift from the code.
 </Note>
 
 {/* verify:import */}
@@ -285,7 +287,71 @@ needed. See [addresses are normalized](/invitations/email-invites#addresses-are-
 Rows written by **v0.1.0**, which normalized nothing, may hold non-normalized
 addresses; the changelog carries the one-time migration.
 
-{/* verify:stdout "organizations\n  id PK\n  owner_id\n  created_at\n  updated_at\n  name\n  slug UNIQUE\n  indexes: 0\norganization_members\n  container_id\n  user_id\n  role_key\n  joined_at\n  PRIMARY KEY [container_id user_id]\n  indexes: 0\norganization_roles\n  id PK\n  container_id\n  key\n  name\n  permissions\n  created_at\n  UNIQUE [container_id key] as organization_roles_container_key\n  indexes: 0\nusers\n  id PK\n  email UNIQUE\n  email_verified_at NULL\n  password_hash\n  created_at\n  updated_at\n  deleted_at NULL\n  UNIQUE [email] as users_email_key\n  indexes: 0\nsessions\n  id PK\n  user_id\n  token_hash\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  user_agent\n  ip\n  mfa_at NULL\n  UNIQUE [token_hash] as sessions_token_hash\n  indexes: 1\nverifications\n  id PK\n  user_id\n  token_hash\n  purpose\n  email\n  expires_at\n  created_at\n  UNIQUE [token_hash] as verifications_token_hash\n  indexes: 1\norganization_invites\n  id PK\n  container_id\n  email\n  role_key\n  token_hash\n  invited_by\n  expires_at\n  created_at\n  UNIQUE [container_id email] as organization_invites_container_email\n  UNIQUE [token_hash] as organization_invites_token_hash\n  indexes: 0\norganization_invite_links\n  id PK\n  container_id\n  code\n  role_key\n  created_by\n  max_uses\n  use_count\n  expires_at NULL\n  revoked_at NULL\n  created_at\n  UNIQUE [code] as organization_invite_links_code\n  indexes: 0\nidentities\n  id PK\n  user_id\n  provider\n  subject\n  email\n  created_at\n  last_used_at NULL\n  UNIQUE [provider subject] as identities_provider_subject\n  indexes: 1" */}
+{/* verify:stdout "organizations\n  id PK\n  owner_id\n  created_at\n  updated_at\n  name\n  slug UNIQUE\n  indexes: 0\norganization_members\n  container_id\n  user_id\n  role_key\n  joined_at\n  PRIMARY KEY [container_id user_id]\n  indexes: 0\norganization_roles\n  id PK\n  container_id\n  key\n  name\n  permissions\n  created_at\n  UNIQUE [container_id key] as organization_roles_container_key\n  indexes: 0\nusers\n  id PK\n  email UNIQUE\n  email_verified_at NULL\n  password_hash\n  created_at\n  updated_at\n  deleted_at NULL\n  UNIQUE [email] as users_email_key\n  indexes: 0\nsessions\n  id PK\n  user_id\n  token_hash\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  user_agent\n  ip\n  mfa_at NULL\n  UNIQUE [token_hash] as sessions_token_hash\n  indexes: 1\nverifications\n  id PK\n  user_id\n  token_hash\n  purpose\n  email\n  expires_at\n  created_at\n  UNIQUE [token_hash] as verifications_token_hash\n  indexes: 1\norganization_invites\n  id PK\n  container_id\n  email\n  role_key\n  token_hash\n  invited_by\n  expires_at\n  created_at\n  UNIQUE [container_id email] as organization_invites_container_email\n  UNIQUE [token_hash] as organization_invites_token_hash\n  indexes: 0\norganization_invite_links\n  id PK\n  container_id\n  code\n  role_key\n  created_by\n  max_uses\n  use_count\n  expires_at NULL\n  revoked_at NULL\n  created_at\n  UNIQUE [code] as organization_invite_links_code\n  indexes: 0\nservice_accounts\n  id PK\n  container_id\n  name\n  description\n  created_by\n  created_at\n  updated_at\n  disabled_at NULL\n  indexes: 1\napi_keys\n  id PK\n  service_account_id\n  container_id\n  name\n  prefix\n  token_hash UNIQUE\n  permissions\n  expires_at NULL\n  last_used_at NULL\n  created_by\n  created_at\n  revoked_at NULL\n  indexes: 2\napi_keys.service_account_id -> service_accounts ON DELETE CASCADE\nidentities\n  id PK\n  user_id\n  provider\n  subject\n  email\n  created_at\n  last_used_at NULL\n  UNIQUE [provider subject] as identities_provider_subject\n  indexes: 1" */}
+
+## The service-account tables
+
+{/* verify:main */}
+```go
+ak := dropsstore.NewAPIKeySchema()
+describe(ak.ServiceAccounts)
+describe(ak.Keys)
+fk := ak.Keys.Col("service_account_id").ForeignKey()
+fmt.Println("api_keys.service_account_id ->", fk.Target.Table().Name(), "ON DELETE", fk.OnDelete)
+```
+
+```
+service_accounts
+  id PK
+  container_id
+  name
+  description
+  created_by
+  created_at
+  updated_at
+  disabled_at NULL
+  indexes: 1
+api_keys
+  id PK
+  service_account_id
+  container_id
+  name
+  prefix
+  token_hash UNIQUE
+  permissions
+  expires_at NULL
+  last_used_at NULL
+  created_by
+  created_at
+  revoked_at NULL
+  indexes: 2
+api_keys.service_account_id -> service_accounts ON DELETE CASCADE
+```
+
+<Warning>
+**`token_hash` UNIQUE** is the same MUST `sessions.token_hash` carries: two rows
+sharing a hash would make a presented key resolve to whichever the server
+reached first, so *which account, at which cap* a bearer credential acts as
+would be decided by row order. It is declared **inline**, through the record's
+own `drop:"token_hash,unique"` tag, so unlike the guarded `ALTER TABLE`
+constraints above `CreateSchema` cannot self-heal a pre-existing `api_keys`
+table that lacks it.
+
+**The foreign key is the cascade.** `ON DELETE CASCADE` makes a delete on the
+account remove its keys in the same statement, and the constraint is what turns
+a key naming no account into a foreign-key violation, classified as
+`apikey.ErrServiceAccountNotFound`. `DeleteServiceAccount` still deletes the keys
+explicitly inside one transaction, so the port's cascade MUST holds against a
+hand-migrated schema that dropped the constraint.
+
+**`permissions` is NOT NULL**, and empty means *no cap*: a nil
+`Key.Permissions` is written as an empty `bytea`, never NULL — declare it the
+same way in your own migration.
+</Warning>
+
+The three indexes serve `ListServiceAccounts` (`container_id`), `ListKeys` and
+the explicit cascade (`service_account_id`), and tenant-scoped queries over
+keys (`container_id`). All are `CREATE INDEX IF NOT EXISTS`.
 
 ## The identity table
 

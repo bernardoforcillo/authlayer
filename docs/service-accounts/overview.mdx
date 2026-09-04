@@ -1,0 +1,196 @@
+---
+title: "Service accounts"
+description: "A non-human member of a scope, minted by the apikey package and admitted through GrantMembership — so every Can and Authorize you already make works unchanged for it."
+---
+
+`apikey` gives a scope **non-human members**. A `ServiceAccount` is an ordinary
+membership whose id this package mints rather than your users table; a `Key`
+is a bearer credential that authenticates as it. From the moment the account
+is admitted, the RBAC engine treats it exactly like a person — the same role
+resolution, the same [escalation guard](/authorization/privilege-escalation),
+the same [query guards](/authorization/query-filtering).
+
+<Columns cols={2}>
+  <Card title="Keys" icon="key" href="/service-accounts/keys">
+    Minting, the record, revocation, expiry, disabling the account, purging.
+  </Card>
+  <Card title="Restricted permissions" icon="filter" href="/service-accounts/restricted-permissions">
+    A key that can do strictly less than its account — role ∩ cap.
+  </Card>
+  <Card title="Authenticating" icon="fingerprint" href="/service-accounts/authenticating">
+    From a presented plaintext to a `Principal` and a context the engine accepts.
+  </Card>
+  <Card title="Errors" icon="triangle-exclamation" href="/reference/errors">
+    The eight `apikey` sentinels, and the `scope` ones it reuses.
+  </Card>
+</Columns>
+
+## Wiring it
+
+`apikey.New` takes the **generic `*scope.Service`**, which `org.Service` embeds
+under the embedded type's own name — the same seam `invite.New` uses.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/apikey"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/scope"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{
+	"project": {"read", "deploy"},
+}), memory.New[org.Organization, org.Member]())
+keys := apikey.New(svc.Service, memory.NewAPIKeyStore()) // .Service, not svc
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme") // alice is owner
+owner := org.WithOrg(ctx, acme.ID)
+
+// A custom role is the honest shape for automation: exactly what it needs.
+_, _ = svc.CreateRole(owner, "deployer", "Deployer", map[string][]access.Action{
+	"project": {"read", "deploy"},
+})
+```
+
+`store/memory`'s `NewAPIKeyStore` is the dev/test backend, exactly as
+`memory.New` is for `scope.Store`; `store/drops` ships the production one as
+`dropsstore.NewAPIKeyStore(db)`, with its own `CreateSchema` — two tables, see
+[the schema](/storage/schema#the-service-account-tables).
+
+## Creating one
+
+{/* verify:main */}
+```go
+sa, err := keys.CreateServiceAccount(owner, "ci", "deploys main", "deployer")
+fmt.Println("created:", err, sa.Name, sa.CreatedBy)
+
+// It is a member: scope resolves its role like anyone's.
+perms, elevated, err := svc.Standing(context.Background(), acme.ID, sa.ID)
+fmt.Println("a member:", err, elevated, perms.Allows("project", "deploy"), perms.Allows("project", "delete"))
+```
+
+```
+created: <nil> ci alice
+a member: <nil> false true false
+```
+
+`sa.ID` is the account's **subject**: what `GrantMembership` admitted, what a
+[`Principal`](/service-accounts/authenticating) carries, and what
+`scope.WithSubject` receives when a key acts.
+
+## The escalation guard applies
+
+The actor needs `service_account:create`, and — unless elevated — may not give
+the account a role more powerful than their own standing. It is the same rule
+`AddMember` applies, for the same reason: a service account you can mint keys
+for is a standing you can borrow.
+
+{/* verify:main */}
+```go
+_, _ = svc.AddMember(owner, "bob", org.RoleAdmin)
+bob := org.WithOrg(org.WithSubject(context.Background(), "bob"), acme.ID)
+
+_, err = keys.CreateServiceAccount(bob, "root", "", org.RoleOwner)
+fmt.Println("admin creating an owner-role account:", errors.Is(err, scope.ErrPrivilegeEscalation))
+_, err = keys.CreateServiceAccount(bob, "helper", "", org.RoleMember)
+fmt.Println("admin creating a member-role account:", err)
+```
+
+```
+admin creating an owner-role account: true
+admin creating a member-role account: <nil>
+```
+
+The guard compares against the actor's **capped** standing, so an admin acting
+through a [restricted key](/service-accounts/restricted-permissions) is bounded
+by that key, not by the admin's role.
+
+## What each call requires
+
+| Call | Permission | Notes |
+|---|---|---|
+| `CreateServiceAccount(ctx, name, description, roleKey)` | `service_account:create` + escalation guard | record first, then `GrantMembership` — see below |
+| `ListServiceAccounts(ctx)` | `service_account:read` | disabled ones included |
+| `DisableServiceAccount(ctx, id)` / `EnableServiceAccount(ctx, id)` | `service_account:update` | every key refused while disabled; membership untouched |
+| `ChangeServiceAccountRole(ctx, id, roleKey)` | `service_account:update` **and** `member:update` + escalation guard | delegates to `scope.Service.ChangeMemberRole` |
+| `DeleteServiceAccount(ctx, id)` | `service_account:delete` **and** `member:delete` + target-rank guard | membership first, then record and keys together |
+| `CreateKey(ctx, id, name, opts...)` | `service_account:update` + escalation guard | returns the plaintext **once** |
+| `ListKeys(ctx, id)` | `service_account:read` | nothing to redact — no plaintext is stored |
+| `RevokeKey(ctx, keyID)` | `service_account:update` | idempotent |
+| `Authenticate(ctx, plaintext)` | **nothing** | the key is the credential |
+| `PurgeExpired(ctx, before)` | **nothing, and it spans every container** | cron only |
+
+`service_account:create/read/update/delete` sit on the
+[control-statement surface](/concepts/statements#the-control-statements-you-get-for-free)
+every `NewAccess` builds, so the built-in `admin` role acquires all four
+automatically. A cross-tenant id is reported as not-found, exactly as
+`invite` does for its records.
+
+<Warning>
+**Every `admin` gains `service_account:*` on adoption**, with no code change
+and no migration to notice — the same widening `invite:*` caused in 0.1.0,
+because `admin` is derived from the merged surface. Define a custom role if
+`admin` must not manage service accounts.
+</Warning>
+
+## What is not atomic
+
+An account spans **two stores** that may not share a database: its record in
+`apikey.Store`, its membership in `scope.Store`. There is no cross-store
+transaction, exactly as
+[invitation acceptance](/invitations/security#claim-first-admit-second) has
+none, and each two-store method orders its halves so that a failure between
+them leaves the **inert** shape behind:
+
+- **`CreateServiceAccount` writes the record first, then the membership.** A
+  record with no membership has no standing, gets no key (`CreateKey`
+  resolves its role and finds `ErrNotMember`), and authenticates nothing. The
+  reverse leftover — a membership for a subject nothing knows — would be a
+  phantom member with a role that every roster reports. If the grant fails the
+  record is deleted again, best-effort; if that fails too, both errors come
+  back joined and `DeleteServiceAccount` removes the leftover on request.
+- **`DeleteServiceAccount` removes the membership first, then the record and
+  every key together**, atomically in `apikey.Store`. The instant the
+  membership is gone the account has no standing anywhere, so a key that
+  still resolves is inert.
+
+<Warning>
+On a **nested scope** under the default `Policy.MembersFromParent`,
+`GrantMembership` refuses a subject with no standing in the parent — which a
+freshly minted id never has. `CreateServiceAccount` on a team therefore fails
+with `scope.ErrNotParentMember` (and cleans up its record). Clear
+`MembersFromParent` for that scope if it is to hold service accounts.
+</Warning>
+
+## Events
+
+`apikey.WithHooks` mirrors `scope.WithHooks` exactly — one `Hook`, one `Event`,
+a `HookFunc` adapter — and fires after the store change, before the method
+returns. `scope` emits its own `MemberAdded` for the membership half with
+`ActorID` equal to the **account id** (see
+[why GrantMembership cannot name an actor](/authorization/hooks#grantmembership-cannot-name-an-actor));
+`ServiceAccountCreated` from this package carries the real actor, so attribute
+the creation from that one.
+
+{/* verify:stdout "created: <nil> ci alice\na member: <nil> false true false\nadmin creating an owner-role account: true\nadmin creating a member-role account: <nil>" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Keys" icon="key" href="/service-accounts/keys">
+    Mint one, and the three ways it stops working.
+  </Card>
+  <Card title="Authenticating" icon="fingerprint" href="/service-accounts/authenticating">
+    `Authenticate`, `Principal`, `WithPrincipal`.
+  </Card>
+</Columns>

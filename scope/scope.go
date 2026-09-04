@@ -30,6 +30,13 @@ import (
 //     decoded. Unknown key → ErrRoleNotFound.
 //  6. The actor is elevated if the resolved permission set is full, or if the
 //     parent conferred elevation.
+//  7. If the context carries a permission cap ([WithPermissionCap]) and the
+//     actor is the CONTEXT subject, the standing is capped: permissions
+//     become role ∩ cap and the actor stays elevated only if the cap itself
+//     is Full. A capped owner is therefore not elevated. The cap is applied
+//     last, so it can only ever remove. The explicit-user-id methods
+//     ([Service.HasPermission], [Service.Standing]) skip this step — see
+//     [WithPermissionCap] for which paths honour it and why.
 //
 // An elevated actor passes every fine-grained check naming at least one action,
 // and the privilege-escalation guard. Everyone else must hold every requested
@@ -158,7 +165,13 @@ func (s *Service[C, M, PC, PM]) emit(ctx context.Context, e Event) error {
 // elevated standing in the parent. A subject with no standing in the parent
 // gets ErrNotMember, one with standing but not that grant ErrForbidden. The
 // new container's ParentID is stamped from that parent, not from the value you
-// pass, so setting it beforehand has no effect either.
+// pass, so setting it beforehand has no effect either. A subject carrying a
+// permission cap ([WithPermissionCap]) that is not Full is refused with
+// ErrForbidden here — the cap speaks this scope's vocabulary, not the
+// parent's, and cannot be honoured against the parent's surface, so it is
+// not silently ignored. On an UNPARENTED scope the cap plays no part: there
+// is no container on the context for it to be scoped to, and container
+// creation is gated upstream by the application, cap or not.
 //
 // A unique-constraint violation on one of your own fields (a slug, say) is
 // reported by the Store as ErrConflict.
@@ -263,6 +276,13 @@ func (s *Service[C, M, PC, PM]) Can(ctx context.Context, resource string, action
 // resource must be granted. An empty req therefore returns true for any member
 // — it asks nothing. Non-membership is (false, nil), matching Can.
 //
+// "Reads nothing from the context" includes a permission cap
+// ([WithPermissionCap]): this answers about userID as they actually stand,
+// uncapped, even when ctx carries a cap for a different — or the same —
+// subject. Apply [Service.CapStanding] to a [Service.Standing] result if a
+// capped answer about the ctx principal is what you need; [Service.Can]
+// already gives one.
+//
 // Because it bypasses the ctx subject entirely, HasPermission performs no check
 // that the *caller* is entitled to ask. Do not expose it directly to end users.
 func (s *Service[C, M, PC, PM]) HasPermission(ctx context.Context, containerID, userID string, req map[string][]access.Action) (bool, error) {
@@ -288,9 +308,13 @@ func (s *Service[C, M, PC, PM]) HasPermission(ctx context.Context, containerID, 
 // they are elevated there — the same resolution [Service.Can] performs, exposed
 // so a nested scope can consult its parent through [ParentScope].
 //
-// It reads nothing from the context and performs no check that the caller is
-// entitled to ask, exactly like [Service.HasPermission]. Do not expose it
-// directly to end users.
+// It reads nothing from the context — a permission cap on ctx
+// ([WithPermissionCap]) included, so the answer is userID's real standing,
+// never a capped one; see [Service.HasPermission] for why, and
+// [Service.CapStanding] for applying the cap yourself — and performs no
+// check that the caller is
+// entitled to ask, exactly like HasPermission. Do not expose it directly to
+// end users.
 func (s *Service[C, M, PC, PM]) Standing(
 	ctx context.Context, containerID, userID string,
 ) (access.Permission, bool, error) {
@@ -385,6 +409,62 @@ func (s *Service[C, M, PC, PM]) standing(ctx context.Context, containerID, userI
 	}, nil
 }
 
+// CapStanding applies the cap on ctx, if any, to a standing already
+// resolved in THIS scope: it returns perms ∩ cap and whether the subject is
+// still elevated, which is only when they were AND the cap is Full. With no
+// cap on ctx both values come back unchanged.
+//
+// This is the one definition of the cap rule. The engine applies it on
+// every context-subject path itself; it is exported so a package that
+// resolves an actor through [Service.Standing] — which reads no cap, by
+// contract — can apply the identical rule rather than an approximation of
+// it. The invite package's escalation guard and the apikey package's do
+// exactly that, so a restricted key can mint neither an invitation nor
+// another key above what the key itself allows.
+//
+// "Full" is judged in this scope's statement space, not the cap's own:
+// Full() ∩ cap IsFull only when cap grants every pair THIS scope declares. A
+// cap compiled against a different Statements — one that happens to set
+// every bit of its own, smaller space — is not Full here, and intersects to
+// nothing ([access.Permission.Intersect] fails closed), so a subject
+// carrying it is neither elevated nor granted anything. Asking cap.IsFull()
+// alone would let exactly such a cap keep an owner elevated, which is why
+// this is a method on the Service rather than a free function.
+//
+// Elevation is deliberately not derived from the intersected set alone
+// either: an owner under OwnerBypass holds Full, and Full ∩ cap IsFull only
+// when cap is, so the two formulations agree there; but a subject elevated
+// through inheritance alone ([Inheritance] conferring elevation with no
+// grants) has an empty perms and elevated=true, and for them the intersected
+// set says nothing. Requiring the cap itself to be Full is the rule that
+// gives the right answer in both shapes.
+func (s *Service[C, M, PC, PM]) CapStanding(ctx context.Context, perms access.Permission, elevated bool) (access.Permission, bool) {
+	ceiling, ok := PermissionCapFrom(ctx)
+	if !ok {
+		return perms, elevated
+	}
+	fullHere := s.ac.Full().Intersect(ceiling).IsFull()
+	return perms.Intersect(ceiling), elevated && fullHere
+}
+
+// standingCapped is standing for the CONTEXT subject: the same resolution,
+// followed by the permission cap on ctx if there is one
+// ([Service.CapStanding]).
+// Every path that acts on behalf of the ctx subject goes through this;
+// [Service.HasPermission] and [Service.Standing], which take an explicit
+// user id and read nothing from the context by contract, call standing
+// directly and never see a cap. The cap is applied after the owner-bypass,
+// inherited and role rungs have all run, which is what makes it unable to
+// add a grant: there is nothing left to resolve after it.
+func (s *Service[C, M, PC, PM]) standingCapped(ctx context.Context, containerID, userID string) (authz, error) {
+	a, err := s.standing(ctx, containerID, userID)
+	if err != nil {
+		return authz{}, err
+	}
+	a.perms, a.elevated = s.CapStanding(ctx, a.perms, a.elevated)
+	return a, nil
+}
+
 // inherited resolves what a subject's standing in the parent scope confers
 // here: grants named in this scope's own vocabulary, and whether the parent
 // standing alone makes them elevated. It yields nothing at all when no parent
@@ -415,7 +495,7 @@ func (s *Service[C, M, PC, PM]) inherited(
 }
 
 func (s *Service[C, M, PC, PM]) authorize(ctx context.Context, containerID, userID, resource string, actions ...access.Action) (authz, error) {
-	a, err := s.standing(ctx, containerID, userID)
+	a, err := s.standingCapped(ctx, containerID, userID)
 	if err != nil {
 		return authz{}, err
 	}
@@ -440,10 +520,22 @@ func (s *Service[C, M, PC, PM]) authorize(ctx context.Context, containerID, user
 // (ErrNotMember, ErrContainerNotFound, a store failure) is returned as-is: on
 // create there is no membership of one's own to fall back to, so none of them
 // is a condition to swallow.
+//
+// A permission cap on ctx ([WithPermissionCap]) is compiled against THIS
+// scope's statements, and the check here runs against the PARENT's, so the
+// cap cannot be intersected with the parent standing — [access.Permission.
+// Intersect] would fail closed to nothing anyway. Rather than pretend
+// otherwise, a capped subject is refused with ErrForbidden unless the cap is
+// Full, in which case it caps nothing and the ordinary check runs. A
+// restricted API key therefore cannot create nested containers; a key with
+// no restriction can, exactly as the account behind it could.
 func (s *Service[C, M, PC, PM]) authorizeCreateInParent(ctx context.Context, subject string) (string, error) {
 	parentID, ok := ScopeFrom(ctx)
 	if !ok {
 		return "", ErrScopeMissing
+	}
+	if ceiling, capped := PermissionCapFrom(ctx); capped && !ceiling.IsFull() {
+		return "", ErrForbidden
 	}
 	perms, elevated, err := s.cfg.parent.Standing(ctx, parentID, subject)
 	if err != nil {
@@ -532,6 +624,21 @@ func (s *Service[C, M, PC, PM]) resolveRole(ctx context.Context, containerID, ro
 func (s *Service[C, M, PC, PM]) RolePermissions(ctx context.Context, containerID, roleKey string) (access.Permission, error) {
 	return s.resolveRole(ctx, containerID, roleKey)
 }
+
+// Access returns the access engine this Service was built with — the
+// Statements every permission it resolves is compiled against, and the
+// registry of its code-defined roles.
+//
+// It exists so a package building on this one can encode and decode
+// permissions in the SAME statement space the engine decides in: the apikey
+// package compiles a key's restricted permissions with Access().Permission
+// and decodes a stored key's cap with Access().Decode, and a cap built
+// against any other Statements would intersect to nothing (see
+// [access.Permission.Intersect]). It is the engine's own *access.Access, not
+// a copy, and an *access.Access is only safe for concurrent use once its
+// code-defined roles are registered — so do not call NewRole on the result
+// after the Service is in service.
+func (s *Service[C, M, PC, PM]) Access() *access.Access { return s.ac }
 
 // Container loads the container identified by id, returning
 // ErrContainerNotFound when there is none.
@@ -830,7 +937,7 @@ func (s *Service[C, M, PC, PM]) ListMembers(ctx context.Context) ([]M, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.standing(ctx, containerID, actor); err != nil {
+	if _, err := s.standingCapped(ctx, containerID, actor); err != nil {
 		return nil, err
 	}
 	return s.store.ListMembers(ctx, containerID)

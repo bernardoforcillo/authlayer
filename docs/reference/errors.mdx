@@ -95,6 +95,32 @@ atomicity rules out. `JoinViaLink` re-reads the link afterwards to tell them
 apart.
 </Note>
 
+## `apikey` — eight
+
+Not exported by `scope`, and not aliased anywhere. Denials are **not**
+re-declared: a management call the actor may not make is `scope.ErrForbidden`
+(or `scope.ErrNotMember`), and minting above one's standing is
+`scope.ErrPrivilegeEscalation`.
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrServiceAccountNotFound` | No service account with that id — or one in **another** container than the one on the context | 404 |
+| `ErrKeyNotFound` | No key with that id or token hash — or, from the management calls, one in another container | 404 |
+| `ErrKeyRevoked` | The key's `RevokedAt` is set | 401 |
+| `ErrKeyExpired` | The key's `ExpiresAt` is not in the future | 401 |
+| `ErrServiceAccountDisabled` | The key is live but its account is disabled; also refused by `CreateKey` | 401 (403 from `CreateKey`) |
+| `ErrIDTaken` | A `Create*` was given an id that already identifies a row of that kind | 409 |
+| `ErrEmptyPermissions` | `WithPermissions` compiled to a set granting nothing — refused rather than stored as *no cap* | 400 |
+| `ErrInvalidExpiry` | `WithExpiry` named an instant not after now | 400 |
+
+The first two are raised by the `Store` on any lookup, update or delete that
+matches no row — **and also by the service layer, deliberately** — for a
+record that exists in another container, so a cross-tenant id is
+indistinguishable from a missing one. The middle three describe *why an
+authentication was refused* and only `Authenticate` raises them; a `Store`
+returns the row and the service reads the timestamps. The last two are
+argument errors raised before any store is touched.
+
 ## `auth` — twenty-four
 
 Eighteen belong to the password-and-session core. The six for
@@ -214,7 +240,7 @@ differently on purpose:
 
 | Case | `store/memory` | `store/drops` |
 |---|---|---|
-| duplicate `token_hash` (session, verification, invite) | `memory.ErrTokenHashTaken` | the driver's unique violation |
+| duplicate `token_hash` (session, verification, invite, API key) | `memory.ErrTokenHashTaken` | the driver's unique violation |
 | duplicate `(container_id, email)` invite | `memory.ErrInviteEmailTaken` | the driver's unique violation |
 | duplicate link `code` | `memory.ErrLinkCodeTaken` | the driver's unique violation |
 

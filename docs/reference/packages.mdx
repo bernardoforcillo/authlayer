@@ -16,14 +16,16 @@ Current release **v0.1.0**.
 | [`team`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/team) | Team RBAC nested inside `org` via `scope.WithParent` — the worked example of [nesting](/authorization/nested-scopes) | `drops` |
 | [`invite`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/invite) | [Invitations](/invitations/overview) — email tokens and reusable links | `drops` |
 | [`invite/invitetest`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/invite/invitetest) | `invite.Store`'s contract as an executable suite. **Test-only**; imports `testing` | `drops` |
+| [`apikey`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/apikey) | [Service accounts](/service-accounts/overview) — non-human members and the API keys that authenticate as them, capped with `scope.WithPermissionCap` | `drops` |
+| [`apikey/apikeytest`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/apikey/apikeytest) | `apikey.Store`'s contract as an executable suite. **Test-only**; imports `testing` | `drops` |
 | [`auth`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/auth) | [Authentication](/authentication/overview) — `Service`, its `Store` port, and the user/session/verification records; plus the optional `IdentityStore` port and the four [external-identity](/oauth/overview) methods | `x/crypto` |
 | [`auth/authtest`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/auth/authtest) | `auth.Store`'s contract as an executable suite. **Test-only**; imports `testing` | `x/crypto` |
 | [`token`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/token) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled JWT behind one `Signer` interface with [one algorithm per constructor](/authentication/access-tokens#why-hand-rolling-this-jwt-is-defensible): `HS256` over a shared secret, [`EdDSA` with a published JWKS](/authentication/access-tokens#eddsa-and-the-jwks) | standard library |
 | [`password`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/password) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` | `x/crypto` — the **only** package that does |
-| [`store/memory`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/store/memory) | In-memory `scope.Store`, `invite.Store`, `auth.Store` and `auth.IdentityStore` | — |
+| [`store/memory`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/store/memory) | In-memory `scope.Store`, `invite.Store`, `apikey.Store`, `auth.Store` and `auth.IdentityStore` | — |
 | [`store/drops`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/store/drops) | PostgreSQL stores — declares **`package dropsstore`** | `drops`, `pgx/v5` |
 
-Seven runnable, database-free tours ship alongside them:
+Eight runnable, database-free tours ship alongside them:
 
 ```sh
 go run ./examples/basic     # organization RBAC
@@ -33,13 +35,14 @@ go run ./examples/oauth     # external identities: the ladder, linking, unlinkin
 go run ./examples/magiclink # passwordless sign-in
 go run ./examples/deletion  # the two account-ending postures
 go run ./examples/hooks     # lifecycle hooks, and an EdDSA signer with its JWKS
+go run ./examples/apikey    # service accounts and API keys, mint through cascade delete
 ```
 
 <Note>
 `internal/uid` is not importable. It is the RFC 9562 UUIDv7 generator authlayer
 uses for every id it mints — containers, roles, users, sessions, verifications,
-invites, links, identities — written out rather than depended on so the module
-stays at three requirements.
+invites, links, identities, service accounts, keys — written out rather than
+depended on so the module stays at three requirements.
 </Note>
 
 ## The dependency budget
@@ -73,6 +76,9 @@ Three, and which one you pay depends on what you import:
   <Card title="Sign in with Google?" icon="id-badge" href="/oauth/overview">
     `auth`'s optional `IdentityStore` — you run the dance, it owns the link.
   </Card>
+  <Card title="A robot needs a key?" icon="robot" href="/service-accounts/overview">
+    `apikey` — a service account is a member; a key authenticates as it, capped.
+  </Card>
 </Columns>
 
 ## `go doc` is the reference
@@ -87,6 +93,7 @@ go doc ./auth Store     # the eleven MUSTs, each with the failure it prevents
 go doc ./auth Service.ChangePassword  # the sweep matrix: eleven paths, five credential kinds
 go doc ./auth IdentityStore  # the optional port, and why DeleteIdentityIfNotLast has that shape
 go doc ./invite Store   # the four method MUSTs and four record-type ones
+go doc ./apikey Store   # token-hash uniqueness, the atomic cascade, the orphan refusal
 go doc ./token          # why hand-rolling this JWT is safe here, and only here
 go doc ./password       # why Dummy exists and why its result is ignored on purpose
 ```
@@ -102,7 +109,7 @@ go test ./... -count=1          # database-free
 golangci-lint run ./...         # v2 required; the config is .golangci.yml
 go run ./examples/basic && go run ./examples/auth && go run ./examples/reset
 go run ./examples/oauth && go run ./examples/magiclink && go run ./examples/deletion
-go run ./examples/hooks
+go run ./examples/hooks && go run ./examples/apikey
 ```
 
 CI adds two the hand gate does not: the unit tests under `-race`, and the live

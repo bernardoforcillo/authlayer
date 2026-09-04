@@ -1835,3 +1835,139 @@ func TestJoinViaLinkConcurrentCallsNeverExceedMaxUses(t *testing.T) {
 		t.Fatalf("joined = %d of %d concurrent candidates against a MaxUses:1 link, want exactly 1", joined, n)
 	}
 }
+
+// ── The permission cap ───────────────────────────────────────────────────────
+
+// capOf compiles grants against the fixture's own statements, the only space a
+// scope.WithPermissionCap can meaningfully be built in.
+func (f *fixture) capOf(grants map[string][]access.Action) access.Permission {
+	f.t.Helper()
+	p, err := f.ac.Permission(grants)
+	if err != nil {
+		f.t.Fatalf("build cap %v: %v", grants, err)
+	}
+	return p
+}
+
+// A restricted API key acts as its service account with a permission cap on
+// the context (scope.WithPermissionCap). The mint-time escalation guard must
+// see the CAPPED standing: an admin's key capped to invite:create may mint an
+// invitation for a role within the cap, and for nothing above it — even
+// though the admin behind the key could.
+func TestInviteByEmailAndCreateLinkGuardEscalationUnderTheCap(t *testing.T) {
+	f := newFixture(t)
+	f.addMember("admin1", org.RoleAdmin)
+	capped := scope.WithPermissionCap(f.ctx("admin1"), f.capOf(map[string][]access.Action{
+		scope.ResourceInvite: {scope.ActionCreate},
+	}))
+
+	// Uncapped, an admin may invite to admin.
+	if _, _, err := f.isvc.InviteByEmail(f.ctx("admin1"), "a@example.com", org.RoleAdmin); err != nil {
+		t.Fatalf("uncapped admin inviting to admin: %v", err)
+	}
+	// Capped, admin exceeds the cap; member (no grants) is within it.
+	if _, _, err := f.isvc.InviteByEmail(capped, "b@example.com", org.RoleAdmin); !errors.Is(err, scope.ErrPrivilegeEscalation) {
+		t.Fatalf("capped InviteByEmail(admin) = %v, want ErrPrivilegeEscalation", err)
+	}
+	if _, _, err := f.isvc.InviteByEmail(capped, "b@example.com", org.RoleMember); err != nil {
+		t.Fatalf("capped InviteByEmail(member): %v", err)
+	}
+	if _, _, err := f.isvc.CreateLink(capped, org.RoleAdmin, 0, nil); !errors.Is(err, scope.ErrPrivilegeEscalation) {
+		t.Fatalf("capped CreateLink(admin) = %v, want ErrPrivilegeEscalation", err)
+	}
+	if _, _, err := f.isvc.CreateLink(capped, org.RoleMember, 0, nil); err != nil {
+		t.Fatalf("capped CreateLink(member): %v", err)
+	}
+	// A capped OWNER is not elevated either.
+	ownerCapped := scope.WithPermissionCap(f.ctx("owner"), f.capOf(map[string][]access.Action{
+		scope.ResourceInvite: {scope.ActionCreate},
+	}))
+	if _, _, err := f.isvc.InviteByEmail(ownerCapped, "c@example.com", org.RoleAdmin); !errors.Is(err, scope.ErrPrivilegeEscalation) {
+		t.Fatalf("capped owner inviting to admin = %v, want ErrPrivilegeEscalation", err)
+	}
+}
+
+// The acceptance-time recheck is about the INVITER's current standing, not
+// the accepting subject's, so a cap on the invitee's context must play no
+// part in it: an admin's uncapped invitation to admin still admits an invitee
+// whose own context happens to carry a cap.
+func TestAcceptInviteRecheckIgnoresTheInviteesCap(t *testing.T) {
+	f := newFixture(t)
+	f.addMember("admin1", org.RoleAdmin)
+	_, token, err := f.isvc.InviteByEmail(f.ctx("admin1"), "bob@example.com", org.RoleAdmin)
+	if err != nil {
+		t.Fatalf("InviteByEmail: %v", err)
+	}
+	bob := scope.WithPermissionCap(scope.WithSubject(context.Background(), "bob"),
+		f.capOf(map[string][]access.Action{scope.ResourceInvite: {scope.ActionRead}}))
+	if _, err := f.isvc.AcceptInvite(bob, token); err != nil {
+		t.Fatalf("AcceptInvite with a cap on the invitee's ctx = %v, want nil — the recheck is about the inviter", err)
+	}
+	if _, elevated, err := f.sc.Standing(context.Background(), f.cID, "bob"); err != nil || elevated {
+		t.Fatalf("bob's standing after accept = elevated %v, %v", elevated, err)
+	}
+}
+
+// ListLinks' redaction reapplies the mint test to the READER, so it is capped
+// the same way the mint is: through a restricted key, a Code the key could
+// not have minted is not readable back — including one at the key holder's
+// own uncapped rank.
+func TestListLinksRedactsUnderTheCap(t *testing.T) {
+	f := newFixture(t)
+	f.addMember("admin1", org.RoleAdmin)
+	if _, _, err := f.isvc.CreateLink(f.ctx("admin1"), org.RoleAdmin, 0, nil); err != nil {
+		t.Fatalf("CreateLink(admin): %v", err)
+	}
+	if _, _, err := f.isvc.CreateLink(f.ctx("admin1"), org.RoleMember, 0, nil); err != nil {
+		t.Fatalf("CreateLink(member): %v", err)
+	}
+
+	// Uncapped, the admin reads both codes back.
+	links, err := f.isvc.ListLinks(f.ctx("admin1"))
+	if err != nil {
+		t.Fatalf("ListLinks: %v", err)
+	}
+	for _, l := range links {
+		if l.Code == "" {
+			t.Fatalf("uncapped admin had %s link's code redacted", l.RoleKey)
+		}
+	}
+
+	// Capped to invite:create+read, only the member-role link survives.
+	capped := scope.WithPermissionCap(f.ctx("admin1"), f.capOf(map[string][]access.Action{
+		scope.ResourceInvite: {scope.ActionCreate, scope.ActionRead},
+	}))
+	links, err = f.isvc.ListLinks(capped)
+	if err != nil {
+		t.Fatalf("ListLinks under the cap: %v", err)
+	}
+	if len(links) != 2 {
+		t.Fatalf("len(links) = %d, want 2", len(links))
+	}
+	for _, l := range links {
+		switch l.RoleKey {
+		case org.RoleAdmin:
+			if l.Code != "" {
+				t.Fatalf("admin-role link's Code readable under a cap that could not have minted it")
+			}
+		case org.RoleMember:
+			if l.Code == "" {
+				t.Fatalf("member-role link's Code redacted under a cap that could have minted it")
+			}
+		}
+	}
+
+	// A cap without invite:create reads nothing back at all — half one.
+	readOnly := scope.WithPermissionCap(f.ctx("admin1"), f.capOf(map[string][]access.Action{
+		scope.ResourceInvite: {scope.ActionRead},
+	}))
+	links, err = f.isvc.ListLinks(readOnly)
+	if err != nil {
+		t.Fatalf("ListLinks under a read-only cap: %v", err)
+	}
+	for _, l := range links {
+		if l.Code != "" {
+			t.Fatalf("%s link's Code readable under a cap without invite:create", l.RoleKey)
+		}
+	}
+}

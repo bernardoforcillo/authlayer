@@ -1,0 +1,162 @@
+---
+title: "Authenticating a key"
+description: "Authenticate needs no subject on the context — the key is the credential. It returns a Principal, and WithPrincipal turns one into a context every Can and Authorize already accepts."
+---
+
+`Authenticate(ctx, plaintext)` hashes the presented string, looks it up by
+hash, refuses a revoked, expired or disabled key, and returns a `Principal`.
+Unlike every management call it reads **no** subject and **no** container
+from the context: the container comes from the key.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/apikey"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/scope"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+var failures []string
+svc := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member]())
+keys := apikey.New(svc.Service, memory.NewAPIKeyStore(),
+	apikey.WithHooks(apikey.HookFunc(func(_ context.Context, e apikey.Event) error {
+		if e.Kind == apikey.KeyAuthenticationFailed {
+			failures = append(failures, e.Detail)
+		}
+		return nil
+	})))
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+sa, _ := keys.CreateServiceAccount(owner, "ci", "", org.RoleAdmin)
+key, plaintext, _ := keys.CreateKey(owner, sa.ID, "github")
+
+p, err := keys.Authenticate(context.Background(), plaintext) // bare context
+fmt.Println("principal:", err, p.Kind, p.ID == sa.ID, p.ContainerID == acme.ID, p.KeyID == key.ID, p.Permissions == nil)
+```
+
+```
+principal: <nil> service_account true true true true
+```
+
+## The `Principal`
+
+<ResponseField name="Kind" type="apikey.Kind">
+  `KindServiceAccount` from this package. `KindUser` and `KindDelegated` are
+  declared here so every reader of a `Principal` shares one vocabulary; the
+  oauth package populates them.
+</ResponseField>
+<ResponseField name="ID" type="string">
+  The subject: the service account's id.
+</ResponseField>
+<ResponseField name="ContainerID" type="string">
+  The scope the principal acts in, read off the key.
+</ResponseField>
+<ResponseField name="KeyID" type="string">
+  The key that authenticated — for audit, and for `RevokeKey`.
+</ResponseField>
+<ResponseField name="ClientID / GrantID" type="string">
+  Set by the oauth package; empty for API-key principals.
+</ResponseField>
+<ResponseField name="Permissions" type="*access.Permission">
+  The key's [restricted set](/service-accounts/restricted-permissions), decoded
+  against the scope's statements, or nil for an unrestricted key.
+</ResponseField>
+<ResponseField name="AuthenticatedAt" type="time.Time">
+  The service clock's now.
+</ResponseField>
+
+## `WithPrincipal`
+
+Annotates a context the way `WithSubject` and `WithOrg` would for a logged-in
+user — subject `p.ID`, scope `p.ContainerID` — plus the permission cap when
+`p.Permissions` is set, and the `Principal` itself, readable back with
+`PrincipalFrom` so a handler can tell a key from a session.
+
+{/* verify:main */}
+```go
+asKey := apikey.WithPrincipal(context.Background(), p)
+sub, _ := scope.SubjectFrom(asKey)
+o, _ := org.OrgFrom(asKey)
+_, capped := scope.PermissionCapFrom(asKey)
+back, ok := apikey.PrincipalFrom(asKey)
+fmt.Println("context:", sub == sa.ID, o == acme.ID, capped, ok, back.KeyID == key.ID)
+
+can, err := svc.Can(asKey, org.ResourceMember, org.ActionCreate)
+fmt.Println("an admin-role key may member:create:", can, err)
+```
+
+```
+context: true true false true true
+an admin-role key may member:create: true <nil>
+```
+
+<Warning>
+Apply `WithPrincipal` to a **request-fresh** context. A context value cannot be
+removed, so a context already carrying a cap from an earlier principal keeps
+it when `p.Permissions` is nil.
+</Warning>
+
+## What is refused, and in which order
+
+| Condition | Error | `Event.Detail` |
+|---|---|---|
+| no key hashes to the plaintext | `ErrKeyNotFound` | `key_not_found` |
+| `RevokedAt` set | `ErrKeyRevoked` | `key_revoked` |
+| `ExpiresAt` not in the future | `ErrKeyExpired` | `key_expired` |
+| the account row is gone | `ErrServiceAccountNotFound` | `account_not_found` |
+| `DisabledAt` set | `ErrServiceAccountDisabled` | `account_disabled` |
+
+Every refusal emits `KeyAuthenticationFailed` with the reason in `Detail`. That
+event fires for every presentation of an unknown string, so a hook on it is
+on the unauthenticated path: keep it cheap.
+
+{/* verify:main */}
+```go
+_, err = keys.Authenticate(context.Background(), "sk_not-a-key")
+fmt.Println("unknown:", errors.Is(err, apikey.ErrKeyNotFound), failures)
+```
+
+```
+unknown: true [key_not_found]
+```
+
+<Note>
+**Why the reason is disclosed.** The caller already holds the key, and a
+256-bit random plaintext cannot be enumerated, so telling its holder that it
+is revoked rather than unknown gives an attacker nothing and gives an operator
+the diagnosis. Hand the sentinel to your logs and a uniform 401 to the wire if
+you prefer.
+</Note>
+
+## Hooks
+
+A hook error on a **successful** authentication is returned instead of the
+principal — scope's rule, hooks fire after the change and their error is the
+caller's — so the key was touched and the caller does not get in. On a
+**refusal** the hook's error is joined onto the sentinel rather than replacing
+it: `errors.Is(err, ErrKeyRevoked)` still holds. A `TouchKey` failure is
+neither: the principal is returned and `KeyAuthenticated` carries
+`Detail: "touch_failed"`.
+
+{/* verify:stdout "principal: <nil> service_account true true true true\ncontext: true true false true true\nan admin-role key may member:create: true <nil>\nunknown: true [key_not_found]" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Restricted permissions" icon="filter" href="/service-accounts/restricted-permissions">
+    Where `Principal.Permissions` comes from, and what it cannot do.
+  </Card>
+  <Card title="Errors" icon="triangle-exclamation" href="/reference/errors">
+    The `apikey` sentinels and their suggested statuses.
+  </Card>
+</Columns>
