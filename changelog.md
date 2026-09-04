@@ -10,6 +10,91 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **`token.Signer`, EdDSA and the JWKS** (`authlayer/token`). A `Signer`
+  interface — `Issue(claims, ttl)`, `Parse(raw)`, `Alg()` — with two
+  constructors and **one algorithm each**. `HS256(keys...)` is the released
+  `Issue`/`Parse` free functions behind the interface, unchanged, refusing
+  fewer than one key or any key under 32 bytes with `ErrKeyTooShort` at
+  construction. `EdDSA(kid, priv, verifiers)` signs Ed25519 (`crypto/ed25519`,
+  no new dependency) with a `kid` header; `Parse` *requires* a `kid` naming a
+  key it holds — the new sentinel `ErrUnknownKey` otherwise — and checks the
+  signature only against that one key. `verifiers` are additional public keys
+  by kid, which is how a key rotates. `PublicKeySetter` is implemented by the
+  EdDSA signer only and returns an RFC 7517 / RFC 8037 `JWKS` (`kty` `OKP`,
+  `crv` `Ed25519`, `use` `sig`, `alg` `EdDSA`); `JWKS.PublicKeys` reads one
+  back and `EdDSAVerifier(keys)` builds the verify-only half a party that is
+  not the issuer holds — its `Issue` always fails. `ErrInvalidKey` is the
+  second new sentinel, for unusable key material at construction.
+
+  **The single-algorithm argument in the package doc is preserved, and the
+  package doc says how.** Each signer compares the header's `alg` to its own
+  one literal and refuses the other's tokens with `ErrUnsupportedAlgorithm`;
+  the classic confusion — an HMAC computed with the public key's bytes under
+  a header claiming `EdDSA` — fails on signature length before verification.
+  What must never be added is a parser that reads `alg` and picks a signer
+  from it. Tests pin both refusal directions, the confusion forgery, an
+  unknown `kid`, rotation through verifiers, and the JWKS wire shape.
+
+  `Claims` gains the OAuth-shaped claims RFC 9068 and RFC 8693 name — `iss`,
+  `aud` (an `Audience` type that unmarshals a string or an array and marshals
+  a bare string for one recipient), `jti`, `client_id`, `scope`, and `act`
+  (an `Actor{Subject, ClientID}`). **All `omitempty`, none interpreted**: a
+  test pins that the pre-existing payload, and the HS256 header, are
+  byte-identical when none is set.
+
+- **`auth.WithSigner`, `WithAccessTTL` and `Service.Signer()`**
+  (`authlayer/auth`). `WithSigner(s token.Signer)` replaces the HS256 signer
+  `WithJWT` builds — the two fill one slot and the last applied wins — and
+  `WithAccessTTL(d)` carries the access-token lifetime `WithJWT`'s second
+  argument used to, for a deployment that has no HMAC keys to pass.
+  `Signer()` hands the configured signer back, so a sibling package minting
+  tokens this `Service` must accept signs with the same key material, and so
+  an application can serve the JWKS. `Login`, `Refresh` and
+  `VerifyAccessToken` all go through the signer. **`WithJWT` is unchanged in
+  every observable way**: it builds a `token.HS256` signer, ignores a key list
+  with any unusable key exactly as before, and a `Service` with no signer at
+  all still fails closed with `token.ErrKeyTooShort` — the sentinel a missing
+  HMAC key has always produced — so the tests that pin that path pass
+  unmodified. `VerifyAccessToken` additionally hands back `ErrUnknownKey`,
+  unwrapped, from an EdDSA signer.
+
+- **Lifecycle hooks** (`authlayer/auth`). `WithHooks(h ...Hook)`, with `Hook`,
+  `HookFunc`, `Event` and `EventKind` in exactly `scope`'s shape, so one audit
+  sink consumes both packages. **Twenty-four kinds**: `SignedUp`,
+  `EmailVerified`, `LoggedIn`, `LoginFailed`, `MFAChallenged`,
+  `SessionRefreshed`, `TokenReuseDetected`, `LoggedOut`, `LoggedOutAll`,
+  `SessionRevoked`, `PasswordChanged`, `PasswordReset`, `EmailChanged`,
+  `MagicLinkRedeemed`, `IdentityLinked`, `IdentityUnlinked`, `MFAEnrolled`,
+  `MFADisabled`, `PasskeyRegistered`, `PasskeyDeleted`, `DeviceTrusted`,
+  `TrustedDeviceRevoked`, `AccountDeleted`, `AccountAnonymized`. Every path
+  that mints a session emits `LoggedIn` with the door in `Detail` —
+  `password`, `trusted_device`, `mfa`, `magic_link`, `external_identity`,
+  `passkey` — and `Detail` is a **closed vocabulary**, exported as `Detail*`
+  constants, never free text.
+
+  **Hooks fire after the mutation and before the return, and a hook error
+  propagates**, exactly as in `scope`. The consequence is stated on `Hook`
+  rather than left to be discovered: nothing in `auth` runs in a transaction,
+  so a failing `LoggedIn` hook leaves a live `Session` whose refresh token the
+  caller never received. On a failure event — `LoginFailed`,
+  `TokenReuseDetected` — the hook's error is **joined** to the refusal, so
+  `errors.Is` still matches `ErrInvalidCredentials` or `ErrTokenReuse`.
+
+  **What deliberately emits nothing.** The enumeration-hardened request paths
+  — `SignUp`'s duplicate branch, `RequestPasswordReset`, `RequestMagicLink`
+  and `RequestEmailChange` — emit **no event on either branch**, because a
+  hook is a caller-visible side effect whose cost differs between branches
+  only if the application makes it, and that is not this package's to risk;
+  the redemptions do emit. `LoginFailed` carries the attempted **IP and never
+  the attempted address** — a failed-login log keyed by address is a list of
+  which addresses exist. An account `RequestMagicLink` provisions therefore
+  gets no `SignedUp`; its first event is the `MagicLinkRedeemed` that signs it
+  in. **Emission changes no Store-call sequence and no error**: the existing
+  suite passes unchanged, and a `Service` whose hooks return `nil` is
+  observably identical to one built before hooks existed. A new runnable tour,
+  `examples/hooks`, prints every event of a sign-up-to-sign-out flow against
+  an EdDSA signer and then publishes and verifies its JWKS.
+
 - **Magic links — passwordless sign-in** (`authlayer/auth`). Two new methods on
   the existing `auth.Service`: `RequestMagicLink(ctx, email, ip) (token, ok,
   error)` and `RedeemMagicLink(ctx, token, ip, userAgent) (LoginResult,

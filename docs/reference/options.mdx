@@ -62,8 +62,33 @@ falling back to a default — construction **panics**: `scope.New` when
 <ResponseField name="WithJWT(keys [][]byte, ttl time.Duration)" type="Option" default="no keys, 15 min">
   The HS256 signing keys and the access-token TTL. `Issue` always signs with
   `keys[0]`; `Parse` tries every key, which is how a signing key rotates. Every
-  key must be **at least 32 bytes**. Without this option, `Login` and
-  `VerifyAccessToken` fail closed with `token.ErrKeyTooShort`.
+  key must be **at least 32 bytes**. It is `WithSigner` with a `token.HS256`
+  signer built from the keys — the two fill one slot and the **last applied
+  wins**. Without either, `Login` and `VerifyAccessToken` fail closed with
+  `token.ErrKeyTooShort`.
+</ResponseField>
+
+<ResponseField name="WithSigner(s token.Signer)" type="Option" default="none">
+  The `token.Signer` that mints and verifies every access token — a
+  `token.EdDSA` signer, typically, when a party that is not this `Service`
+  must verify its tokens. See
+  [EdDSA and the JWKS](/authentication/access-tokens#eddsa-and-the-jwks). The
+  TTL is not part of the signer: set it with `WithAccessTTL`. A `nil` signer is
+  ignored. `Service.Signer()` hands the configured value back.
+</ResponseField>
+
+<ResponseField name="WithAccessTTL(d time.Duration)" type="Option" default="15 min">
+  The access-token lifetime, the same value `WithJWT`'s second argument sets —
+  for a `WithSigner` deployment that has no HMAC keys to pass. Shortening it
+  narrows the window a revoked session's token keeps verifying, without closing
+  it.
+</ResponseField>
+
+<ResponseField name="WithHooks(h ...Hook)" type="Option" default="none">
+  Append [lifecycle hooks](/authentication/hooks). **Accumulates** across
+  calls, as `scope.WithHooks` does; `nil` hooks are skipped. Hooks fire after
+  the mutation and before the return, and an error propagates — with the
+  change already made.
 </ResponseField>
 
 <ResponseField name="WithRefreshTTL(d time.Duration)" type="Option" default="30 days">

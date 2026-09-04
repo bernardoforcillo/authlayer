@@ -1382,7 +1382,9 @@ ask — do not expose either directly to end users.
 `auth` owns identity: the user record, its password credential, revocable
 server-side sessions, and the one-time tokens that confirm an address or reset
 a password. It sits on two smaller packages — [`token`](token/), which mints
-the opaque refresh tokens and the HS256 access tokens, and
+the opaque refresh tokens and the access tokens (HS256 over a shared secret
+by default, or [EdDSA with a published JWKS](#the-jwt-and-why-hand-rolling-it-is-defensible)
+when something that is not the issuer must verify them), and
 [`password`](password/), the hashing port with a bcrypt default. Together they
 replace the sign-up, login and refresh-rotation code an application would
 otherwise write by hand.
@@ -1416,6 +1418,15 @@ prints the same kind of trace:
 
 ```sh
 go run ./examples/reset
+```
+
+[`examples/hooks`](examples/hooks/main.go) prints every [lifecycle
+event](#hooks) a `Service` emits while a user signs up, fails a login, signs
+in, refreshes, replays a stolen token and signs out — against an EdDSA signer,
+whose JWKS it then publishes and verifies from the other side:
+
+```sh
+go run ./examples/hooks
 ```
 
 ### Sign-up, verification, login
@@ -1480,7 +1491,7 @@ rather than a tolerated "unknown".
 
 | Token | Minted by | TTL | Option |
 |---|---|---|---|
-| access | `Login`, `Refresh` | 15 min default | `WithJWT` |
+| access | `Login`, `Refresh` | 15 min default | `WithJWT`, or `WithAccessTTL` beside `WithSigner` |
 | refresh (session) | `Login`, `Refresh` | 30 days default | `WithRefreshTTL` |
 | `signup`, `email_change` | `SignUp`, `RequestEmailChange` | 24 hours default | `WithVerificationTTL` |
 | `password_reset` | `RequestPasswordReset` | 1 hour default | `WithPasswordResetTTL` |
@@ -1589,7 +1600,8 @@ superuser console, never a per-request handler. The cutoff is literal: a
 
 ### Verifying an access token
 
-`WithJWT` already holds the keys, so verification is a method rather than
+The `Service` already holds the signer — the HS256 keys `WithJWT` was given,
+or whatever `WithSigner` supplied — so verification is a method rather than
 something you re-wire with a second copy of the key material:
 
 ```go
@@ -1600,13 +1612,17 @@ u, _ := svc.User(ctx, claims.Subject)
 fmt.Println(u.Email, u.PasswordHash == "") // bob@example.com true
 ```
 
-It tries every key in the list, not just the signing key, which is what makes
+It tries every key in the list, not just the signing key — and an EdDSA
+signer accepts its verifiers as well as its signing key — which is what makes
 a rotation transparent to tokens already in flight. Failures are
 [`token`](token/)'s own sentinels — `ErrMalformedToken`,
 `ErrUnsupportedAlgorithm`, `ErrInvalidSignature`, `ErrExpiredToken`,
-`ErrKeyTooShort` — unwrapped, so you can tell an expired token from a forged
-one; a `Service` built without `WithJWT` returns `ErrKeyTooShort` here exactly
-as `Login` fails closed on the same misconfiguration. `claims.SessionID` is
+`ErrKeyTooShort`, and `ErrUnknownKey` from an EdDSA signer — unwrapped, so you
+can tell an expired token from a forged one; a `Service` built without
+`WithJWT` or `WithSigner` returns `ErrKeyTooShort` here exactly as `Login`
+fails closed on the same misconfiguration. `svc.Signer()` hands the configured
+signer back, so a sibling package that must mint tokens this `Service` accepts
+signs with the same key material rather than a second copy. `claims.SessionID` is
 what `ChangePassword` wants for its `currentSessionID`, which is the pairing
 most handlers need:
 
@@ -1965,6 +1981,77 @@ exception is *shape*, not stance: a denial from either address-keyed limiter
 requests for *that* address had run would itself be the existence oracle the
 method exists to close.
 
+### Hooks
+
+`auth.WithHooks` has exactly the shape of [`scope.WithHooks`](#hooks--events):
+a `Hook` with one `On(ctx, Event) error` method, a `HookFunc` adapter, an
+`Event` with a `Kind`, and the same rule about when it fires — **after** the
+mutation is applied and **before** the method returns, in registration order,
+on the caller's goroutine, first error stops the chain.
+
+```go
+audit := auth.HookFunc(func(ctx context.Context, e auth.Event) error {
+    return auditLog.Write(ctx, e.Kind, e.UserID, e.SessionID, e.IP, e.Detail) // never the address
+})
+svc := auth.New(store, auth.WithJWT([][]byte{key}, 15*time.Minute), auth.WithHooks(audit))
+```
+
+Twenty-four kinds, and the table is the contract. `UserID` is on every event
+but two; the other fields are set where the entry point had them.
+
+| Kind | Emitted by | Also carries |
+|---|---|---|
+| `SignedUp` | `SignUp` (created branch **only**), `SignInWith` when it provisions | `Detail` — the door |
+| `EmailVerified` / `EmailChanged` | `VerifyEmail` — both purposes / the `email_change` one, before its `EmailVerified` | — |
+| `LoggedIn` | every path that **mints a session**: `Login`, `LoginWithTrustedDevice`, `CompleteMFA`, `RedeemMagicLink`, `SignInWith`, `FinishPasskeyLogin` | `SessionID`, `IP`, `UserAgent`, `Detail` — `password`, `trusted_device`, `mfa`, `magic_link`, `external_identity`, `passkey` |
+| `LoginFailed` | `Login` (unknown, anonymized, no password, wrong password, unverified, MFA required), `CompleteMFA` (bad code), `FinishPasskeyLogin` (unknown credential, bad challenge, cloned authenticator) | `IP`, `UserAgent`, `Detail` — why; `UserID` **empty** for `unknown_user` and `passkey_unknown_credential` |
+| `MFAChallenged` | `Login`, `RedeemMagicLink`, `SignInWith` stopping at a challenge | `IP`, `UserAgent` |
+| `SessionRefreshed` | `Refresh`, once the successor is persisted | `SessionID` — the **new** one |
+| `TokenReuseDetected` | `Refresh` on a replay, **after** the family is revoked; `Logout` of a superseded token | `SessionID` — the replayed one; `Detail` `reuse` |
+| `LoggedOut` / `LoggedOutAll` / `SessionRevoked` | `Logout` / `LogoutAll` / `RevokeSession` | `SessionID` on the first and third |
+| `PasswordChanged` / `PasswordReset` | `ChangePassword` / `ResetPassword` | `SessionID` — the caller's, on change |
+| `MagicLinkRedeemed` | `RedeemMagicLink`, before the second factor is consulted | `IP`, `UserAgent` |
+| `IdentityLinked` / `IdentityUnlinked` | `LinkIdentity` and both row-writing rungs of `SignInWith` / `UnlinkIdentity` | — |
+| `MFAEnrolled` / `MFADisabled` | `ConfirmMFAEnrolment` / `DisableMFA` | `SessionID` on disable |
+| `PasskeyRegistered` / `PasskeyDeleted` | `FinishPasskeyRegistration` / `DeletePasskey` | `SessionID` on register |
+| `DeviceTrusted` / `TrustedDeviceRevoked` | `TrustThisDevice` / `RevokeTrustedDevice` | `SessionID` on trust |
+| `AccountDeleted` / `AccountAnonymized` | `DeleteAccount` / `AnonymizeAccount`, as the **last** step | `SessionID` — the caller's |
+
+`Detail` is a **closed vocabulary**, exported as `auth.Detail*` constants —
+never free text and never an address. **`LoginFailed` carries the attempted IP
+and not the attempted email**, not in `Detail` and not anywhere: a failed-login
+log keyed by address is a list of which addresses exist, and this package will
+not build one. The hook runs *after* `Hasher.Dummy` on the branches that call
+it, so it does not itself separate "unknown" from "wrong password" — unless it
+does different work per `Detail`. Keep a `LoginFailed` hook constant-shape.
+
+**What deliberately emits nothing.** The enumeration-hardened request paths —
+`SignUp`'s duplicate-address branch, `RequestPasswordReset`,
+`RequestMagicLink` (provisioning or not) and `RequestEmailChange` — emit **no
+event on either branch**. Each is built so its store calls, error set and
+returned shape are identical whether or not the address is registered, and a
+hook is a caller-visible side effect whose cost is whatever you put in it:
+firing one on the known branch alone reopens the oracle by timing, firing one
+on both hands the application a known/unknown flag it must then be trusted
+never to act on. Neither is this package's to risk. Log those *requests* at
+your own handler, where you already know you must answer uniformly; the
+*redemptions* are not hardened and do emit. One consequence stated rather than
+hidden: an account `RequestMagicLink` provisions gets no `SignedUp` — its first
+event is the `MagicLinkRedeemed` that signs it in.
+
+**A hook error aborts the call with the change already made.** Nothing in
+`auth` runs inside a transaction a hook could roll back, so for `Login` a
+failing `LoggedIn` hook leaves a live `Session` whose refresh token the caller
+never received (it ages out with the refresh TTL, or falls to `LogoutAll`), and
+for `SignUp` a real account whose verification token was never handed back.
+Keep non-retryable side effects out of hooks and return `nil` for best-effort
+work. On a **failure** event — `LoginFailed`, `TokenReuseDetected` — the
+method was already returning an error and the hook's does not replace it: the
+caller gets both joined, so `errors.Is` still matches `ErrInvalidCredentials`
+or `ErrTokenReuse`. A `Service` with no hooks, or whose hooks return `nil`, is
+observably identical to one built before hooks existed — no Store-call
+sequence and no error changed.
+
 ### The JWT, and why hand-rolling it is defensible
 
 The two classic JWT vulnerabilities — `alg: none`, and RS256/HS256 confusion
@@ -1976,8 +2063,23 @@ or decodes a payload; every other value, a missing field and a lower-case
 `hs256` included, is rejected through that one line with
 `ErrUnsupportedAlgorithm`. There is no `none` branch to reach and no second
 algorithm to confuse it with. That single check is the whole justification for
-not taking a dependency — and it is why generalising this package to a second
-algorithm would bring both vulnerabilities back.
+not taking a dependency.
+
+The package does offer a second algorithm, and the argument survives only
+because of *where* the choice is made. `token.Signer` is the interface —
+`Issue`, `Parse`, `Alg` — and it has two constructors, `token.HS256(keys...)`
+and `token.EdDSA(kid, priv, verifiers)`. The algorithm is fixed by the caller,
+once, in the constructor, and never read from a token: an HS256 signer refuses
+a token whose header says `EdDSA`, an EdDSA signer refuses one that says
+`HS256`, both refuse `none`, each through the same one-line equality check
+against its own literal. Handing an Ed25519 public key to an HS256 signer as
+an HMAC secret is impossible by type, and the reverse forgery — an HMAC
+computed with the public key's bytes under a header claiming `EdDSA` — fails at
+the EdDSA signer on signature length before verification is attempted. What
+the package still does not have, and must not grow, is a parser that reads
+`alg` and picks a signer from it: *that* is the dispatch both attacks need, and
+a `Signer` that accepted both algorithms would be exactly it. A third algorithm
+is a third constructor, never a second branch in an existing `Parse`.
 
 The same reasoning covers the key. An empty or undersized HMAC key is `alg:
 none` reached through the key parameter instead of the header — the realistic
@@ -2013,6 +2115,55 @@ fmt.Println(c.Extra["plan"], c.Extra["sub"]) // pro victim
 ```
 
 The extender's `"sub"` lands at `ext.sub` and the real subject is untouched.
+
+**EdDSA, and the JWKS.** HS256 verification needs the signing secret, so it
+fits exactly one deployment shape: the party that mints a token is the only
+party that checks it. As soon as anything *else* must verify — another
+service, an agent acting for a user, an MCP client, a gateway in front of the
+application — sharing the secret makes every verifier an issuer.
+`token.EdDSA` is for that case. The private key stays with the issuer; `kid`
+names it in every token's header; `verifiers` are additional public keys, by
+kid, accepted on `Parse` for rotation. `Parse` *requires* a `kid` naming a key
+the signer holds — `ErrUnknownKey` otherwise — and checks the signature only
+against that one key, never against every key in turn. `auth.WithSigner`
+replaces `WithJWT` (the last of the two applied wins) and `auth.WithAccessTTL`
+carries the TTL `WithJWT`'s second argument used to:
+
+```go
+_, priv, _ := ed25519.GenerateKey(rand.Reader) // from your key store, in production
+signer, err := token.EdDSA("2026-09", priv, nil)
+fmt.Println(err, signer.Alg()) // <nil> EdDSA
+
+svc := auth.New(memory.NewAuthStore(),
+    auth.WithSigner(signer),            // instead of WithJWT
+    auth.WithAccessTTL(15*time.Minute)) // the TTL WithJWT carried
+
+// Serve this at your jwks_uri. HS256 has nothing to publish, so the method
+// lives on the concrete EdDSA type, reached through the assertion.
+jwks := svc.Signer().(token.PublicKeySetter).PublicKeySet()
+
+// The other party: a verify-only Signer built from the published document.
+// It accepts the issuer's tokens and its Issue always fails — it holds nothing
+// it could sign with.
+keys, _ := jwks.PublicKeys()
+verifier, _ := token.EdDSAVerifier(keys)
+```
+
+The JWKS is RFC 7517 with RFC 8037's Octet Key Pair: `kty` `OKP`, `crv`
+`Ed25519`, `use` `sig`, `alg` `EdDSA`, the signing key first and verifiers
+sorted by `kid`. `JWKS.PublicKeys` refuses a document it does not fully
+understand rather than skipping a key — a verifier that silently dropped one
+would refuse every token signed under it with `ErrUnknownKey` and nothing
+would say why.
+
+`token.Claims` also carries the OAuth-shaped claims RFC 9068 and RFC 8693 name
+— `Issuer` (`iss`), `Audience` (`aud`, a type that reads a string or an array
+and writes a bare string for one recipient), `ID` (`jti`), `ClientID`,
+`Scope`, and `Actor` (`act`, the party acting on behalf of `Subject` in a
+delegated token). All are `omitempty` and none is interpreted by this package:
+a caller that sets none of them gets byte-for-byte the payload it got before
+they existed, which is pinned by test. They exist for the OAuth server that
+sits on `Signer()`.
 
 ### Wiring `auth`, `org` and `invite` together
 
@@ -2717,20 +2868,23 @@ The remaining six are the [external-identity](#oauth) surface's own, raised by
 | `ErrProviderSubjectRequired` | An `ExternalIdentity` arrived with a blank or whitespace-only `Provider` or `Subject`. Refused before any store is touched, by both entry points | 400 |
 | `ErrOAuthNotConfigured` | An external-identity method was called on a `Service` built without `WithIdentityStore` — a wiring bug, not caller input | 500 |
 
-[`token`](token/) adds six. The first four are what a caller gets from
-`Parse` for a bad token. The last two report a bad *key or TTL* rather than a
-bad token — but only `ErrInvalidTTL` is confined to `Issue`. `Parse` checks
-every key's length before it looks at the token at all and refuses the whole
-call with `ErrKeyTooShort` if any one of them is short, so a misconfigured
-`Service` surfaces that on the request path, not only at startup:
+[`token`](token/) adds eight. The first five are what a caller gets from
+`Parse` — the free function or a `Signer`'s — for a bad token. The last three
+report bad *key material or TTL* rather than a bad token — but only
+`ErrInvalidTTL` is confined to `Issue`. `Parse` checks every key's length
+before it looks at the token at all and refuses the whole call with
+`ErrKeyTooShort` if any one of them is short, so a misconfigured `Service`
+surfaces that on the request path, not only at startup:
 
 | Error | Meaning | Suggested status |
 |---|---|---|
 | `ErrMalformedToken` | Not a valid JWS compact serialization — wrong segment count, non-canonical base64, or a segment that is not JSON | 401 |
-| `ErrUnsupportedAlgorithm` | The header's `alg` is not exactly `"HS256"`. Returned before any signature is verified | 401 |
-| `ErrInvalidSignature` | No key in the list produced a matching signature | 401 |
+| `ErrUnsupportedAlgorithm` | The header's `alg` is not exactly the parser's own — `"HS256"` at `Parse` and the `HS256` signer, `"EdDSA"` at the `EdDSA` signer. Returned before any signature is verified, and before an EdDSA signer reads the `kid` | 401 |
+| `ErrUnknownKey` | An `EdDSA` signer was presented a token with no `kid`, or a `kid` naming no key it holds. After the `alg` check, before any signature is verified | 401 |
+| `ErrInvalidSignature` | No key in the list produced a matching signature — or, at an EdDSA signer, the signature is not 64 bytes or does not verify under the named key | 401 |
 | `ErrExpiredToken` | The signature verified but `exp` is not in the future — checked after verification, so it cannot probe for a valid signature on forged claims | 401 |
-| `ErrKeyTooShort` | An HMAC key under 32 bytes was passed to `Issue`, or appears anywhere in `Parse`'s key list | 500 |
+| `ErrKeyTooShort` | An HMAC key under 32 bytes was passed to `Issue` or `HS256`, or appears anywhere in `Parse`'s key list; also a `Service` with neither `WithJWT` nor `WithSigner` | 500 |
+| `ErrInvalidKey` | Key material handed to `EdDSA`, `EdDSAVerifier` or `JWKS.PublicKeys` is unusable — an empty `kid`, a wrong-length Ed25519 key, two different keys under one `kid`, a JWK of a shape this package does not publish. Also what a verify-only signer's `Issue` returns | 500 |
 | `ErrInvalidTTL` | `Issue` was given a zero or negative ttl | 500 |
 
 `password` defines no sentinels: `Validate` returns the names of the failed
@@ -2749,7 +2903,7 @@ rules and `Verify` returns a bool, so there is nothing to compare with
 | [`invite/invitetest`](invite/invitetest/) | `invite.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-invitestore) and run it. Test-only; imports `testing`. |
 | [`auth`](auth/) | [Authentication](#authentication) — `Service`, its `Store` port, and the user/session/verification records. Sign-up, login, email verification, refresh rotation, and the password lifecycle. Also the optional `IdentityStore` port and the four [external-identity](#oauth) methods. |
 | [`auth/authtest`](auth/authtest/) | `auth.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-authstore) and run it. Test-only; imports `testing`. |
-| [`token`](token/) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled, [single-algorithm](#the-jwt-and-why-hand-rolling-it-is-defensible) HS256 JWT. Standard library only. |
+| [`token`](token/) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled JWT behind one `Signer` interface with [one algorithm per constructor](#the-jwt-and-why-hand-rolling-it-is-defensible): `HS256` over a shared secret, `EdDSA` with a published JWKS for verifiers that are not the issuer. Standard library only. |
 | [`password`](password/) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` for a strength policy. The only package that pulls in `golang.org/x/crypto`. |
 | [`store/memory`](store/memory/) | In-memory `scope.Store`, `invite.Store`, `auth.Store` and `auth.IdentityStore` for dev, tests, and examples. |
 | [`store/drops`](store/drops/) | PostgreSQL stores built on drops — RBAC (composite-key membership), invitations, the three auth tables, and the [`identities`](#the-identities-table) table. |
@@ -2757,6 +2911,7 @@ rules and `Verify` returns a bool, so there is nothing to compare with
 | [`examples/auth`](examples/auth/) | Runnable, database-free tour of `auth` + `org` + `invite` wired together. |
 | [`examples/reset`](examples/reset/) | Runnable, database-free tour of [the password lifecycle](#the-password-lifecycle) — `RequestPasswordReset`, `ResetPassword`, `RequestEmailChange`. |
 | [`examples/oauth`](examples/oauth/) | Runnable, database-free tour of [external identities](#oauth) — the ladder, the linking policy, the explicit link, and the last-credential guard. |
+| [`examples/hooks`](examples/hooks/) | Runnable, database-free tour of [lifecycle hooks](#hooks) and an [EdDSA signer](#the-jwt-and-why-hand-rolling-it-is-defensible) — every event a sign-up-to-sign-out flow emits, then the JWKS published and verified from the other side. |
 
 Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
 
@@ -2769,6 +2924,7 @@ go test ./... -count=1          # database-free
 golangci-lint run ./...         # v2 required; the config is .golangci.yml
 go run ./examples/basic && go run ./examples/auth && go run ./examples/reset
 go run ./examples/oauth && go run ./examples/magiclink && go run ./examples/deletion
+go run ./examples/hooks
 go run ./docs/_verify           # every Go sample under docs/, compiled and run
 ```
 

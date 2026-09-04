@@ -18,18 +18,21 @@ Current release **v0.1.0**.
 | [`invite/invitetest`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/invite/invitetest) | `invite.Store`'s contract as an executable suite. **Test-only**; imports `testing` | `drops` |
 | [`auth`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/auth) | [Authentication](/authentication/overview) — `Service`, its `Store` port, and the user/session/verification records; plus the optional `IdentityStore` port and the four [external-identity](/oauth/overview) methods | `x/crypto` |
 | [`auth/authtest`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/auth/authtest) | `auth.Store`'s contract as an executable suite. **Test-only**; imports `testing` | `x/crypto` |
-| [`token`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/token) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled, [single-algorithm](/authentication/access-tokens#why-hand-rolling-this-jwt-is-defensible) HS256 JWT | standard library |
+| [`token`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/token) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled JWT behind one `Signer` interface with [one algorithm per constructor](/authentication/access-tokens#why-hand-rolling-this-jwt-is-defensible): `HS256` over a shared secret, [`EdDSA` with a published JWKS](/authentication/access-tokens#eddsa-and-the-jwks) | standard library |
 | [`password`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/password) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` | `x/crypto` — the **only** package that does |
 | [`store/memory`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/store/memory) | In-memory `scope.Store`, `invite.Store`, `auth.Store` and `auth.IdentityStore` | — |
 | [`store/drops`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/store/drops) | PostgreSQL stores — declares **`package dropsstore`** | `drops`, `pgx/v5` |
 
-Four runnable, database-free tours ship alongside them:
+Seven runnable, database-free tours ship alongside them:
 
 ```sh
-go run ./examples/basic   # organization RBAC
-go run ./examples/auth    # auth + org + invite, sign-up through log-out
-go run ./examples/reset   # the password lifecycle
-go run ./examples/oauth   # external identities: the ladder, linking, unlinking
+go run ./examples/basic     # organization RBAC
+go run ./examples/auth      # auth + org + invite, sign-up through log-out
+go run ./examples/reset     # the password lifecycle
+go run ./examples/oauth     # external identities: the ladder, linking, unlinking
+go run ./examples/magiclink # passwordless sign-in
+go run ./examples/deletion  # the two account-ending postures
+go run ./examples/hooks     # lifecycle hooks, and an EdDSA signer with its JWKS
 ```
 
 <Note>
@@ -98,7 +101,8 @@ go vet ./... && go vet -tags integration ./...
 go test ./... -count=1          # database-free
 golangci-lint run ./...         # v2 required; the config is .golangci.yml
 go run ./examples/basic && go run ./examples/auth && go run ./examples/reset
-go run ./examples/oauth
+go run ./examples/oauth && go run ./examples/magiclink && go run ./examples/deletion
+go run ./examples/hooks
 ```
 
 CI adds two the hand gate does not: the unit tests under `-race`, and the live

@@ -100,12 +100,14 @@ apart.
 Eighteen belong to the password-and-session core. The six for
 [external identities](/oauth/overview) follow in their own table below.
 
-Neither [magic links](/authentication/magic-links) nor
-[account deletion](/authentication/account-deletion) added a sentinel, which is
-deliberate rather than an oversight: both reuse the ones already in their
-methods' documented error sets, so no caller's error handling changes, and — for
-the two enumeration-safe request methods — a *new* error would itself have been
-the oracle their shape exists to close.
+Neither [magic links](/authentication/magic-links), nor
+[account deletion](/authentication/account-deletion), nor
+[lifecycle hooks](/authentication/hooks) added a sentinel, which is deliberate
+rather than an oversight: all reuse the ones already in their methods'
+documented error sets, so no caller's error handling changes, and — for the
+enumeration-safe request methods — a *new* error would itself have been the
+oracle their shape exists to close. A hook's own error is propagated as-is, or
+joined to the refusal it accompanied.
 
 | Error | Meaning | Suggested status |
 |---|---|---|
@@ -173,26 +175,29 @@ written pointing at a user that does not exist.
 exist?" for a caller who should not be asking.
 </Note>
 
-## `token` — six
+## `token` — eight
 
-The first four are what a caller gets from `Parse` for a bad token. The last two
-report a bad **key or TTL** rather than a bad token — but only `ErrInvalidTTL`
-is confined to `Issue`.
+The first five are what a caller gets from `Parse` — the free function or a
+`Signer`'s — for a bad token. The last three report bad **key material or
+TTL** rather than a bad token — but only `ErrInvalidTTL` is confined to
+`Issue`.
 
 | Error | Meaning | Suggested status |
 |---|---|---|
 | `ErrMalformedToken` | Not a valid JWS compact serialization — wrong segment count, non-canonical base64, or a segment that is not JSON | 401 |
-| `ErrUnsupportedAlgorithm` | The header's `alg` is not exactly `"HS256"`. Returned **before** any signature is verified | 401 |
-| `ErrInvalidSignature` | No key in the list produced a matching signature | 401 |
+| `ErrUnsupportedAlgorithm` | The header's `alg` is not exactly the parser's own — `"HS256"` at `Parse` and the `HS256` signer, `"EdDSA"` at the `EdDSA` signer. Returned **before** any signature is verified, and before an EdDSA signer reads the `kid` | 401 |
+| `ErrUnknownKey` | An `EdDSA` signer was presented a token with no `kid`, or a `kid` naming no key it holds. After the `alg` check, **before** any signature is verified | 401 |
+| `ErrInvalidSignature` | No key in the list produced a matching signature — or, at an EdDSA signer, the signature is not 64 bytes or does not verify under the named key | 401 |
 | `ErrExpiredToken` | The signature verified but `exp` is not in the future — checked **after** verification, so it cannot probe for a valid signature on forged claims | 401 |
-| `ErrKeyTooShort` | An HMAC key under 32 bytes was passed to `Issue`, or appears anywhere in `Parse`'s key list | 500 |
+| `ErrKeyTooShort` | An HMAC key under 32 bytes was passed to `Issue` or `HS256`, or appears anywhere in `Parse`'s key list; also a `Service` with neither `WithJWT` nor `WithSigner` | 500 |
+| `ErrInvalidKey` | Key material handed to `EdDSA`, `EdDSAVerifier` or `JWKS.PublicKeys` is unusable — an empty `kid`, a wrong-length Ed25519 key, two different keys under one `kid`, a JWK of a shape this package does not publish. Also what a verify-only signer's `Issue` returns | 500 |
 | `ErrInvalidTTL` | `Issue` was given a zero or negative ttl | 500 |
 
 `Parse` checks every key's length **before** it looks at the token at all and
 refuses the whole call if any one of them is short — so a misconfigured
 `Service` surfaces `ErrKeyTooShort` on the request path, not only at startup.
 `auth.Service.VerifyAccessToken` hands these back **unwrapped**, so you can tell
-an expired token from a forged one.
+an expired token from a forged one, and an unknown key from either.
 
 ## `password` — none
 

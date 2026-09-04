@@ -1,9 +1,10 @@
 ---
 title: "Access tokens"
-description: "Verifying the short-lived HS256 JWT with no store round trip, the sid claim, key rotation, and why hand-rolling this JWT is the safe choice here."
+description: "Verifying the short-lived JWT with no store round trip, the sid claim, key rotation, EdDSA and the JWKS for verifiers that are not the issuer, and why hand-rolling this JWT is the safe choice here."
 ---
 
-An access token is a short-lived HS256 JWT the server **never stores**.
+An access token is a short-lived JWT the server **never stores** — HS256 over
+a shared secret by default, [EdDSA](#eddsa-and-the-jwks) when you choose it.
 Verifying one is signature and expiry and nothing else — no lookup, no round
 trip — which is what makes it cheap enough to do on every request.
 
@@ -11,6 +12,8 @@ trip — which is what makes it cheap enough to do on every request.
 ```go
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"time"
@@ -40,8 +43,11 @@ fmt.Println(err, claims.Subject == login.User.ID, claims.Email, claims.SessionID
 <nil> true bob@example.com true
 ```
 
-`WithJWT` already holds the keys, so verification is a **method** rather than
-something you re-wire with a second copy of the key material.
+The `Service` already holds the signer — the keys `WithJWT` was given, or
+whatever `WithSigner` supplied — so verification is a **method** rather than
+something you re-wire with a second copy of the key material. `svc.Signer()`
+hands it back for a sibling package that must mint tokens this `Service`
+accepts.
 
 ## The claims
 
@@ -68,6 +74,16 @@ something you re-wire with a second copy of the key material.
 <ResponseField name="Extra" type="map[string]any">
   JSON `ext`, populated by `WithClaimsExtender` and nil otherwise. See
   [below](#application-claims-nest-under-ext).
+</ResponseField>
+
+<ResponseField name="Issuer / Audience / ID / ClientID / Scope / Actor" type="omitempty">
+  JSON `iss`, `aud`, `jti`, `client_id`, `scope`, `act` — the OAuth-shaped
+  claims RFC 9068 and RFC 8693 name, carried for an OAuth server that sits on
+  `svc.Signer()`. `Audience` reads a string or an array and writes a bare
+  string for one recipient; `Actor{Subject, ClientID}` is the party acting on
+  behalf of `Subject` in a delegated token. **None is interpreted** by `Parse`,
+  and all are `omitempty`, so a caller that sets none gets the payload it
+  always got — byte for byte, pinned by test.
 </ResponseField>
 
 ## The pairing most handlers need
@@ -121,14 +137,15 @@ Service built without WithJWT: true
 | Sentinel | Meaning |
 |---|---|
 | `token.ErrMalformedToken` | Not a valid JWS compact serialization — wrong segment count, non-canonical base64, or a segment that is not JSON |
-| `token.ErrUnsupportedAlgorithm` | The header's `alg` is not exactly `"HS256"`. Returned **before** any signature is verified |
+| `token.ErrUnsupportedAlgorithm` | The header's `alg` is not exactly the signer's own — `"HS256"` or `"EdDSA"`. Returned **before** any signature is verified |
+| `token.ErrUnknownKey` | An EdDSA signer was handed a token with no `kid`, or one naming a key it does not hold. After the `alg` check, before any signature is verified |
 | `token.ErrInvalidSignature` | No key in the list produced a matching signature |
 | `token.ErrExpiredToken` | The signature verified but `exp` is not in the future — checked **after** verification, so it cannot probe for a valid signature on forged claims |
-| `token.ErrKeyTooShort` | An HMAC key under 32 bytes appears anywhere in the key list |
+| `token.ErrKeyTooShort` | An HMAC key under 32 bytes appears anywhere in the key list — or the `Service` has neither `WithJWT` nor `WithSigner` |
 
 <Note>
-A `Service` built without `WithJWT` fails closed with `ErrKeyTooShort` here,
-exactly as `Login` does on the same misconfiguration. `Parse` checks every key's
+A `Service` built without `WithJWT` or `WithSigner` fails closed with
+`ErrKeyTooShort` here, exactly as `Login` does on the same misconfiguration. `Parse` checks every key's
 length **before** it looks at the token at all, so a misconfigured service
 surfaces on the request path and not only at startup.
 </Note>
@@ -197,6 +214,95 @@ The extender is where you attach the profile fields authlayer does not store.
 Look them up by `UserBase.ID` from your own tables and return them here.
 </Tip>
 
+## EdDSA, and the JWKS
+
+HS256 verification needs the signing secret, so it fits exactly one shape: the
+party that mints a token is the **only** party that checks it. The moment
+anything else must verify — another service, an agent acting for a user, an
+MCP client, a gateway in front of the application — sharing the secret makes
+every verifier an issuer.
+
+`token.EdDSA` is for that case. The private key stays with the issuer; `kid`
+names it in every token's header; `verifiers` are additional public keys, by
+kid, accepted on `Parse` — which is how a key rotates. `WithSigner` replaces
+`WithJWT` (the last of the two applied wins) and `WithAccessTTL` carries the
+TTL `WithJWT`'s second argument used to.
+
+{/* verify:main */}
+```go
+_, priv, _ := ed25519.GenerateKey(rand.Reader) // from your key store, in production
+signer, err := token.EdDSA("2026-09", priv, nil)
+fmt.Println("eddsa alg:", err, signer.Alg())
+
+ed := auth.New(memory.NewAuthStore(),
+	auth.WithSigner(signer),            // instead of WithJWT
+	auth.WithAccessTTL(15*time.Minute)) // the TTL WithJWT carried
+_, _ = ed.SignUp(ctx, "erin@example.com", "Correct-Horse-Battery-7")
+erin, _ := ed.Login(ctx, "erin@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+
+ec, err := ed.VerifyAccessToken(erin.AccessToken)
+fmt.Println("verified by its own service:", err, ec.Subject == erin.User.ID)
+_, err = token.Parse(erin.AccessToken, key)
+fmt.Println("refused by the HS256 path:", errors.Is(err, token.ErrUnsupportedAlgorithm))
+```
+
+```
+eddsa alg: <nil> EdDSA
+verified by its own service: <nil> true
+refused by the HS256 path: true
+```
+
+`Parse` **requires** a `kid` naming a key the signer holds — `ErrUnknownKey`
+otherwise — and checks the signature against that one key only, never against
+every key in turn.
+
+### Publishing the keys
+
+The JWKS is RFC 7517 with RFC 8037's Octet Key Pair — `kty` `OKP`, `crv`
+`Ed25519`, `use` `sig`, `alg` `EdDSA` — the signing key first, then verifiers
+sorted by `kid`. HS256 has nothing to publish, so the method is not on the
+`Signer` interface: it lives on the concrete EdDSA type, reached through the
+`token.PublicKeySetter` assertion. Serving it is yours — a plain struct with
+JSON tags, no handler.
+
+{/* verify:main */}
+```go
+pks, _ := ed.Signer().(token.PublicKeySetter)
+jwks := pks.PublicKeySet() // serve this at your jwks_uri
+fmt.Printf("jwks: %d key, kty=%s crv=%s kid=%s\n", len(jwks.Keys), jwks.Keys[0].Kty, jwks.Keys[0].Crv, jwks.Keys[0].Kid)
+
+// The other party: a verify-only Signer built from the published document.
+keys, _ := jwks.PublicKeys()
+verifier, _ := token.EdDSAVerifier(keys)
+_, err = verifier.Parse(erin.AccessToken)
+fmt.Println("verifier accepts:", err)
+_, err = verifier.Issue(token.Claims{Subject: "forged"}, time.Minute)
+fmt.Println("verifier cannot issue:", errors.Is(err, token.ErrInvalidKey))
+
+// A signer that never learned this kid refuses before any signature check.
+_, other, _ := ed25519.GenerateKey(rand.Reader)
+stranger, _ := token.EdDSA("2025-01", other, nil)
+_, err = stranger.Parse(erin.AccessToken)
+fmt.Println("unknown kid:", errors.Is(err, token.ErrUnknownKey))
+```
+
+```
+jwks: 1 key, kty=OKP crv=Ed25519 kid=2026-09
+verifier accepts: <nil>
+verifier cannot issue: true
+unknown kid: true
+```
+
+<Note>
+`JWKS.PublicKeys` refuses a document it does not fully understand — another
+`kty`, another curve, a malformed `x` — rather than skipping the key it did
+not. A verifier that silently dropped one would then refuse every token signed
+under it with `ErrUnknownKey`, and nothing would say why.
+</Note>
+
+`go run ./examples/hooks` runs this whole flow against `store/memory` and
+prints the JWKS it publishes.
+
 ## Why hand-rolling this JWT is defensible
 
 The two classic JWT vulnerabilities — `alg: none`, and RS256/HS256 confusion
@@ -212,9 +318,16 @@ lower-case `hs256` — is rejected through that one line with
 algorithm to confuse it with.
 
 <Warning>
-That single check is the whole justification for not taking a dependency — and
-it is why **generalising this package to a second algorithm would bring both
-vulnerabilities back**.
+That single check is the whole justification for not taking a dependency. The
+package does offer a second algorithm, and the argument survives only because
+of **where the choice is made**: by the caller, once, in the constructor —
+`token.HS256` or `token.EdDSA` — and never by the token. Each `Signer`
+compares the header's `alg` to its own one literal and refuses the other's
+tokens with `ErrUnsupportedAlgorithm`; an HMAC computed with an Ed25519 public
+key's bytes under a header claiming `EdDSA` fails at the EdDSA signer on
+signature length before verification. What must never be added is a parser
+that reads `alg` and picks a signer from it — **a third algorithm is a third
+constructor, never a second branch in an existing `Parse`.**
 </Warning>
 
 The same reasoning covers the key. An empty or undersized HMAC key is `alg:
@@ -241,7 +354,7 @@ Signature comparison is `hmac.Equal`, and every segment is decoded with
 **strict** base64 — so one token has exactly one valid encoding, and the raw
 string is usable as a denylist key.
 
-{/* verify:stdout "<nil> true bob@example.com true\n<nil> bob@example.com hash scrubbed: true\nchange password: <nil>\ntampered: true\ngarbage: true\nService built without WithJWT: true\nin-flight token survives rotation: <nil> true\n<nil> true\npro victim\nshort key at Issue: true\nzero ttl at Issue:  true" */}
+{/* verify:stdout "<nil> true bob@example.com true\n<nil> bob@example.com hash scrubbed: true\nchange password: <nil>\ntampered: true\ngarbage: true\nService built without WithJWT: true\nin-flight token survives rotation: <nil> true\n<nil> true\npro victim\neddsa alg: <nil> EdDSA\nverified by its own service: <nil> true\nrefused by the HS256 path: true\njwks: 1 key, kty=OKP crv=Ed25519 kid=2026-09\nverifier accepts: <nil>\nverifier cannot issue: true\nunknown kid: true\nshort key at Issue: true\nzero ttl at Issue:  true" */}
 
 ## The bound you must carry
 

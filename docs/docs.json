@@ -68,6 +68,7 @@
           "authentication/magic-links",
           "authentication/account-deletion",
           "authentication/rate-limiting",
+          "authentication/hooks",
           "authentication/wiring"
         ]
       },
