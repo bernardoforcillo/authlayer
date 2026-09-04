@@ -538,22 +538,22 @@ func (s *Service[C, M, PC, PM]) CreateKey(ctx context.Context, serviceAccountID,
 	}
 	var encoded []byte
 	if o.grants != nil {
-		cap, err := s.sc.Access().Permission(o.grants)
+		ceiling, err := s.sc.Access().Permission(o.grants)
 		if err != nil {
 			return Key{}, "", err
 		}
-		if cap.IsZero() {
+		if ceiling.IsZero() {
 			return Key{}, "", ErrEmptyPermissions
 		}
-		if !keyElevated && !cap.SubsetOf(keyPerms) {
+		if !keyElevated && !ceiling.SubsetOf(keyPerms) {
 			return Key{}, "", scope.ErrPrivilegeEscalation
 		}
 		// The cap is within the role (or the role is Full), so the key's
 		// effective set is the cap itself, and it is elevated only if the
 		// cap grants every pair this scope declares.
-		keyPerms = cap
-		keyElevated = keyElevated && s.sc.Access().Full().Intersect(cap).IsFull()
-		encoded = cap.Encode()
+		keyPerms = ceiling
+		keyElevated = keyElevated && s.sc.Access().Full().Intersect(ceiling).IsFull()
+		encoded = ceiling.Encode()
 	}
 
 	// ... which must be within what the actor holds, capped.
@@ -721,11 +721,11 @@ func (s *Service[C, M, PC, PM]) Authenticate(ctx context.Context, plaintext stri
 		AuthenticatedAt: now,
 	}
 	if len(k.Permissions) > 0 {
-		cap, err := s.sc.Access().Decode(k.Permissions)
+		ceiling, err := s.sc.Access().Decode(k.Permissions)
 		if err != nil {
 			return Principal{}, err
 		}
-		p.Permissions = &cap
+		p.Permissions = &ceiling
 	}
 
 	ok := Event{

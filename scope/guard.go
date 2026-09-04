@@ -93,7 +93,7 @@ func (s *Service[C, M, PC, PM]) PermissionGuard(
 		// subject owns, since a capped owner is not elevated. pg.In of an
 		// empty list is the false predicate, the same fail-closed shape the
 		// no-qualifying-containers case below already takes.
-		if cap, capped := PermissionCapFrom(ctx); capped && !cap.Allows(resource, actions...) {
+		if ceiling, capped := PermissionCapFrom(ctx); capped && !ceiling.Allows(resource, actions...) {
 			return pg.In(col, []string{}), nil
 		}
 		ids, err := s.ContainersWith(ctx, subject, resource, actions...)

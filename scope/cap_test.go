@@ -69,8 +69,8 @@ func TestCappedOwnerIsNotElevated(t *testing.T) {
 	svc := newTestService()
 	octx, _ := ownerCtx(t, svc, "alice")
 
-	cap := mustCap(t, svc, map[string][]access.Action{ResourceMember: {ActionCreate}})
-	capped := WithPermissionCap(octx, cap)
+	ceiling := mustCap(t, svc, map[string][]access.Action{ResourceMember: {ActionCreate}})
+	capped := WithPermissionCap(octx, ceiling)
 
 	// The owner's own organization:delete is gone under the cap.
 	if ok, err := svc.Can(capped, resOrg, ActionDelete); err != nil || ok {
@@ -343,8 +343,8 @@ func TestPermissionCapFromReportsAbsence(t *testing.T) {
 		t.Fatal("a bare context reports a cap")
 	}
 	svc := newTestService()
-	cap := svc.Access().Full()
-	got, ok := PermissionCapFrom(WithPermissionCap(context.Background(), cap))
+	ceiling := svc.Access().Full()
+	got, ok := PermissionCapFrom(WithPermissionCap(context.Background(), ceiling))
 	if !ok || !got.IsFull() {
 		t.Fatalf("PermissionCapFrom = %v, %v; want the Full cap back", got.IsFull(), ok)
 	}

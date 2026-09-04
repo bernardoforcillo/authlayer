@@ -439,12 +439,12 @@ func (s *Service[C, M, PC, PM]) standing(ctx context.Context, containerID, userI
 // set says nothing. Requiring the cap itself to be Full is the rule that
 // gives the right answer in both shapes.
 func (s *Service[C, M, PC, PM]) CapStanding(ctx context.Context, perms access.Permission, elevated bool) (access.Permission, bool) {
-	cap, ok := PermissionCapFrom(ctx)
+	ceiling, ok := PermissionCapFrom(ctx)
 	if !ok {
 		return perms, elevated
 	}
-	fullHere := s.ac.Full().Intersect(cap).IsFull()
-	return perms.Intersect(cap), elevated && fullHere
+	fullHere := s.ac.Full().Intersect(ceiling).IsFull()
+	return perms.Intersect(ceiling), elevated && fullHere
 }
 
 // standingCapped is standing for the CONTEXT subject: the same resolution,
@@ -534,7 +534,7 @@ func (s *Service[C, M, PC, PM]) authorizeCreateInParent(ctx context.Context, sub
 	if !ok {
 		return "", ErrScopeMissing
 	}
-	if cap, capped := PermissionCapFrom(ctx); capped && !cap.IsFull() {
+	if ceiling, capped := PermissionCapFrom(ctx); capped && !ceiling.IsFull() {
 		return "", ErrForbidden
 	}
 	perms, elevated, err := s.cfg.parent.Standing(ctx, parentID, subject)

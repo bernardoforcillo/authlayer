@@ -109,14 +109,14 @@ type capKey struct{}
 // intersects to nothing, so a subject carrying it can do nothing at all.
 // That is deliberate: a cap the caller failed to build is not the same as no
 // cap, and silently ignoring it would be the fail-open reading.
-func WithPermissionCap(ctx context.Context, cap access.Permission) context.Context {
-	return context.WithValue(ctx, capKey{}, cap)
+func WithPermissionCap(ctx context.Context, ceiling access.Permission) context.Context {
+	return context.WithValue(ctx, capKey{}, ceiling)
 }
 
 // PermissionCapFrom returns the cap [WithPermissionCap] put on ctx and
 // ok=false when there is none. A context with no cap is the ordinary case:
 // the subject stands on their role alone.
 func PermissionCapFrom(ctx context.Context) (access.Permission, bool) {
-	cap, ok := ctx.Value(capKey{}).(access.Permission)
-	return cap, ok
+	ceiling, ok := ctx.Value(capKey{}).(access.Permission)
+	return ceiling, ok
 }
