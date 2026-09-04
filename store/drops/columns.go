@@ -37,9 +37,10 @@ import (
 // see [WithAuthTextLibraryIDs].
 var (
 	libraryIDColumns = map[string]bool{
-		"id":           true,
-		"parent_id":    true,
-		"container_id": true,
+		"id":                 true,
+		"parent_id":          true,
+		"container_id":       true,
+		"service_account_id": true,
 	}
 	userIDColumns = map[string]bool{
 		"user_id":    true,
