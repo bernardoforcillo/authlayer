@@ -38,8 +38,9 @@ RBAC engine pulls in `drops`, and `pgx/v5` comes with the PostgreSQL store.
   [Policy](#policy) · [Hooks & events](#hooks--events) · [Options](#options)
 - [Query-level filtering](#query-level-filtering) · [Storage](#storage) ·
   [Custom scopes](#custom-scopes) · [Nested scopes](#nested-scopes)
-- [Invitations](#invitations) · [Authentication](#authentication) ·
-  [Magic links](#magic-links) · [OAuth](#oauth) ·
+- [Invitations](#invitations) ·
+  [Service accounts & API keys](#service-accounts--api-keys) ·
+  [Authentication](#authentication) · [Magic links](#magic-links) · [OAuth](#oauth) ·
   [Account deletion](#account-deletion) · [Errors](#errors) ·
   [Packages](#packages)
 
@@ -178,6 +179,7 @@ the engine enforces on its own operations:
 | `member`       | `create`, `update`, `delete` | `AddMember`, `ChangeMemberRole`, `RemoveMember` |
 | `role`         | `create`, `update`, `delete` | `CreateRole`, `UpdateRole`, `DeleteRole` |
 | `invite`       | `create`, `read`, `delete` | the [`invite`](#invitations) package's own mint/list/revoke calls — the engine itself checks none of it |
+| `service_account` | `create`, `read`, `update`, `delete` | the [`apikey`](#service-accounts--api-keys) package's own calls — likewise declared here, checked there |
 
 `organization:update` / `organization:delete` are declared so your own "rename
 the org" and "delete the org" handlers have something to check with `Authorize`,
@@ -541,10 +543,10 @@ owe the engine is the right sentinel error when a lookup finds nothing —
 `ErrNotMember` rather than a generic not-found — because the engine branches on
 those. Each method's contract is documented on the interface.
 
-`invite.Store` and `auth.Store` are separate ports with the same discipline,
-and so is the optional `auth.IdentityStore` behind
-[external identities](#oauth) — a fourth port rather than five more methods on
-`auth.Store`, which is released. Both backends implement all four.
+`invite.Store`, `apikey.Store` and `auth.Store` are separate ports with the
+same discipline, and so is the optional `auth.IdentityStore` behind
+[external identities](#oauth) — a port of its own rather than six more methods
+on `auth.Store`, which is released. Both backends implement all five.
 `auth.Store` is the strictest of them:
 eleven of its twenty-two methods carry an explicit **MUST**, each naming the
 failure it prevents. They are not all the same kind of obligation, and the
@@ -1035,6 +1037,51 @@ into forty-seven defect/check cases, each asserted to **fail** the check
 that covers it. A further test fails if a check is ever added without a control,
 so a check that asserts nothing cannot slip in green.
 
+### Writing your own `apikey.Store`
+
+`apikey.Store`'s three **MUST**s — `Key.TokenHash` unique across every row,
+`DeleteServiceAccount`'s cascade atomic with the delete, `CreateKey` refusing a
+key naming no account — ship as an executable suite too, built the same way
+and placed the same way:
+
+```go
+import "github.com/bernardoforcillo/authlayer/apikey/apikeytest"
+
+func TestMyStoreSatisfiesTheAPIKeyContract(t *testing.T) {
+    apikeytest.RunStoreContract(t, func(t *testing.T) apikey.Store {
+        return myStoreWithEmptyTables(t)   // called once per check
+    })
+}
+```
+
+The factory must hand back a store with **no** service accounts and no keys
+in it, and may register teardown with `t.Cleanup` or call `t.Skip`. Ids,
+container ids and creator ids are UUIDv7, and token hashes are unique per
+call unless a check is deliberately forcing a collision, so the suite runs
+unchanged against a backend that types its id columns as `uuid`. Warm your
+pool to `apikeytest.RaceGoroutines` connections first, for the reason given
+above.
+
+Four of the thirty-seven checks are races: one winner among concurrent
+creates of one token hash, one among concurrent creates of one account id,
+one among concurrent deletes of one account, and the cascade as a
+*linearizability* property — a `CreateKey` racing the `DeleteServiceAccount`
+of its account, after which the store must be in a state some serial order
+could have produced, never the account gone and the key present. That last
+one catches a grossly non-atomic cascade every time and a subtly non-atomic
+one only sometimes, for the reason `ConsumeLink`'s races do; against
+`store/drops` the property is carried by one transaction plus an
+`ON DELETE CASCADE` backstop, against `store/memory` by one mutex
+acquisition. Points the port leaves unspecified — list order,
+empty-slice-versus-nil, and *which error* a rejected duplicate hash comes
+back as — are not asserted.
+
+The suite's own tests include thirty-seven deliberately non-compliant stores,
+one per check — one that lets two keys share a hash, one that writes a key for
+an account that does not exist, one whose cascade deletes the keys, releases
+the lock, then the account — each asserted to **fail** the check that covers
+it, and a further test fails if a check is ever added without a control.
+
 ## Custom scopes
 
 `org` fixes the container type to `Organization` and the member type to `Member`.
@@ -1376,6 +1423,162 @@ the new membership, not the container the invitee was just admitted to, and
 acceptance needs to hand one back. Like `Standing` and `HasPermission`, neither
 reads anything from the context nor checks that the caller is entitled to
 ask — do not expose either directly to end users.
+
+## Service accounts & API keys
+
+`apikey` gives a scope **non-human members**. A `ServiceAccount` is an
+ordinary membership whose id the package mints rather than your users table;
+a `Key` is a bearer credential that authenticates as it. From the moment the
+account is admitted the engine treats it exactly like a person — the same
+role resolution, the same [escalation guard](#the-privilege-escalation-guard),
+the same [query guards](#query-level-filtering) — and nothing in `scope`
+knows the difference.
+
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{"project": {"read", "deploy"}}),
+    memory.New[org.Organization, org.Member]())
+keys := apikey.New(svc.Service, memory.NewAPIKeyStore()) // .Service: the embedded *scope.Service
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+_, _ = svc.CreateRole(owner, "deployer", "Deployer", map[string][]access.Action{"project": {"read", "deploy"}})
+
+sa, _ := keys.CreateServiceAccount(owner, "ci", "deploys main", "deployer") // a member now
+key, plaintext, _ := keys.CreateKey(owner, sa.ID, "github",                 // plaintext returned ONCE
+    apikey.WithPermissions(map[string][]access.Action{"project": {"read"}}))
+
+p, _ := keys.Authenticate(context.Background(), plaintext) // no subject needed: the key IS the credential
+asKey := apikey.WithPrincipal(context.Background(), p)     // subject + org + cap on one context
+ok, _ := svc.Can(asKey, "project", "read")   // true  — in the role and in the cap
+ok, _ = svc.Can(asKey, "project", "deploy")  // false — in the role, removed by the cap
+_ = keys.RevokeKey(owner, key.ID)
+```
+
+`store/memory`'s `NewAPIKeyStore` is the dev/test `apikey.Store`;
+`store/drops` ships `dropsstore.NewAPIKeyStore(db)` with its own
+`CreateSchema` — two tables, `service_accounts` and `api_keys` (see
+[`store/drops`](#storedrops)). `examples/apikey` is the runnable tour.
+
+**Minting.** The plaintext is `sk_` followed by the url-safe base64 of 32
+bytes from `crypto/rand` — 46 characters — and `CreateKey` returns it exactly
+once. Only `token.HashOpaque(plaintext)` is stored, so a database leak cannot
+be replayed into a working key; `Key.Prefix` keeps `sk_` plus eight characters
+in clear so a management screen can show `sk_ab12cd34…`. `WithExpiry` makes a
+key valid strictly before an instant (one not after now is
+`ErrInvalidExpiry`); `WithKeyPrefix` on the service changes the prefix, which
+is never checked on authentication — the hash is — so existing keys survive
+it.
+
+**Restricted permissions, and the cap.** `WithPermissions` restricts a key to
+a set narrower than its account's role. It is a *cap*, never a grant: the
+key's effective standing is `role ∩ cap`, enforced by
+`scope.WithPermissionCap`, which the engine applies *after* owner bypass,
+inherited standing and role lookup — so it can only ever remove, and a capped
+owner is not elevated. Minting is guarded twice: the cap must be within the
+account's role (a cap outside it would intersect to less than it claims and
+mislead whoever reads it back) *and* within the actor's own capped standing,
+both with `scope.ErrPrivilegeEscalation`. An *unrestricted* key is guarded the
+same way — holding a key is holding the account's standing, so minting one is
+treated like `AddMember`: an admin cannot mint a full key for an owner-role
+account. A cap that compiles to nothing is `ErrEmptyPermissions`, because the
+stored encoding cannot tell an empty cap from no cap and such a key would
+authenticate as the whole role. The cap is intersected at every check, never
+copied onto the key, so lowering the account's role lowers every key with it.
+The paths that honour the cap are exactly the ones that resolve the *context
+subject* — `Can`, `Authorize`, every escalation guard (scope's, invite's and
+apikey's), `PermissionGuard`; the explicit-user-id methods `HasPermission`,
+`Standing`, `RolePermissions` and `ContainersWith` read nothing from the
+context by contract, the cap included, and say so.
+`scope.Service.CapStanding(ctx, perms, elevated)` is the one exported
+definition of the rule — role ∩ cap, elevated only if the cap is Full *in this
+scope's space* — for a package that resolves an actor through `Standing` and
+must apply what the engine applies.
+
+**Authenticating.** `Authenticate(ctx, plaintext)` hashes, looks up by hash,
+and refuses in this order: `ErrKeyNotFound`, `ErrKeyRevoked`, `ErrKeyExpired`
+(valid strictly before `ExpiresAt`), `ErrServiceAccountNotFound` (a key that
+outlived its account, which the store's cascade MUST prevents),
+`ErrServiceAccountDisabled`. It reads no subject and no container: the
+container comes from the key. On success it decodes the key's cap against the
+scope's own statements into `Principal.Permissions`, stamps `LastUsedAt`
+through `Store.TouchKey` — *best-effort*: a touch failure is reported on the
+`KeyAuthenticated` event as `touch_failed` and the principal is returned all
+the same, because a bookkeeping hiccup must not lock every automated client
+out — and returns a `Principal{Kind, ID, ContainerID, KeyID, ClientID,
+GrantID, Permissions, AuthenticatedAt}`. `WithPrincipal(ctx, p)` installs
+`scope.WithSubject(p.ID)`, `scope.WithScope(p.ContainerID)`, the cap when
+`p.Permissions` is set, and the principal itself (`PrincipalFrom`). `Kind` is
+a string — `service_account` from this package; `user` and `delegated` are
+declared for the oauth package to populate, as are `ClientID` and `GrantID`.
+The refusal reason is disclosed on purpose: the caller already holds a
+256-bit random plaintext that cannot be enumerated, so "revoked" rather than
+"unknown" gives an attacker nothing and an operator the diagnosis.
+
+**Revocation, expiry, disable.** `RevokeKey` stamps `RevokedAt` and is
+idempotent; the row stays for audit until `PurgeExpired(ctx, before)` removes
+keys expired *or* revoked strictly before the cutoff — a cron-only call that
+spans every container and checks nothing, like invite's.
+`DisableServiceAccount` refuses every key of the account and lets none be
+minted while the membership and keys are untouched, so
+`EnableServiceAccount` restores it exactly: the move for "something leaked
+and we do not yet know which key". `DeleteServiceAccount` removes the
+membership, then the record and every key together.
+
+**What is NOT atomic.** An account spans two stores that may not share a
+database — its record in `apikey.Store`, its membership in `scope.Store` —
+and there is no cross-store transaction, exactly as
+[invitation acceptance](#invitations) has none. Each two-store method orders
+its halves so a failure between them leaves the *inert* shape behind.
+`CreateServiceAccount` writes the record FIRST, then
+`scope.Service.GrantMembership`: a record with no membership has no standing,
+gets no key (`CreateKey` resolves its role and finds `ErrNotMember`) and
+authenticates nothing, whereas a membership with no record would be a phantom
+member with a role that every roster reports. If the grant fails the record
+is deleted again, best-effort, and on a second failure both errors come back
+joined. `DeleteServiceAccount` removes the membership FIRST — from that
+instant the account has no standing anywhere — then the record and keys,
+atomically in `apikey.Store`. On a [nested scope](#nested-scopes) under the
+default `MembersFromParent`, `GrantMembership` refuses a subject with no
+parent standing, which a freshly minted id never has: `CreateServiceAccount`
+on a team fails with `scope.ErrNotParentMember` and cleans up, and this
+package makes no attempt to admit the account to the parent for you.
+
+**Authorization of the management calls.** Every call reads the subject and
+container from the context and checks the `service_account` control resource
+through `scope.Service.Authorize`: `create` for `CreateServiceAccount` (plus
+the escalation guard on the role), `read` for `ListServiceAccounts` and
+`ListKeys`, `update` for enable/disable, `ChangeServiceAccountRole`,
+`CreateKey` and `RevokeKey`, `delete` for `DeleteServiceAccount`. Two calls
+delegate the membership half to scope and so need scope's grants as well:
+`ChangeServiceAccountRole` runs `ChangeMemberRole` (`member:update`, guard),
+`DeleteServiceAccount` runs `RemoveMember` (`member:delete`, target-rank
+guard). A cross-tenant id is reported as not-found, as `invite` does.
+
+**Every `admin` gains `service_account:*` on adoption.** `ControlStatements`
+now declares `service_account: create, read, update, delete`, and `admin` is
+derived from the merged surface — the same widening `invite:*` caused in
+0.1.0, landing on existing installations with no code change and no
+migration to notice. Define a custom role if `admin` must not manage service
+accounts. `member` still holds nothing.
+
+**Hooks** mirror scope's exactly — `Hook`, `Event`, `HookFunc`, `WithHooks`,
+fired after the change and before the return, a hook error returned to the
+caller (for `Authenticate`, *instead of* the principal; on a refusal, joined
+onto the sentinel so `errors.Is` still holds). `Event.Detail` is a fixed
+vocabulary, never free text and never a plaintext. `scope` emits its own
+`MemberAdded` for the membership half with `ActorID` equal to the *account*
+id (see [Hooks & events](#hooks--events) on `GrantMembership`);
+`ServiceAccountCreated` from this package carries the real actor.
+
+**`scope` primitives exported for this package.** `WithPermissionCap` /
+`PermissionCapFrom` on a private key of `scope`'s own;
+`Service.CapStanding`; `Service.Access()`, so a sibling package compiles and
+decodes permissions in the *same* statement space the engine decides in (a
+cap built against any other intersects to nothing —
+`access.Permission.Intersect` fails closed rather than reinterpret bits); and
+`access.Permission.Intersect` itself, the meet of two permissions, with the
+same same-Statements precondition as `Union` and `SubsetOf`.
 
 ## Authentication
 
@@ -2645,7 +2848,7 @@ matches.
 
 `invite` adds seven sentinels of its own — not exported by `scope`, and not
 aliased anywhere, since invitations are a separate package with its own
-failure modes:
+failure modes (`apikey`'s eight follow further down):
 
 | Error | Meaning | Suggested status |
 |---|---|---|
@@ -2669,6 +2872,28 @@ rather than a lookup miss, and only the service layer raises them: a link's
 that step to also report which of three conditions applied would require a
 second, separate read, which is exactly the race atomicity rules out — and
 `JoinViaLink` re-reads the link afterwards to tell them apart.
+
+[`apikey`](#service-accounts--api-keys) adds eight. Denials are not
+re-declared: a management call the actor may not make is `scope.ErrForbidden`
+(or `scope.ErrNotMember`), and minting above one's standing is
+`scope.ErrPrivilegeEscalation`.
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrServiceAccountNotFound` | No service account with that id — or one in *another* container than the one on the context | 404 |
+| `ErrKeyNotFound` | No key with that id or token hash — or, from the management calls, one in another container | 404 |
+| `ErrKeyRevoked` | The key's `RevokedAt` is set | 401 |
+| `ErrKeyExpired` | The key's `ExpiresAt` is not in the future | 401 |
+| `ErrServiceAccountDisabled` | The key is live but its account is disabled; also refused by `CreateKey` | 401 (403 from `CreateKey`) |
+| `ErrIDTaken` | A `Create*` was given an id that already identifies a row of that kind | 409 |
+| `ErrEmptyPermissions` | `WithPermissions` compiled to a set granting nothing — refused rather than stored as *no cap* | 400 |
+| `ErrInvalidExpiry` | `WithExpiry` named an instant not after now | 400 |
+
+The first two are raised by the `Store` on any lookup, update or delete that
+matches no row — and by the service, deliberately, for a record in another
+container. The middle three are raised only by `Authenticate`; a `Store`
+returns the row and the service reads the timestamps. The last two are
+argument errors raised before any store is touched.
 
 [`auth`](#authentication) adds twenty-four, split the same way — some raised by
 the `Store` on a lookup or a constraint, the rest by the service. Eighteen
@@ -2747,16 +2972,19 @@ rules and `Verify` returns a bool, so there is nothing to compare with
 | [`team`](team/) | Team RBAC nested inside `org` via `scope.WithParent` — the worked example of [nesting](#nested-scopes). |
 | [`invite`](invite/) | [Invitations](#invitations) — email tokens and reusable links admitting a user with no standing yet, via `scope.Service.GrantMembership`. |
 | [`invite/invitetest`](invite/invitetest/) | `invite.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-invitestore) and run it. Test-only; imports `testing`. |
+| [`apikey`](apikey/) | [Service accounts & API keys](#service-accounts--api-keys) — non-human members and the keys that authenticate as them, capped with `scope.WithPermissionCap`. |
+| [`apikey/apikeytest`](apikey/apikeytest/) | `apikey.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-apikeystore) and run it. Test-only; imports `testing`. |
 | [`auth`](auth/) | [Authentication](#authentication) — `Service`, its `Store` port, and the user/session/verification records. Sign-up, login, email verification, refresh rotation, and the password lifecycle. Also the optional `IdentityStore` port and the four [external-identity](#oauth) methods. |
 | [`auth/authtest`](auth/authtest/) | `auth.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-authstore) and run it. Test-only; imports `testing`. |
 | [`token`](token/) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled, [single-algorithm](#the-jwt-and-why-hand-rolling-it-is-defensible) HS256 JWT. Standard library only. |
 | [`password`](password/) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` for a strength policy. The only package that pulls in `golang.org/x/crypto`. |
-| [`store/memory`](store/memory/) | In-memory `scope.Store`, `invite.Store`, `auth.Store` and `auth.IdentityStore` for dev, tests, and examples. |
-| [`store/drops`](store/drops/) | PostgreSQL stores built on drops — RBAC (composite-key membership), invitations, the three auth tables, and the [`identities`](#the-identities-table) table. |
+| [`store/memory`](store/memory/) | In-memory `scope.Store`, `invite.Store`, `apikey.Store`, `auth.Store` and `auth.IdentityStore` for dev, tests, and examples. |
+| [`store/drops`](store/drops/) | PostgreSQL stores built on drops — RBAC (composite-key membership), invitations, service accounts and keys, the three auth tables, and the [`identities`](#the-identities-table) table. |
 | [`examples/basic`](examples/basic/) | Runnable, database-free tour of the RBAC half. |
 | [`examples/auth`](examples/auth/) | Runnable, database-free tour of `auth` + `org` + `invite` wired together. |
 | [`examples/reset`](examples/reset/) | Runnable, database-free tour of [the password lifecycle](#the-password-lifecycle) — `RequestPasswordReset`, `ResetPassword`, `RequestEmailChange`. |
 | [`examples/oauth`](examples/oauth/) | Runnable, database-free tour of [external identities](#oauth) — the ladder, the linking policy, the explicit link, and the last-credential guard. |
+| [`examples/apikey`](examples/apikey/) | Runnable, database-free tour of [service accounts & API keys](#service-accounts--api-keys) — mint, cap, authenticate, revoke, disable, cascade delete. |
 
 Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
 
@@ -2769,6 +2997,7 @@ go test ./... -count=1          # database-free
 golangci-lint run ./...         # v2 required; the config is .golangci.yml
 go run ./examples/basic && go run ./examples/auth && go run ./examples/reset
 go run ./examples/oauth && go run ./examples/magiclink && go run ./examples/deletion
+go run ./examples/apikey
 go run ./docs/_verify           # every Go sample under docs/, compiled and run
 ```
 

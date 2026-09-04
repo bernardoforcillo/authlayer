@@ -207,9 +207,47 @@ independently; `invite` does **not** read `Policy`.
   source of unguessability for every credential the service mints.
 </ResponseField>
 
+## `apikey`
+
+An `apikey.Service` and the `scope.Service` it wraps are configured
+independently; like `invite`, `apikey` does **not** read `Policy`, and its
+escalation guards are always strict.
+
+<ResponseField name="WithClock(now func() time.Time)" type="Option" default="time.Now().UTC()">
+  Every stamp — created, updated, expiry, revocation, last-used, events — and
+  `Authenticate`'s expiry test.
+</ResponseField>
+
+<ResponseField name="WithIDGenerator(gen func() string)" type="Option" default="UUIDv7">
+  Ids for service accounts and keys. Against `store/drops` a non-UUID
+  generator needs `WithAPIKeyTextLibraryIDs()` — see [Ids](/concepts/ids).
+</ResponseField>
+
+<ResponseField name="WithHooks(hooks ...Hook)" type="Option" default="none">
+  Lifecycle hooks, appended in order. A hook error is returned to the caller
+  — for `Authenticate`, instead of the principal.
+</ResponseField>
+
+<ResponseField name="WithKeyPrefix(prefix string)" type="Option" default='"sk_"'>
+  The plaintext prefix. Not checked on authentication — the hash is — so
+  changing it does not invalidate keys minted under the old one. An empty
+  prefix is ignored.
+</ResponseField>
+
+Per key, at `CreateKey`:
+
+<ResponseField name="WithExpiry(at time.Time)" type="KeyOption" default="never">
+  Valid strictly before `at`; an instant not after now is `ErrInvalidExpiry`.
+</ResponseField>
+
+<ResponseField name="WithPermissions(grants map[string][]access.Action)" type="KeyOption" default="the whole role">
+  A [cap](/service-accounts/restricted-permissions), never a grant: must be
+  within the account's role and the actor's own capped standing.
+</ResponseField>
+
 ## `store/drops`
 
-Four separate option types, one per store, because the four stores are
+Five separate option types, one per store, because the five stores are
 independent.
 
 | Option | Type | Effect |
@@ -220,6 +258,9 @@ independent.
 | `WithInviteNames(InviteNames{...})` | `InviteOption` | Rename the two invitation tables |
 | `WithInviteTextLibraryIDs()` | `InviteOption` | Retype the invitation `id` and `container_id` |
 | `WithInviteTextUserIDs()` | `InviteOption` | Retype `invited_by`, `created_by` |
+| `WithAPIKeyNames(APIKeyNames{...})` | `APIKeyOption` | Rename `service_accounts`, `api_keys` |
+| `WithAPIKeyTextLibraryIDs()` | `APIKeyOption` | Retype `id`, `container_id`, `service_account_id` |
+| `WithAPIKeyTextUserIDs()` | `APIKeyOption` | Retype `created_by` on both tables |
 | `WithAuthNames(AuthNames{...})` | `AuthOption` | Rename `users`, `sessions`, `verifications` |
 | `WithAuthTextLibraryIDs()` | `AuthOption` | Retype **all five** auth id columns together |
 | `WithIdentityNames(IdentityNames{...})` | `IdentityOption` | Rename `identities` |

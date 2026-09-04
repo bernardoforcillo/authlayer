@@ -1,16 +1,17 @@
 ---
 title: "Storage"
-description: "Four independent Store ports, two shipped backends, and one discipline: a store is pure persistence that never authorizes anything."
+description: "Five independent Store ports, two shipped backends, and one discipline: a store is pure persistence that never authorizes anything."
 ---
 
-authlayer has **four** persistence ports, and they are independent. You can
+authlayer has **five** persistence ports, and they are independent. You can
 implement one and not the others, and the two shipped backends implement all
-four.
+five.
 
 | Port | Holds | Methods |
 |---|---|---|
 | `scope.Store[C, M]` | containers, members, custom roles, a transaction | composed from `ContainerStore`, `MemberStore`, `RoleStore` |
 | `invite.Store` | email invitations and links | 13 |
+| `apikey.Store` | [service accounts](/service-accounts/overview) and their keys | 14 |
 | `auth.Store` | users, sessions, verifications | 18 |
 | `auth.IdentityStore` | [external identities](/oauth/overview) — **optional** | 6 |
 
@@ -71,8 +72,10 @@ database's.
 
 <Warning>
 There is **no cross-store transaction anywhere**. Invitation acceptance spans
-`invite.Store` and `scope.Store`, which may not even share a database, and
-`auth`, `scope` and `invite` declare no foreign keys between their tables. That
+`invite.Store` and `scope.Store`, which may not even share a database — and so
+does a [service account](/service-accounts/overview#what-is-not-atomic), whose
+record and membership live one in each — and `auth`, `scope`, `invite` and
+`apikey` declare no foreign keys between their tables. That
 constraint is what shapes
 [claim-first-admit-second](/invitations/security#claim-first-admit-second), what
 leaves the

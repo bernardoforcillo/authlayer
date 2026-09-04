@@ -10,6 +10,92 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Service accounts and API keys** (`authlayer/apikey`). A `ServiceAccount`
+  is a non-human member: `CreateServiceAccount(ctx, name, description,
+  roleKey)` writes the record and admits its id through
+  `scope.Service.GrantMembership`, after which every `Can`, `Authorize`,
+  escalation guard and `PermissionGuard` works for it unchanged. A `Key` is a
+  bearer credential — `sk_` plus the url-safe base64 of 32 random bytes,
+  returned by `CreateKey` **exactly once** and stored only as its sha256
+  (`token.HashOpaque`). `Authenticate(ctx, plaintext)` needs no subject on the
+  context and returns a `Principal{Kind, ID, ContainerID, KeyID, ClientID,
+  GrantID, Permissions, AuthenticatedAt}`; `WithPrincipal` installs subject,
+  scope and — for a restricted key — the permission cap on one context, and
+  `PrincipalFrom` reads it back. `Kind` is a string (`service_account`;
+  `user` and `delegated` declared for the oauth package, as are `ClientID`
+  and `GrantID`).
+
+  **Restricted permissions are a cap, never a grant.** `WithPermissions` must
+  sit within the account's role *and* within the actor's own capped standing
+  (`scope.ErrPrivilegeEscalation` otherwise); an unrestricted key is guarded
+  the same way, since holding a key is holding the account's standing. A cap
+  compiling to nothing is `ErrEmptyPermissions` rather than stored as "no
+  cap". The cap is intersected at every check, so lowering the role lowers
+  every key.
+
+  `Authenticate` refuses, in order, `ErrKeyNotFound`, `ErrKeyRevoked`,
+  `ErrKeyExpired` (valid strictly before `ExpiresAt`),
+  `ErrServiceAccountNotFound`, `ErrServiceAccountDisabled`, and emits
+  `KeyAuthenticationFailed` with a fixed-vocabulary `Detail`. A `TouchKey`
+  failure is **not** an authentication failure — reported as `touch_failed`
+  on `KeyAuthenticated`, principal returned. `RevokeKey` is idempotent;
+  `DisableServiceAccount`/`EnableServiceAccount` refuse and restore every key
+  of an account without touching membership or keys; `DeleteServiceAccount`
+  removes membership, then record and keys together; `PurgeExpired` is a
+  cron-only sweep of keys expired *or* revoked before a cutoff. Options
+  `WithClock`, `WithIDGenerator`, `WithHooks` (`Hook`/`Event`/`HookFunc`,
+  scope's shape), `WithKeyPrefix`; key options `WithExpiry`,
+  `WithPermissions`. Sentinels `ErrServiceAccountNotFound`, `ErrKeyNotFound`,
+  `ErrKeyRevoked`, `ErrKeyExpired`, `ErrServiceAccountDisabled`, `ErrIDTaken`,
+  `ErrEmptyPermissions`, `ErrInvalidExpiry`; denials reuse `scope`'s.
+
+  **What is not atomic is stated.** An account spans two stores with no
+  cross-store transaction. `CreateServiceAccount` writes the inert half —
+  the record — first, then the membership, and deletes the record again
+  (best-effort, errors joined) if the grant fails; `DeleteServiceAccount`
+  removes the membership first, then record and keys atomically. On a nested
+  scope under `MembersFromParent` the grant fails with `ErrNotParentMember`
+  and is cleaned up.
+
+  `apikey.Store` is a new port (fourteen methods) with three MUSTs:
+  `Key.TokenHash` UNIQUE, `DeleteServiceAccount`'s cascade atomic with the
+  delete, `CreateKey` refusing a key naming no account.
+  `store/memory.NewAPIKeyStore()` is the reference implementation;
+  `store/drops.NewAPIKeyStore(db, opts...)` (`APIKeyNames`, `WithAPIKeyNames`,
+  `WithAPIKeyTextLibraryIDs`, `WithAPIKeyTextUserIDs`, `CreateSchema`) owns
+  `service_accounts` and `api_keys` — UNIQUE (token_hash) inline, INDEX on
+  `container_id` (both) and `service_account_id`, and the package's one
+  foreign key, `api_keys.service_account_id REFERENCES service_accounts(id)
+  ON DELETE CASCADE`, both ends owned by the same store. `permissions` is
+  NOT NULL and a nil cap is written as an empty bytea.
+  `apikey/apikeytest.RunStoreContract` is the port's contract as an executable
+  suite — thirty-seven checks, four of them races, each with a non-compliant
+  double proving it bites — and both backends run it, drops in the live
+  lane. `examples/apikey` is the runnable tour; the docs site gains a
+  "Service accounts" group.
+
+- **A permission cap on the context** (`authlayer/scope`).
+  `WithPermissionCap(ctx, p)` / `PermissionCapFrom(ctx)`, on a private key of
+  scope's own, cap every standing the engine resolves for the ctx subject to
+  `role ∩ p`, with elevation only if `p` is Full *in this scope's space* —
+  applied last, after owner bypass, inherited standing and role lookup, so it
+  can only remove. A capped owner is not elevated. Honoured by `Can`,
+  `Authorize`, the escalation guard in `AddMember`/`ChangeMemberRole`/
+  `RemoveMember`/`CreateRole`/`UpdateRole`, `PermissionGuard`, `ListMembers`
+  and `ListRoles`; the parented `CreateContainer` refuses a non-Full cap
+  rather than ignore it. `HasPermission`, `Standing`, `RolePermissions`,
+  `ContainersWith` and `Container` stay cap-free by contract and now say so.
+  `Service.CapStanding(ctx, perms, elevated)` is the exported single
+  definition of the rule, and `Service.Access()` exposes the engine's
+  `*access.Access` so sibling packages compile permissions in the same
+  statement space. `ResourceServiceAccount = "service_account"` with
+  create/read/update/delete joins `ControlStatements`.
+
+- **`access.Permission.Intersect`** — the meet of two permissions, the
+  counterpart to `Access.Union`. Same same-Statements precondition; with no
+  error to return, a foreign or zero operand yields the zero Permission
+  (grants nothing) rather than reinterpreting bits.
+
 - **Magic links — passwordless sign-in** (`authlayer/auth`). Two new methods on
   the existing `auth.Service`: `RequestMagicLink(ctx, email, ip) (token, ok,
   error)` and `RedeemMagicLink(ctx, token, ip, userAgent) (LoginResult,
@@ -555,6 +641,25 @@ once a 1.0 is cut. Until then, minor versions may break API.
   implemented and neither port sentence said.
 
 ### Changed
+
+- **BREAKING (grants): every `admin` silently gains `service_account:*` on
+  adoption.** `ControlStatements` now declares the `service_account` resource
+  with create, read, update and delete, and the built-in `admin` role is
+  derived from the merged surface — so every `admin`, new and previously
+  seeded, holds all four the moment this version is adopted, with no code
+  change and no migration to notice, exactly as `invite:*` landed in 0.1.0.
+  An application that treats `admin`'s grant set as fixed should account for
+  it before upgrading; define a custom role if `admin` must not manage
+  service accounts. `member` still holds nothing. Listed in full under
+  **Added** (`apikey`), and repeated here because the widening lands on
+  existing installations rather than only on new ones.
+- **`invite`'s mint-time escalation guard and `ListLinks` redaction honour
+  the permission cap.** `Standing` reads no cap by contract, so a restricted
+  key acting for an admin could previously have minted an invitation above
+  what the key allows; `InviteByEmail`, `CreateLink` and the reader half of
+  `ListLinks` now apply `scope.Service.CapStanding`. The acceptance-time
+  inviter recheck deliberately does not — there the ctx subject is the
+  invitee, and a cap on their context says nothing about the inviter.
 
 - **BREAKING (Store port): four new methods on `auth.Store`.** `DeleteUser`,
   `DeleteVerificationsByUser`, `DeleteSessionsByUser` and `MarkUserDeleted`.
