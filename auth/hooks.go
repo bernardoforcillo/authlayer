@@ -258,7 +258,7 @@ type Event struct {
 // error stops the chain. They are called on the caller's goroutine and share
 // its context, so a slow hook slows the request — and, for [LoginFailed], a
 // hook whose cost DIFFERS by [Event.Detail] reopens the timing channel
-// [password.Hasher.Dummy] exists to close between "unknown address" and
+// [github.com/bernardoforcillo/authlayer/password.Hasher.Dummy] exists to close between "unknown address" and
 // "wrong password". Keep a LoginFailed hook constant-shape: write the event
 // and return.
 type Hook interface {
