@@ -311,9 +311,14 @@ type RateLimiter interface {
 // mutated via Option at construction — immutable once New returns, matching
 // [github.com/bernardoforcillo/authlayer/scope.Option]'s own stance.
 type config struct {
-	hasher     password.Hasher
-	rules      password.Rules
-	signingKey [][]byte
+	hasher password.Hasher
+	rules  password.Rules
+	// signer mints and verifies access tokens — see [WithJWT], which builds
+	// an HS256 one, and [WithSigner], which supplies any other. nil means
+	// none was configured, and every path that needs one fails closed with
+	// token.ErrKeyTooShort rather than dereferencing this — see
+	// [Service.accessSigner].
+	signer     token.Signer
 	accessTTL  time.Duration
 	refreshTTL time.Duration
 	// verificationTTL, passwordResetTTL and magicLinkTTL are the three
@@ -454,17 +459,19 @@ func WithRules(r password.Rules) Option {
 // [Service.Login] issues with. keys[0] is the key every new access token is
 // signed with; any keys after it are accepted on tokens presented for
 // verification but never used to sign — the same rotation convention
-// [token.Issue]/[token.Parse] document. A nil or empty keys leaves the
-// signing key unset, in which case Login fails closed the first time it
-// tries to issue a token: [token.Issue] itself refuses a key shorter than
-// 32 bytes with token.ErrKeyTooShort, and a missing key is indistinguishable
+// [token.Issue]/[token.Parse] document. It is [WithSigner] with a
+// [token.HS256] signer built from keys: the two options fill the same slot,
+// and the last one applied wins. A nil or empty keys leaves the signer
+// unset, in which case Login fails closed the first time it tries to issue
+// a token, with token.ErrKeyTooShort — a missing key is indistinguishable
 // from a zero-length one for that check. ttl <= 0 is ignored, leaving the
-// default (15 minutes) or a prior option in place.
+// default (15 minutes) or a prior option in place; ttl is also what
+// [WithSigner] uses, or set it on its own with [WithAccessTTL].
 //
 // # The whole list is checked, not just the signing key
 //
 // A keys where ANY entry is unusable is ignored in full, exactly like a nil
-// or empty one, leaving the signing key unset.
+// or empty one, leaving the signer unset.
 //
 // This is not tidiness. [token.Issue] validates only the key it signs with,
 // while [token.Parse] refuses the ENTIRE call if any key in the list is
@@ -474,23 +481,25 @@ func WithRules(r password.Rules) Option {
 // token.ErrKeyTooShort, and nothing pointed at the misconfiguration. Fail
 // closed, but a total, self-inflicted auth outage discovered by users
 // rather than by the operator. Rejecting the list here moves that to the
-// operator's first Login, where the "no signing key configured" path
-// already reports it.
+// operator's first Login, where the "no signer configured" path already
+// reports it.
 //
-// "Unusable" is not defined here: each key is checked by asking
-// [token.Issue] to mint a throwaway token with it, so the floor lives in
-// exactly one place — the token package — and this option cannot drift from
-// it or miss a constraint added there later.
+// "Unusable" is not defined here: [token.HS256] checks every key against
+// the token package's own floor at construction, so the rule lives in
+// exactly one place and this option cannot drift from it or miss a
+// constraint added there later.
 //
-// There is no default signing key — an application MUST call this before
-// any successful Login, by design: silently minting tokens under a
-// zero-value or generated-on-the-fly key would be the exact "alg: none
-// reached through the key parameter" failure mode [token]'s own package doc
-// warns about.
+// There is no default signing key — an application MUST call this (or
+// [WithSigner]) before any successful Login, by design: silently minting
+// tokens under a zero-value or generated-on-the-fly key would be the exact
+// "alg: none reached through the key parameter" failure mode [token]'s own
+// package doc warns about.
 func WithJWT(keys [][]byte, ttl time.Duration) Option {
 	return func(c *config) {
-		if len(keys) > 0 && keysUsable(keys) {
-			c.signingKey = keys
+		if len(keys) > 0 {
+			if s, err := token.HS256(keys...); err == nil {
+				c.signer = s
+			}
 		}
 		if ttl > 0 {
 			c.accessTTL = ttl
@@ -498,19 +507,48 @@ func WithJWT(keys [][]byte, ttl time.Duration) Option {
 	}
 }
 
-// keysUsable reports whether every key in keys is one [token.Issue] will
-// sign with and [token.Parse] will accept. It asks the token package rather
-// than re-stating its rules: a throwaway Issue exercises exactly the checks
-// a real mint would, so there is no second copy of the HS256 key floor to
-// fall out of step. Claims{} and a positive ttl leave the key as the only
-// thing that can fail.
-func keysUsable(keys [][]byte) bool {
-	for _, k := range keys {
-		if _, err := token.Issue(token.Claims{}, k, time.Minute); err != nil {
-			return false
+// WithSigner sets the [token.Signer] that mints every access token and
+// verifies every one presented to [Service.VerifyAccessToken] — an
+// [token.EdDSA] signer, typically, when a party that is NOT this Service
+// must verify its tokens: another service, an agent, an MCP client, a
+// gateway. [WithJWT] is this option with a [token.HS256] signer; the two
+// fill the same slot and the last one applied wins. A nil s is ignored,
+// leaving the default (or a prior option) in place.
+//
+// The access-token TTL is not part of the Signer — it is a policy of this
+// Service, not of the key — so it still comes from [WithJWT]'s second
+// argument or from [WithAccessTTL]; the default is 15 minutes.
+//
+// The Signer is what [Service.Signer] hands back, so a sibling package that
+// mints tokens this Service must accept — an OAuth server issuing access
+// tokens for the same audience, say — signs with the same key material
+// rather than a second copy of it.
+func WithSigner(s token.Signer) Option {
+	return func(c *config) {
+		if s != nil {
+			c.signer = s
 		}
 	}
-	return true
+}
+
+// WithAccessTTL sets how long an access token minted by [Service.Login],
+// [Service.Refresh] and every other session-issuing path stays valid. The
+// default is 15 minutes; [WithJWT]'s second argument sets the same value,
+// and this option exists so a [WithSigner] deployment has somewhere to set
+// it without also configuring HMAC keys it does not use. d <= 0 is ignored,
+// leaving the default (or a prior option) in place, rather than minting a
+// token that is already expired — the stance every TTL option in this
+// package takes.
+//
+// Shortening it narrows the window in which a token issued for a revoked
+// session keeps verifying — see [Service.LogoutAll]'s doc, "What this does
+// not revoke" — without closing it.
+func WithAccessTTL(d time.Duration) Option {
+	return func(c *config) {
+		if d > 0 {
+			c.accessTTL = d
+		}
+	}
 }
 
 // WithRefreshTTL sets how long a session minted by [Service.Login] remains
@@ -1061,7 +1099,8 @@ type LoginResult struct {
 	// is always cleared to "" here, matching every other Service method
 	// that hands back a [UserBase] — see [UserBase.PasswordHash]'s own doc.
 	User UserBase
-	// AccessToken is a fresh, short-lived HS256 JWT — see [WithJWT] — bound
+	// AccessToken is a fresh, short-lived JWT — HS256 under [WithJWT],
+	// whatever [WithSigner] was given otherwise — bound
 	// to the session named by RefreshToken: from [Service.Login], the
 	// session that login just created; from [Service.Refresh], the NEW
 	// successor session, not the rotated-away predecessor. Verify one with
@@ -1130,11 +1169,12 @@ type Service struct {
 // declared constants rather than leaving the Service holding a policy no
 // branch handles — see that option's doc, and scope.New, which takes the
 // same construction-time stance on WithParent.
-// The one configuration this constructor cannot check for you is [WithJWT]:
-// there is no default signing key, so a Service built without one — or with
-// one under the 32-byte HS256 floor — fails closed the first time
-// [Service.Login] tries to issue a token, or [Service.VerifyAccessToken] to
-// verify one, with token.ErrKeyTooShort. See that option's doc.
+// The one configuration this constructor cannot check for you is the
+// signer — [WithJWT] or [WithSigner]: there is no default, so a Service built
+// without one — or with a [WithJWT] key list under the 32-byte HS256 floor —
+// fails closed the first time [Service.Login] tries to issue a token, or
+// [Service.VerifyAccessToken] to verify one, with token.ErrKeyTooShort. See
+// those options' docs.
 func New(store Store, opts ...Option) *Service {
 	cfg := defaultConfig()
 	for _, o := range opts {
@@ -1380,8 +1420,8 @@ func (s *Service) mintSignupVerification(ctx context.Context, userID, email stri
 
 // Login authenticates email/plainPassword and, unless the account owes a
 // second factor (see "The pending state" below), mints a new
-// session: an access token (a short-lived, HS256-signed JWT — see
-// [WithJWT]) and a refresh token (a long-lived opaque bearer token, whose
+// session: an access token (a short-lived JWT signed by the configured
+// signer — see [WithJWT] and [WithSigner]) and a refresh token (a long-lived opaque bearer token, whose
 // hash becomes the minted [Session]'s TokenHash). Both, with the
 // authenticated account, come back in a [LoginResult] — the same type
 // [Service.Refresh] returns, since a login and a rotation hand a caller the
@@ -1447,10 +1487,10 @@ func (s *Service) mintSignupVerification(ctx context.Context, userID, email stri
 //     may become an oracle for a caller who has not proven the password.
 //  8. Only once every check above has passed does this touch the Store
 //     with a write ([Store.CreateSession]) — and even that is ordered
-//     LAST, after [token.Issue] has already succeeded (see mintSession,
-//     the minting tail this method and [Service.SignInWith] share): a
-//     misconfigured signing key ([WithJWT] never called, or too short)
-//     fails before any Session row is persisted, rather than leaving an
+//     LAST, after the access token has already been issued (see
+//     mintSession, the minting tail this method and [Service.SignInWith]
+//     share): a misconfigured signer ([WithJWT] never called, or its key
+//     too short) fails before any Session row is persisted, rather than leaving an
 //     orphaned, unreachable-by-refresh-token row behind that
 //     [Store.ListSessionsByUser] would still report.
 //
@@ -1654,9 +1694,9 @@ func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPasswo
 //
 // The order inside is load-bearing, and is the order [Service.Login]'s own
 // doc describes at point 8: PasswordHash is scrubbed BEFORE the claims
-// extender runs, and [github.com/bernardoforcillo/authlayer/token.Issue]
-// runs BEFORE [Store.CreateSession], so a misconfigured signing key fails
-// without leaving an orphaned session row behind.
+// extender runs, and the configured [token.Signer] issues the access token
+// BEFORE [Store.CreateSession], so a misconfigured signer fails without
+// leaving an orphaned session row behind.
 //
 // u is taken BY VALUE and its PasswordHash cleared here, so no caller can
 // leak a credential digest through the returned record or into a
@@ -1702,14 +1742,14 @@ func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent str
 		extra = s.cfg.claimsExtender(u)
 	}
 	// Issued BEFORE CreateSession, deliberately — see [Service.Login]'s
-	// "Order of checks" point 8: a bad signing key must fail before any
-	// Session row exists to be orphaned.
-	accessToken, err := token.Issue(token.Claims{
+	// "Order of checks" point 8: a bad or missing signer must fail before
+	// any Session row exists to be orphaned.
+	accessToken, err := s.issueAccessToken(token.Claims{
 		Subject:   u.ID,
 		SessionID: sessionID,
 		Email:     u.Email,
 		Extra:     extra,
-	}, s.signingKey(), s.cfg.accessTTL)
+	})
 	if err != nil {
 		return zero, err
 	}
@@ -1738,24 +1778,60 @@ func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent str
 	return LoginResult{User: u, AccessToken: accessToken, RefreshToken: refreshPlain}, nil
 }
 
-// signingKey returns the current signing key ([WithJWT]'s keys[0]), or nil
-// if none was configured. Returning nil rather than indexing an empty slice
-// (which would panic) lets [token.Issue]'s own key-length check —
-// token.ErrKeyTooShort for anything under 32 bytes, nil included — be what
-// fails a misconfigured Service closed, with a clear, existing sentinel,
-// instead of this package inventing a second one or panicking itself.
-func (s *Service) signingKey() []byte {
-	if len(s.cfg.signingKey) == 0 {
-		return nil
+// accessSigner returns the configured [token.Signer], or token.ErrKeyTooShort
+// when neither [WithJWT] nor [WithSigner] set one. The sentinel is the token
+// package's own rather than a new one of this package's: for the HS256
+// signer [WithJWT] builds, a missing signer IS a missing key, and that is
+// the sentinel [token.Issue] has always produced for it — so a caller that
+// pinned this failure mode before [WithSigner] existed sees exactly what it
+// saw. An [EdDSA] deployment that forgets WithSigner gets the same answer,
+// because "no key to sign with" is the same condition whatever the
+// algorithm would have been.
+func (s *Service) accessSigner() (token.Signer, error) {
+	if s.cfg.signer == nil {
+		return nil, fmt.Errorf("%w: no signer is configured; call WithJWT or WithSigner", token.ErrKeyTooShort)
 	}
-	return s.cfg.signingKey[0]
+	return s.cfg.signer, nil
+}
+
+// issueAccessToken mints c under the configured signer with the configured
+// access TTL. It is the ONE place an access token is issued — mintSession
+// and [Service.Refresh] both call it — so the signer, the TTL and the
+// fail-closed rule for a missing signer live in exactly one function.
+func (s *Service) issueAccessToken(c token.Claims) (string, error) {
+	signer, err := s.accessSigner()
+	if err != nil {
+		return "", err
+	}
+	return signer.Issue(c, s.cfg.accessTTL)
+}
+
+// Signer returns the [token.Signer] this Service mints and verifies access
+// tokens with — the one [WithSigner] set, or the [token.HS256] signer
+// [WithJWT] built — or nil when neither was called. It exists so a sibling
+// package that issues tokens this Service must accept (an OAuth server
+// minting access tokens for the same resource, say) signs with the SAME key
+// material rather than a second, separately-rotated copy, and so an
+// application can publish the signer's JWKS:
+//
+//	if pks, ok := svc.Signer().(token.PublicKeySetter); ok {
+//		// serve pks.PublicKeySet() at your jwks_uri
+//	}
+//
+// It hands back the configured value as-is, private key included for an
+// [token.EdDSA] signer; the Signer interface exposes no way to read it, but
+// the value is still the credential, so pass it to code you trust to mint.
+func (s *Service) Signer() token.Signer {
+	return s.cfg.signer
 }
 
 // VerifyAccessToken verifies raw — an access token minted by
-// [Service.Login] or [Service.Refresh] — against the keys [WithJWT]
-// configured, and returns its claims. Every key in that list is tried, not
-// only the signing key, which is what makes a key rotation transparent to
-// tokens already in flight (see [token.Parse]).
+// [Service.Login] or [Service.Refresh] — with the configured signer
+// ([WithJWT] or [WithSigner]), and returns its claims. An HS256 signer tries
+// every key in its list, not only the signing key, and an EdDSA signer
+// accepts its verifiers as well as its signing key — either way a key
+// rotation is transparent to tokens already in flight (see [token.Parse]
+// and [token.EdDSA]).
 //
 // This exists so an application does not have to keep a SECOND copy of the
 // key material beside the Service that already holds it. Verifying an
@@ -1769,17 +1845,19 @@ func (s *Service) signingKey() []byte {
 //
 // The errors are [github.com/bernardoforcillo/authlayer/token]'s own,
 // unwrapped and unchanged: ErrMalformedToken, ErrUnsupportedAlgorithm,
-// ErrInvalidSignature, ErrExpiredToken, and ErrKeyTooShort — compare with
-// [errors.Is] against the token package, not this one. This method
+// ErrInvalidSignature, ErrExpiredToken, ErrKeyTooShort and — from an EdDSA
+// signer — ErrUnknownKey — compare with [errors.Is] against the token
+// package, not this one. This method
 // deliberately adds no auth-level sentinel of its own: it performs no
 // authentication decision beyond what token.Parse already performs, so a
 // translated error would carry no information the original does not, while
 // costing the caller the ability to tell "expired" from "forged".
 //
-// A Service built without [WithJWT] returns token.ErrKeyTooShort here,
-// matching how [Service.Login] fails closed on the same misconfiguration —
-// a missing key is not distinguishable from a zero-length one, and neither
-// may be treated as "verified".
+// A Service built without [WithJWT] or [WithSigner] returns
+// token.ErrKeyTooShort here, matching how [Service.Login] fails closed on
+// the same misconfiguration — a missing key is not distinguishable from a
+// zero-length one, and neither may be treated as "verified". See
+// [Service.accessSigner] for why that sentinel and not a new one.
 //
 // # What a nil error does and does not mean
 //
@@ -1811,10 +1889,11 @@ func (s *Service) signingKey() []byte {
 // Passing an empty or foreign currentSessionID is not an error; it revokes
 // everything, which is the fail-closed direction — see that method's doc.
 func (s *Service) VerifyAccessToken(raw string) (token.Claims, error) {
-	if len(s.cfg.signingKey) == 0 {
-		return token.Claims{}, fmt.Errorf("%w: no signing key is configured; call WithJWT", token.ErrKeyTooShort)
+	signer, err := s.accessSigner()
+	if err != nil {
+		return token.Claims{}, err
 	}
-	return token.Parse(raw, s.cfg.signingKey...)
+	return signer.Parse(raw)
 }
 
 // User loads the account identified by userID, returning [ErrUserNotFound]
@@ -2413,12 +2492,12 @@ func (s *Service) Refresh(ctx context.Context, refreshPlain string) (LoginResult
 	// for the same reason: a bad signing key must fail before step 5 is
 	// even attempted, rather than leaving a successor Session row persisted
 	// that no refresh token can ever reach.
-	accessToken, err := token.Issue(token.Claims{
+	accessToken, err := s.issueAccessToken(token.Claims{
 		Subject:   rotated.UserID,
 		SessionID: successorID,
 		Email:     u.Email,
 		Extra:     extra,
-	}, s.signingKey(), s.cfg.accessTTL)
+	})
 	if err != nil {
 		return zero, err
 	}
