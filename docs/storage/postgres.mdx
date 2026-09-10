@@ -83,20 +83,26 @@ open: <nil>
 three services, four stores: true true true true
 ```
 
-## Four stores, four sets of tables
+## Six stores, six sets of tables
 
 | Constructor | Port | Default tables |
 |---|---|---|
 | `New[C, M](db, opts...)` | `scope.Store` | `organizations`, `organization_members`, `organization_roles` |
 | `NewAuthStore(db, opts...)` | `auth.Store` | `users`, `sessions`, `verifications` |
 | `NewInviteStore(db, opts...)` | `invite.Store` | `organization_invites`, `organization_invite_links` |
+| `NewAPIKeyStore(db, opts...)` | `apikey.Store` | `service_accounts`, `api_keys` |
+| `NewOAuthStore(db, opts...)` | `oauth.Store` | `oauth_clients`, `oauth_grants`, `oauth_codes`, `oauth_device_authorizations`, `oauth_refresh_tokens` |
 | `NewIdentityStore(db, opts...)` | `auth.IdentityStore` — [optional](/oauth/overview) | `identities` |
 
 Each has its own `CreateSchema` and its own `Schema()`. **No foreign keys are
-declared** — not to a users table from the RBAC side, which authlayer does not
-own, not between the three auth tables, and not from `identities` to `users`
-either. That last one is also forced: the auth store may be an entirely
-different backend.
+declared between stores** — not to a users table from the RBAC side, which
+authlayer does not own, not between the three auth tables, and not from
+`identities` to `users` either. That last one is also forced: the auth store
+may be an entirely different backend. Every foreign key in the package is
+*inside* a store: `api_keys.service_account_id` references
+`service_accounts(id)` with `ON DELETE CASCADE`, and the five OAuth tables
+reference one another the same way, because in each case both ends are owned
+by the same store — see [the schema](/storage/schema#the-service-account-tables).
 
 {/* verify:main */}
 ```go
@@ -104,6 +110,7 @@ fmt.Println(dropsstore.NewSchema[org.Organization, org.Member]().Containers.Name
 fmt.Println(dropsstore.NewAuthSchema().Users.Name())
 fmt.Println(dropsstore.NewInviteSchema().Links.Name())
 fmt.Println(dropsstore.NewIdentitySchema().Identities.Name())
+fmt.Println(dropsstore.NewOAuthSchema().RefreshTokens.Name())
 ```
 
 ```
@@ -111,6 +118,7 @@ organizations
 users
 organization_invite_links
 identities
+oauth_refresh_tokens
 ```
 
 ## Renaming tables
@@ -194,6 +202,8 @@ override `WithIDGenerator`, you need the matching option on each store, and
 |---|---|---|
 | `New` | `WithTextLibraryIDs()` | `WithTextUserIDs()` |
 | `NewInviteStore` | `WithInviteTextLibraryIDs()` | `WithInviteTextUserIDs()` |
+| `NewAPIKeyStore` | `WithAPIKeyTextLibraryIDs()` — moves `service_account_id` too | `WithAPIKeyTextUserIDs()` |
+| `NewOAuthStore` | `WithOAuthTextLibraryIDs()` — moves `client_id`, `grant_id`, `family_id`, `container_id`, `service_account_id` too | `WithOAuthTextUserIDs()` |
 | `NewAuthStore` | `WithAuthTextLibraryIDs()` — moves **all five** columns | none, deliberately |
 | `NewIdentityStore` | `WithIdentityTextLibraryIDs()` — moves **both** columns | none, deliberately |
 
@@ -228,8 +238,8 @@ AUTHLAYER_TEST_DSN='postgres://user:pass@host/scratch?sslmode=disable' go test -
 
 <Warning>
 **This lane is destructive and wants the database to itself.** It `DROP`s the
-auth, RBAC, invite and identity tables in the target database on the way in and
-rebuilds them, so point `AUTHLAYER_TEST_DSN` at a scratch database, never at
+auth, RBAC, invite, service-account and identity tables in the target database
+on the way in and rebuilds them, so point `AUTHLAYER_TEST_DSN` at a scratch database, never at
 anything you care about.
 
 It also expects **exclusive** use of it: two copies running at once — or
@@ -238,7 +248,7 @@ product bugs (`relation ... does not exist` mid-run, timing measurements
 polluted by the other client's writes).
 </Warning>
 
-{/* verify:stdout "open: <nil>\nthree services, four stores: true true true true\norganizations\nusers\norganization_invite_links\nidentities\nrenamed: teams\noptions compose: true" */}
+{/* verify:stdout "open: <nil>\nthree services, four stores: true true true true\norganizations\nusers\norganization_invite_links\nidentities\noauth_refresh_tokens\nrenamed: teams\noptions compose: true" */}
 
 ## Next
 

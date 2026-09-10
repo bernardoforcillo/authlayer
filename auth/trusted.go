@@ -291,6 +291,9 @@ func (s *Service) TrustThisDevice(ctx context.Context, userID, sessionID, label 
 	}); err != nil {
 		return "", err
 	}
+	if err := s.emit(ctx, Event{Kind: DeviceTrusted, UserID: u.ID, SessionID: sessionID}); err != nil {
+		return "", err
+	}
 	return plain, nil
 }
 
@@ -350,7 +353,10 @@ func (s *Service) RevokeTrustedDevice(ctx context.Context, userID, deviceID stri
 	}
 	for _, d := range devices {
 		if d.ID == deviceID {
-			return st.DeleteTrustedDevice(ctx, deviceID)
+			if err := st.DeleteTrustedDevice(ctx, deviceID); err != nil {
+				return err
+			}
+			return s.emit(ctx, Event{Kind: TrustedDeviceRevoked, UserID: userID})
 		}
 	}
 	return ErrTrustedDeviceNotFound

@@ -1,0 +1,215 @@
+---
+title: "Discovery & registration"
+description: "The RFC 8414 and RFC 9728 metadata documents an MCP client reads to find you, the JWKS a verifier loads, and RFC 7591 dynamic registration — off by default."
+---
+
+An MCP client that is handed a resource URL knows nothing else. It fetches
+the resource's RFC 9728 document to learn which authorization server to go
+to, that server's RFC 8414 document to learn the endpoints, registers itself
+through RFC 7591 if it has no client id yet, and runs the
+[authorization-code flow](/agents/authorization-code). Every document here is a
+struct with JSON tags — you serialise it at the well-known path; there is no
+handler.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/oauth"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+	"github.com/bernardoforcillo/authlayer/token"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{"project": {"read", "deploy"}}),
+	memory.New[org.Organization, org.Member]())
+signer, _ := token.HS256([]byte("a-32-byte-secret-for-the-example!"))
+as := oauth.New(memory.NewOAuthStore(), svc.Service, signer,
+	oauth.WithIssuer("https://auth.example"),
+	oauth.WithDynamicRegistration(true),
+	oauth.WithScopeMap(map[string]map[string][]access.Action{
+		"project:read":   {"project": {"read"}},
+		"project:deploy": {"project": {"deploy"}},
+	}))
+```
+
+## The authorization server document (RFC 8414)
+
+`ServerMetadata(issuer, Endpoints{...})` — served at
+`/.well-known/oauth-authorization-server`. Optional endpoints are published
+only when you name them, so a client never discovers an endpoint that does not
+exist. `response_types_supported` is `["code"]`,
+`code_challenge_methods_supported` is `["S256"]` and nothing else, and
+`scopes_supported` is the [scope map](/agents/delegation#the-scope-map)'s keys.
+An empty issuer falls back to `WithIssuer`'s; RFC 8414 §2 requires the two to
+agree.
+
+{/* verify:main */}
+```go
+meta := as.ServerMetadata("", oauth.Endpoints{
+	Authorization:       "https://auth.example/authorize",
+	Token:               "https://auth.example/token",
+	JWKS:                "https://auth.example/jwks",
+	DeviceAuthorization: "https://auth.example/device",
+	Registration:        "https://auth.example/register",
+})
+enc := json.NewEncoder(os.Stdout)
+enc.SetIndent("", "  ")
+_ = enc.Encode(meta)
+```
+
+```
+{
+  "issuer": "https://auth.example",
+  "authorization_endpoint": "https://auth.example/authorize",
+  "token_endpoint": "https://auth.example/token",
+  "jwks_uri": "https://auth.example/jwks",
+  "registration_endpoint": "https://auth.example/register",
+  "device_authorization_endpoint": "https://auth.example/device",
+  "scopes_supported": [
+    "project:deploy",
+    "project:read"
+  ],
+  "response_types_supported": [
+    "code"
+  ],
+  "grant_types_supported": [
+    "authorization_code",
+    "refresh_token",
+    "client_credentials",
+    "urn:ietf:params:oauth:grant-type:device_code"
+  ],
+  "code_challenge_methods_supported": [
+    "S256"
+  ],
+  "token_endpoint_auth_methods_supported": [
+    "client_secret_basic",
+    "client_secret_post",
+    "none"
+  ]
+}
+```
+
+`client_secret_basic` and `client_secret_post` are the same secret carried
+two ways; which one a request used is your transport's concern, since both
+reach `ClientCredentials`, `ExchangeCode`, `Refresh`, `PollDevice` and
+`Revoke` as a plain `clientSecret`.
+
+## The protected resource document (RFC 9728)
+
+`ProtectedResourceMetadata(resource, authorizationServers, scopes)` — served
+by the resource at `/.well-known/oauth-protected-resource`. `scopes` may be
+`nil` to publish the scope map's keys. `bearer_methods_supported` is
+`["header"]`: this package's tokens are meant for the `Authorization` header,
+never a query string.
+
+{/* verify:main */}
+```go
+pr := as.ProtectedResourceMetadata("https://api.example", []string{"https://auth.example"}, nil)
+b, _ := json.Marshal(pr)
+fmt.Println(string(b))
+```
+
+```
+{"resource":"https://api.example","authorization_servers":["https://auth.example"],"scopes_supported":["project:deploy","project:read"],"bearer_methods_supported":["header"]}
+```
+
+## The JWKS
+
+The JWKS is the **signer's** — `token.PublicKeySetter`, implemented by the
+EdDSA signer only. Serve it at `jwks_uri`, and a resource server that is not
+the issuer verifies with `token.EdDSAVerifier` and
+[offline verification](/agents/introspection-and-revocation#offline-verification).
+An HS256 signer has no public half to publish: it is the right choice only
+while the party that mints is the only party that verifies.
+
+{/* verify:main */}
+```go
+_, isPublishable := signer.(token.PublicKeySetter)
+fmt.Println("HS256 publishes a JWKS:", isPublishable)
+```
+
+```
+HS256 publishes a JWKS: false
+```
+
+See [EdDSA and the JWKS](/authentication/access-tokens#eddsa-and-the-jwks)
+for the rotation story.
+
+## Dynamic registration (RFC 7591)
+
+`RegisterClient` lets a client register itself. It creates an
+**application-level** client — no container, no creator — reads no subject
+and performs no authorization: the endpoint is open by design, since a client
+has no power until a user approves it. It is refused outright unless the
+service was built with `WithDynamicRegistration(true)`.
+
+{/* verify:main */}
+```go
+closed := oauth.New(memory.NewOAuthStore(), svc.Service, signer, oauth.WithIssuer("https://auth.example"))
+_, _, err := closed.RegisterClient(context.Background(), oauth.ClientRegistration{ClientName: "mcp"})
+fmt.Println("off by default:", errors.Is(err, oauth.ErrRegistrationDisabled))
+
+reg := oauth.ClientRegistration{
+	ClientName:              "mcp-client",
+	RedirectURIs:            []string{"http://127.0.0.1:8123/callback"}, // http is fine on loopback only
+	TokenEndpointAuthMethod: oauth.AuthMethodNone,                       // a public client
+	Scope:                   "project:read",
+}
+c, secret, err := as.RegisterClient(context.Background(), reg)
+fmt.Println("registered:", err, c.Public, secret == "", c.ContainerID == "", c.CreatedBy == "", c.GrantTypes)
+
+_, _, err = as.RegisterClient(context.Background(), oauth.ClientRegistration{
+	ClientName: "m2m", GrantTypes: []string{oauth.GrantClientCredentials},
+})
+fmt.Println("client_credentials by registration:", errors.Is(err, oauth.ErrInvalidClientMetadata))
+_, _, err = as.RegisterClient(context.Background(), oauth.ClientRegistration{
+	ClientName: "x", RedirectURIs: []string{"https://x.example/cb"}, Scope: "everything",
+})
+fmt.Println("a scope the map does not know:", errors.Is(err, oauth.ErrInvalidScope))
+```
+
+```
+off by default: true
+registered: <nil> true true true true [authorization_code refresh_token]
+client_credentials by registration: true
+a scope the map does not know: true
+```
+
+`ClientRegistration` carries RFC 7591's JSON names, so a request body decodes
+straight into it; what the RFC defines and the struct omits — `client_uri`,
+`logo_uri`, `contacts`, `jwks` — is ignored, not refused. `grant_types`
+defaults to `authorization_code` and `refresh_token`; `client_credentials` is
+never granted this way, since an anonymous registrant has no service account
+to act as. The RFC's response (`client_id`, `client_secret`,
+`client_id_issued_at`, the metadata echoed back) is yours to write from the
+returned `Client`.
+
+<Note>
+An application-level client is reachable through the token endpoints alone:
+the management calls scope to the ctx container, and `ListClients` never lists
+it. Operators write one directly to the `Store` if they need one without
+dynamic registration.
+</Note>
+
+{/* verify:stdout "{\n  \"issuer\": \"https://auth.example\",\n  \"authorization_endpoint\": \"https://auth.example/authorize\",\n  \"token_endpoint\": \"https://auth.example/token\",\n  \"jwks_uri\": \"https://auth.example/jwks\",\n  \"registration_endpoint\": \"https://auth.example/register\",\n  \"device_authorization_endpoint\": \"https://auth.example/device\",\n  \"scopes_supported\": [\n    \"project:deploy\",\n    \"project:read\"\n  ],\n  \"response_types_supported\": [\n    \"code\"\n  ],\n  \"grant_types_supported\": [\n    \"authorization_code\",\n    \"refresh_token\",\n    \"client_credentials\",\n    \"urn:ietf:params:oauth:grant-type:device_code\"\n  ],\n  \"code_challenge_methods_supported\": [\n    \"S256\"\n  ],\n  \"token_endpoint_auth_methods_supported\": [\n    \"client_secret_basic\",\n    \"client_secret_post\",\n    \"none\"\n  ]\n}\n{\"resource\":\"https://api.example\",\"authorization_servers\":[\"https://auth.example\"],\"scopes_supported\":[\"project:deploy\",\"project:read\"],\"bearer_methods_supported\":[\"header\"]}\nHS256 publishes a JWKS: false\noff by default: true\nregistered: <nil> true true true true [authorization_code refresh_token]\nclient_credentials by registration: true\na scope the map does not know: true" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Authorization code + PKCE" icon="globe" href="/agents/authorization-code">
+    The flow the registered client runs next.
+  </Card>
+  <Card title="Access tokens" icon="key" href="/authentication/access-tokens">
+    The signer, EdDSA, and the JWKS.
+  </Card>
+</Columns>

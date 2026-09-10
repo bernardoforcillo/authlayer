@@ -97,6 +97,11 @@ carol has both: false <nil>
 the caller may ask**. Keep it out of end-user-facing paths — it is for
 administrative and internal callers who have already been authorized by
 something else. An empty request map returns `true` for any member.
+
+"Nothing" includes a [permission cap](/concepts/context#a-third-value-the-permission-cap)
+on the context: `HasPermission` answers about the user as they really stand,
+uncapped, even when the asking context is a restricted API key's. `Can` on the
+same context is capped.
 </Warning>
 
 The same caveat applies to `Standing(ctx, containerID, userID)`, which resolves

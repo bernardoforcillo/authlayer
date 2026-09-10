@@ -21,25 +21,58 @@
 // Both require the same enabling mistake: a parser that takes its algorithm
 // from the token it is verifying, and dispatches on it.
 //
-// [Parse] does not do that. It supports exactly one algorithm, HS256, and
-// checks the token's header "alg" field for exact equality with the literal
-// string "HS256" before it decodes, verifies, or trusts anything else about
-// the token. There is no "none" branch to take and no second algorithm for a
-// key meant for one to be replayed against, because there is no dispatch on
-// the header at all beyond that single equality check — every other alg
-// value, including a missing one or a differently-cased one, is rejected
-// through the same line. That equality check is the entire justification for
-// hand-rolling this instead of taking a dependency on a general-purpose JWT
-// library: a general-purpose parser supports many algorithms by design,
-// which is exactly the surface both attacks need and this one refuses to
-// have. If this package is ever "generalised" to accept more than one
-// algorithm, both vulnerabilities come back — don't.
+// Nothing in this package does that. Every parser here supports exactly one
+// algorithm, fixed when it was CONSTRUCTED, and checks the token's header
+// "alg" field for exact equality with that one literal before it decodes,
+// verifies, or trusts anything else about the token. There is no "none"
+// branch to take and no second algorithm for a key meant for one to be
+// replayed against, because there is no dispatch on the header at all
+// beyond that single equality check — every other alg value, including a
+// missing one or a differently-cased one, is rejected through the same
+// line with [ErrUnsupportedAlgorithm]. That equality check is the entire
+// justification for hand-rolling this instead of taking a dependency on a
+// general-purpose JWT library: a general-purpose parser supports many
+// algorithms by design and picks between them per token, which is exactly
+// the surface both attacks need and this one refuses to have.
 //
-// The same reasoning extends to the key, not just the header: [Issue] and
-// [Parse] both refuse any HMAC key shorter than 32 bytes. A nil or
-// undersized key — the realistic failure mode being an unset environment
+// # Two signers, still one algorithm each
+//
+// The package offers two algorithms — HS256 through [Parse] and [HS256],
+// EdDSA through [EdDSA] — and the argument above survives that only because
+// of WHERE the choice is made. It is made once, by the caller, in the
+// constructor it picks, and a [Signer] never changes its mind for a token:
+// an [HS256] signer refuses a token whose header says "EdDSA", an [EdDSA]
+// signer refuses one whose header says "HS256", and both refuse "none",
+// each through the same one-line equality check against its own literal.
+// Handing an EdDSA public key to an HS256 signer as if it were a secret is
+// impossible by type — an HS256 signer takes byte slices it will use ONLY
+// as HMAC keys, an EdDSA signer takes [crypto/ed25519] types it will use
+// ONLY for Ed25519 — and the reverse forgery, an HMAC computed with a
+// public key's bytes under a header claiming "EdDSA", fails at the EdDSA
+// signer on signature length before it is ever verified. What this package
+// still does not have, and must not grow, is a parser that reads "alg" and
+// picks a signer from it: THAT is the dispatch both attacks need, and a
+// Signer that accepted both algorithms would be exactly it. Add a third
+// algorithm as a third constructor if it is ever needed; never as a second
+// branch in an existing Parse.
+//
+// The same reasoning extends to the key, not just the header: [Issue],
+// [Parse] and [HS256] all refuse any HMAC key shorter than 32 bytes. A nil
+// or undersized key — the realistic failure mode being an unset environment
 // variable — is computable by an attacker, which is "alg: none" reached
-// through the key instead of the header. See [minKeyLen].
+// through the key instead of the header. See [minKeyLen]. [EdDSA] refuses
+// key material of the wrong size the same way, with [ErrInvalidKey].
+//
+// # When EdDSA, and the JWKS
+//
+// HS256 needs the verifier to hold the signing secret, so it fits exactly
+// one shape: the party that mints a token is the only party that checks
+// it. As soon as anything else must verify — another service, an agent, an
+// MCP client, a gateway in front of the application — sharing the secret
+// makes every verifier an issuer. [EdDSA] is for that case: the private key
+// stays with the issuer, the public half is published as an RFC 7517 JWK
+// Set through [PublicKeySetter], and a verifier constructs [EdDSAVerifier]
+// from it via [JWKS.PublicKeys] and holds nothing it could sign with.
 package token
 
 import (

@@ -562,6 +562,9 @@ func (s *Service) ConfirmMFAEnrolment(ctx context.Context, userID, code string) 
 	if err := st.ReplaceRecoveryCodes(ctx, userID, records); err != nil {
 		return nil, err
 	}
+	if err := s.emit(ctx, Event{Kind: MFAEnrolled, UserID: userID}); err != nil {
+		return nil, err
+	}
 	return plain, nil
 }
 
@@ -700,6 +703,11 @@ func (s *Service) CompleteMFA(ctx context.Context, challengeToken, code, ip, use
 	}
 
 	if err := s.spendMFACode(ctx, st, f, v.UserID, code, now); err != nil {
+		if errors.Is(err, ErrMFACodeInvalid) {
+			// A known account, a wrong second factor: [LoginFailed], with
+			// the challenge still live for the next try.
+			return zero, s.emitFailure(ctx, Event{Kind: LoginFailed, UserID: v.UserID, IP: ip, UserAgent: userAgent, Detail: DetailMFACodeInvalid}, err)
+		}
 		return zero, err
 	}
 
@@ -714,7 +722,7 @@ func (s *Service) CompleteMFA(ctx context.Context, challengeToken, code, ip, use
 	// this is the instant that makes the new session FRESH for
 	// [Service.RequireFreshMFA]. It is stamped in the same INSERT as the
 	// row, so no session of this method's ever exists unstamped.
-	return s.mintSession(ctx, u, ip, userAgent, &now)
+	return s.mintSession(ctx, u, ip, userAgent, &now, DetailMFA)
 }
 
 // DisableMFA removes userID's second factor and every recovery code with
@@ -854,7 +862,10 @@ func (s *Service) DisableMFA(ctx context.Context, userID, currentSessionID, curr
 	if err := st.ReplaceRecoveryCodes(ctx, userID, nil); err != nil {
 		return err
 	}
-	return st.DeleteFactor(ctx, userID)
+	if err := st.DeleteFactor(ctx, userID); err != nil {
+		return err
+	}
+	return s.emit(ctx, Event{Kind: MFADisabled, UserID: userID, SessionID: currentSessionID})
 }
 
 // sweepMFAState removes userID's SECOND-FACTOR state: every recovery code,

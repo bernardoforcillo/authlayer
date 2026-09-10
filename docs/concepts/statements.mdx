@@ -40,6 +40,7 @@ the same for a scope of your own, substituting your container resource name.
 | `member` | `create`, `update`, `delete` | `AddMember`, `ChangeMemberRole`, `RemoveMember` |
 | `role` | `create`, `update`, `delete` | `CreateRole`, `UpdateRole`, `DeleteRole` |
 | `invite` | `create`, `read`, `delete` | the [`invite`](/invitations/overview) package's own mint/list/revoke calls — the engine itself checks none of it |
+| `service_account` | `create`, `read`, `update`, `delete` | the [`apikey`](/service-accounts/overview) package's own calls — likewise declared here, checked there |
 
 `organization:update` and `organization:delete` are declared so your own
 "rename the org" and "delete the org" handlers have something to check with

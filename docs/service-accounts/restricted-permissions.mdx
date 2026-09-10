@@ -1,0 +1,183 @@
+---
+title: "Restricted permissions"
+description: "A key that can do strictly less than its account: the permission cap, the two guards on minting it, and the one thing the cap can never do — add."
+---
+
+`WithPermissions` restricts a key to a permission set narrower than its
+account's role. It is a **cap**, never a grant: the key's effective standing is
+`role ∩ cap`, enforced by `scope.WithPermissionCap`, which the engine applies
+**after** every other rung of its resolution — owner bypass, inherited
+standing, role lookup — so it can only ever remove.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/apikey"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/scope"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{
+	"project": {"read", "deploy", "delete"},
+}), memory.New[org.Organization, org.Member]())
+keys := apikey.New(svc.Service, memory.NewAPIKeyStore())
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+_, _ = svc.CreateRole(owner, "deployer", "Deployer", map[string][]access.Action{
+	"project": {"read", "deploy"},
+})
+sa, _ := keys.CreateServiceAccount(owner, "ci", "", "deployer")
+
+key, plaintext, err := keys.CreateKey(owner, sa.ID, "read-only",
+	apikey.WithPermissions(map[string][]access.Action{"project": {"read"}}))
+fmt.Println("minted:", err, string(key.Permissions))
+
+p, _ := keys.Authenticate(context.Background(), plaintext)
+asKey := apikey.WithPrincipal(context.Background(), p)
+read, _ := svc.Can(asKey, "project", "read")
+deploy, _ := svc.Can(asKey, "project", "deploy")
+del, _ := svc.Can(asKey, "project", "delete")
+fmt.Println("role ∩ cap:", read, deploy, del)
+```
+
+```
+minted: <nil> project:read
+role ∩ cap: true false false
+```
+
+`project:deploy` is in the role and not in the cap; `project:delete` is in
+neither. Both are refused, and nothing the cap names that the role lacks could
+ever be allowed — there is nothing left to resolve after the intersection.
+
+## Two guards on minting
+
+<Columns cols={2}>
+  <Card title="Within the account's role" icon="user-gear">
+    A cap naming a grant the role does not hold would intersect to less than
+    it claims and mislead whoever reads it back, so it is refused with
+    `scope.ErrPrivilegeEscalation` rather than stored.
+  </Card>
+  <Card title="Within the actor's capped standing" icon="user-shield">
+    Holding a key is holding the account's standing, so minting one is guarded
+    like `AddMember`: unless elevated, what the key will be able to do must be
+    within the **actor's own** standing — capped, if the actor is themselves
+    acting through a restricted key.
+  </Card>
+</Columns>
+
+{/* verify:main */}
+```go
+_, _, err = keys.CreateKey(owner, sa.ID, "too-much",
+	apikey.WithPermissions(map[string][]access.Action{"project": {"delete"}}))
+fmt.Println("cap above the role:", errors.Is(err, scope.ErrPrivilegeEscalation))
+
+// carol may mint keys but holds only project:read herself.
+_, _ = svc.CreateRole(owner, "keymaster", "Key master", map[string][]access.Action{
+	scope.ResourceServiceAccount: {scope.ActionUpdate},
+	"project":                    {"read"},
+})
+_, _ = svc.AddMember(owner, "carol", "keymaster")
+carol := org.WithOrg(org.WithSubject(context.Background(), "carol"), acme.ID)
+
+_, _, err = keys.CreateKey(carol, sa.ID, "deploy",
+	apikey.WithPermissions(map[string][]access.Action{"project": {"deploy"}}))
+fmt.Println("cap above the actor:", errors.Is(err, scope.ErrPrivilegeEscalation))
+_, _, err = keys.CreateKey(carol, sa.ID, "full")
+fmt.Println("unrestricted key above the actor:", errors.Is(err, scope.ErrPrivilegeEscalation))
+_, _, err = keys.CreateKey(carol, sa.ID, "read",
+	apikey.WithPermissions(map[string][]access.Action{"project": {"read"}}))
+fmt.Println("cap within both:", err)
+```
+
+```
+cap above the role: true
+cap above the actor: true
+unrestricted key above the actor: true
+cap within both: <nil>
+```
+
+The second and third refusals are the same rule: an unrestricted key for a
+`deployer` account would let carol deploy, which carol cannot do herself.
+
+Two argument refusals happen before any store is touched: a set that compiles
+to **nothing** is `ErrEmptyPermissions` — the stored encoding cannot tell an
+empty cap from no cap, so such a key would authenticate as the full role, the
+opposite of what was asked — and an undeclared `(resource, action)` pair is an
+error from `access.Access.Permission`, so a typo fails closed.
+
+## The cap follows the role
+
+`Key.Permissions` is intersected with the role at **every** check, never
+copied onto the key. Lowering the account's role lowers every key with it;
+raising it never lifts a restricted key above its own cap.
+
+{/* verify:main */}
+```go
+_, full, _ := keys.CreateKey(owner, sa.ID, "full")
+_, _ = svc.CreateRole(owner, "reader", "Reader", map[string][]access.Action{"project": {"read"}})
+_ = keys.ChangeServiceAccountRole(owner, sa.ID, "reader")
+
+pf, _ := keys.Authenticate(context.Background(), full)
+deploy, _ = svc.Can(apikey.WithPrincipal(context.Background(), pf), "project", "deploy")
+fmt.Println("unrestricted key after the role was lowered:", deploy)
+```
+
+```
+unrestricted key after the role was lowered: false
+```
+
+## Which paths honour the cap
+
+Every path that resolves the **context subject**: `Can`, `Authorize`, the
+escalation guard inside `AddMember`, `ChangeMemberRole`, `RemoveMember`,
+`CreateRole` and `UpdateRole`, `PermissionGuard`, and the mint-time guards in
+`invite` and `apikey`. A capped **owner** is not elevated and stands on
+`Full ∩ cap`. On a [nested scope](/authorization/nested-scopes), the parented
+`CreateContainer` refuses a non-Full cap outright rather than pretend to
+project it onto the parent's surface.
+
+The explicit-user-id methods — `HasPermission`, `Standing`, `RolePermissions`,
+`ContainersWith` — read **nothing** from the context by contract, and that
+includes the cap. They answer about the user as that user really stands,
+whoever is asking; that is what admin tooling wants, and why none of them may
+face an end user.
+
+{/* verify:main */}
+```go
+ok, _ := svc.HasPermission(asKey, acme.ID, sa.ID, map[string][]access.Action{"project": {"read"}})
+fmt.Println("HasPermission ignores the cap:", ok)
+```
+
+```
+HasPermission ignores the cap: true
+```
+
+<Tip>
+Need a capped answer from a `Standing` result? `scope.Service.CapStanding(ctx,
+perms, elevated)` is the one definition of the rule, exported so the invite
+and apikey guards apply exactly what the engine applies.
+</Tip>
+
+{/* verify:stdout "minted: <nil> project:read\nrole ∩ cap: true false false\ncap above the role: true\ncap above the actor: true\nunrestricted key above the actor: true\ncap within both: <nil>\nunrestricted key after the role was lowered: false\nHasPermission ignores the cap: true" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Authenticating" icon="fingerprint" href="/service-accounts/authenticating">
+    Where the cap is installed on the context.
+  </Card>
+  <Card title="Privilege escalation" icon="stairs" href="/authorization/privilege-escalation">
+    The guard the two minting rules are instances of.
+  </Card>
+</Columns>

@@ -92,6 +92,21 @@ Both are wiring bugs rather than caller input, which is why they suggest a
 no organization yet. It needs a subject, and the caller becomes the owner.
 </Note>
 
+## A third value: the permission cap
+
+`scope.WithPermissionCap(ctx, p)` caps every standing the engine resolves for
+the context **subject**: the effective permission set becomes `role ∩ p`, and
+the subject is elevated only if `p` itself is `Full`. It travels under a key of
+`scope`'s own, not one of drops', and it can only ever remove — it is applied
+after owner bypass, inherited standing and role lookup have all run. It is what
+lets an [API key](/service-accounts/restricted-permissions) act as a principal
+that can do strictly less than the account behind it; `apikey.WithPrincipal`
+installs it alongside the subject and the scope.
+
+The explicit-user-id methods — `HasPermission`, `Standing`, `RolePermissions`,
+`ContainersWith` — read nothing from the context, the cap included. See
+[which paths honour it](/service-accounts/restricted-permissions#which-paths-honour-the-cap).
+
 ## Where the subject comes from
 
 authlayer mints nothing onto the context for you — it owns no transport, so it

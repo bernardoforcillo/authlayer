@@ -1,0 +1,232 @@
+---
+title: "API keys"
+description: "sk_ plus 32 random bytes, returned once and stored as a hash — with an optional expiry, an idempotent revocation, an account-wide disable, and a purge for the cron."
+---
+
+A `Key` is a bearer credential for one service account. Its plaintext is
+`sk_` followed by the url-safe base64 of 32 bytes from `crypto/rand` — 46
+characters — and it is returned by `CreateKey` **exactly once**. Only its
+sha256 (`token.HashOpaque`) is stored, so a database leak cannot be replayed
+into a working key; `Key.Prefix` keeps the first eleven characters in clear so
+a management screen can show `sk_ab12cd34…`.
+
+<Note>
+Read [Service accounts](/service-accounts/overview) first for the wiring and
+the permissions each call needs. This page is the key lifecycle in detail.
+</Note>
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/apikey"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+at := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+now := at
+clock := func() time.Time { return now }
+
+svc := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member](), org.WithClock(clock))
+keys := apikey.New(svc.Service, memory.NewAPIKeyStore(), apikey.WithClock(clock))
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+sa, _ := keys.CreateServiceAccount(owner, "ci", "", org.RoleMember)
+
+key, plaintext, err := keys.CreateKey(owner, sa.ID, "github", apikey.WithExpiry(at.Add(24*time.Hour)))
+fmt.Println("minted:", err, len(plaintext), plaintext[:3], key.Prefix == plaintext[:11])
+fmt.Println("stored:", key.TokenHash != plaintext, key.ExpiresAt.Equal(at.Add(24*time.Hour)), key.RevokedAt == nil, key.LastUsedAt == nil)
+```
+
+```
+minted: <nil> 46 sk_ true
+stored: true true true true
+```
+
+## The record
+
+<ResponseField name="ID" type="string">
+  The key's own id, and what `RevokeKey` takes.
+</ResponseField>
+<ResponseField name="ServiceAccountID" type="string">
+  The account this key authenticates as.
+</ResponseField>
+<ResponseField name="ContainerID" type="string">
+  The account's container, denormalised onto the key so `Authenticate` builds
+  a `Principal` from the key row alone.
+</ResponseField>
+<ResponseField name="Prefix" type="string">
+  `sk_` plus eight characters, in clear, for display. Eight base64 characters
+  disclose 48 of the 256 random bits.
+</ResponseField>
+<ResponseField name="TokenHash" type="string">
+  `token.HashOpaque(plaintext)`. **UNIQUE** in every backend — a MUST on the
+  port, because two rows sharing a hash would make a bearer credential resolve
+  to whichever the backend returned first.
+</ResponseField>
+<ResponseField name="Permissions" type="[]byte">
+  The [restricted permission set](/service-accounts/restricted-permissions),
+  encoded by name; nil or empty means no cap.
+</ResponseField>
+<ResponseField name="ExpiresAt" type="*time.Time">
+  nil means never. The instant itself is already expired.
+</ResponseField>
+<ResponseField name="LastUsedAt" type="*time.Time">
+  Stamped on each successful authentication, best-effort.
+</ResponseField>
+<ResponseField name="RevokedAt" type="*time.Time">
+  nil means live. Never un-revoked — mint a new key.
+</ResponseField>
+
+## `LastUsedAt` is best-effort
+
+Every successful `Authenticate` calls `Store.TouchKey`. A touch failure is
+**not** an authentication failure: the principal is returned and the
+`KeyAuthenticated` event carries `Detail: "touch_failed"`, because a store
+hiccup on a bookkeeping column must not lock every automated client out.
+
+{/* verify:main */}
+```go
+p, err := keys.Authenticate(context.Background(), plaintext)
+listed, _ := keys.ListKeys(owner, sa.ID)
+fmt.Println("authenticated:", err, p.KeyID == key.ID, listed[0].LastUsedAt.Equal(now))
+```
+
+```
+authenticated: <nil> true true
+```
+
+## Expiry
+
+`WithExpiry(t)` makes the key valid **strictly before** `t`; an instant not
+after the service clock's now is `ErrInvalidExpiry` — a key already expired at
+mint is a dead credential produced silently, so it is refused instead.
+
+{/* verify:main */}
+```go
+now = at.Add(24 * time.Hour) // the expiry instant itself
+_, err = keys.Authenticate(context.Background(), plaintext)
+fmt.Println("at expiry:", errors.Is(err, apikey.ErrKeyExpired))
+now = at
+
+_, _, err = keys.CreateKey(owner, sa.ID, "stale", apikey.WithExpiry(at))
+fmt.Println("expiry not in the future:", errors.Is(err, apikey.ErrInvalidExpiry))
+```
+
+```
+at expiry: true
+expiry not in the future: true
+```
+
+## Revocation
+
+`RevokeKey` stamps `RevokedAt`; the row stays for audit until purged, and
+revoking a revoked key is not an error. A key in another container is
+`ErrKeyNotFound`, so a `service_account:update` grant in one organization is
+never a way to revoke another's keys.
+
+{/* verify:main */}
+```go
+err = keys.RevokeKey(owner, key.ID)
+_, authErr := keys.Authenticate(context.Background(), plaintext)
+fmt.Println("revoked:", err, errors.Is(authErr, apikey.ErrKeyRevoked))
+fmt.Println("again:", keys.RevokeKey(owner, key.ID))
+```
+
+```
+revoked: <nil> true
+again: <nil>
+```
+
+## Disabling the account
+
+`DisableServiceAccount` refuses **every** key of the account with
+`ErrServiceAccountDisabled` and lets none be minted, while the membership and
+the keys themselves are untouched — so `EnableServiceAccount` restores it
+exactly. It is the move for "something leaked and we do not yet know which
+key"; revoke the key once you do.
+
+{/* verify:main */}
+```go
+_, second, _ := keys.CreateKey(owner, sa.ID, "laptop")
+_ = keys.DisableServiceAccount(owner, sa.ID)
+_, err = keys.Authenticate(context.Background(), second)
+fmt.Println("disabled:", errors.Is(err, apikey.ErrServiceAccountDisabled))
+_, _, err = keys.CreateKey(owner, sa.ID, "another")
+fmt.Println("mint while disabled:", errors.Is(err, apikey.ErrServiceAccountDisabled))
+
+_ = keys.EnableServiceAccount(owner, sa.ID)
+_, err = keys.Authenticate(context.Background(), second)
+fmt.Println("re-enabled:", err)
+```
+
+```
+disabled: true
+mint while disabled: true
+re-enabled: <nil>
+```
+
+A revoked key of a disabled account reports `ErrKeyRevoked`: the key is judged
+before the account.
+
+## Purging
+
+`PurgeExpired(ctx, before)` deletes every key whose `ExpiresAt` **or** whose
+`RevokedAt` is strictly before the cutoff, across every container the store
+holds, and returns how many went. Accounts are never purged.
+
+{/* verify:main */}
+```go
+n, err := keys.PurgeExpired(context.Background(), at.Add(time.Hour))
+fmt.Println("purged:", n, err)
+```
+
+```
+purged: 1 <nil>
+```
+
+<Warning>
+`PurgeExpired` performs **no** authorization check and reads neither a subject
+nor a container from the context — one call spans every container. Call it
+from a cron job, never from a per-request handler wired to caller input.
+</Warning>
+
+## Deleting the account
+
+`DeleteServiceAccount` removes the membership, then the record and **every**
+key together — the cascade is a MUST on the store, one transaction or one
+critical section. A key of a deleted account is simply unknown.
+
+{/* verify:main */}
+```go
+err = keys.DeleteServiceAccount(owner, sa.ID)
+_, authErr = keys.Authenticate(context.Background(), second)
+fmt.Println("deleted:", err, errors.Is(authErr, apikey.ErrKeyNotFound))
+```
+
+```
+deleted: <nil> true
+```
+
+{/* verify:stdout "minted: <nil> 46 sk_ true\nstored: true true true true\nauthenticated: <nil> true true\nat expiry: true\nexpiry not in the future: true\nrevoked: <nil> true\nagain: <nil>\ndisabled: true\nmint while disabled: true\nre-enabled: <nil>\npurged: 1 <nil>\ndeleted: <nil> true" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Restricted permissions" icon="filter" href="/service-accounts/restricted-permissions">
+    A key that can do strictly less than its account.
+  </Card>
+  <Card title="Authenticating" icon="fingerprint" href="/service-accounts/authenticating">
+    What `Authenticate` refuses, and in which order.
+  </Card>
+</Columns>

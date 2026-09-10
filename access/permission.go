@@ -116,3 +116,35 @@ func (p Permission) Encode() []byte {
 	}
 	return []byte(b.String())
 }
+
+// Intersect returns the permission granting exactly the (resource, action)
+// pairs both p and other grant — the meet of the two sets. Neither argument
+// is modified.
+//
+// Both must come from the same Statements, the precondition [Access.Union]
+// and [Permission.SubsetOf] state: a Permission is a bitset over one
+// statement space, and the same bit means a different pair in another. Union
+// reports a foreign argument as an error; this method has no error to
+// return, so it FAILS CLOSED instead — a foreign other, a zero p or a zero
+// other all yield the zero Permission, which grants nothing ([Permission.
+// Allows] false, [Permission.IsFull] false). Denial is the only answer here
+// that cannot hand a caller a grant nobody meant, and the two callers this
+// exists for are both deny-by-default: scope's permission cap (an effective
+// standing of role ∩ cap, where a cap that cannot be read against this
+// scope's statements must confer nothing) and an API key's restricted
+// permissions.
+//
+// It follows that Intersect never adds: for every resource and action,
+// p.Intersect(other).Allows(r, a) implies both p.Allows(r, a) and
+// other.Allows(r, a), and the result is a [Permission.SubsetOf] each input.
+// Intersecting with [Access.Full] returns a permission equal to p.
+func (p Permission) Intersect(other Permission) Permission {
+	if p.s == nil || other.s == nil || p.s != other.s {
+		return Permission{}
+	}
+	out := newPermission(p.s)
+	for i := range out.bits {
+		out.bits[i] = p.bits[i] & other.bits[i]
+	}
+	return out
+}

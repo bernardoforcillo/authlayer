@@ -1,0 +1,289 @@
+---
+title: "Lifecycle hooks"
+description: "Observe every sign-up, login, failed login, refresh, replay, logout and credential change — after the mutation, before the call returns — for audit trails, webhooks and cache invalidation. And the paths that deliberately emit nothing."
+---
+
+A hook runs **after** a mutation is applied and **before** the method returns.
+`auth.WithHooks` has the same shape as
+[`scope.WithHooks`](/authorization/hooks) — `Hook`, `HookFunc`, an `Event`
+with a `Kind` — so one audit sink can consume both.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+names := map[auth.EventKind]string{
+	auth.SignedUp: "SignedUp", auth.EmailVerified: "EmailVerified", auth.LoggedIn: "LoggedIn",
+	auth.LoginFailed: "LoginFailed", auth.SessionRefreshed: "SessionRefreshed",
+	auth.TokenReuseDetected: "TokenReuseDetected", auth.LoggedOut: "LoggedOut",
+}
+audit := auth.HookFunc(func(_ context.Context, e auth.Event) error {
+	fmt.Printf("%s user=%v session=%v ip=%q detail=%q\n",
+		names[e.Kind], e.UserID != "", e.SessionID != "", e.IP, e.Detail)
+	return nil // best-effort: never fail the mutation because the log did
+})
+
+key := []byte("32-bytes-or-more-from-your-vault")
+svc := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithHooks(audit))
+
+ctx := context.Background()
+res, _ := svc.SignUp(ctx, "bob@example.com", "Correct-Horse-Battery-7")
+_, _ = svc.VerifyEmail(ctx, res.VerifyToken)
+_, _ = svc.Login(ctx, "bob@example.com", "wrong-password", "203.0.113.9", "curl/8")
+_, _ = svc.Login(ctx, "nobody@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+login, _ := svc.Login(ctx, "bob@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+next, _ := svc.Refresh(ctx, login.RefreshToken)
+_ = svc.Logout(ctx, next.RefreshToken)
+_, _ = svc.Refresh(ctx, login.RefreshToken) // the replay of a rotated-away token
+```
+
+```
+SignedUp user=true session=false ip="" detail="password"
+EmailVerified user=true session=false ip="" detail=""
+LoginFailed user=true session=false ip="203.0.113.9" detail="wrong_password"
+LoginFailed user=false session=false ip="203.0.113.9" detail="unknown_user"
+LoggedIn user=true session=true ip="203.0.113.9" detail="password"
+SessionRefreshed user=true session=true ip="203.0.113.9" detail=""
+LoggedOut user=true session=true ip="203.0.113.9" detail=""
+TokenReuseDetected user=true session=true ip="203.0.113.9" detail="reuse"
+```
+
+Read the two `LoginFailed` lines again. The wrong-password one names the
+account, because the attacker already knew it existed. The unknown-address one
+names **nothing** — not the address, not in `Detail`, not anywhere on the
+event. That is the rule the whole page turns on, below.
+
+## The event
+
+<ResponseField name="Kind" type="EventKind">
+  Which mutation occurred — the table below.
+</ResponseField>
+
+<ResponseField name="UserID" type="string">
+  The account. Empty on exactly two `LoginFailed` details, `unknown_user` and
+  `passkey_unknown_credential`, where there was no account to name.
+</ResponseField>
+
+<ResponseField name="SessionID" type="string">
+  When a session is involved: the one minted, rotated to, removed or replayed,
+  or — on a step-up-gated method — the caller's own.
+</ResponseField>
+
+<ResponseField name="IP / UserAgent" type="string">
+  When the entry point had them. Never the key of a rate-limit decision: no
+  event is emitted for `ErrRateLimited` or `ErrMissingIP`.
+</ResponseField>
+
+<ResponseField name="Detail" type="string">
+  A word from a **closed vocabulary**, exported as `auth.Detail*` constants —
+  the door a login came through (`password`, `trusted_device`, `mfa`,
+  `magic_link`, `external_identity`, `passkey`) or why an attempt failed
+  (`unknown_user`, `account_anonymized`, `no_password`, `wrong_password`,
+  `email_not_verified`, `mfa_required`, `mfa_code_invalid`,
+  `passkey_unknown_credential`, `passkey_challenge_invalid`,
+  `cloned_authenticator`, `reuse`). Never free text, never an address.
+</ResponseField>
+
+<ResponseField name="At" type="time.Time">
+  Stamped from the `Service` clock if the engine leaves it zero.
+</ResponseField>
+
+## The event kinds
+
+| Kind | Emitted by | Fields beyond `UserID` |
+|---|---|---|
+| `SignedUp` | `SignUp` (created branch **only**), `SignInWith` when it provisions | `Detail` = the door |
+| `EmailVerified` | `VerifyEmail`, both purposes | — |
+| `EmailChanged` | `VerifyEmail` redeeming `email_change`, before its `EmailVerified` | — |
+| `LoggedIn` | every path that **mints a session**: `Login`, `LoginWithTrustedDevice`, `CompleteMFA`, `RedeemMagicLink`, `SignInWith`, `FinishPasskeyLogin` | `SessionID`, `IP`, `UserAgent`, `Detail` = the door |
+| `LoginFailed` | `Login` (unknown / anonymized / no password / wrong password / unverified / MFA required), `CompleteMFA` (bad code), `FinishPasskeyLogin` (unknown credential / bad challenge / cloned authenticator) | `IP`, `UserAgent`, `Detail` = why; `UserID` empty when unknown |
+| `MFAChallenged` | `Login`, `RedeemMagicLink`, `SignInWith` stopping at a challenge | `IP`, `UserAgent`; no session exists |
+| `SessionRefreshed` | `Refresh`, once the successor is persisted | `SessionID` = the **new** session; `IP`/`UserAgent` inherited |
+| `TokenReuseDetected` | `Refresh` on a replay **after** the family is revoked; `Logout` of a superseded token | `SessionID` = the replayed session, `Detail` = `reuse` |
+| `LoggedOut` | `Logout` of a current token | `SessionID` |
+| `LoggedOutAll` | `LogoutAll`, after every sweep | — |
+| `SessionRevoked` | `RevokeSession` | `SessionID` = the one named |
+| `PasswordChanged` | `ChangePassword` | `SessionID` = the caller's spared session |
+| `PasswordReset` | `ResetPassword` | — |
+| `MagicLinkRedeemed` | `RedeemMagicLink`, before the second factor is consulted | `IP`, `UserAgent` |
+| `IdentityLinked` | `LinkIdentity`, `SignInWith` on both rungs that write a row | — (the provider is not on the event) |
+| `IdentityUnlinked` | `UnlinkIdentity` | — |
+| `MFAEnrolled` / `MFADisabled` | `ConfirmMFAEnrolment` / `DisableMFA` | `SessionID` on disable |
+| `PasskeyRegistered` / `PasskeyDeleted` | `FinishPasskeyRegistration` / `DeletePasskey` | `SessionID` on register |
+| `DeviceTrusted` / `TrustedDeviceRevoked` | `TrustThisDevice` / `RevokeTrustedDevice` | `SessionID` on trust |
+| `AccountDeleted` / `AccountAnonymized` | `DeleteAccount` / `AnonymizeAccount`, **last** | `SessionID` = the caller's |
+
+`BeginMFAEnrolment`, `BeginPasskeyRegistration` and `BeginPasskeyLogin` emit
+nothing: an unconfirmed factor and an unclaimed challenge are, for every
+purpose, not yet anything.
+
+## What deliberately emits nothing
+
+<Warning>
+The **enumeration-hardened request paths emit no event, on either branch**:
+`SignUp`'s duplicate-address branch, `RequestPasswordReset`,
+`RequestMagicLink` (with or without provisioning) and `RequestEmailChange`.
+
+Each of those is built so that its store calls, its error set and its returned
+shape are identical whether or not the address is registered. A hook is a
+caller-visible side effect whose cost is whatever you put in it: firing one on
+the known branch only reopens the oracle by timing, and firing one on both
+hands the application a known/unknown flag it must then never act on
+differently. Neither is this package's to risk. Log those **requests** at your
+own handler, where you already know you must answer uniformly. The
+**redemptions** are not hardened and do emit — `PasswordReset`,
+`MagicLinkRedeemed`, `EmailChanged`.
+</Warning>
+
+{/* verify:main */}
+```go
+count := 0
+counting := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithMagicLinkProvisioning(true),
+	auth.WithHooks(auth.HookFunc(func(context.Context, auth.Event) error { count++; return nil })))
+_, _ = counting.SignUp(ctx, "fay@example.com", "Correct-Horse-Battery-7")
+count = 0
+_, _ = counting.SignUp(ctx, "fay@example.com", "Correct-Horse-Battery-7")           // duplicate
+_, _, _ = counting.RequestPasswordReset(ctx, "fay@example.com", "203.0.113.9")      // known
+_, _, _ = counting.RequestPasswordReset(ctx, "nobody@example.com", "203.0.113.9")   // unknown
+_, _, _ = counting.RequestMagicLink(ctx, "fay@example.com", "203.0.113.9")          // known
+_, _, _ = counting.RequestMagicLink(ctx, "provisioned@example.com", "203.0.113.9")  // creates an account
+fmt.Println("events from the hardened request paths:", count)
+```
+
+```
+events from the hardened request paths: 0
+```
+
+One consequence is stated rather than hidden: an account
+`RequestMagicLink` provisions gets **no `SignedUp`**. Its first event is the
+`MagicLinkRedeemed` that signs it in.
+
+<Note>
+`LoginFailed` is emitted with the attempted **IP** and never the attempted
+**address**. A failed-login log keyed by address is a list of which addresses
+exist, and this package will not build one. Key yours by IP, or by the
+`UserID` a wrong-password event carries — an account the attacker already knew
+existed.
+
+The hook runs **after** `Hasher.Dummy` on the branches that call it, so its own
+cost is not what separates "unknown" from "wrong password" — unless the hook
+does different work per `Detail`. Keep a `LoginFailed` hook constant-shape:
+write the event and return.
+</Note>
+
+## A hook that errors aborts the call — with the change already made
+
+Nothing in `auth` runs inside a transaction a hook could roll back. The store
+change is **already in place** when the caller sees the hook's error.
+
+{/* verify:main */}
+```go
+boom := errors.New("audit sink is down")
+strict := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithHooks(auth.HookFunc(func(_ context.Context, e auth.Event) error {
+		if e.Kind == auth.LoggedIn {
+			return boom
+		}
+		return nil
+	})))
+dana, _ := strict.SignUp(ctx, "dana@example.com", "Correct-Horse-Battery-7")
+_, err := strict.Login(ctx, "dana@example.com", "Correct-Horse-Battery-7", "203.0.113.9", "curl/8")
+fmt.Println("Login with a failing LoggedIn hook:", errors.Is(err, boom))
+
+sessions, _ := strict.ListSessions(ctx, dana.User.ID)
+fmt.Println("sessions left behind:", len(sessions))
+```
+
+```
+Login with a failing LoggedIn hook: true
+sessions left behind: 1
+```
+
+For `Login` that is a live `Session` whose refresh token the caller never
+received: it ages out with the refresh TTL, or falls to `LogoutAll`. For
+`SignUp` it is a real account whose verification token was never handed back.
+So keep side effects that must not be retried out of hooks, and return `nil`
+for best-effort work — an audit write, an outbox row, a cache drop are the
+right things to put here; anything whose failure should *undo* the mutation is
+not, because it cannot.
+
+On a **failure event** — `LoginFailed`, `TokenReuseDetected` — the method was
+already returning an error, and the hook's error does not replace it. The
+caller gets both, joined, so `errors.Is` matches the original sentinel and the
+hook's error alike.
+
+{/* verify:main */}
+```go
+noisy := auth.New(memory.NewAuthStore(),
+	auth.WithJWT([][]byte{key}, 15*time.Minute),
+	auth.WithHooks(auth.HookFunc(func(context.Context, auth.Event) error { return boom })))
+_, err = noisy.SignUp(ctx, "erin@example.com", "Correct-Horse-Battery-7")
+fmt.Println("SignUp with a failing hook:", errors.Is(err, boom))
+_, err = noisy.Login(ctx, "erin@example.com", "wrong-password", "203.0.113.9", "curl/8")
+fmt.Println("still ErrInvalidCredentials:", errors.Is(err, auth.ErrInvalidCredentials), "and the hook's:", errors.Is(err, boom))
+```
+
+```
+SignUp with a failing hook: true
+still ErrInvalidCredentials: true and the hook's: true
+```
+
+Hooks run in registration order, on the caller's goroutine, sharing its
+context; the first error stops the chain. `WithHooks` **appends** and
+accumulates across calls, exactly as `scope.WithHooks` does.
+
+{/* verify:stdout "SignedUp user=true session=false ip=\"\" detail=\"password\"\nEmailVerified user=true session=false ip=\"\" detail=\"\"\nLoginFailed user=true session=false ip=\"203.0.113.9\" detail=\"wrong_password\"\nLoginFailed user=false session=false ip=\"203.0.113.9\" detail=\"unknown_user\"\nLoggedIn user=true session=true ip=\"203.0.113.9\" detail=\"password\"\nSessionRefreshed user=true session=true ip=\"203.0.113.9\" detail=\"\"\nLoggedOut user=true session=true ip=\"203.0.113.9\" detail=\"\"\nTokenReuseDetected user=true session=true ip=\"203.0.113.9\" detail=\"reuse\"\nevents from the hardened request paths: 0\nLogin with a failing LoggedIn hook: true\nsessions left behind: 1\nSignUp with a failing hook: true\nstill ErrInvalidCredentials: true and the hook's: true" */}
+
+## Good uses
+
+<Columns cols={2}>
+  <Card title="Audit trail" icon="scroll">
+    Write the event and return `nil`. Never fail a login because the log write
+    failed — and never key the failed-login table by address.
+  </Card>
+  <Card title="Reuse alarm" icon="bell">
+    `TokenReuseDetected` fires after the family is revoked. Page someone; the
+    containment already happened.
+  </Card>
+  <Card title="Cache invalidation" icon="broom">
+    `PasswordChanged`, `LoggedOutAll`, `AccountDeleted` are where a per-user
+    cache in front of the `Store` drops its keys.
+  </Card>
+  <Card title="Webhooks" icon="satellite-dish">
+    Enqueue, do not deliver. A synchronous HTTP call inside a hook puts a third
+    party's availability on your login path.
+  </Card>
+</Columns>
+
+<Note>
+Every claim on this page is demonstrated by `go run ./examples/hooks`, which
+also shows the [EdDSA signer](/authentication/access-tokens#eddsa-and-the-jwks)
+and its JWKS.
+</Note>
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Authorization hooks" icon="shield-halved" href="/authorization/hooks">
+    The same shape, on `scope`, `org` and `team`.
+  </Card>
+  <Card title="Refresh rotation" icon="rotate" href="/authentication/refresh-rotation">
+    What `TokenReuseDetected` is reporting.
+  </Card>
+</Columns>

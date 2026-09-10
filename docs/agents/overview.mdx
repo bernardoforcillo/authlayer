@@ -1,0 +1,219 @@
+---
+title: "Agents & machine clients"
+description: "An OAuth 2.1 authorization server as a library — three grants, one delegation model, and tokens that never carry more power than the human or service account behind them."
+---
+
+`oauth` makes an authlayer application an **OAuth 2.1 authorization server**.
+It exists so agents — CLIs, MCP clients, automation — and machine clients
+authenticate against every product the same way, and so a token an agent holds
+is checked by the same [`scope`](/concepts/scopes) engine, through the same
+`apikey.Principal`, as a session or an [API key](/service-accounts/overview).
+
+There is no HTTP in it. You own every endpoint; each method takes a context
+and returns the struct the endpoint serialises, and
+[`ErrorCode`](/agents/introspection-and-revocation#the-error-table) maps every
+sentinel to the RFC 6749 error code your JSON body carries.
+
+<Columns cols={2}>
+  <Card title="Client credentials" icon="robot" href="/agents/client-credentials">
+    A machine client bound to a service account. The token acts **as** the
+    account.
+  </Card>
+  <Card title="Device flow" icon="terminal" href="/agents/device-flow">
+    An agent with no browser. A person types a code and approves, capped.
+  </Card>
+  <Card title="Authorization code + PKCE" icon="globe" href="/agents/authorization-code">
+    A third-party or MCP client with a redirect URI. PKCE is mandatory.
+  </Card>
+  <Card title="Delegation" icon="hand-holding" href="/agents/delegation">
+    Why a delegated token can never exceed the human, and what happens when
+    the human's role changes.
+  </Card>
+  <Card title="Introspection & revocation" icon="ban" href="/agents/introspection-and-revocation">
+    Refresh rotation, reuse detection, RFC 7662 and RFC 7009, and what a JWT
+    cannot do.
+  </Card>
+  <Card title="Discovery & registration" icon="compass" href="/agents/discovery-and-registration">
+    RFC 8414 and RFC 9728 metadata, the JWKS, and RFC 7591 dynamic
+    registration for MCP clients.
+  </Card>
+</Columns>
+
+## The three grants, one delegation model
+
+| Flow | Who | Token subject |
+|---|---|---|
+| Client credentials (RFC 6749 §4.4) | a machine client bound to an `apikey.ServiceAccount` | `sub` = the service account |
+| Device authorization (RFC 8628) | an agent or CLI with no browser; a user approves a code | `sub` = the user, `act.sub` = the client |
+| Authorization code + PKCE (OAuth 2.1) | a third-party or MCP client with a redirect URI | `sub` = the user, `act.sub` = the client |
+
+A **client-credentials** token acts as the service account: its subject is the
+account's id, which is an ordinary member, so `Can` resolves its role exactly
+as it does for an API key. The other two produce **delegated** tokens (RFC
+8693 `act`): the subject is the user who approved, the actor is the client,
+and the token is bound to a `Grant` — one user's consent to one client in one
+container. A delegated token authenticates as `apikey.KindDelegated` with the
+grant's permission cap, and the engine intersects that cap with the user's
+**current** standing at every check.
+
+## Wiring it
+
+`oauth.New` takes the store, an `Authority` — the generic `*scope.Service`,
+which `org.Service` embeds as `.Service` — and a `token.Signer`. Pass
+`auth.Service.Signer()` so session tokens and agent tokens verify in one
+place, and prefer `token.EdDSA` the moment anything that is not this process
+must verify. `WithIssuer` is **required**.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/apikey"
+	"github.com/bernardoforcillo/authlayer/oauth"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+	"github.com/bernardoforcillo/authlayer/token"
+)
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{
+	"project": {"read", "deploy", "delete"},
+}), memory.New[org.Organization, org.Member]())
+keyStore := memory.NewAPIKeyStore()
+keys := apikey.New(svc.Service, keyStore)
+
+signer, _ := token.HS256([]byte("a-32-byte-secret-for-the-example!"))
+now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+as := oauth.New(memory.NewOAuthStore(), svc.Service, signer,
+	oauth.WithIssuer("https://auth.example"),
+	oauth.WithClock(func() time.Time { return now }),
+	oauth.WithServiceAccounts(keyStore), // so a disabled account refuses its clients
+)
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+_, _ = svc.CreateRole(owner, "deployer", "Deployer", map[string][]access.Action{
+	"project": {"read", "deploy"},
+})
+sa, _ := keys.CreateServiceAccount(owner, "ci", "", "deployer")
+fmt.Println("wired:", as != nil, sa.Name)
+```
+
+```
+wired: true ci
+```
+
+`store/memory`'s `NewOAuthStore` is the dev/test backend; `store/drops` ships
+`dropsstore.NewOAuthStore(db)` with its own `CreateSchema` — five tables, see
+[the schema](/storage/schema#the-oauth-tables).
+
+## One token, one principal, the same engine
+
+Whatever grant minted it, an access token resolves through `Authenticate` to
+an `apikey.Principal`, and `apikey.WithPrincipal` annotates a context every
+`Can` and `Authorize` already accepts.
+
+{/* verify:main */}
+```go
+cc, secret, err := as.CreateClient(owner, oauth.ClientSpec{
+	Name: "ci bot", GrantTypes: []string{oauth.GrantClientCredentials}, ServiceAccountID: sa.ID,
+})
+fmt.Println("client:", err, cc.Public, secret != "")
+
+tokens, err := as.ClientCredentials(context.Background(), cc.ID, secret, "")
+fmt.Println("tokens:", err, tokens.TokenType, tokens.ExpiresIn, tokens.RefreshToken == "")
+
+p, err := as.Authenticate(context.Background(), tokens.AccessToken)
+fmt.Println("principal:", err, p.Kind, p.ID == sa.ID, p.ClientID == cc.ID)
+
+bot := apikey.WithPrincipal(context.Background(), p)
+deploy, _ := svc.Can(bot, "project", "deploy")
+del, _ := svc.Can(bot, "project", "delete")
+fmt.Println("as the account:", deploy, del)
+```
+
+```
+client: <nil> false true
+tokens: <nil> Bearer 600 true
+principal: <nil> service_account true true
+as the account: true false
+```
+
+## Every mint is an escalation guard
+
+A cap is only ever a ceiling, and every place one is minted checks it against
+the standing it is carved from:
+
+- a **delegation** cap must sit within the grantor's own capped standing
+  (`Approve`, `ApproveDevice`);
+- a **client-credentials** cap must sit within the service account's role
+  (`CreateClient`), and is re-checked at every mint — lower the role and the
+  client is refused, not issued a token that claims more than the account
+  holds;
+- where an **administrator** mints, the client's whole power must sit within
+  that administrator's own capped standing, so a restricted API key cannot
+  register a client that exceeds the key.
+
+The refusal is `scope.ErrPrivilegeEscalation` in every case. A cap that
+compiles to nothing is `ErrEmptyPermissions` — the same value as `apikey`'s —
+rather than stored as *no cap*.
+
+## What each call requires
+
+| Call | Needs | Notes |
+|---|---|---|
+| `CreateClient`, `RotateClientSecret`, `DisableClient`, `EnableClient`, `UpdateClientRedirectURIs` | `service_account:update` on the ctx container | a client is a credential of the organization or of one of its service accounts |
+| `ListClients` | `service_account:read` | the ctx container's clients; application-level ones are never listed here |
+| `DeleteClient` | `service_account:delete` | grants, codes, device authorizations and refresh tokens go with it, atomically |
+| `Approve`, `ApproveDevice` | the ctx user's membership + the escalation guard | every approval is a new `Grant` |
+| `DenyDevice` | nothing | refusing needs no permission |
+| `ListGrants`, `RevokeGrant` | the ctx subject — their own grants only | an owner revoking someone else's consent is `ErrForbidden` |
+| every token endpoint, `Authenticate`, `Introspect`, `Revoke` | **no subject** — the client or the token is the credential | |
+| `RegisterClient` | nothing, and `WithDynamicRegistration(true)` | application-level, never `client_credentials` |
+| `PurgeExpired` | **nothing, and it spans every container** | cron only |
+
+## What is deliberately not here
+
+<AccordionGroup>
+  <Accordion title="Endpoints, a consent screen, a token store for clients" icon="server">
+    Every method is what a handler calls after decoding a request. The
+    structs it returns — `TokenResponse`, `DeviceResponse`, `Introspection`,
+    the two metadata documents — are the response bodies, with the RFC's
+    JSON names.
+  </Accordion>
+  <Accordion title="private_key_jwt, mTLS, plain PKCE, the implicit grant, token exchange" icon="ban">
+    A client authenticates with a secret or with nothing. PKCE is S256 only.
+    RFC 8693's `act` claim is used; its grant is not implemented.
+  </Accordion>
+  <Accordion title="Nested delegation" icon="layer-group">
+    `token.Actor` does not nest. An agent approving for another agent gets a
+    grant capped to its own capped standing — a delegation never exceeds its
+    grantor — rather than a chain.
+  </Accordion>
+  <Accordion title="Recalling a JWT" icon="clock">
+    An access token already issued is a signed statement and cannot be
+    unsaid. Revocation revokes the **grant**; `Authenticate` sees that at once
+    unless verification is offline, and the ten-minute default TTL bounds the
+    rest. See [what a JWT cannot do](/agents/introspection-and-revocation#what-a-jwt-cannot-do).
+  </Accordion>
+</AccordionGroup>
+
+{/* verify:stdout "wired: true ci\nclient: <nil> false true\ntokens: <nil> Bearer 600 true\nprincipal: <nil> service_account true true\nas the account: true false" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Client credentials" icon="robot" href="/agents/client-credentials">
+    The machine grant, its cap, and the two guards on minting a client.
+  </Card>
+  <Card title="Delegation" icon="hand-holding" href="/agents/delegation">
+    The cap, the scope map, and the human's current standing.
+  </Card>
+</Columns>

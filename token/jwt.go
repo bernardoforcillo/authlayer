@@ -36,7 +36,9 @@ var (
 	// segment that does not decode as JSON.
 	ErrMalformedToken = errors.New("authlayer/token: malformed token")
 	// ErrUnsupportedAlgorithm: the header's "alg" is not the exact string
-	// "HS256". Returned before any signature verification is attempted.
+	// the parser was built for — "HS256" at [Parse] and the [HS256] signer,
+	// "EdDSA" at the [EdDSA] signer. Returned before any signature
+	// verification is attempted, and before an EdDSA signer reads the kid.
 	ErrUnsupportedAlgorithm = errors.New("authlayer/token: unsupported algorithm")
 	// ErrInvalidSignature: none of the keys passed to Parse produced a
 	// signature matching the token's.
@@ -54,10 +56,13 @@ var (
 )
 
 // jwtHeader is the JOSE header this package writes and reads. It carries
-// nothing beyond alg/typ because nothing else is ever consulted.
+// alg/typ, and — for the [EdDSA] signer only — a kid naming the signing
+// key. Nothing else is ever consulted. Kid is omitempty so the HS256 header
+// [Issue] writes is byte-for-byte what it was before the field existed.
 type jwtHeader struct {
 	Alg string `json:"alg"`
 	Typ string `json:"typ"`
+	Kid string `json:"kid,omitempty"`
 }
 
 // Claims are the fields carried in an access token's JWT payload: who the
@@ -66,14 +71,41 @@ type jwtHeader struct {
 // validity), a denormalized Email for display without a lookup, and the
 // standard JWT IssuedAt/ExpiresAt timestamps (Unix seconds).
 //
-// [Issue] sets IssuedAt and ExpiresAt itself from the ttl it is given;
-// values set on the Claims passed in are ignored for those two fields.
+// [Issue] — and every [Signer]'s Issue — sets IssuedAt and ExpiresAt itself
+// from the ttl it is given; values set on the Claims passed in are ignored
+// for those two fields.
+//
+// The fields from Issuer down to Actor are the OAuth-shaped claims RFC 9068
+// (JWT access tokens) and RFC 8693 (token exchange) name. This package
+// carries them and interprets none of them — no Parse checks iss or aud,
+// exactly as none checks Email — so they are for the issuer to set and the
+// verifier to read. All are omitempty: a caller that sets none of them gets
+// byte-for-byte the payload this package produced before they existed,
+// which is pinned by test.
 type Claims struct {
 	Subject   string `json:"sub"`
 	SessionID string `json:"sid"`
 	Email     string `json:"email"`
 	IssuedAt  int64  `json:"iat"`
 	ExpiresAt int64  `json:"exp"`
+	// Issuer is RFC 7519 §4.1.1 "iss": who minted the token, usually the
+	// issuer URL an OAuth server publishes in its metadata.
+	Issuer string `json:"iss,omitempty"`
+	// Audience is RFC 7519 §4.1.3 "aud": who the token is for. See
+	// [Audience] for the string-or-array encoding rule.
+	Audience Audience `json:"aud,omitempty"`
+	// ID is RFC 7519 §4.1.7 "jti": a unique token id, the key a denylist
+	// or replay cache uses when the raw token string is not the right one.
+	ID string `json:"jti,omitempty"`
+	// ClientID is RFC 9068 §2.2 "client_id": the OAuth client the token
+	// was issued to.
+	ClientID string `json:"client_id,omitempty"`
+	// Scope is RFC 9068 §2.2.3 "scope": the granted scopes, space-separated
+	// as RFC 6749 §3.3 spells them.
+	Scope string `json:"scope,omitempty"`
+	// Actor is RFC 8693 §4.1 "act": the party acting on behalf of Subject
+	// in a delegated token. nil on every token that is not delegated.
+	Actor *Actor `json:"act,omitempty"`
 	// Extra carries additional, application-defined claims beyond the fixed
 	// set above — populated by
 	// [github.com/bernardoforcillo/authlayer/auth]'s WithClaimsExtender, nil

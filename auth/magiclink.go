@@ -483,6 +483,13 @@ func (s *Service) RedeemMagicLink(ctx context.Context, plainToken, ip, userAgent
 		u.UpdatedAt = now
 	}
 
+	// [MagicLinkRedeemed]: the link is burned and the account has passed
+	// every check. Before the second factor, so it is followed by either
+	// [MFAChallenged] or [LoggedIn] — the redemption happened either way.
+	if err := s.emit(ctx, Event{Kind: MagicLinkRedeemed, UserID: u.ID, IP: ip, UserAgent: userAgent}); err != nil {
+		return zero, err
+	}
+
 	// The second factor, consulted last and only once the link has been
 	// claimed and the account has passed every check above — this door's
 	// OWN call to mfaAtSignIn, not a guard shared with Login's. A confirmed
@@ -499,6 +506,9 @@ func (s *Service) RedeemMagicLink(ctx context.Context, plainToken, ip, userAgent
 		// a success path that does not go through mintSession, which is
 		// where every other return value gets scrubbed.
 		u.PasswordHash = ""
+		if err := s.emit(ctx, Event{Kind: MFAChallenged, UserID: u.ID, IP: ip, UserAgent: userAgent}); err != nil {
+			return zero, err
+		}
 		return LoginResult{User: u, MFA: challenge}, nil
 	}
 
@@ -506,5 +516,5 @@ func (s *Service) RedeemMagicLink(ctx context.Context, plainToken, ip, userAgent
 	// nil is [Session.MFAAt]: a link is not a second factor, so a session
 	// minted here has proved none. An account that HAS one never reaches
 	// this line — it left with a challenge above.
-	return s.mintSession(ctx, u, ip, userAgent, nil)
+	return s.mintSession(ctx, u, ip, userAgent, nil, DetailMagicLink)
 }

@@ -1,0 +1,255 @@
+---
+title: "Delegation"
+description: "A delegated token acts as the user with the client as actor, capped — and the cap is intersected with the user's current standing at every check, so revoking the human revokes the agent."
+---
+
+The device and authorization-code grants produce **delegated** tokens: the
+subject is the user who approved, the actor (RFC 8693 `act`) is the client,
+and the token is bound to a `Grant` — one user's consent to one client in one
+container. This page is what that buys, and what it costs the agent.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/apikey"
+	"github.com/bernardoforcillo/authlayer/oauth"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/scope"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+	"github.com/bernardoforcillo/authlayer/token"
+)
+```
+
+{/* verify:decl */}
+```go
+const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+// authorize runs Begin → Approve → Exchange for user and returns the
+// principal the access token resolves to.
+func authorize(as *oauth.Service, user context.Context, c oauth.Client, secret, scope string, a oauth.Approval) (apikey.Principal, error) {
+	sum := sha256.Sum256([]byte(verifier))
+	req := oauth.AuthorizationRequest{ClientID: c.ID, Scope: scope,
+		CodeChallenge: base64.RawURLEncoding.EncodeToString(sum[:]), CodeChallengeMethod: "S256"}
+	code, err := as.Approve(user, req, a)
+	if err != nil {
+		return apikey.Principal{}, err
+	}
+	tokens, err := as.ExchangeCode(context.Background(), oauth.CodeExchange{
+		ClientID: c.ID, ClientSecret: secret, Code: code, CodeVerifier: verifier})
+	if err != nil {
+		return apikey.Principal{}, err
+	}
+	return as.Authenticate(context.Background(), tokens.AccessToken)
+}
+```
+
+{/* verify:main */}
+```go
+svc := org.New(org.NewAccess(map[string][]access.Action{
+	"project": {"read", "deploy", "delete"},
+}), memory.New[org.Organization, org.Member]())
+signer, _ := token.HS256([]byte("a-32-byte-secret-for-the-example!"))
+now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+as := oauth.New(memory.NewOAuthStore(), svc.Service, signer,
+	oauth.WithIssuer("https://auth.example"),
+	oauth.WithClock(func() time.Time { return now }),
+	oauth.WithScopeMap(map[string]map[string][]access.Action{
+		"project:read":   {"project": {"read"}},
+		"project:deploy": {"project": {"deploy"}},
+		"org:members":    {org.ResourceMember: {org.ActionCreate, org.ActionDelete}},
+	}))
+
+ctx := org.WithSubject(context.Background(), "alice")
+acme, _ := svc.CreateOrganization(ctx, "Acme", "acme")
+owner := org.WithOrg(ctx, acme.ID)
+_, _ = svc.AddMember(owner, "bob", org.RoleAdmin)
+_, _ = svc.AddMember(owner, "carol", org.RoleMember)
+bob := org.WithOrg(org.WithSubject(context.Background(), "bob"), acme.ID)
+carol := org.WithOrg(org.WithSubject(context.Background(), "carol"), acme.ID)
+web, secret, _ := as.CreateClient(owner, oauth.ClientSpec{
+	Name: "agent", GrantTypes: []string{oauth.GrantAuthorizationCode, oauth.GrantRefreshToken},
+	RedirectURIs: []string{"https://app.example/cb"},
+})
+```
+
+## The cap follows the human
+
+A delegated token authenticates as `apikey.KindDelegated`: `ID` is the user,
+`ClientID` the client, `GrantID` the grant, and `Permissions` the grant's cap.
+`apikey.WithPrincipal` installs the cap through
+[`scope.WithPermissionCap`](/service-accounts/restricted-permissions), which
+the engine applies **after** every other rung of its resolution. Nothing is
+copied onto the token that the engine would later have to trust.
+
+{/* verify:main */}
+```go
+p, err := authorize(as, bob, web, secret, "project:read project:deploy", oauth.Approval{})
+fmt.Println("principal:", err, p.Kind, p.ID, p.Permissions != nil)
+agent := apikey.WithPrincipal(context.Background(), p)
+deploy, _ := svc.Can(agent, "project", "deploy")
+del, _ := svc.Can(agent, "project", "delete")
+fmt.Println("agent deploy / delete:", deploy, del) // bob could delete; the cap cannot
+
+// Demote bob: the agent is demoted with him. No token changed hands.
+_ = svc.ChangeMemberRole(owner, "bob", org.RoleMember)
+deploy, _ = svc.Can(agent, "project", "deploy")
+fmt.Println("after bob's demotion:", deploy)
+
+// Remove bob: the agent has no standing at all.
+_ = svc.RemoveMember(owner, "bob")
+deploy, _ = svc.Can(agent, "project", "deploy")
+fmt.Println("after bob's removal:", deploy)
+```
+
+```
+principal: <nil> delegated bob true
+agent deploy / delete: true false
+after bob's demotion: false
+after bob's removal: false
+```
+
+<Note>
+This is the whole point of binding a token to a **user** rather than copying
+the user's permissions into it. `HasPermission` and `Standing`, which take an
+explicit user id and read nothing from the context, stay cap-free by contract
+— see [the cap's reach](/service-accounts/restricted-permissions#which-paths-honour-the-cap).
+</Note>
+
+## The scope map
+
+`WithScopeMap` translates OAuth scope strings into RBAC permissions: each key
+is a scope a client may request, each value the grants it stands for, compiled
+against the engine's own statements at `New` (an undeclared pair panics there,
+as a mis-declared role does). An approved scope set becomes the cap — the
+**union** of its entries — so an agent's requested scopes bound what it may do
+without the application writing permission maths, and the keys are published
+as `scopes_supported`. The token above was capped by its scopes: `project:read
+project:deploy`, not `project:delete`.
+
+With a map configured, every requested scope must be a key of it, and an empty
+scope set is refused rather than minted as a token that may do nothing.
+
+{/* verify:main */}
+```go
+_, _ = svc.AddMember(owner, "bob", org.RoleAdmin)
+_, err = authorize(as, bob, web, secret, "everything", oauth.Approval{})
+fmt.Println("unknown scope:", errors.Is(err, oauth.ErrInvalidScope))
+_, err = authorize(as, bob, web, secret, "", oauth.Approval{})
+fmt.Println("no scope with a map:", errors.Is(err, oauth.ErrInvalidScope))
+```
+
+```
+unknown scope: true
+no scope with a map: true
+```
+
+`Approval.Permissions` overrides the map with an explicit cap — a consent
+screen with checkboxes. With no map and no explicit cap, the grant carries the
+user's whole standing, as it stands at each check.
+
+## Every mint is an escalation guard
+
+The cap must sit within the approver's **capped** standing unless they are
+elevated. `scope:member` holds nothing, so carol cannot delegate a read; an
+admin cannot delegate `organization:delete`; a cap compiling to nothing is
+refused.
+
+{/* verify:main */}
+```go
+_, err = authorize(as, carol, web, secret, "project:read", oauth.Approval{})
+fmt.Println("member delegating a read:", errors.Is(err, scope.ErrPrivilegeEscalation))
+_, err = authorize(as, bob, web, secret, "project:read", oauth.Approval{
+	Permissions: map[string][]access.Action{org.ResourceOrganization: {org.ActionDelete}},
+})
+fmt.Println("admin delegating organization:delete:", errors.Is(err, scope.ErrPrivilegeEscalation))
+_, err = authorize(as, carol, web, secret, "org:members", oauth.Approval{})
+fmt.Println("member delegating org:members:", errors.Is(err, scope.ErrPrivilegeEscalation))
+_, err = authorize(as, bob, web, secret, "org:members", oauth.Approval{})
+fmt.Println("admin delegating org:members:", err)
+stranger := org.WithOrg(org.WithSubject(context.Background(), "zed"), acme.ID)
+_, err = authorize(as, stranger, web, secret, "project:read", oauth.Approval{})
+fmt.Println("non-member delegating anything:", errors.Is(err, scope.ErrNotMember))
+```
+
+```
+member delegating a read: true
+admin delegating organization:delete: true
+member delegating org:members: true
+admin delegating org:members: <nil>
+non-member delegating anything: true
+```
+
+### A capped approver delegates no more than the cap
+
+An approver who is themselves acting under a cap — an agent approving a
+further delegation, or an admin through a restricted API key — is bounded by
+that cap. Asking for no explicit cap gets the grant capped to the approver's
+own capped standing, not to the human's whole one: a delegation never exceeds
+its grantor.
+
+{/* verify:main */}
+```go
+readOnly, _ := svc.Access().Permission(map[string][]access.Action{"project": {"read"}})
+cappedBob := scope.WithPermissionCap(bob, readOnly)
+_, err = authorize(as, cappedBob, web, secret, "project:deploy", oauth.Approval{})
+fmt.Println("capped approver beyond the cap:", errors.Is(err, scope.ErrPrivilegeEscalation))
+p, err = authorize(as, cappedBob, web, secret, "project:read", oauth.Approval{})
+fmt.Println("capped approver within it:", err, p.Permissions != nil)
+```
+
+```
+capped approver beyond the cap: true
+capped approver within it: <nil> true
+```
+
+## Connected apps
+
+Every approval is a **new** grant, revocable on its own: two devices approving
+one client are two consents. `ListGrants` is the user's own, across every
+container and client; `RevokeGrant` is the grantor's alone — an owner revoking
+someone else's consent is `scope.ErrForbidden`, because a delegation is the
+user's consent, not an administrator's resource. Administrators revoke a
+client's every grant by disabling or deleting the client.
+
+{/* verify:main */}
+```go
+grants, _ := as.ListGrants(bob)
+fmt.Println("bob's live grants:", len(grants))
+err = as.RevokeGrant(owner, grants[0].ID)
+fmt.Println("alice revoking bob's grant:", errors.Is(err, scope.ErrForbidden))
+err = as.RevokeGrant(bob, grants[0].ID)
+after, _ := as.ListGrants(bob)
+fmt.Println("bob revoking his own:", err, len(after))
+```
+
+```
+bob's live grants: 3
+alice revoking bob's grant: true
+bob revoking his own: <nil> 2
+```
+
+A revoked grant refuses refresh at once and, unless verification is
+[offline](/agents/introspection-and-revocation#offline-verification), refuses
+its access tokens at the next `Authenticate`. `WithGrantTTL` gives every grant
+an expiry; the default is until revoked.
+
+{/* verify:stdout "principal: <nil> delegated bob true\nagent deploy / delete: true false\nafter bob's demotion: false\nafter bob's removal: false\nunknown scope: true\nno scope with a map: true\nmember delegating a read: true\nadmin delegating organization:delete: true\nmember delegating org:members: true\nadmin delegating org:members: <nil>\nnon-member delegating anything: true\ncapped approver beyond the cap: true\ncapped approver within it: <nil> true\nbob's live grants: 3\nalice revoking bob's grant: true\nbob revoking his own: <nil> 2" */}
+
+## Next
+
+<Columns cols={2}>
+  <Card title="Restricted permissions" icon="filter" href="/service-accounts/restricted-permissions">
+    The cap in the API-key setting, and the one thing it can never do.
+  </Card>
+  <Card title="Introspection & revocation" icon="ban" href="/agents/introspection-and-revocation">
+    Refresh rotation, reuse, and what a JWT cannot do.
+  </Card>
+</Columns>

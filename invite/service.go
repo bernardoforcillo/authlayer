@@ -289,10 +289,24 @@ func ctxActor(ctx context.Context) (subject, containerID string, err error) {
 // AddMember directly, never the reverse — but an application running with
 // EscalationOff should know invite/link creation does not inherit that
 // leniency.
-func (s *Service[C, M, PC, PM]) guardEscalation(ctx context.Context, containerID, actorID, roleKey string) error {
+//
+// capped selects whether a permission cap on ctx ([scope.WithPermissionCap])
+// bounds the actor. Standing reads no cap by contract, so the guard applies
+// it itself through [scope.Service.CapStanding] — the same rule
+// scope.Service.AddMember's own guard applies — and only when the actor IS
+// the ctx subject: at mint time ([Service.InviteByEmail],
+// [Service.CreateLink]), so a restricted API key cannot mint an invitation
+// above what the key itself allows even though the account behind it could.
+// The acceptance-time recheck ([recheckValid]) passes false: there actorID
+// is the INVITER and the ctx subject is the invitee, so a cap on ctx belongs
+// to somebody else's standing and must not be applied to the inviter's.
+func (s *Service[C, M, PC, PM]) guardEscalation(ctx context.Context, containerID, actorID, roleKey string, capped bool) error {
 	perms, elevated, err := s.sc.Standing(ctx, containerID, actorID)
 	if err != nil {
 		return err
+	}
+	if capped {
+		perms, elevated = s.sc.CapStanding(ctx, perms, elevated)
 	}
 	if elevated {
 		return nil
@@ -330,7 +344,7 @@ func (s *Service[C, M, PC, PM]) recheckValid(ctx context.Context, containerID, i
 	if !s.cfg.recheckInviterOnAccept {
 		return true, nil
 	}
-	err := s.guardEscalation(ctx, containerID, inviterID, roleKey)
+	err := s.guardEscalation(ctx, containerID, inviterID, roleKey, false)
 	switch {
 	case err == nil:
 		return true, nil
@@ -386,7 +400,7 @@ func (s *Service[C, M, PC, PM]) InviteByEmail(ctx context.Context, email, roleKe
 	if err := s.sc.Authorize(ctx, scope.ResourceInvite, scope.ActionCreate); err != nil {
 		return EmailInvite{}, "", err
 	}
-	if err := s.guardEscalation(ctx, containerID, actor, roleKey); err != nil {
+	if err := s.guardEscalation(ctx, containerID, actor, roleKey, true); err != nil {
 		return EmailInvite{}, "", err
 	}
 
@@ -452,7 +466,7 @@ func (s *Service[C, M, PC, PM]) CreateLink(ctx context.Context, roleKey string, 
 	if err := s.sc.Authorize(ctx, scope.ResourceInvite, scope.ActionCreate); err != nil {
 		return Link{}, "", err
 	}
-	if err := s.guardEscalation(ctx, containerID, actor, roleKey); err != nil {
+	if err := s.guardEscalation(ctx, containerID, actor, roleKey, true); err != nil {
 		return Link{}, "", err
 	}
 	if maxUses < 0 {
@@ -592,11 +606,14 @@ func (s *Service[C, M, PC, PM]) ListLinks(ctx context.Context) ([]Link, error) {
 		return out, nil
 	}
 
-	// Half two: how high could they have minted?
+	// Half two: how high could they have minted? Capped exactly as the
+	// mint test itself is (see guardEscalation): a restricted key reads back
+	// no Code it could not have minted through that same key.
 	perms, elevated, err := s.sc.Standing(ctx, containerID, actor)
 	if err != nil {
 		return nil, err
 	}
+	perms, elevated = s.sc.CapStanding(ctx, perms, elevated)
 	if elevated {
 		return links, nil
 	}
@@ -828,7 +845,7 @@ func (s *Service[C, M, PC, PM]) AcceptInvite(ctx context.Context, plainToken str
 	}
 
 	if s.cfg.recheckInviterOnAccept {
-		if err := s.guardEscalation(ctx, inv.ContainerID, inv.InvitedBy, inv.RoleKey); err != nil {
+		if err := s.guardEscalation(ctx, inv.ContainerID, inv.InvitedBy, inv.RoleKey, false); err != nil {
 			return zero, err
 		}
 	}
@@ -920,7 +937,7 @@ func (s *Service[C, M, PC, PM]) JoinViaLink(ctx context.Context, code string) (C
 	}
 
 	if s.cfg.recheckInviterOnAccept {
-		if err := s.guardEscalation(ctx, l.ContainerID, l.CreatedBy, l.RoleKey); err != nil {
+		if err := s.guardEscalation(ctx, l.ContainerID, l.CreatedBy, l.RoleKey, false); err != nil {
 			return zero, err
 		}
 	}
