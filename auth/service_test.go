@@ -1886,6 +1886,16 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 			}
 			return res.User, u.ID
 		},
+		// A custom Authenticator, which names the account by id. Signed up
+		// WITH a password for RedeemMagicLink's reason.
+		"Authenticate": func(t *testing.T, svc *auth.Service) (auth.UserBase, string) {
+			u := mustSignUp(t, svc, "scrub-custom@example.com", validPassword)
+			res, err := svc.Authenticate(ctx, "by_id", auth.AuthRequest{IP: "1.2.3.4", UserAgent: "agent", Fields: map[string]string{"user_id": u.ID}})
+			if err != nil {
+				t.Fatalf("Authenticate: %v", err)
+			}
+			return res.User, u.ID
+		},
 		// Signed up WITH a password for RedeemMagicLink's reason: step 2
 		// asserts the Store's own copy still holds a live digest, which is
 		// what makes the empty returned value meaningful.
@@ -1949,6 +1959,7 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 				auth.WithMFAStore(memory.NewMFAStore()),
 				auth.WithMFASecretCipher(testCipher{}),
 				auth.WithCredentialStore(memory.NewCredentialStore()),
+				auth.WithAuthenticators(byIDAuthenticator{}),
 			)
 			got, userID := drive(t, svc)
 			if got.PasswordHash != "" {

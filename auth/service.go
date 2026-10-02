@@ -48,9 +48,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
+	"github.com/bernardoforcillo/authlayer/auth/magiclink"
+	"github.com/bernardoforcillo/authlayer/core"
 	"github.com/bernardoforcillo/authlayer/internal/uid"
 	"github.com/bernardoforcillo/authlayer/password"
 	"github.com/bernardoforcillo/authlayer/token"
@@ -294,25 +295,25 @@ var (
 // email — so a malicious caller cannot lock a victim out of their own
 // account merely by exhausting a bucket keyed on the victim's address; only
 // the attacker's own IP bucket is ever spent. See [WithRateLimiter].
-type RateLimiter interface {
-	// Allow reports whether an attempt keyed by key may proceed right now.
-	//
-	// A false, nil result means Login refuses immediately with
-	// [ErrRateLimited], without calling the Store or the Hasher at all. A
-	// non-nil error means the limiter itself could not answer — Login
-	// treats that as "deny" too (propagating the error, not ErrRateLimited)
-	// rather than guessing "allow": an authentication decision that cannot
-	// be made must deny, the same fail-closed discipline every store error
-	// elsewhere in this package already follows.
-	Allow(ctx context.Context, key string) (bool, error)
-}
+type RateLimiter = core.RateLimiter
 
 // config is the resolved Service configuration, built from the defaults and
 // mutated via Option at construction — immutable once New returns, matching
 // [github.com/bernardoforcillo/authlayer/scope.Option]'s own stance.
 type config struct {
 	hasher password.Hasher
-	rules  password.Rules
+	// passwordOptional lets [Service.SignUp] register an account with no
+	// password — see [WithPasswordRequired].
+	passwordOptional bool
+	// Delegation seams — see delegate.go.
+	methods        map[Method]bool
+	signUpPolicy   SignUpPolicy
+	passwordPolicy PasswordPolicy
+	sessionGate    SessionGate
+	authenticators map[Method]Authenticator
+	sweepers       []Sweeper
+	magicFlow      magiclink.Factory
+	rules          password.Rules
 	// signer mints and verifies access tokens — see [WithJWT], which builds
 	// an HS256 one, and [WithSigner], which supplies any other. nil means
 	// none was configured, and every path that needs one fails closed with
@@ -326,10 +327,12 @@ type config struct {
 	// [WithPasswordResetTTL] and [WithMagicLinkTTL].
 	verificationTTL  time.Duration
 	passwordResetTTL time.Duration
-	magicLinkTTL     time.Duration
-	clock            func() time.Time
-	idGen            func() string
-	limiter          RateLimiter
+	// magicLink is the link engine's whole configuration — see
+	// [WithMagicLink]; the three WithMagicLink* options below write into it.
+	magicLink magiclink.Config
+	clock     func() time.Time
+	idGen     func() string
+	limiter   RateLimiter
 	// resetLimiter is the address-keyed [RateLimiter] [Service.RequestPasswordReset]
 	// additionally consults — see [WithPasswordResetRateLimiter]'s doc for
 	// why it is a second, independent config slot rather than reusing
@@ -342,13 +345,11 @@ type config struct {
 	// want a tighter bucket on magic links than on password resets (a
 	// magic link is a login, not a credential-set form). See
 	// [WithMagicLinkRateLimiter].
-	magicLinkLimiter RateLimiter
 	// magicLinkProvisioning is [WithMagicLinkProvisioning]: whether
 	// [Service.RequestMagicLink] creates an account for an address it does
 	// not recognise. Defaults to false.
-	magicLinkProvisioning bool
-	claimsExtender        func(UserBase) map[string]any
-	requireVerifiedEmail  bool
+	claimsExtender       func(UserBase) map[string]any
+	requireVerifiedEmail bool
 	// identityStore is the OPTIONAL external-identity port — see
 	// [WithIdentityStore]. nil means no external sign-in is configured, and
 	// every entry point needing it fails with [ErrOAuthNotConfigured]
@@ -423,7 +424,7 @@ func defaultConfig() config {
 		refreshTTL:          30 * 24 * time.Hour,
 		verificationTTL:     defaultVerificationTTL,
 		passwordResetTTL:    defaultPasswordResetTTL,
-		magicLinkTTL:        defaultMagicLinkTTL,
+		magicLink:           magiclink.Config{TTL: defaultMagicLinkTTL},
 		mfaChallengeTTL:     defaultMFAChallengeTTL,
 		passkeyChallengeTTL: defaultPasskeyChallengeTTL,
 		stepUpWindow:        defaultStepUpWindow,
@@ -634,7 +635,7 @@ func WithPasswordResetTTL(d time.Duration) Option {
 func WithMagicLinkTTL(d time.Duration) Option {
 	return func(c *config) {
 		if d > 0 {
-			c.magicLinkTTL = d
+			c.magicLink.TTL = d
 		}
 	}
 }
@@ -669,7 +670,21 @@ func WithMagicLinkTTL(d time.Duration) Option {
 // not remove it, so a deployment enabling this should expect its users
 // table to accumulate addresses nobody ever signed in with.
 func WithMagicLinkProvisioning(enabled bool) Option {
-	return func(c *config) { c.magicLinkProvisioning = enabled }
+	return func(c *config) { c.magicLink.Provisioning = enabled }
+}
+
+// WithPasswordRequired controls whether [Service.SignUp] insists on a
+// password. The default is true. With false, SignUp accepts an empty
+// plainPassword and registers an account with no password credential
+// (PasswordHash "", so [Service.Login] can never authenticate it); the
+// account signs in by magic link, and may arm a password later with
+// [Service.SetPassword] or [Service.ResetPassword]. A NON-empty password is
+// still checked against [WithRules] and hashed as usual.
+//
+// The signup verification is minted either way, so the address is still
+// proven by receiving mail.
+func WithPasswordRequired(required bool) Option {
+	return func(c *config) { c.passwordOptional = !required }
 }
 
 // WithClock sets the clock Service stamps CreatedAt/UpdatedAt/ExpiresAt
@@ -826,7 +841,7 @@ func WithPasswordResetRateLimiter(l RateLimiter) Option {
 // This package configures no default here, for the reason [WithRateLimiter]'s
 // own default is nil: the right bucket size is an operator decision.
 func WithMagicLinkRateLimiter(l RateLimiter) Option {
-	return func(c *config) { c.magicLinkLimiter = l }
+	return func(c *config) { c.magicLink.AddressLimiter = l }
 }
 
 // WithRequireVerifiedEmail controls whether [Service.Login] refuses an
@@ -1348,17 +1363,30 @@ func New(store Store, opts ...Option) *Service {
 // carries a live PasswordHash even then — see that field's own doc and
 // [UserBase.PasswordHash]'s.
 func (s *Service) SignUp(ctx context.Context, email, plainPassword string) (SignUpResult, error) {
-	if failed := password.Validate(plainPassword, s.cfg.rules); len(failed) > 0 {
-		return SignUpResult{}, fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
+	if plainPassword != "" && !s.methodEnabled(MethodPassword) {
+		return SignUpResult{}, ErrMethodDisabled
+	}
+	if s.cfg.signUpPolicy != nil {
+		if err := s.cfg.signUpPolicy.AllowSignUp(ctx, NormalizeEmail(email)); err != nil {
+			return SignUpResult{}, err
+		}
+	}
+
+	var hash string
+	if plainPassword != "" || !s.passwordOptionalNow() {
+		if err := s.checkPassword(plainPassword); err != nil {
+			return SignUpResult{}, err
+		}
+		var herr error
+		hash, herr = s.cfg.hasher.Hash(plainPassword)
+		if herr != nil {
+			return SignUpResult{}, herr
+		}
 	}
 
 	normalized := NormalizeEmail(email)
 	now := s.cfg.clock()
-
-	hash, err := s.cfg.hasher.Hash(plainPassword)
-	if err != nil {
-		return SignUpResult{}, err
-	}
+	var err error
 
 	_, err = s.store.CreateUser(ctx, UserBase{
 		ID:           s.cfg.idGen(),
@@ -1582,6 +1610,10 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPassword, ip, userAgent, deviceToken string) (LoginResult, error) {
 	var zero LoginResult
 
+	if err := s.requireMethod(MethodPassword); err != nil {
+		return zero, err
+	}
+
 	if ip == "" {
 		return zero, ErrMissingIP
 	}
@@ -1756,6 +1788,10 @@ func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPasswo
 // consequence [Hook]'s doc asks a hook author to design for.
 func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent string, mfaAt *time.Time, door string) (LoginResult, error) {
 	var zero LoginResult
+
+	if err := s.gateSession(ctx, u, door); err != nil {
+		return zero, err
+	}
 
 	now := s.cfg.clock()
 	sessionID := s.cfg.idGen()
@@ -2889,7 +2925,7 @@ func (s *Service) LogoutAll(ctx context.Context, userID string) error {
 	// the control a user reaches for when they believe a machine is in the
 	// wrong hands, and a device left trusted means that machine still skips
 	// the second factor on its way back in.
-	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
+	if err := s.sweep(ctx, SweepLoggedOutAll, userID); err != nil {
 		return err
 	}
 	return s.emit(ctx, Event{Kind: LoggedOutAll, UserID: userID})
@@ -3477,8 +3513,47 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 		return err
 	}
 
-	if failed := password.Validate(next, s.cfg.rules); len(failed) > 0 {
-		return fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
+	return s.applyNewPassword(ctx, userID, currentSessionID, next)
+}
+
+// SetPassword arms a first password on an account that has none — one
+// registered by magic link or by [Service.SignUp] under
+// [WithPasswordRequired](false). It is the passwordless counterpart of
+// [Service.ChangePassword], which needs a current password to check.
+//
+// An account that already has a password gets [ErrInvalidCredentials]; use
+// ChangePassword. An anonymized account gets [ErrUserNotFound]. Because
+// the caller proves nothing but holding a session, [Service.RequireFreshMFA]
+// gates it: an account with a confirmed factor must have stepped up
+// recently. An account without one is protected only by the session
+// itself, so a deployment that cares should have the user confirm by email
+// ([Service.RequestPasswordReset]) instead.
+//
+// Every other session, trusted device and outstanding token is swept
+// exactly as ChangePassword does; currentSessionID is spared.
+func (s *Service) SetPassword(ctx context.Context, userID, currentSessionID, next string) error {
+	u, err := s.store.FindUserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if u.DeletedAt != nil {
+		return ErrUserNotFound
+	}
+	if u.PasswordHash != "" {
+		return ErrInvalidCredentials
+	}
+	if err := s.RequireFreshMFA(ctx, userID, currentSessionID); err != nil {
+		return err
+	}
+	return s.applyNewPassword(ctx, userID, currentSessionID, next)
+}
+
+// applyNewPassword validates, hashes and stores next, then closes every
+// side door — see [Service.ChangePassword], "The sweep matrix". Callers
+// have already authorized the change.
+func (s *Service) applyNewPassword(ctx context.Context, userID, currentSessionID, next string) error {
+	if err := s.checkPassword(next); err != nil {
+		return err
 	}
 	hash, err := s.cfg.hasher.Hash(next)
 	if err != nil {
@@ -3512,7 +3587,7 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 	// family is the thing this caller is demonstrably holding, while a
 	// trusted device is a cookie that may have been copied off the machine
 	// whose compromise prompted this call.
-	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
+	if err := s.sweep(ctx, SweepPasswordChanged, userID); err != nil {
 		return err
 	}
 
@@ -4121,8 +4196,8 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 		return ErrUserNotFound
 	}
 
-	if failed := password.Validate(next, s.cfg.rules); len(failed) > 0 {
-		return fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
+	if err := s.checkPassword(next); err != nil {
+		return err
 	}
 	hash, err := s.cfg.hasher.Hash(next)
 	if err != nil {
@@ -4160,18 +4235,7 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 	// UNAUTHENTICATED recovery, where every other credential has to be
 	// assumed hostile, and a trusted device is precisely a credential the
 	// person resetting cannot see and cannot have consented to.
-	if err := s.sweepTrustedDevices(ctx, v.UserID); err != nil {
-		return err
-	}
-
-	// Remove every external identity BEFORE the sessions — see the method
-	// doc's "Why an unauthenticated recovery sweeps identities". An identity
-	// left standing is a live credential this rotation did not touch, and one
-	// that can mint a fresh session; taking it away first means the session
-	// revocation below also catches anything minted through it in the
-	// meantime. A Service with no [WithIdentityStore] sweeps nothing and
-	// reports no error.
-	if err := s.sweepIdentities(ctx, v.UserID); err != nil {
+	if err := s.sweep(ctx, SweepPasswordReset, v.UserID); err != nil {
 		return err
 	}
 

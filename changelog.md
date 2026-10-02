@@ -10,6 +10,78 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Anonymizing departures.** `scope.WithAnonymizer` tells the application, for
+  every membership that ends (leave, removal by another member, account
+  removal), who is leaving, why (`DepartedLeft` / `DepartedRemoved` /
+  `DepartedAccount`) and whether to scrub them (`Departure.Anonymize`), before
+  anything is removed; an error aborts the departure. `LeaveContainerAnonymized`
+  and `RemoveUserAnonymized` request scrubbing, and `MemberRemoved` events carry
+  `Anonymized`. `scope.WithPseudonymKey` derives a stable per-container
+  pseudonym (HMAC-SHA256, different in every container, not reversible without
+  the key) in `Departure.Pseudonym` / `Service.Pseudonym`, so a former member's
+  contributions stay attributable without keeping the person. `auth` adds
+  `SweepAccountAnonymized`, used by `AnonymizeAccount`, distinct from
+  `SweepAccountRemoved` (`DeleteAccount`); `authlayer.RemoveUserSweeper` maps
+  them to `RemoveUserAnonymized` / `RemoveUser`. `UserRemover` gained
+  `RemoveUserAnonymized`.
+- **Containers: a veto and an account-removal path.** `scope.WithDecider`
+  installs a `Decider` consulted after the engine's own checks and before any
+  write for container creation, member add/role-change/remove, ownership
+  transfer and leave; it can only restrict. `Service.RemoveUser(ctx, userID)`
+  removes a user from every container atomically, resolving containers they
+  own through `scope.WithOrphanPolicy` (default: refuse with
+  `ErrOwnsContainer`; `SuccessorFirstMember` hands them to another member;
+  a policy may also abandon). `authlayer.RemoveUserSweeper(org, team, ...)`
+  plugs it into `auth.WithSweeper`, so deleting or anonymizing an account
+  cleans memberships and fails closed when an owned container is unresolved.
+- **`auth/passkey`: the ceremony engine as its own module.** Challenge
+  mint/claim (single-use, ceremony- and owner-checked, not burned by a refused
+  claim) and the signature-counter clone check moved out of `auth.Service` into
+  a package with no dependency on `auth`, over a small `Backend`; `auth` adapts
+  its `CredentialStore`. `BeginPasskey*`, `FinishPasskey*` and the errors are
+  unchanged and the existing suite passes untouched.
+- **`auth.WithMagicLink(magiclink.Config)`** configures the link engine in one
+  value; `WithMagicLinkTTL`, `WithMagicLinkProvisioning` and
+  `WithMagicLinkRateLimiter` write into the same value.
+- **Replaceable link engine.** `magiclink.Flow` (`Request`, `Redeem`) and
+  `auth.WithMagicLinkEngine(factory)` swap the engine behind
+  `RequestMagicLink` / `RedeemMagicLink` — a one-time-code engine, a vendor
+  service — while MFA, events, `SessionGate` and the sweeps still apply.
+- **`auth/magiclink`: the link engine as its own module.** The request and
+  redeem logic (enumeration-safe request, expiry/purpose checks,
+  burn-before-use, address verification) moved out of `auth.Service` into a
+  package with no dependency on `auth`, over a small `Backend` interface;
+  `auth` adapts its `Store` to it. `RequestMagicLink` / `RedeemMagicLink` keep
+  their signatures, docs, errors and store-call order, and the existing suite
+  passes unchanged. The engine is unit-tested against a fake backend and can be
+  replaced or reused with another identity store.
+- **The sweep matrix is data.** `auth.SweepReason` (`SweepPasswordChanged`,
+  `SweepPasswordReset`, `SweepMFADisabled`, `SweepLoggedOutAll`,
+  `SweepAccountRemoved`) and `Service.sweep` replace the hand-written
+  `sweepX` calls at each call site; each reason keeps exactly the built-in
+  sweeps it ran before. `WithSweeper(Sweeper)` lets a custom module (an SMS
+  enrolment, a device registry…) clear its own per-user state for every
+  reason, failing the operation closed on error.
+- **Shared core and composition.** New `core` package: `Runtime` (clock + id
+  generator), generic `Hook[E]` / `HookFunc[E]` / `Hooks[E]`, and `RateLimiter`.
+  `auth`, `apikey`, `oauth` and `scope` alias their `Hook`, `HookFunc` and
+  (auth) `RateLimiter` to it, so existing code compiles unchanged, and each gains
+  `WithRuntime(core.Runtime)`. New root package `authlayer` with
+  `Shared{Runtime}` and `.Auth() / .Scope() / .APIKey() / .OAuth()` hands one
+  setting to every module as its own typed option.
+- **Delegation seams** (`auth/delegate.go`). `WithMethods(...)` chooses which
+  sign-in methods exist (`MethodPassword`, `MethodMagicLink`, `MethodPasskey`,
+  `MethodExternalIdentity`); disabled ones return `ErrMethodDisabled`.
+  Delegates for decisions: `SignUpPolicy`, `PasswordPolicy`, `SessionGate`
+  (consulted before any session, whichever door). `Authenticator` +
+  `Service.Authenticate` plug in a custom method (SAML, SMS OTP…) that gets the
+  same rate limit, deleted-account refusal, MFA challenge, session minting and
+  audit events as built-in ones. All defaults reproduce the previous behaviour.
+- **Optional passwords.** `auth.WithPasswordRequired(false)` lets `SignUp`
+  register an account from an email alone (empty password; the signup
+  verification is still minted). New `Service.SetPassword` arms a first
+  password on a passwordless account, gated by `RequireFreshMFA`;
+  `ChangePassword` and `SetPassword` now share one sweep.
 - **Agents & machine clients — an OAuth 2.1 authorization server as a
   library** (`authlayer/oauth`). No HTTP, no handlers: `oauth.New(store,
   authority, signer, opts...)` over a narrow `Authority` interface

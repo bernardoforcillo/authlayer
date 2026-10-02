@@ -853,7 +853,7 @@ func (s *Service) DisableMFA(ctx context.Context, userID, currentSessionID, curr
 	// a surviving one would mean, and why it runs first: a failure here
 	// leaves MFA fully on with nothing trusted, which is the direction a
 	// retry can fix.
-	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
+	if err := s.sweep(ctx, SweepMFADisabled, userID); err != nil {
 		return err
 	}
 

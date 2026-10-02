@@ -1,8 +1,9 @@
 package scope
 
 import (
-	"context"
 	"time"
+
+	"github.com/bernardoforcillo/authlayer/core"
 )
 
 // EventKind identifies a lifecycle event emitted after a successful mutation.
@@ -47,6 +48,9 @@ const (
 type Event struct {
 	// Kind is which mutation occurred.
 	Kind EventKind
+	// Anonymized is set on a [MemberRemoved] event when the membership ended
+	// with the user's identity to be scrubbed — see [Anonymizer].
+	Anonymized bool
 	// ContainerID is the scope the mutation happened in.
 	ContainerID string
 	// ActorID is the user who performed the mutation — the ctx subject, for
@@ -86,12 +90,7 @@ type Event struct {
 // Hooks run in the order they were registered with [WithHooks]; the first error
 // stops the chain. They are called on the caller's goroutine and share its
 // context, so a slow hook slows the request.
-type Hook interface {
-	On(ctx context.Context, e Event) error
-}
+type Hook = core.Hook[Event]
 
 // HookFunc adapts a function to the Hook interface.
-type HookFunc func(ctx context.Context, e Event) error
-
-// On implements Hook.
-func (f HookFunc) On(ctx context.Context, e Event) error { return f(ctx, e) }
+type HookFunc = core.HookFunc[Event]

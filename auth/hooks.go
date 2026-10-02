@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/bernardoforcillo/authlayer/core"
 )
 
 // EventKind identifies a lifecycle event this package emits to the [Hook]s
@@ -261,15 +263,10 @@ type Event struct {
 // [github.com/bernardoforcillo/authlayer/password.Hasher.Dummy] exists to close between "unknown address" and
 // "wrong password". Keep a LoginFailed hook constant-shape: write the event
 // and return.
-type Hook interface {
-	On(ctx context.Context, e Event) error
-}
+type Hook = core.Hook[Event]
 
 // HookFunc adapts a function to the [Hook] interface.
-type HookFunc func(ctx context.Context, e Event) error
-
-// On implements [Hook].
-func (f HookFunc) On(ctx context.Context, e Event) error { return f(ctx, e) }
+type HookFunc = core.HookFunc[Event]
 
 // WithHooks appends lifecycle hooks fired after successful mutations. It
 // appends rather than replaces, so several calls accumulate and hooks run in
