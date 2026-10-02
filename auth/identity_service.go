@@ -345,6 +345,9 @@ func requireProviderSubject(ext ExternalIdentity) error {
 // current password), and the only route to a first password is
 // [Service.RequestPasswordReset] followed by [Service.ResetPassword].
 func (s *Service) SignInWith(ctx context.Context, req SignInRequest) (SignInResult, error) {
+	if err := s.requireMethod(MethodExternalIdentity); err != nil {
+		return SignInResult{}, err
+	}
 	var zero SignInResult
 
 	identities, err := s.identities()

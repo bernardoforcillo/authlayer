@@ -127,6 +127,31 @@ falling back to a default — construction **panics**: `scope.New` when
   validated against `WithRules`.
 </ResponseField>
 
+<ResponseField name="WithMethods(methods ...Method)" type="Option" default="all built-ins">
+  Enables exactly the listed sign-in methods (`MethodPassword`,
+  `MethodMagicLink`, `MethodPasskey`, `MethodExternalIdentity`, or the name of a
+  registered `Authenticator`). Others return `ErrMethodDisabled`. Omitting
+  `MethodPassword` also lets `SignUp` register from an email alone.
+</ResponseField>
+
+<ResponseField name="WithSignUpPolicy(p SignUpPolicy)" type="Option" default="none">
+  Decides from the normalized address alone whether it may register (domain
+  allowlist). Must not depend on whether the address already exists.
+</ResponseField>
+
+<ResponseField name="WithPasswordPolicy(p PasswordPolicy)" type="Option" default="WithRules">
+  Replaces the built-in rules everywhere a password is chosen.
+</ResponseField>
+
+<ResponseField name="WithSessionGate(g SessionGate)" type="Option" default="none">
+  Last check before any session is minted, for every door; use for bans,
+  suspensions, tenant checks.
+</ResponseField>
+
+<ResponseField name="WithAuthenticators(as ...Authenticator)" type="Option" default="none">
+  Registers custom sign-in methods used through `Service.Authenticate`.
+</ResponseField>
+
 <ResponseField name="WithAccountDeletionHook(f func(ctx, userID) error)" type="Option" default="none">
   The application's own cleanup, fired by **both**
   [`DeleteAccount` and `AnonymizeAccount`](/authentication/account-deletion)

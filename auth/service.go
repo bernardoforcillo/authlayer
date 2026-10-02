@@ -48,7 +48,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/bernardoforcillo/authlayer/internal/uid"
@@ -315,7 +314,13 @@ type config struct {
 	// passwordOptional lets [Service.SignUp] register an account with no
 	// password — see [WithPasswordRequired].
 	passwordOptional bool
-	rules            password.Rules
+	// Delegation seams — see delegate.go.
+	methods        map[Method]bool
+	signUpPolicy   SignUpPolicy
+	passwordPolicy PasswordPolicy
+	sessionGate    SessionGate
+	authenticators map[Method]Authenticator
+	rules          password.Rules
 	// signer mints and verifies access tokens — see [WithJWT], which builds
 	// an HS256 one, and [WithSigner], which supplies any other. nil means
 	// none was configured, and every path that needs one fails closed with
@@ -1365,10 +1370,19 @@ func New(store Store, opts ...Option) *Service {
 // carries a live PasswordHash even then — see that field's own doc and
 // [UserBase.PasswordHash]'s.
 func (s *Service) SignUp(ctx context.Context, email, plainPassword string) (SignUpResult, error) {
+	if plainPassword != "" && !s.methodEnabled(MethodPassword) {
+		return SignUpResult{}, ErrMethodDisabled
+	}
+	if s.cfg.signUpPolicy != nil {
+		if err := s.cfg.signUpPolicy.AllowSignUp(ctx, NormalizeEmail(email)); err != nil {
+			return SignUpResult{}, err
+		}
+	}
+
 	var hash string
-	if plainPassword != "" || !s.cfg.passwordOptional {
-		if failed := password.Validate(plainPassword, s.cfg.rules); len(failed) > 0 {
-			return SignUpResult{}, fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
+	if plainPassword != "" || !s.passwordOptionalNow() {
+		if err := s.checkPassword(plainPassword); err != nil {
+			return SignUpResult{}, err
 		}
 		var herr error
 		hash, herr = s.cfg.hasher.Hash(plainPassword)
@@ -1603,6 +1617,10 @@ func (s *Service) Login(ctx context.Context, email, plainPassword, ip, userAgent
 func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPassword, ip, userAgent, deviceToken string) (LoginResult, error) {
 	var zero LoginResult
 
+	if err := s.requireMethod(MethodPassword); err != nil {
+		return zero, err
+	}
+
 	if ip == "" {
 		return zero, ErrMissingIP
 	}
@@ -1777,6 +1795,10 @@ func (s *Service) LoginWithTrustedDevice(ctx context.Context, email, plainPasswo
 // consequence [Hook]'s doc asks a hook author to design for.
 func (s *Service) mintSession(ctx context.Context, u UserBase, ip, userAgent string, mfaAt *time.Time, door string) (LoginResult, error) {
 	var zero LoginResult
+
+	if err := s.gateSession(ctx, u, door); err != nil {
+		return zero, err
+	}
 
 	now := s.cfg.clock()
 	sessionID := s.cfg.idGen()
@@ -3537,8 +3559,8 @@ func (s *Service) SetPassword(ctx context.Context, userID, currentSessionID, nex
 // side door — see [Service.ChangePassword], "The sweep matrix". Callers
 // have already authorized the change.
 func (s *Service) applyNewPassword(ctx context.Context, userID, currentSessionID, next string) error {
-	if failed := password.Validate(next, s.cfg.rules); len(failed) > 0 {
-		return fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
+	if err := s.checkPassword(next); err != nil {
+		return err
 	}
 	hash, err := s.cfg.hasher.Hash(next)
 	if err != nil {
@@ -4181,8 +4203,8 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 		return ErrUserNotFound
 	}
 
-	if failed := password.Validate(next, s.cfg.rules); len(failed) > 0 {
-		return fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
+	if err := s.checkPassword(next); err != nil {
+		return err
 	}
 	hash, err := s.cfg.hasher.Hash(next)
 	if err != nil {

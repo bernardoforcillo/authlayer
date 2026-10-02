@@ -461,6 +461,9 @@ func (s *Service) FinishPasskeyRegistration(ctx context.Context, userID, current
 // and is useless without an assertion signed by a private key the caller does
 // not have.
 func (s *Service) BeginPasskeyLogin(ctx context.Context) (string, error) {
+	if err := s.requireMethod(MethodPasskey); err != nil {
+		return "", err
+	}
 	creds, err := s.credentials()
 	if err != nil {
 		return "", err
@@ -604,6 +607,9 @@ func (s *Service) BeginPasskeyLogin(ctx context.Context) (string, error) {
 // succeeded such a failure leaves the challenge burned and no session issued;
 // the application must begin another ceremony.
 func (s *Service) FinishPasskeyLogin(ctx context.Context, a VerifiedAssertion, ip, userAgent string) (LoginResult, error) {
+	if err := s.requireMethod(MethodPasskey); err != nil {
+		return LoginResult{}, err
+	}
 	var zero LoginResult
 
 	creds, err := s.credentials()

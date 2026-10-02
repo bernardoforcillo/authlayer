@@ -10,6 +10,14 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Delegation seams** (`auth/delegate.go`). `WithMethods(...)` chooses which
+  sign-in methods exist (`MethodPassword`, `MethodMagicLink`, `MethodPasskey`,
+  `MethodExternalIdentity`); disabled ones return `ErrMethodDisabled`.
+  Delegates for decisions: `SignUpPolicy`, `PasswordPolicy`, `SessionGate`
+  (consulted before any session, whichever door). `Authenticator` +
+  `Service.Authenticate` plug in a custom method (SAML, SMS OTP…) that gets the
+  same rate limit, deleted-account refusal, MFA challenge, session minting and
+  audit events as built-in ones. All defaults reproduce the previous behaviour.
 - **Optional passwords.** `auth.WithPasswordRequired(false)` lets `SignUp`
   register an account from an email alone (empty password; the signup
   verification is still minted). New `Service.SetPassword` arms a first

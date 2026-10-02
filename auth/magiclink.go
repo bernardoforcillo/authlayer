@@ -140,6 +140,9 @@ import (
 // as-is; see the package's "Fail closed" constraint, and point 3 above for
 // the deliberate, enumerated exceptions.
 func (s *Service) RequestMagicLink(ctx context.Context, email, ip string) (string, bool, error) {
+	if err := s.requireMethod(MethodMagicLink); err != nil {
+		return "", false, err
+	}
 	if ip == "" {
 		return "", false, ErrMissingIP
 	}
@@ -421,6 +424,9 @@ func (s *Service) RequestMagicLink(ctx context.Context, email, ip string) (strin
 // request another link. This is the same accepted, disclosed trade-off
 // [Service.ResetPassword] makes for its own post-claim steps.
 func (s *Service) RedeemMagicLink(ctx context.Context, plainToken, ip, userAgent string) (LoginResult, error) {
+	if err := s.requireMethod(MethodMagicLink); err != nil {
+		return LoginResult{}, err
+	}
 	var zero LoginResult
 
 	v, err := s.store.FindVerificationByHash(ctx, token.HashOpaque(plainToken))
