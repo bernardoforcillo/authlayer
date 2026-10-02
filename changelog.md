@@ -10,6 +10,16 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Containers: a veto and an account-removal path.** `scope.WithDecider`
+  installs a `Decider` consulted after the engine's own checks and before any
+  write for container creation, member add/role-change/remove, ownership
+  transfer and leave; it can only restrict. `Service.RemoveUser(ctx, userID)`
+  removes a user from every container atomically, resolving containers they
+  own through `scope.WithOrphanPolicy` (default: refuse with
+  `ErrOwnsContainer`; `SuccessorFirstMember` hands them to another member;
+  a policy may also abandon). `authlayer.RemoveUserSweeper(org, team, ...)`
+  plugs it into `auth.WithSweeper`, so deleting or anonymizing an account
+  cleans memberships and fails closed when an owned container is unresolved.
 - **`auth/passkey`: the ceremony engine as its own module.** Challenge
   mint/claim (single-use, ceremony- and owner-checked, not burned by a refused
   claim) and the signature-counter clone check moved out of `auth.Service` into

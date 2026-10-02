@@ -16,6 +16,8 @@ type config struct {
 	parent            ParentScope
 	inherit           Inheritance
 	containerResource string
+	decider           Decider
+	orphan            OrphanPolicy
 }
 
 func defaultConfig() config {

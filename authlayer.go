@@ -16,6 +16,8 @@
 package authlayer
 
 import (
+	"context"
+
 	"github.com/bernardoforcillo/authlayer/apikey"
 	"github.com/bernardoforcillo/authlayer/auth"
 	"github.com/bernardoforcillo/authlayer/core"
@@ -41,3 +43,39 @@ func (s Shared) APIKey() apikey.Option { return apikey.WithRuntime(s.Runtime) }
 
 // OAuth returns the shared settings as an [oauth.Option].
 func (s Shared) OAuth() oauth.Option { return oauth.WithRuntime(s.Runtime) }
+
+// UserRemover is what the scope-family services ([scope.Service],
+// org.Service, team.Service — promoted through their embedded
+// scope.Service) offer for account removal.
+type UserRemover interface {
+	RemoveUser(ctx context.Context, userID string) error
+}
+
+// RemoveUserSweeper links account removal to containers: it returns an
+// [auth.Sweeper] that, when an account is deleted or anonymized
+// ([auth.SweepAccountRemoved]), removes the user from every container of each
+// given service, in the order given — list nested services (teams) before the
+// ones that contain them (organizations).
+//
+// Register it with [auth.WithSweeper]. It acts on no other reason, so a
+// password change or logout leaves memberships alone. What happens to a
+// container the user owns is each service's [scope.WithOrphanPolicy]; by
+// default the removal is refused with [scope.ErrOwnsContainer] and the
+// account is NOT deleted, because the sweep fails the operation closed.
+//
+// Each service removes atomically, but the services are separate stores: if a
+// later one fails, earlier ones have already committed. Removal is
+// idempotent, so retrying the account deletion completes it.
+func RemoveUserSweeper(services ...UserRemover) auth.Sweeper {
+	return auth.SweeperFunc(func(ctx context.Context, reason auth.SweepReason, userID string) error {
+		if reason != auth.SweepAccountRemoved {
+			return nil
+		}
+		for _, s := range services {
+			if err := s.RemoveUser(ctx, userID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}

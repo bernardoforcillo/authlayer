@@ -189,6 +189,10 @@ func (s *Service[C, M, PC, PM]) CreateContainer(ctx context.Context, c C) (C, er
 			return zero, err
 		}
 	}
+	if err := s.decide(ctx, Mutation{Kind: ContainerCreated, ActorID: subject, TargetID: subject}); err != nil {
+		var zero C
+		return zero, err
+	}
 	pc := PC(&c)
 	pc.SetID(s.cfg.idgen())
 	pc.SetOwner(subject)
@@ -713,6 +717,9 @@ func (s *Service[C, M, PC, PM]) AddMember(ctx context.Context, userID, roleKey s
 			return zero, err
 		}
 	}
+	if err := s.decide(ctx, Mutation{Kind: MemberAdded, ContainerID: containerID, ActorID: actor, TargetID: userID, RoleKey: roleKey}); err != nil {
+		return zero, err
+	}
 	m, err := s.store.AddMember(ctx, s.newMember(containerID, userID, roleKey))
 	if err != nil {
 		return zero, err
@@ -790,6 +797,9 @@ func (s *Service[C, M, PC, PM]) GrantMembership(
 			return zero, err
 		}
 	}
+	if err := s.decide(ctx, Mutation{Kind: MemberAdded, ContainerID: containerID, ActorID: userID, TargetID: userID, RoleKey: roleKey}); err != nil {
+		return zero, err
+	}
 	m, err := s.store.AddMember(ctx, s.newMember(containerID, userID, roleKey))
 	if err != nil {
 		return zero, err
@@ -826,6 +836,9 @@ func (s *Service[C, M, PC, PM]) ChangeMemberRole(ctx context.Context, targetUser
 		return err
 	}
 	if _, err := s.store.FindMember(ctx, containerID, targetUserID); err != nil {
+		return err
+	}
+	if err := s.decide(ctx, Mutation{Kind: MemberRoleChanged, ContainerID: containerID, ActorID: actor, TargetID: targetUserID, RoleKey: roleKey}); err != nil {
 		return err
 	}
 	if err := s.store.UpdateMemberRole(ctx, containerID, targetUserID, roleKey); err != nil {
@@ -869,6 +882,9 @@ func (s *Service[C, M, PC, PM]) RemoveMember(ctx context.Context, targetUserID s
 			return ErrPrivilegeEscalation
 		}
 	}
+	if err := s.decide(ctx, Mutation{Kind: MemberRemoved, ContainerID: containerID, ActorID: actor, TargetID: targetUserID}); err != nil {
+		return err
+	}
 	if err := s.store.RemoveMember(ctx, containerID, targetUserID); err != nil {
 		return err
 	}
@@ -897,6 +913,9 @@ func (s *Service[C, M, PC, PM]) TransferOwnership(ctx context.Context, newOwnerU
 	if _, err := s.store.FindMember(ctx, containerID, newOwnerUserID); err != nil {
 		return err
 	}
+	if err := s.decide(ctx, Mutation{Kind: OwnershipTransferred, ContainerID: containerID, ActorID: actor, TargetID: newOwnerUserID}); err != nil {
+		return err
+	}
 	if err := s.store.UpdateContainerOwner(ctx, containerID, newOwnerUserID); err != nil {
 		return err
 	}
@@ -919,6 +938,9 @@ func (s *Service[C, M, PC, PM]) LeaveContainer(ctx context.Context) error {
 	}
 	if s.cfg.policy.LastOwnerLocked && c.ContainerOwner() == actor {
 		return ErrLastOwner
+	}
+	if err := s.decide(ctx, Mutation{Kind: MemberRemoved, ContainerID: containerID, ActorID: actor, TargetID: actor}); err != nil {
+		return err
 	}
 	if err := s.store.RemoveMember(ctx, containerID, actor); err != nil {
 		return err
