@@ -10,6 +10,15 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **`auth/passkey`: the ceremony engine as its own module.** Challenge
+  mint/claim (single-use, ceremony- and owner-checked, not burned by a refused
+  claim) and the signature-counter clone check moved out of `auth.Service` into
+  a package with no dependency on `auth`, over a small `Backend`; `auth` adapts
+  its `CredentialStore`. `BeginPasskey*`, `FinishPasskey*` and the errors are
+  unchanged and the existing suite passes untouched.
+- **`auth.WithMagicLink(magiclink.Config)`** configures the link engine in one
+  value; `WithMagicLinkTTL`, `WithMagicLinkProvisioning` and
+  `WithMagicLinkRateLimiter` write into the same value.
 - **Replaceable link engine.** `magiclink.Flow` (`Request`, `Redeem`) and
   `auth.WithMagicLinkEngine(factory)` swap the engine behind
   `RequestMagicLink` / `RedeemMagicLink` — a one-time-code engine, a vendor

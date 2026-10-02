@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/bernardoforcillo/authlayer/token"
+	"github.com/bernardoforcillo/authlayer/auth/passkey"
 )
 
 // credentials resolves the configured [CredentialStore], or reports
@@ -172,29 +172,7 @@ func (s *Service) hasWayInBesides(ctx context.Context, u UserBase, excluding cre
 // disclosed, deliberate direction [Service.RedeemMagicLink] takes —
 // under-granting rather than leaving a claimed one-time value live.
 func (s *Service) claimChallenge(ctx context.Context, creds CredentialStore, plainChallenge, ceremony string, forUser *string, now time.Time) error {
-	c, err := creds.FindChallengeByHash(ctx, token.HashOpaque(plainChallenge))
-	if err != nil {
-		return err
-	}
-	if !now.Before(c.ExpiresAt) {
-		return ErrChallengeExpired
-	}
-	if c.Ceremony != ceremony {
-		// Checked before the claim, and load-bearing rather than
-		// bookkeeping: any authenticated user can obtain a registration
-		// challenge for their own account, freely and repeatedly, so
-		// without this that challenge completes a LOGIN and the only
-		// remaining question is whose credential id the caller names. See
-		// [ErrChallengeCeremony].
-		return ErrChallengeCeremony
-	}
-	if forUser != nil && (c.UserID == nil || *c.UserID != *forUser) {
-		return ErrChallengeUser
-	}
-
-	// The claim: exactly one caller ever sees a nil error for this id, and it
-	// runs before anything is issued — see "Claim before apply" above.
-	return creds.DeleteChallenge(ctx, c.ID)
+	return mapPasskeyErr(s.passkeyEngine(creds).Claim(ctx, plainChallenge, ceremony, forUser, now))
 }
 
 // BeginPasskeyRegistration starts a WebAuthn registration ceremony for
@@ -254,28 +232,12 @@ func (s *Service) BeginPasskeyRegistration(ctx context.Context, userID string) (
 		return "", ErrUserNotFound
 	}
 
-	plainChallenge, hash, err := token.GenerateOpaque()
-	if err != nil {
-		return "", err
-	}
-
-	now := s.cfg.clock()
 	// A registration challenge always names its account — that is what
 	// [Service.FinishPasskeyRegistration]'s ErrChallengeUser check compares
 	// against, and it is taken from the row just read rather than from the
 	// argument, so the id stored is one that exists.
 	owner := u.ID
-	if _, err := creds.CreateChallenge(ctx, Challenge{
-		ID:        s.cfg.idGen(),
-		UserID:    &owner,
-		Ceremony:  CeremonyRegistration,
-		Hash:      hash,
-		ExpiresAt: now.Add(s.cfg.passkeyChallengeTTL),
-		CreatedAt: now,
-	}); err != nil {
-		return "", err
-	}
-	return plainChallenge, nil
+	return s.passkeyEngine(creds).Begin(ctx, CeremonyRegistration, &owner, s.cfg.clock())
 }
 
 // FinishPasskeyRegistration records the credential the application's WebAuthn
@@ -469,24 +431,9 @@ func (s *Service) BeginPasskeyLogin(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	plainChallenge, hash, err := token.GenerateOpaque()
-	if err != nil {
-		return "", err
-	}
-
-	now := s.cfg.clock()
-	if _, err := creds.CreateChallenge(ctx, Challenge{
-		ID: s.cfg.idGen(),
-		// UserID stays nil: this ceremony began before anyone was
-		// identified, and nil is that fact — see [Challenge.UserID].
-		Ceremony:  CeremonyLogin,
-		Hash:      hash,
-		ExpiresAt: now.Add(s.cfg.passkeyChallengeTTL),
-		CreatedAt: now,
-	}); err != nil {
-		return "", err
-	}
-	return plainChallenge, nil
+	// No owner: this ceremony began before anyone was identified, and nil
+	// is that fact — see [Challenge.UserID].
+	return s.passkeyEngine(creds).Begin(ctx, CeremonyLogin, nil, s.cfg.clock())
 }
 
 // FinishPasskeyLogin signs in the account the assertion's credential belongs
@@ -662,23 +609,14 @@ func (s *Service) FinishPasskeyLogin(ctx context.Context, a VerifiedAssertion, i
 
 	// The counter, after the claim and before the session — see "The
 	// signature counter, and the zero counter" above.
-	if a.SignCount == 0 && cred.SignCount == 0 {
-		// A counter-less authenticator. Record the use; there is no
-		// compare-and-set to be had.
-		if err := creds.TouchCredential(ctx, cred.ID, now); err != nil {
-			return zero, err
-		}
-	} else {
-		applied, err := creds.UpdateSignCount(ctx, cred.ID, a.SignCount, now)
-		if err != nil {
-			return zero, err
-		}
-		if !applied {
-			// The store refused a counter that did not increase. Refuse the
-			// LOGIN — this is the only clone detection in the package, and
-			// signing in anyway would discard it.
+	// A refused counter is the only clone detection in the package: refuse
+	// the LOGIN, since signing in anyway would discard it. A counter-less
+	// authenticator (both zero) is only touched — the engine decides.
+	if err := s.passkeyEngine(creds).CheckAssertion(ctx, cred.ID, cred.SignCount, a.SignCount, now); err != nil {
+		if errors.Is(err, passkey.ErrCloned) {
 			return zero, failed(u.ID, DetailClonedAuthenticator, ErrClonedAuthenticator)
 		}
+		return zero, err
 	}
 
 	// One minting path, shared with [Service.Login] — see mintSession. The
