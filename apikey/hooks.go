@@ -1,8 +1,9 @@
 package apikey
 
 import (
-	"context"
 	"time"
+
+	"github.com/bernardoforcillo/authlayer/core"
 )
 
 // EventKind identifies a lifecycle event emitted by the Service. The shape
@@ -114,12 +115,7 @@ type Event struct {
 // Hooks run in the order they were registered with [WithHooks]; the first
 // error stops the chain. They are called on the caller's goroutine and share
 // its context.
-type Hook interface {
-	On(ctx context.Context, e Event) error
-}
+type Hook = core.Hook[Event]
 
 // HookFunc adapts a function to the Hook interface.
-type HookFunc func(ctx context.Context, e Event) error
-
-// On implements Hook.
-func (f HookFunc) On(ctx context.Context, e Event) error { return f(ctx, e) }
+type HookFunc = core.HookFunc[Event]

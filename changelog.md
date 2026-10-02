@@ -10,6 +10,13 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Shared core and composition.** New `core` package: `Runtime` (clock + id
+  generator), generic `Hook[E]` / `HookFunc[E]` / `Hooks[E]`, and `RateLimiter`.
+  `auth`, `apikey`, `oauth` and `scope` alias their `Hook`, `HookFunc` and
+  (auth) `RateLimiter` to it, so existing code compiles unchanged, and each gains
+  `WithRuntime(core.Runtime)`. New root package `authlayer` with
+  `Shared{Runtime}` and `.Auth() / .Scope() / .APIKey() / .OAuth()` hands one
+  setting to every module as its own typed option.
 - **Delegation seams** (`auth/delegate.go`). `WithMethods(...)` chooses which
   sign-in methods exist (`MethodPassword`, `MethodMagicLink`, `MethodPasskey`,
   `MethodExternalIdentity`); disabled ones return `ErrMethodDisabled`.

@@ -50,6 +50,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/bernardoforcillo/authlayer/core"
 	"github.com/bernardoforcillo/authlayer/internal/uid"
 	"github.com/bernardoforcillo/authlayer/password"
 	"github.com/bernardoforcillo/authlayer/token"
@@ -293,18 +294,7 @@ var (
 // email — so a malicious caller cannot lock a victim out of their own
 // account merely by exhausting a bucket keyed on the victim's address; only
 // the attacker's own IP bucket is ever spent. See [WithRateLimiter].
-type RateLimiter interface {
-	// Allow reports whether an attempt keyed by key may proceed right now.
-	//
-	// A false, nil result means Login refuses immediately with
-	// [ErrRateLimited], without calling the Store or the Hasher at all. A
-	// non-nil error means the limiter itself could not answer — Login
-	// treats that as "deny" too (propagating the error, not ErrRateLimited)
-	// rather than guessing "allow": an authentication decision that cannot
-	// be made must deny, the same fail-closed discipline every store error
-	// elsewhere in this package already follows.
-	Allow(ctx context.Context, key string) (bool, error)
-}
+type RateLimiter = core.RateLimiter
 
 // config is the resolved Service configuration, built from the defaults and
 // mutated via Option at construction — immutable once New returns, matching
