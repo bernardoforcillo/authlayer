@@ -10,6 +10,14 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **`auth/magiclink`: the link engine as its own module.** The request and
+  redeem logic (enumeration-safe request, expiry/purpose checks,
+  burn-before-use, address verification) moved out of `auth.Service` into a
+  package with no dependency on `auth`, over a small `Backend` interface;
+  `auth` adapts its `Store` to it. `RequestMagicLink` / `RedeemMagicLink` keep
+  their signatures, docs, errors and store-call order, and the existing suite
+  passes unchanged. The engine is unit-tested against a fake backend and can be
+  replaced or reused with another identity store.
 - **The sweep matrix is data.** `auth.SweepReason` (`SweepPasswordChanged`,
   `SweepPasswordReset`, `SweepMFADisabled`, `SweepLoggedOutAll`,
   `SweepAccountRemoved`) and `Service.sweep` replace the hand-written

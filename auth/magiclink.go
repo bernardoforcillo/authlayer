@@ -2,9 +2,6 @@ package auth
 
 import (
 	"context"
-	"errors"
-
-	"github.com/bernardoforcillo/authlayer/token"
 )
 
 // RequestMagicLink begins a passwordless sign-in for email: for an address
@@ -155,108 +152,10 @@ func (s *Service) RequestMagicLink(ctx context.Context, email, ip string) (strin
 			return "", false, ErrRateLimited
 		}
 	}
-
-	normalized := NormalizeEmail(email)
-
-	addressAllowed := true
-	if s.cfg.magicLinkLimiter != nil {
-		allowed, err := s.cfg.magicLinkLimiter.Allow(ctx, normalized)
-		if err != nil {
-			return "", false, err
-		}
-		addressAllowed = allowed
-	}
-
-	u, err := s.store.FindUserByEmail(ctx, normalized)
-	switch {
-	case errors.Is(err, ErrUserNotFound):
-		// known stays false; fall through to the identical calls below.
-	case err != nil:
-		return "", false, err
-	}
-	known := err == nil
-
-	// Identical on every call, whether or not its result is ever used — see
-	// the method doc's "The enumeration property", point 1.
-	plainToken, tokenHash, gerr := token.GenerateOpaque()
-	if gerr != nil {
-		return "", false, gerr
-	}
-
-	// The address-keyed denial is answered here, BEFORE the provisioning
-	// branch below, so a denied request creates no account — see
-	// [WithMagicLinkRateLimiter] and the method doc's point 2.
-	if !addressAllowed {
-		return "", false, nil
-	}
-
-	now := s.cfg.clock()
-
-	// An ANONYMIZED account is refused here, and refused the way an
-	// UNREGISTERED address is refused: the same ("", false, nil), never a
-	// new error. A distinguishable refusal would be exactly the existence
-	// oracle this method's whole shape exists to close. It also sits ABOVE
-	// the provisioning branch, so a stamped account is never handed a fresh
-	// row either — and below the clock read, so both branches have made the
-	// identical calls by the time either returns. u is the zero [UserBase]
-	// when the lookup missed, so this is only ever consulted on the known
-	// path. See [Service.AnonymizeAccount], "Every entry point that refuses
-	// a stamped account".
-	if known && u.DeletedAt != nil {
-		return "", false, nil
-	}
-
-	if !known {
-		if !s.cfg.magicLinkProvisioning {
-			return "", false, nil
-		}
-		// Provisioning: bring the account into existence, with NO password
-		// credential and an unset EmailVerifiedAt — asking for a link
-		// proves nothing about the address; only redeeming one does (see
-		// [Service.RedeemMagicLink]). See [WithMagicLinkProvisioning] for
-		// what enabling this exposes.
-		created, cerr := s.store.CreateUser(ctx, UserBase{
-			ID:        s.cfg.idGen(),
-			Email:     normalized,
-			CreatedAt: now,
-			UpdatedAt: now,
-		})
-		if cerr != nil {
-			// See the method doc, point 3: a failure reachable ONLY on this
-			// branch must not be surfaced as a distinguishable error.
-			return "", false, nil
-		}
-		u = created
-	}
-
-	// From here on both branches run the identical mint sequence against a
-	// real user row.
-
-	// Invalidate any earlier "magic_link" token for this user before
-	// minting the new one — honouring [Store.DeleteVerificationsByUserAndPurpose]'s
-	// own documented contract, and keeping at most one live link per
-	// account. Purpose-scoped: a pending "signup", "email_change" or
-	// "password_reset" token is none of this method's business.
-	if derr := s.store.DeleteVerificationsByUserAndPurpose(ctx, u.ID, PurposeMagicLink); derr != nil {
-		// See point 3: a failure reachable ONLY on this branch must not be
-		// surfaced as a distinguishable error.
-		return "", false, nil
-	}
-
-	if _, cerr := s.store.CreateVerification(ctx, Verification{
-		ID:        s.cfg.idGen(),
-		UserID:    u.ID,
-		TokenHash: tokenHash,
-		Purpose:   PurposeMagicLink,
-		Email:     u.Email,
-		ExpiresAt: now.Add(s.cfg.magicLinkTTL),
-		CreatedAt: now,
-	}); cerr != nil {
-		// See the method doc, point 3.
-		return "", false, nil
-	}
-
-	return plainToken, true, nil
+	// Everything address-specific, in the order the doc above argues for,
+	// lives in the [magiclink] engine.
+	engine, _ := s.magicEngine()
+	return engine.Request(ctx, NormalizeEmail(email))
 }
 
 // RedeemMagicLink exchanges plainToken — a "magic_link" [Verification]
@@ -429,64 +328,18 @@ func (s *Service) RedeemMagicLink(ctx context.Context, plainToken, ip, userAgent
 	}
 	var zero LoginResult
 
-	v, err := s.store.FindVerificationByHash(ctx, token.HashOpaque(plainToken))
-	if err != nil {
-		return zero, err
+	// Claim, expiry, purpose, burn-before-use, anonymized-account refusal
+	// and the address verification all live in the [magiclink] engine.
+	engine, backend := s.magicEngine()
+	if _, err := engine.Redeem(ctx, plainToken); err != nil {
+		return zero, mapMagicErr(err)
 	}
-
-	now := s.cfg.clock()
-	if !now.Before(v.ExpiresAt) {
-		return zero, ErrVerificationExpired
-	}
-	if v.Purpose != PurposeMagicLink {
-		// Checked before the claim, so a wrongly-presented token is not
-		// burned — and, critically, a lower-privileged purpose never
-		// becomes a session. See the method doc above.
-		return zero, ErrVerificationPurpose
-	}
-
-	// The claim: exactly one caller ever sees a nil error for this id, and
-	// it runs before ANYTHING is issued — see the method doc's "Claim
-	// before apply, and why it is not negotiable".
-	if err := s.store.DeleteVerification(ctx, v.ID); err != nil {
-		return zero, err
-	}
-
-	// The apply: the verification is burned from here on, whatever happens
-	// below.
-	u, err := s.store.FindUserByID(ctx, v.UserID)
-	if err != nil {
-		return zero, err
-	}
-
-	// An ANONYMIZED account may not be signed into. Checked AFTER the claim
-	// deliberately — see the method doc's "A stamped account, and why this
-	// one refuses after the claim": a magic-link token IS a session
-	// credential, so burning one aimed at a closed account is remediation
-	// rather than a cost, and this needs no extra read to do it.
-	// [Service.AnonymizeAccount] deletes every verification before it
-	// stamps, so reaching this is either a token minted before the stamp in
-	// a concurrent call or a row written around this package; it is defence
-	// in depth either way. See that method's "Every entry point that
-	// refuses a stamped account".
-	if u.DeletedAt != nil {
-		return zero, ErrUserNotFound
-	}
-
-	// Redeeming this link proved control of the address it was delivered
-	// to — see the method doc's "Why a redemption verifies the address".
-	// Both fields are normalized by the Store on the way in (see
-	// [Store.CreateUser], [Store.UpdateUserEmail] and
-	// [Store.CreateVerification]), so this compares like with like.
-	if u.EmailVerifiedAt == nil && u.Email == v.Email {
-		if err := s.store.MarkEmailVerified(ctx, v.UserID, v.Email, now); err != nil {
-			return zero, err
-		}
-		// Reflect the write in the record this call hands back, rather
+	u := backend.user
+	if backend.verified != nil {
+		// Reflect the stamp in the record this call hands back, rather
 		// than returning the stale pre-stamp value read a moment ago.
-		stamped := now
-		u.EmailVerifiedAt = &stamped
-		u.UpdatedAt = now
+		u.EmailVerifiedAt = backend.verified
+		u.UpdatedAt = *backend.verified
 	}
 
 	// [MagicLinkRedeemed]: the link is burned and the account has passed
@@ -496,21 +349,17 @@ func (s *Service) RedeemMagicLink(ctx context.Context, plainToken, ip, userAgent
 		return zero, err
 	}
 
-	// The second factor, consulted last and only once the link has been
-	// claimed and the account has passed every check above — this door's
-	// OWN call to mfaAtSignIn, not a guard shared with Login's. A confirmed
-	// factor short-circuits the mint entirely and hands back a challenge
-	// with EMPTY tokens; see the method doc's "A link is a first factor,
-	// never a second".
+	// The second factor, consulted last — this door's OWN call to
+	// mfaAtSignIn. A confirmed factor short-circuits the mint and hands back
+	// a challenge with EMPTY tokens; see the method doc's "A link is a first
+	// factor, never a second".
 	challenge, err := s.mfaAtSignIn(ctx, u)
 	if err != nil {
 		return zero, err
 	}
 	if challenge != nil {
-		// Deliberately NOT mintSession: no session row, no access token,
-		// no refresh token. PasswordHash is scrubbed here because this is
-		// a success path that does not go through mintSession, which is
-		// where every other return value gets scrubbed.
+		// Not mintSession: no session row or tokens. PasswordHash is
+		// scrubbed here because this success path skips the scrub there.
 		u.PasswordHash = ""
 		if err := s.emit(ctx, Event{Kind: MFAChallenged, UserID: u.ID, IP: ip, UserAgent: userAgent}); err != nil {
 			return zero, err
@@ -518,9 +367,7 @@ func (s *Service) RedeemMagicLink(ctx context.Context, plainToken, ip, userAgent
 		return LoginResult{User: u, MFA: challenge}, nil
 	}
 
-	// One minting path, shared with [Service.Login] — see mintSession. The
-	// nil is [Session.MFAAt]: a link is not a second factor, so a session
-	// minted here has proved none. An account that HAS one never reaches
-	// this line — it left with a challenge above.
+	// One minting path, shared with [Service.Login]. The nil is
+	// [Session.MFAAt]: a link is not a second factor.
 	return s.mintSession(ctx, u, ip, userAgent, nil, DetailMagicLink)
 }
