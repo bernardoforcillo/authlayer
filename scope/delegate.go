@@ -110,6 +110,10 @@ func WithOrphanPolicy(p OrphanPolicy) Option {
 // [Decider] is not consulted, because the account is going away whatever a
 // container's rules would say. Its events carry ActorID "" to say so.
 func (s *Service[C, M, PC, PM]) RemoveUser(ctx context.Context, userID string) error {
+	return s.removeUser(ctx, userID, false)
+}
+
+func (s *Service[C, M, PC, PM]) removeUser(ctx context.Context, userID string, anonymize bool) error {
 	containers, err := s.store.ListUserContainers(ctx, userID)
 	if err != nil {
 		return err
@@ -156,6 +160,12 @@ func (s *Service[C, M, PC, PM]) RemoveUser(ctx context.Context, userID string) e
 		steps = append(steps, st)
 	}
 
+	for _, st := range steps {
+		if err := s.depart(ctx, st.containerID, userID, DepartedAccount, anonymize); err != nil {
+			return err
+		}
+	}
+
 	if err := s.store.WithTx(ctx, func(tx Store[C, M]) error {
 		for _, st := range steps {
 			if st.successor != "" {
@@ -178,7 +188,7 @@ func (s *Service[C, M, PC, PM]) RemoveUser(ctx context.Context, userID string) e
 				return err
 			}
 		}
-		if err := s.emit(ctx, Event{Kind: MemberRemoved, ContainerID: st.containerID, TargetID: userID}); err != nil {
+		if err := s.emit(ctx, Event{Kind: MemberRemoved, ContainerID: st.containerID, TargetID: userID, Anonymized: anonymize}); err != nil {
 			return err
 		}
 	}

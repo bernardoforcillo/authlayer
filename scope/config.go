@@ -18,6 +18,8 @@ type config struct {
 	containerResource string
 	decider           Decider
 	orphan            OrphanPolicy
+	anonymizer        Anonymizer
+	pseudonymKey      []byte
 }
 
 func defaultConfig() config {

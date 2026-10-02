@@ -73,3 +73,45 @@ func TestAccountRemovalLeavesContainers(t *testing.T) {
 		t.Fatalf("alice's account was deleted despite the refusal: %v", err)
 	}
 }
+
+func TestAnonymizeVersusDeleteReachesTheAnonymizer(t *testing.T) {
+	ctx := context.Background()
+	var seen []scope.Departure
+	orgs := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member](),
+		scope.WithAnonymizer(scope.AnonymizerFunc(func(_ context.Context, d scope.Departure) error {
+			seen = append(seen, d)
+			return nil
+		})))
+	svc := auth.New(memory.NewAuthStore(),
+		auth.WithHasher(password.Bcrypt(4)),
+		auth.WithSweeper(authlayer.RemoveUserSweeper(orgs)),
+	)
+	const pw = "Correct-Horse-Battery-9"
+	owner, _ := svc.SignUp(ctx, "owner@example.com", pw)
+	octx := org.WithSubject(ctx, owner.User.ID)
+	o, _ := orgs.CreateOrganization(octx, "Acme", "acme")
+	octx = org.WithOrg(octx, o.ID)
+
+	for _, tc := range []struct {
+		email     string
+		anonymize bool
+	}{{"deleted@example.com", false}, {"anonymized@example.com", true}} {
+		u, _ := svc.SignUp(ctx, tc.email, pw)
+		if _, err := orgs.AddMember(octx, u.User.ID, org.RoleMember); err != nil {
+			t.Fatal(err)
+		}
+		seen = nil
+		var err error
+		if tc.anonymize {
+			err = svc.AnonymizeAccount(ctx, u.User.ID, "", pw)
+		} else {
+			err = svc.DeleteAccount(ctx, u.User.ID, "", pw)
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", tc.email, err)
+		}
+		if len(seen) != 1 || seen[0].Anonymize != tc.anonymize || seen[0].Cause != scope.DepartedAccount {
+			t.Fatalf("%s: departures = %+v, want one with Anonymize=%v", tc.email, seen, tc.anonymize)
+		}
+	}
+}

@@ -48,6 +48,9 @@ const (
 type Event struct {
 	// Kind is which mutation occurred.
 	Kind EventKind
+	// Anonymized is set on a [MemberRemoved] event when the membership ended
+	// with the user's identity to be scrubbed — see [Anonymizer].
+	Anonymized bool
 	// ContainerID is the scope the mutation happened in.
 	ContainerID string
 	// ActorID is the user who performed the mutation — the ctx subject, for

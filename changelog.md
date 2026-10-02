@@ -10,6 +10,20 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Anonymizing departures.** `scope.WithAnonymizer` tells the application, for
+  every membership that ends (leave, removal by another member, account
+  removal), who is leaving, why (`DepartedLeft` / `DepartedRemoved` /
+  `DepartedAccount`) and whether to scrub them (`Departure.Anonymize`), before
+  anything is removed; an error aborts the departure. `LeaveContainerAnonymized`
+  and `RemoveUserAnonymized` request scrubbing, and `MemberRemoved` events carry
+  `Anonymized`. `scope.WithPseudonymKey` derives a stable per-container
+  pseudonym (HMAC-SHA256, different in every container, not reversible without
+  the key) in `Departure.Pseudonym` / `Service.Pseudonym`, so a former member's
+  contributions stay attributable without keeping the person. `auth` adds
+  `SweepAccountAnonymized`, used by `AnonymizeAccount`, distinct from
+  `SweepAccountRemoved` (`DeleteAccount`); `authlayer.RemoveUserSweeper` maps
+  them to `RemoveUserAnonymized` / `RemoveUser`. `UserRemover` gained
+  `RemoveUserAnonymized`.
 - **Containers: a veto and an account-removal path.** `scope.WithDecider`
   installs a `Decider` consulted after the engine's own checks and before any
   write for container creation, member add/role-change/remove, ownership

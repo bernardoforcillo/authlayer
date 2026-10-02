@@ -885,6 +885,9 @@ func (s *Service[C, M, PC, PM]) RemoveMember(ctx context.Context, targetUserID s
 	if err := s.decide(ctx, Mutation{Kind: MemberRemoved, ContainerID: containerID, ActorID: actor, TargetID: targetUserID}); err != nil {
 		return err
 	}
+	if err := s.depart(ctx, containerID, targetUserID, DepartedRemoved, false); err != nil {
+		return err
+	}
 	if err := s.store.RemoveMember(ctx, containerID, targetUserID); err != nil {
 		return err
 	}
@@ -928,6 +931,10 @@ func (s *Service[C, M, PC, PM]) TransferOwnership(ctx context.Context, newOwnerU
 // under LastOwnerLocked the owner cannot leave (ErrLastOwner) and must transfer
 // ownership first. Leaving emits MemberRemoved with TargetID equal to ActorID.
 func (s *Service[C, M, PC, PM]) LeaveContainer(ctx context.Context) error {
+	return s.leave(ctx, false)
+}
+
+func (s *Service[C, M, PC, PM]) leave(ctx context.Context, anonymize bool) error {
 	actor, containerID, err := ctxActor(ctx)
 	if err != nil {
 		return err
@@ -942,10 +949,13 @@ func (s *Service[C, M, PC, PM]) LeaveContainer(ctx context.Context) error {
 	if err := s.decide(ctx, Mutation{Kind: MemberRemoved, ContainerID: containerID, ActorID: actor, TargetID: actor}); err != nil {
 		return err
 	}
+	if err := s.depart(ctx, containerID, actor, DepartedLeft, anonymize); err != nil {
+		return err
+	}
 	if err := s.store.RemoveMember(ctx, containerID, actor); err != nil {
 		return err
 	}
-	return s.emit(ctx, Event{Kind: MemberRemoved, ContainerID: containerID, ActorID: actor, TargetID: actor})
+	return s.emit(ctx, Event{Kind: MemberRemoved, ContainerID: containerID, ActorID: actor, TargetID: actor, Anonymized: anonymize})
 }
 
 // ListMembers returns the members of the ctx container.

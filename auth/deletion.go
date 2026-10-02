@@ -858,7 +858,7 @@ func (s *Service) AnonymizeAccount(ctx context.Context, userID, currentSessionID
 	// step 7 is about to remove the password. A Service with no
 	// [WithIdentityStore] sweeps nothing here and reports no error; see
 	// [Service.sweepIdentities].
-	if err := s.sweep(ctx, SweepAccountRemoved, userID); err != nil {
+	if err := s.sweep(ctx, SweepAccountAnonymized, userID); err != nil {
 		return err
 	}
 

@@ -49,6 +49,7 @@ func (s Shared) OAuth() oauth.Option { return oauth.WithRuntime(s.Runtime) }
 // scope.Service) offer for account removal.
 type UserRemover interface {
 	RemoveUser(ctx context.Context, userID string) error
+	RemoveUserAnonymized(ctx context.Context, userID string) error
 }
 
 // RemoveUserSweeper links account removal to containers: it returns an
@@ -57,7 +58,10 @@ type UserRemover interface {
 // given service, in the order given — list nested services (teams) before the
 // ones that contain them (organizations).
 //
-// Register it with [auth.WithSweeper]. It acts on no other reason, so a
+// Register it with [auth.WithSweeper]. A deleted account
+// ([auth.SweepAccountRemoved]) leaves through RemoveUser; an anonymized one
+// ([auth.SweepAccountAnonymized]) through RemoveUserAnonymized, so each
+// service's [scope.Anonymizer] is told to scrub. It acts on no other reason, so a
 // password change or logout leaves memberships alone. What happens to a
 // container the user owns is each service's [scope.WithOrphanPolicy]; by
 // default the removal is refused with [scope.ErrOwnsContainer] and the
@@ -68,11 +72,17 @@ type UserRemover interface {
 // idempotent, so retrying the account deletion completes it.
 func RemoveUserSweeper(services ...UserRemover) auth.Sweeper {
 	return auth.SweeperFunc(func(ctx context.Context, reason auth.SweepReason, userID string) error {
-		if reason != auth.SweepAccountRemoved {
+		if reason != auth.SweepAccountRemoved && reason != auth.SweepAccountAnonymized {
 			return nil
 		}
 		for _, s := range services {
-			if err := s.RemoveUser(ctx, userID); err != nil {
+			var err error
+			if reason == auth.SweepAccountAnonymized {
+				err = s.RemoveUserAnonymized(ctx, userID)
+			} else {
+				err = s.RemoveUser(ctx, userID)
+			}
+			if err != nil {
 				return err
 			}
 		}

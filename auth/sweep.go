@@ -20,9 +20,14 @@ const (
 	SweepMFADisabled SweepReason = "mfa_disabled"
 	// SweepLoggedOutAll: [Service.LogoutAll].
 	SweepLoggedOutAll SweepReason = "logged_out_all"
-	// SweepAccountRemoved: [Service.DeleteAccount] and
-	// [Service.AnonymizeAccount]. Everything goes.
+	// SweepAccountRemoved: [Service.DeleteAccount]. Everything goes, and the
+	// user row is about to be deleted.
 	SweepAccountRemoved SweepReason = "account_removed"
+	// SweepAccountAnonymized: [Service.AnonymizeAccount]. The same built-in
+	// sweeps as removal, but the user row survives, scrubbed — so a module may
+	// keep records that reference the id (an audit trail, a former member's
+	// contributions) and strip only what identifies the person.
+	SweepAccountAnonymized SweepReason = "account_anonymized"
 )
 
 // Sweeper is a module's hook into the sweep matrix. Sweep must remove or
@@ -60,7 +65,7 @@ func WithSweeper(sw Sweeper) Option {
 func (s *Service) sweep(ctx context.Context, reason SweepReason, userID string) error {
 	var plan []func(context.Context, string) error
 	switch reason {
-	case SweepAccountRemoved:
+	case SweepAccountRemoved, SweepAccountAnonymized:
 		plan = []func(context.Context, string) error{s.sweepIdentities, s.sweepCredentials, s.sweepTrustedDevices, s.sweepMFAState}
 	case SweepPasswordReset:
 		plan = []func(context.Context, string) error{s.sweepTrustedDevices, s.sweepIdentities}
