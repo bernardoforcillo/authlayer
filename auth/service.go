@@ -310,6 +310,7 @@ type config struct {
 	passwordPolicy PasswordPolicy
 	sessionGate    SessionGate
 	authenticators map[Method]Authenticator
+	sweepers       []Sweeper
 	rules          password.Rules
 	// signer mints and verifies access tokens — see [WithJWT], which builds
 	// an HS256 one, and [WithSigner], which supplies any other. nil means
@@ -2922,7 +2923,7 @@ func (s *Service) LogoutAll(ctx context.Context, userID string) error {
 	// the control a user reaches for when they believe a machine is in the
 	// wrong hands, and a device left trusted means that machine still skips
 	// the second factor on its way back in.
-	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
+	if err := s.sweep(ctx, SweepLoggedOutAll, userID); err != nil {
 		return err
 	}
 	return s.emit(ctx, Event{Kind: LoggedOutAll, UserID: userID})
@@ -3584,7 +3585,7 @@ func (s *Service) applyNewPassword(ctx context.Context, userID, currentSessionID
 	// family is the thing this caller is demonstrably holding, while a
 	// trusted device is a cookie that may have been copied off the machine
 	// whose compromise prompted this call.
-	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
+	if err := s.sweep(ctx, SweepPasswordChanged, userID); err != nil {
 		return err
 	}
 
@@ -4232,18 +4233,7 @@ func (s *Service) ResetPassword(ctx context.Context, plainToken, next string) er
 	// UNAUTHENTICATED recovery, where every other credential has to be
 	// assumed hostile, and a trusted device is precisely a credential the
 	// person resetting cannot see and cannot have consented to.
-	if err := s.sweepTrustedDevices(ctx, v.UserID); err != nil {
-		return err
-	}
-
-	// Remove every external identity BEFORE the sessions — see the method
-	// doc's "Why an unauthenticated recovery sweeps identities". An identity
-	// left standing is a live credential this rotation did not touch, and one
-	// that can mint a fresh session; taking it away first means the session
-	// revocation below also catches anything minted through it in the
-	// meantime. A Service with no [WithIdentityStore] sweeps nothing and
-	// reports no error.
-	if err := s.sweepIdentities(ctx, v.UserID); err != nil {
+	if err := s.sweep(ctx, SweepPasswordReset, v.UserID); err != nil {
 		return err
 	}
 

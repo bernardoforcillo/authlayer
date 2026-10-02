@@ -10,6 +10,13 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **The sweep matrix is data.** `auth.SweepReason` (`SweepPasswordChanged`,
+  `SweepPasswordReset`, `SweepMFADisabled`, `SweepLoggedOutAll`,
+  `SweepAccountRemoved`) and `Service.sweep` replace the hand-written
+  `sweepX` calls at each call site; each reason keeps exactly the built-in
+  sweeps it ran before. `WithSweeper(Sweeper)` lets a custom module (an SMS
+  enrolment, a device registry…) clear its own per-user state for every
+  reason, failing the operation closed on error.
 - **Shared core and composition.** New `core` package: `Runtime` (clock + id
   generator), generic `Hook[E]` / `HookFunc[E]` / `Hooks[E]`, and `RateLimiter`.
   `auth`, `apikey`, `oauth` and `scope` alias their `Hook`, `HookFunc` and

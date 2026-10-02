@@ -455,37 +455,7 @@ func (s *Service) DeleteAccount(ctx context.Context, userID, currentSessionID, c
 	// outlives everything that points at it. A Service with no
 	// [WithIdentityStore] sweeps nothing here and reports no error; see
 	// [Service.sweepIdentities].
-	if err := s.sweepIdentities(ctx, userID); err != nil {
-		return err
-	}
-
-	// Step 6b. Every passkey, on this method's own line — the matrix's
-	// eighth column. It sits BESIDE the identity sweep rather than with 6c
-	// because it is the same kind of thing: a way IN that needs no password,
-	// and the most direct one this package has. A failure at 6c with the
-	// credentials still standing would leave a live, password-less door into
-	// an account whose sessions are already gone; the reverse cannot happen.
-	// A Service with no [WithCredentialStore] sweeps nothing here and reports
-	// no error — see [Service.sweepCredentials].
-	if err := s.sweepCredentials(ctx, userID); err != nil {
-		return err
-	}
-
-	// Step 6c. The second-factor state: every [TrustedDevice], then the
-	// recovery codes and the [MFAFactor]. Two calls on two lines, because
-	// they are two columns of the matrix and removing one must fail only its
-	// own cell. See "The second-factor state goes too" in the method doc for
-	// why a termination path sweeps what no remediation path does.
-	//
-	// After steps 6 and 6b rather than before them because neither is a way
-	// IN — both require a first factor this call is about to remove — and
-	// before step 7 so the row still outlives everything keyed on it. A
-	// Service with no [WithMFAStore] sweeps nothing here and reports no
-	// error, the same limit [Service.sweepIdentities] carries.
-	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
-		return err
-	}
-	if err := s.sweepMFAState(ctx, userID); err != nil {
+	if err := s.sweep(ctx, SweepAccountRemoved, userID); err != nil {
 		return err
 	}
 
@@ -888,29 +858,7 @@ func (s *Service) AnonymizeAccount(ctx context.Context, userID, currentSessionID
 	// step 7 is about to remove the password. A Service with no
 	// [WithIdentityStore] sweeps nothing here and reports no error; see
 	// [Service.sweepIdentities].
-	if err := s.sweepIdentities(ctx, userID); err != nil {
-		return err
-	}
-
-	// Step 6b. Every passkey — [Service.DeleteAccount]'s step 6b verbatim,
-	// and the step this posture needs most: step 7 clears the password hash,
-	// so a surviving credential would be the only thing left that could
-	// authenticate a row the deployment has told its owner is closed.
-	if err := s.sweepCredentials(ctx, userID); err != nil {
-		return err
-	}
-
-	// Step 6c. The second-factor state — [Service.DeleteAccount]'s step 6c
-	// verbatim, two calls on two lines so each column of the matrix fails
-	// alone. It matters MORE on this posture than on the hard one: the row
-	// survives here, so a factor left behind is an encrypted TOTP secret and
-	// a set of recovery-code hashes filed under a live user id that the
-	// account's owner has asked to be scrubbed. See "The second-factor state
-	// goes too" in [Service.DeleteAccount]'s doc.
-	if err := s.sweepTrustedDevices(ctx, userID); err != nil {
-		return err
-	}
-	if err := s.sweepMFAState(ctx, userID); err != nil {
+	if err := s.sweep(ctx, SweepAccountRemoved, userID); err != nil {
 		return err
 	}
 
