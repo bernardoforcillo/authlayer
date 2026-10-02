@@ -327,10 +327,12 @@ type config struct {
 	// [WithPasswordResetTTL] and [WithMagicLinkTTL].
 	verificationTTL  time.Duration
 	passwordResetTTL time.Duration
-	magicLinkTTL     time.Duration
-	clock            func() time.Time
-	idGen            func() string
-	limiter          RateLimiter
+	// magicLink is the link engine's whole configuration — see
+	// [WithMagicLink]; the three WithMagicLink* options below write into it.
+	magicLink magiclink.Config
+	clock     func() time.Time
+	idGen     func() string
+	limiter   RateLimiter
 	// resetLimiter is the address-keyed [RateLimiter] [Service.RequestPasswordReset]
 	// additionally consults — see [WithPasswordResetRateLimiter]'s doc for
 	// why it is a second, independent config slot rather than reusing
@@ -343,13 +345,11 @@ type config struct {
 	// want a tighter bucket on magic links than on password resets (a
 	// magic link is a login, not a credential-set form). See
 	// [WithMagicLinkRateLimiter].
-	magicLinkLimiter RateLimiter
 	// magicLinkProvisioning is [WithMagicLinkProvisioning]: whether
 	// [Service.RequestMagicLink] creates an account for an address it does
 	// not recognise. Defaults to false.
-	magicLinkProvisioning bool
-	claimsExtender        func(UserBase) map[string]any
-	requireVerifiedEmail  bool
+	claimsExtender       func(UserBase) map[string]any
+	requireVerifiedEmail bool
 	// identityStore is the OPTIONAL external-identity port — see
 	// [WithIdentityStore]. nil means no external sign-in is configured, and
 	// every entry point needing it fails with [ErrOAuthNotConfigured]
@@ -424,7 +424,7 @@ func defaultConfig() config {
 		refreshTTL:          30 * 24 * time.Hour,
 		verificationTTL:     defaultVerificationTTL,
 		passwordResetTTL:    defaultPasswordResetTTL,
-		magicLinkTTL:        defaultMagicLinkTTL,
+		magicLink:           magiclink.Config{TTL: defaultMagicLinkTTL},
 		mfaChallengeTTL:     defaultMFAChallengeTTL,
 		passkeyChallengeTTL: defaultPasskeyChallengeTTL,
 		stepUpWindow:        defaultStepUpWindow,
@@ -635,7 +635,7 @@ func WithPasswordResetTTL(d time.Duration) Option {
 func WithMagicLinkTTL(d time.Duration) Option {
 	return func(c *config) {
 		if d > 0 {
-			c.magicLinkTTL = d
+			c.magicLink.TTL = d
 		}
 	}
 }
@@ -670,7 +670,7 @@ func WithMagicLinkTTL(d time.Duration) Option {
 // not remove it, so a deployment enabling this should expect its users
 // table to accumulate addresses nobody ever signed in with.
 func WithMagicLinkProvisioning(enabled bool) Option {
-	return func(c *config) { c.magicLinkProvisioning = enabled }
+	return func(c *config) { c.magicLink.Provisioning = enabled }
 }
 
 // WithPasswordRequired controls whether [Service.SignUp] insists on a
@@ -841,7 +841,7 @@ func WithPasswordResetRateLimiter(l RateLimiter) Option {
 // This package configures no default here, for the reason [WithRateLimiter]'s
 // own default is nil: the right bucket size is an operator decision.
 func WithMagicLinkRateLimiter(l RateLimiter) Option {
-	return func(c *config) { c.magicLinkLimiter = l }
+	return func(c *config) { c.magicLink.AddressLimiter = l }
 }
 
 // WithRequireVerifiedEmail controls whether [Service.Login] refuses an

@@ -186,3 +186,12 @@ func TestMagicLinkEngineIsReplaceable(t *testing.T) {
 		t.Fatal("a code redeemed twice")
 	}
 }
+
+func TestWithMagicLinkConfig(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := newTestService(t, auth.WithMagicLink(magiclink.Config{Provisioning: true}))
+	tok, ok, err := svc.RequestMagicLink(ctx, "fresh@example.com", "1.2.3.4")
+	if err != nil || !ok || tok == "" {
+		t.Fatalf("provisioning via WithMagicLink: %q %v %v", tok, ok, err)
+	}
+}

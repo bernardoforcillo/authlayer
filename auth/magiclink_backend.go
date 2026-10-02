@@ -102,12 +102,9 @@ func (s *Service) magicEngine() (magiclink.Flow, *magicBackend) {
 	if factory == nil {
 		factory = magiclink.NewFlow
 	}
-	return factory(b, magiclink.Config{
-		TTL:            s.cfg.magicLinkTTL,
-		Provisioning:   s.cfg.magicLinkProvisioning,
-		AddressLimiter: s.cfg.magicLinkLimiter,
-		Runtime:        core.Runtime{Clock: s.cfg.clock, IDs: s.cfg.idGen},
-	}), b
+	cfg := s.cfg.magicLink
+	cfg.Runtime = core.Runtime{Clock: s.cfg.clock, IDs: s.cfg.idGen}
+	return factory(b, cfg), b
 }
 
 // mapMagicErr translates the engine's sentinels into the auth package's
@@ -129,4 +126,19 @@ func mapMagicErr(err error) error {
 // replacement must keep. nil restores the default [magiclink.Engine].
 func WithMagicLinkEngine(f magiclink.Factory) Option {
 	return func(c *config) { c.magicFlow = f }
+}
+
+// WithMagicLink sets the link engine's whole configuration at once — TTL,
+// provisioning and the address limiter — as one [magiclink.Config], the
+// module's own type. The three WithMagicLinkTTL, WithMagicLinkProvisioning
+// and WithMagicLinkRateLimiter options write into the same value, so they
+// compose with this one in call order. Config.Runtime is ignored: the
+// Service always supplies its own clock and id generator.
+func WithMagicLink(cfg magiclink.Config) Option {
+	return func(c *config) {
+		if cfg.TTL <= 0 {
+			cfg.TTL = defaultMagicLinkTTL
+		}
+		c.magicLink = cfg
+	}
 }
