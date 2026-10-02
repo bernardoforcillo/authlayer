@@ -124,7 +124,9 @@ func TestRemoveUserSoleOwnerAndBadSuccessor(t *testing.T) {
 		return Resolution{Successor: "mallory"}, nil
 	}))
 	octx, _ := ownerCtx(t, bad, "alice")
-	bad.AddMember(octx, "bob", RoleMember)
+	if _, err := bad.AddMember(octx, "bob", RoleMember); err != nil {
+		t.Fatal(err)
+	}
 	if err := bad.RemoveUser(ctx, "alice"); !errors.Is(err, ErrBadSuccessor) {
 		t.Fatalf("outsider successor err = %v, want ErrBadSuccessor", err)
 	}
@@ -147,8 +149,12 @@ func TestLeaveAnonymizedTellsTheAnonymizer(t *testing.T) {
 		WithHooks(HookFunc(func(_ context.Context, e Event) error { events = append(events, e); return nil })),
 	)
 	octx, c := ownerCtx(t, svc, "alice")
-	svc.AddMember(octx, "bob", RoleMember)
-	svc.AddMember(octx, "carol", RoleMember)
+	if _, err := svc.AddMember(octx, "bob", RoleMember); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.AddMember(octx, "carol", RoleMember); err != nil {
+		t.Fatal(err)
+	}
 
 	bctx := WithSubject(octx, "bob")
 	if err := svc.LeaveContainerAnonymized(bctx); err != nil {
@@ -192,7 +198,9 @@ func TestAnonymizerErrorAbortsTheDeparture(t *testing.T) {
 	boom := errors.New("scrub failed")
 	svc := newTestService(WithAnonymizer(AnonymizerFunc(func(context.Context, Departure) error { return boom })))
 	octx, c := ownerCtx(t, svc, "alice")
-	svc.AddMember(octx, "bob", RoleMember)
+	if _, err := svc.AddMember(octx, "bob", RoleMember); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := svc.LeaveContainerAnonymized(WithSubject(octx, "bob")); !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want boom", err)
@@ -213,7 +221,9 @@ func TestRemoveUserAnonymizedFlagsEveryDeparture(t *testing.T) {
 	var got []Departure
 	svc := newTestService(WithAnonymizer(AnonymizerFunc(func(_ context.Context, d Departure) error { got = append(got, d); return nil })))
 	cctx, _ := ownerCtx(t, svc, "carol")
-	svc.AddMember(cctx, "alice", RoleMember)
+	if _, err := svc.AddMember(cctx, "alice", RoleMember); err != nil {
+		t.Fatal(err)
+	}
 	if err := svc.RemoveUserAnonymized(context.Background(), "alice"); err != nil {
 		t.Fatal(err)
 	}
