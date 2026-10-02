@@ -8,6 +8,8 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-02
+
 ### Added
 
 - **Anonymizing departures.** `scope.WithAnonymizer` tells the application, for
@@ -1976,6 +1978,7 @@ OAuth) is not part of this release.
 - `github.com/jackc/pgx/v5` v5.10.0 (PostgreSQL store only)
 - Go 1.26+
 
-[Unreleased]: https://github.com/bernardoforcillo/authlayer/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/bernardoforcillo/authlayer/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/bernardoforcillo/authlayer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bernardoforcillo/authlayer/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/bernardoforcillo/authlayer/releases/tag/v0.0.1
