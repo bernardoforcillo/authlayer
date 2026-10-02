@@ -95,6 +95,28 @@ type Config struct {
 // DefaultTTL is the default link lifetime.
 const DefaultTTL = 15 * time.Minute
 
+// Flow is what the Service needs from a link engine: request a link for a
+// normalized address, redeem a presented token. [*Engine] is the default;
+// supply another (a one-time-code engine, a vendor service) through
+// auth.WithMagicLinkEngine and the Service signs in through it unchanged —
+// MFA, events, the session gate and the sweeps all still apply, because
+// those live in the Service, not here.
+//
+// A replacement inherits the contract the Service relies on: Request must
+// be enumeration-safe exactly as [Engine.Request] documents, and Redeem
+// must burn the credential before it returns the account.
+type Flow interface {
+	Request(ctx context.Context, email string) (token string, ok bool, err error)
+	Redeem(ctx context.Context, plainToken string) (Account, error)
+}
+
+// Factory builds a [Flow] over a Backend and Config. auth.Service calls it
+// per operation with its own store adapter and settings.
+type Factory func(b Backend, cfg Config) Flow
+
+// NewFlow is the default [Factory]: the link [Engine].
+func NewFlow(b Backend, cfg Config) Flow { return New(b, cfg) }
+
 // Engine requests and redeems magic links over a [Backend].
 type Engine struct {
 	b   Backend

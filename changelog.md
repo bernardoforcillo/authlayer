@@ -10,6 +10,10 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Replaceable link engine.** `magiclink.Flow` (`Request`, `Redeem`) and
+  `auth.WithMagicLinkEngine(factory)` swap the engine behind
+  `RequestMagicLink` / `RedeemMagicLink` — a one-time-code engine, a vendor
+  service — while MFA, events, `SessionGate` and the sweeps still apply.
 - **`auth/magiclink`: the link engine as its own module.** The request and
   redeem logic (enumeration-safe request, expiry/purpose checks,
   burn-before-use, address verification) moved out of `auth.Service` into a

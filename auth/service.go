@@ -50,6 +50,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/bernardoforcillo/authlayer/auth/magiclink"
 	"github.com/bernardoforcillo/authlayer/core"
 	"github.com/bernardoforcillo/authlayer/internal/uid"
 	"github.com/bernardoforcillo/authlayer/password"
@@ -311,6 +312,7 @@ type config struct {
 	sessionGate    SessionGate
 	authenticators map[Method]Authenticator
 	sweepers       []Sweeper
+	magicFlow      magiclink.Factory
 	rules          password.Rules
 	// signer mints and verifies access tokens — see [WithJWT], which builds
 	// an HS256 one, and [WithSigner], which supplies any other. nil means

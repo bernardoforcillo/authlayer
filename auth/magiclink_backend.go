@@ -96,9 +96,13 @@ func (m *magicBackend) MarkVerified(ctx context.Context, accountID, email string
 
 // magicEngine builds the link engine over the Service's own store and
 // configuration, with the backend that records what a redemption loaded.
-func (s *Service) magicEngine() (*magiclink.Engine, *magicBackend) {
+func (s *Service) magicEngine() (magiclink.Flow, *magicBackend) {
 	b := &magicBackend{store: s.store}
-	return magiclink.New(b, magiclink.Config{
+	factory := s.cfg.magicFlow
+	if factory == nil {
+		factory = magiclink.NewFlow
+	}
+	return factory(b, magiclink.Config{
 		TTL:            s.cfg.magicLinkTTL,
 		Provisioning:   s.cfg.magicLinkProvisioning,
 		AddressLimiter: s.cfg.magicLinkLimiter,
@@ -118,4 +122,11 @@ func mapMagicErr(err error) error {
 		return ErrUserNotFound
 	}
 	return err
+}
+
+// WithMagicLinkEngine replaces the link engine behind [Service.RequestMagicLink]
+// and [Service.RedeemMagicLink] — see [magiclink.Flow] for the contract a
+// replacement must keep. nil restores the default [magiclink.Engine].
+func WithMagicLinkEngine(f magiclink.Factory) Option {
+	return func(c *config) { c.magicFlow = f }
 }

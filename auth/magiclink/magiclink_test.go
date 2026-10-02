@@ -199,3 +199,8 @@ func TestRedeemRefusals(t *testing.T) {
 		t.Fatalf("gone err = %v", err)
 	}
 }
+
+func TestEngineSatisfiesFlow(t *testing.T) {
+	var _ magiclink.Flow = (*magiclink.Engine)(nil)
+	var _ magiclink.Factory = magiclink.NewFlow
+}

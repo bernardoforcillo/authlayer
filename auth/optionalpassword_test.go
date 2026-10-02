@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/auth/magiclink"
 )
 
 func TestSignUpEmptyPasswordRefusedByDefault(t *testing.T) {
@@ -137,5 +138,51 @@ func TestDelegates(t *testing.T) {
 	}
 	if _, err := svc.Login(ctx, "ok@corp.example", "abc", "1.2.3.4", "ua"); err != nil {
 		t.Fatalf("Login through an open gate: %v", err)
+	}
+}
+
+// otpFlow is a replacement link engine: a fixed code per address, redeemed
+// once. It stands in for any alternative passwordless engine.
+type otpFlow struct {
+	b     magiclink.Backend
+	codes map[string]string
+}
+
+func (o *otpFlow) Request(ctx context.Context, email string) (string, bool, error) {
+	acc, found, err := o.b.FindByEmail(ctx, email)
+	if err != nil || !found || acc.Deleted {
+		return "", false, err
+	}
+	o.codes["123456"] = acc.ID
+	return "123456", true, nil
+}
+
+func (o *otpFlow) Redeem(ctx context.Context, code string) (magiclink.Account, error) {
+	id, ok := o.codes[code]
+	if !ok {
+		return magiclink.Account{}, auth.ErrVerificationNotFound
+	}
+	delete(o.codes, code)
+	return o.b.FindByID(ctx, id)
+}
+
+func TestMagicLinkEngineIsReplaceable(t *testing.T) {
+	ctx := context.Background()
+	codes := map[string]string{}
+	svc, _ := newTestService(t, auth.WithMagicLinkEngine(func(b magiclink.Backend, _ magiclink.Config) magiclink.Flow {
+		return &otpFlow{b: b, codes: codes}
+	}))
+	mustSignUp(t, svc, "otp@example.com", validPassword)
+
+	code, ok, err := svc.RequestMagicLink(ctx, "otp@example.com", "1.2.3.4")
+	if err != nil || !ok || code != "123456" {
+		t.Fatalf("Request = %q %v %v", code, ok, err)
+	}
+	res, err := svc.RedeemMagicLink(ctx, code, "1.2.3.4", "ua")
+	if err != nil || res.AccessToken == "" {
+		t.Fatalf("Redeem = %+v, %v", res, err)
+	}
+	if _, err := svc.RedeemMagicLink(ctx, code, "1.2.3.4", "ua"); err == nil {
+		t.Fatal("a code redeemed twice")
 	}
 }
