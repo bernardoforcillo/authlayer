@@ -10,6 +10,11 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Optional passwords.** `auth.WithPasswordRequired(false)` lets `SignUp`
+  register an account from an email alone (empty password; the signup
+  verification is still minted). New `Service.SetPassword` arms a first
+  password on a passwordless account, gated by `RequireFreshMFA`;
+  `ChangePassword` and `SetPassword` now share one sweep.
 - **Agents & machine clients — an OAuth 2.1 authorization server as a
   library** (`authlayer/oauth`). No HTTP, no handlers: `oauth.New(store,
   authority, signer, opts...)` over a narrow `Authority` interface

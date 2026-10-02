@@ -312,7 +312,10 @@ type RateLimiter interface {
 // [github.com/bernardoforcillo/authlayer/scope.Option]'s own stance.
 type config struct {
 	hasher password.Hasher
-	rules  password.Rules
+	// passwordOptional lets [Service.SignUp] register an account with no
+	// password — see [WithPasswordRequired].
+	passwordOptional bool
+	rules            password.Rules
 	// signer mints and verifies access tokens — see [WithJWT], which builds
 	// an HS256 one, and [WithSigner], which supplies any other. nil means
 	// none was configured, and every path that needs one fails closed with
@@ -670,6 +673,20 @@ func WithMagicLinkTTL(d time.Duration) Option {
 // table to accumulate addresses nobody ever signed in with.
 func WithMagicLinkProvisioning(enabled bool) Option {
 	return func(c *config) { c.magicLinkProvisioning = enabled }
+}
+
+// WithPasswordRequired controls whether [Service.SignUp] insists on a
+// password. The default is true. With false, SignUp accepts an empty
+// plainPassword and registers an account with no password credential
+// (PasswordHash "", so [Service.Login] can never authenticate it); the
+// account signs in by magic link, and may arm a password later with
+// [Service.SetPassword] or [Service.ResetPassword]. A NON-empty password is
+// still checked against [WithRules] and hashed as usual.
+//
+// The signup verification is minted either way, so the address is still
+// proven by receiving mail.
+func WithPasswordRequired(required bool) Option {
+	return func(c *config) { c.passwordOptional = !required }
 }
 
 // WithClock sets the clock Service stamps CreatedAt/UpdatedAt/ExpiresAt
@@ -1348,17 +1365,21 @@ func New(store Store, opts ...Option) *Service {
 // carries a live PasswordHash even then — see that field's own doc and
 // [UserBase.PasswordHash]'s.
 func (s *Service) SignUp(ctx context.Context, email, plainPassword string) (SignUpResult, error) {
-	if failed := password.Validate(plainPassword, s.cfg.rules); len(failed) > 0 {
-		return SignUpResult{}, fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
+	var hash string
+	if plainPassword != "" || !s.cfg.passwordOptional {
+		if failed := password.Validate(plainPassword, s.cfg.rules); len(failed) > 0 {
+			return SignUpResult{}, fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
+		}
+		var herr error
+		hash, herr = s.cfg.hasher.Hash(plainPassword)
+		if herr != nil {
+			return SignUpResult{}, herr
+		}
 	}
 
 	normalized := NormalizeEmail(email)
 	now := s.cfg.clock()
-
-	hash, err := s.cfg.hasher.Hash(plainPassword)
-	if err != nil {
-		return SignUpResult{}, err
-	}
+	var err error
 
 	_, err = s.store.CreateUser(ctx, UserBase{
 		ID:           s.cfg.idGen(),
@@ -3477,6 +3498,45 @@ func (s *Service) ChangePassword(ctx context.Context, userID, currentSessionID, 
 		return err
 	}
 
+	return s.applyNewPassword(ctx, userID, currentSessionID, next)
+}
+
+// SetPassword arms a first password on an account that has none — one
+// registered by magic link or by [Service.SignUp] under
+// [WithPasswordRequired](false). It is the passwordless counterpart of
+// [Service.ChangePassword], which needs a current password to check.
+//
+// An account that already has a password gets [ErrInvalidCredentials]; use
+// ChangePassword. An anonymized account gets [ErrUserNotFound]. Because
+// the caller proves nothing but holding a session, [Service.RequireFreshMFA]
+// gates it: an account with a confirmed factor must have stepped up
+// recently. An account without one is protected only by the session
+// itself, so a deployment that cares should have the user confirm by email
+// ([Service.RequestPasswordReset]) instead.
+//
+// Every other session, trusted device and outstanding token is swept
+// exactly as ChangePassword does; currentSessionID is spared.
+func (s *Service) SetPassword(ctx context.Context, userID, currentSessionID, next string) error {
+	u, err := s.store.FindUserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if u.DeletedAt != nil {
+		return ErrUserNotFound
+	}
+	if u.PasswordHash != "" {
+		return ErrInvalidCredentials
+	}
+	if err := s.RequireFreshMFA(ctx, userID, currentSessionID); err != nil {
+		return err
+	}
+	return s.applyNewPassword(ctx, userID, currentSessionID, next)
+}
+
+// applyNewPassword validates, hashes and stores next, then closes every
+// side door — see [Service.ChangePassword], "The sweep matrix". Callers
+// have already authorized the change.
+func (s *Service) applyNewPassword(ctx context.Context, userID, currentSessionID, next string) error {
 	if failed := password.Validate(next, s.cfg.rules); len(failed) > 0 {
 		return fmt.Errorf("%w: %s", ErrWeakPassword, strings.Join(failed, ","))
 	}
