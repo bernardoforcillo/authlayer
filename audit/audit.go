@@ -406,15 +406,19 @@ type Recorder interface {
 // nothing the Service already validated; it stores what it is handed.
 //
 // The MUSTs below are normative, and
-// [github.com/bernardoforcillo/authlayer/audit/audittest] exercises each of
-// them. Run that suite against a backend rather than trusting this comment.
+// [github.com/bernardoforcillo/authlayer/audit/audittest] exercises them as
+// far as a sequential suite can (the atomicity of Insert's sealed-day check
+// is not raced). Run that suite against a backend rather than trusting this
+// comment.
 type Store interface {
 	// Insert stores e, assigning Seq from an increasing sequence, and
 	// returns the stored row. An event whose ID already exists MUST NOT be
-	// stored again: the stored row is returned unchanged and no Seq is
-	// consumed. An event whose (Topic, UTC day of OccurredAt) is already
-	// sealed MUST be refused with ErrSealed, and the check and the write
-	// MUST be one atomic step.
+	// stored again: the stored row is returned unchanged. Seq is increasing,
+	// not gapless — a backend may consume a value on a duplicate or refused
+	// insert — so a gap in Seq is not evidence of a deletion; the seals are.
+	// An event whose (Topic, UTC day of OccurredAt) is already sealed MUST be
+	// refused with ErrSealed, and the check and the write MUST be one atomic
+	// step.
 	Insert(ctx context.Context, e Event) (Event, error)
 	// Complete writes c onto the open event id and returns the stored row.
 	// Resource and ContainerID fill only the event's empty ones. An unknown
