@@ -144,15 +144,35 @@ func (s *Service) prepare(e Event) Event {
 	return e
 }
 
+// insert stores e. A taken id is a retry of the same call only when the
+// stored event has the same topic, action, origin and actor — and, for an
+// event that is already over, the same outcome; anything else is another
+// event under that id, refused rather than silently dropped.
+func (s *Service) insert(ctx context.Context, e Event) (Event, error) {
+	stored, err := s.store.Insert(ctx, e)
+	if err != nil {
+		return Event{}, err
+	}
+	if stored.Topic != e.Topic || stored.Action != e.Action || stored.Origin != e.Origin ||
+		stored.Actor.Type != e.Actor.Type || stored.Actor.ID != e.Actor.ID ||
+		(e.CompletedAt != nil && stored.Outcome != e.Outcome) {
+		return Event{}, fmt.Errorf("%w: id %q belongs to another event", ErrInvalidEvent, e.ID)
+	}
+	return stored, nil
+}
+
 // Begin stores e as an open event before the action it describes runs, and
 // returns the stored event. A caller that cannot store the event should not
 // run the action: that is the whole point of beginning first.
 //
 // The Service stamps OccurredAt and, when e.ID is empty, a UUIDv7 id; it
 // redacts Request with its Policy. Source defaults to SourceServer. A
-// second Begin with the same id returns the stored event and stores
-// nothing. Errors: ErrUnknownTopic, ErrInvalidEvent (including an event that
-// already has an Outcome — use Record), and the Store's.
+// second Begin with the same id, topic, action, origin and actor returns the
+// stored event and stores nothing; the same id on a different event is
+// ErrInvalidEvent. An id generator that repeats ids therefore collapses
+// events of the same shape. Errors: ErrUnknownTopic, ErrInvalidEvent
+// (including an event that already has an Outcome — use Record), and the
+// Store's.
 func (s *Service) Begin(ctx context.Context, e Event) (Event, error) {
 	if e.Source == "" {
 		e.Source = SourceServer
@@ -165,7 +185,7 @@ func (s *Service) Begin(ctx context.Context, e Event) (Event, error) {
 	}
 	e = s.prepare(e)
 	e.CompletedAt, e.Changes, e.Code, e.Reason, e.DurationMS = nil, nil, "", "", 0
-	return s.store.Insert(ctx, e)
+	return s.insert(ctx, e)
 }
 
 // Complete writes the outcome of the open event id, once. The Diff of
@@ -209,5 +229,5 @@ func (s *Service) Record(ctx context.Context, e Event) (Event, error) {
 	at := e.OccurredAt
 	e.CompletedAt = &at
 	e.Changes = Redact(e.Changes, s.cfg.policy)
-	return s.store.Insert(ctx, e)
+	return s.insert(ctx, e)
 }

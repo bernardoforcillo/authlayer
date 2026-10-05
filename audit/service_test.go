@@ -201,3 +201,21 @@ func TestTopicsReportEffectiveRetention(t *testing.T) {
 		t.Errorf("Topics = %+v, want %+v", got, want)
 	}
 }
+
+func TestBeginAndRecordRefuseAnIDTakenByAnotherEvent(t *testing.T) {
+	svc, st, _ := newService(t)
+	ctx := context.Background()
+	const id = "0192a3b4-c5d6-7e8f-9a0b-1c2d3e4f5a6c"
+	if _, err := svc.Begin(ctx, action(func(e *audit.Event) { e.ID = id })); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := svc.Begin(ctx, action(func(e *audit.Event) { e.ID, e.Action, e.Actor.ID = id, "menu.delete", "mallory" })); !errors.Is(err, audit.ErrInvalidEvent) {
+		t.Errorf("Begin of another event under a taken id err = %v, want ErrInvalidEvent", err)
+	}
+	if _, err := svc.Record(ctx, action(func(e *audit.Event) { e.ID, e.Outcome = id, audit.OutcomeFailed })); !errors.Is(err, audit.ErrInvalidEvent) {
+		t.Errorf("Record over an open event's id err = %v, want ErrInvalidEvent", err)
+	}
+	if n, _ := st.Count(ctx, audit.Filter{}); n != 1 {
+		t.Errorf("events = %d, want 1", n)
+	}
+}
