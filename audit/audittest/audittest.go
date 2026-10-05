@@ -173,10 +173,17 @@ func insertRefusesASealedDay(t tb, st audit.Store) {
 	if err := st.InsertSeal(ctx, audit.Seal{Topic: "t", Day: day0, EventsHash: "e", SealHash: "s", SealedAt: day0.Add(48 * time.Hour)}); err != nil {
 		t.Fatalf("InsertSeal: %v", err)
 	}
-	if _, err := st.Insert(ctx, ev("t", day0.Add(5*time.Hour))); !errors.Is(err, audit.ErrSealed) {
-		t.Errorf("Insert into a sealed day err = %v, want ErrSealed", err)
+	for _, at := range []time.Time{day0, day0.Add(5 * time.Hour), day0.Add(24*time.Hour - time.Microsecond)} {
+		refused := ev("t", at)
+		if _, err := st.Insert(ctx, refused); !errors.Is(err, audit.ErrSealed) {
+			t.Errorf("Insert at %s into a sealed day err = %v, want ErrSealed", at.Format(time.RFC3339Nano), err)
+		}
+		if _, err := st.Get(ctx, refused.ID); !errors.Is(err, audit.ErrNotFound) {
+			t.Errorf("the event refused at %s was stored anyway: Get err = %v, want ErrNotFound", at.Format(time.RFC3339Nano), err)
+		}
 	}
 	mustInsert(t, st, ev("other", day0.Add(5*time.Hour)))
+	mustInsert(t, st, ev("t", day0.Add(-time.Microsecond)))
 	mustInsert(t, st, ev("t", day0.Add(24*time.Hour)))
 }
 
@@ -217,38 +224,54 @@ func getUnknownIsErrNotFound(t tb, st audit.Store) {
 func completeWritesOnce(t tb, st audit.Store) {
 	ctx := context.Background()
 	e := mustInsert(t, st, ev("t", day0))
-	c := audit.Closing{At: day0.Add(time.Second), Outcome: audit.OutcomeOK, Reason: "r",
+	c := audit.Closing{At: day0.Add(time.Second), Outcome: audit.OutcomeOK, Code: "c1", Reason: "r",
 		Changes: json.RawMessage(`{"k":{"before":null,"after":1}}`), DurationMS: 12}
 	got, err := st.Complete(ctx, e.ID, c)
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if got.CompletedAt == nil || !got.CompletedAt.Equal(c.At) || got.Outcome != audit.OutcomeOK || got.DurationMS != 12 {
-		t.Errorf("Complete = %+v, want the closing applied", got)
+	want := e
+	at := c.At
+	want.CompletedAt, want.Outcome, want.Code, want.Reason, want.Changes, want.DurationMS = &at, c.Outcome, c.Code, c.Reason, c.Changes, c.DurationMS
+	back, err := st.Get(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	for name, x := range map[string]audit.Event{"Complete": got, "Get": back} {
+		if field := diffEvent(x, want); field != "" {
+			t.Errorf("%s after Complete: %s differs: got %+v want %+v", name, field, x, want)
+		}
 	}
 	if _, err := st.Complete(ctx, e.ID, audit.Closing{At: day0.Add(time.Hour), Outcome: audit.OutcomeFailed}); !errors.Is(err, audit.ErrCompleted) {
 		t.Errorf("conflicting Complete err = %v, want ErrCompleted", err)
 	}
-	if back, err := st.Get(ctx, e.ID); err != nil || back.Outcome != audit.OutcomeOK || !back.CompletedAt.Equal(c.At) {
-		t.Errorf("after a conflicting Complete: %+v, %v; want the first closing kept", back, err)
+	after, err := st.Get(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("Get after the conflicting Complete: %v", err)
+	}
+	if field := diffEvent(after, want); field != "" {
+		t.Errorf("a conflicting Complete changed %s: got %+v want %+v", field, after, want)
 	}
 }
 
 func completeIdenticalRetryIsNil(t tb, st audit.Store) {
 	ctx := context.Background()
 	e := mustInsert(t, st, ev("t", day0))
-	c := audit.Closing{At: day0.Add(time.Second), Outcome: audit.OutcomeDenied, Code: "permission_denied", DurationMS: 3}
-	if _, err := st.Complete(ctx, e.ID, c); err != nil {
+	c := audit.Closing{At: day0.Add(time.Second), Outcome: audit.OutcomeDenied, Code: "permission_denied", Reason: "r",
+		Changes: json.RawMessage(`{"k":{"before":1,"after":2}}`), DurationMS: 3}
+	first, err := st.Complete(ctx, e.ID, c)
+	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
 	retry := c
 	retry.At = day0.Add(time.Minute)
+	retry.Changes = json.RawMessage(`{ "k": { "after": 2, "before": 1 } }`) // the same JSON value, spelled differently
 	got, err := st.Complete(ctx, e.ID, retry)
 	if err != nil {
 		t.Fatalf("identical retry err = %v, want nil", err)
 	}
-	if !got.CompletedAt.Equal(c.At) {
-		t.Errorf("identical retry moved CompletedAt to %v, want %v", got.CompletedAt, c.At)
+	if field := diffEvent(got, first); field != "" {
+		t.Errorf("identical retry changed %s: got %+v want %+v", field, got, first)
 	}
 }
 
@@ -285,16 +308,22 @@ func completeUnknownIsErrNotFound(t tb, st audit.Store) {
 
 func listNewestFirstWithCursor(t tb, st audit.Store) {
 	ctx := context.Background()
+	// Times out of insertion order, so Seq order and time order differ.
 	var seqs []int64
-	for i := 0; i < 5; i++ {
-		seqs = append(seqs, mustInsert(t, st, ev("t", day0.Add(time.Duration(i)*time.Minute))).Seq)
+	for _, m := range []int{3, 1, 4, 0, 2} {
+		seqs = append(seqs, mustInsert(t, st, ev("t", day0.Add(time.Duration(m)*time.Minute))).Seq)
 	}
+	want := slices.Clone(seqs)
+	slices.Reverse(want)
 	var got []int64
 	before := int64(0)
-	for {
+	for range len(seqs) + 1 {
 		page, err := st.List(ctx, audit.Filter{}, audit.Page{Before: before, Limit: 2})
 		if err != nil {
 			t.Fatalf("List: %v", err)
+		}
+		if len(page) > 2 {
+			t.Fatalf("List with Limit 2 returned %d events", len(page))
 		}
 		for _, e := range page {
 			got = append(got, e.Seq)
@@ -304,10 +333,14 @@ func listNewestFirstWithCursor(t tb, st audit.Store) {
 		}
 		before = page[len(page)-1].Seq
 	}
-	want := slices.Clone(seqs)
-	slices.Reverse(want)
 	if !slices.Equal(got, want) {
-		t.Errorf("pages = %v, want %v", got, want)
+		t.Errorf("pages = %v, want %v (Seq descending)", got, want)
+	}
+	for _, limit := range []int{0, -1, audit.MaxPageSize + 1} {
+		all, err := st.List(ctx, audit.Filter{}, audit.Page{Limit: limit})
+		if err != nil || len(all) != len(seqs) {
+			t.Errorf("List with Limit %d = %d events, %v; want all %d (MaxPageSize applies)", limit, len(all), err, len(seqs))
+		}
 	}
 }
 
@@ -404,7 +437,8 @@ func scanAscendingAndStops(t tb, st audit.Store) {
 	stop := errors.New("stop")
 	calls := 0
 	err := st.Scan(ctx, audit.Filter{}, func(audit.Event) error { calls++; return stop })
-	if !errors.Is(err, stop) || calls != 1 {
+	// The port returns fn's error unwrapped, so compare by identity.
+	if err != stop || calls != 1 {
 		t.Errorf("Scan with a failing fn = %v after %d calls, want stop after 1", err, calls)
 	}
 }
