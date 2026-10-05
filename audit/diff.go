@@ -11,7 +11,9 @@ import (
 // empty objects are leaves. A side that is empty or null has no leaves, so a
 // creation lists every leaf of after with a null before, and a deletion every
 // leaf of before with a null after. Input that is not JSON returns
-// {"redaction_error":true}. Diff does not redact: redact both sides first.
+// {"redaction_error":true}. Diff does not redact: redact its result with
+// Redact, so a changed secret still shows as a changed path whose values are
+// withheld.
 func Diff(before, after json.RawMessage) json.RawMessage {
 	b, err := leaves(before)
 	if err != nil {

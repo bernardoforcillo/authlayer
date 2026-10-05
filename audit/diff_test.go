@@ -34,3 +34,14 @@ func TestDiff(t *testing.T) {
 		})
 	}
 }
+
+func TestRedactingADiffKeepsChangedSecretsWithoutTheirValues(t *testing.T) {
+	before := json.RawMessage(`{"role":"viewer","password":"old","email":"bob@x.com","user":{"newPassword":"a"}}`)
+	after := json.RawMessage(`{"role":"editor","password":"new","email":"bill@x.com","user":{"newPassword":"b"}}`)
+	got := audit.Redact(audit.Diff(before, after), audit.DefaultPolicy())
+	want := `{"role":{"before":"viewer","after":"editor"},"password":"[REDACTED]",
+		"email":{"before":"b***@x.com","after":"b***@x.com"},"user.newPassword":"[REDACTED]"}`
+	if !audit.EqualJSON(got, json.RawMessage(want)) {
+		t.Errorf("Redact(Diff) =\n%s\nwant\n%s", got, want)
+	}
+}

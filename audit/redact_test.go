@@ -17,12 +17,19 @@ func TestRedactRemovesSecretsByWord(t *testing.T) {
 	in := `{"user":{"newPassword":"p","name":"Ann"},"api_key":"k","apiKey":"k",
 		"X-API-KEY":"k","refreshToken":"t","tokens":["a"],"client_secret":"s",
 		"OTPCode":"1","recovery_codes":["c"],"Authorization":"Bearer x",
-		"footprint":12,"tokenizer":"keep","secretary":"keep"}`
+		"footprint":12,"tokenizer":"keep","secretary":"keep",
+		"password1":"s","password2":"s","Password2":"s","token1":"s","secret2":"s",
+		"otp1":"s","refresh_token2":"s","apikey":"s","APIKEY":"s","privatekey":"s",
+		"PRIVATEKEY":"s","recoverycode":"s"}`
 	want := `{"user":{"newPassword":"[REDACTED]","name":"Ann"},"api_key":"[REDACTED]",
 		"apiKey":"[REDACTED]","X-API-KEY":"[REDACTED]","refreshToken":"[REDACTED]",
 		"tokens":"[REDACTED]","client_secret":"[REDACTED]","OTPCode":"[REDACTED]",
 		"recovery_codes":"[REDACTED]","Authorization":"[REDACTED]","footprint":12,
-		"tokenizer":"keep","secretary":"keep"}`
+		"tokenizer":"keep","secretary":"keep",
+		"password1":"[REDACTED]","password2":"[REDACTED]","Password2":"[REDACTED]",
+		"token1":"[REDACTED]","secret2":"[REDACTED]","otp1":"[REDACTED]",
+		"refresh_token2":"[REDACTED]","apikey":"[REDACTED]","APIKEY":"[REDACTED]",
+		"privatekey":"[REDACTED]","PRIVATEKEY":"[REDACTED]","recoverycode":"[REDACTED]"}`
 	if got := redact(t, in, audit.DefaultPolicy()); !audit.EqualJSON(json.RawMessage(got), json.RawMessage(want)) {
 		t.Errorf("Redact =\n%s\nwant\n%s", got, want)
 	}

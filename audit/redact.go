@@ -20,11 +20,13 @@ var redactionError = json.RawMessage(`{"redaction_error":true}`)
 // Policy says what [Redact] removes, masks and truncates.
 //
 // Patterns match JSON object keys by words. Keys and patterns are split on
-// separators and camelCase ("newPassword" is "new password", "X-API-KEY" is
-// "x api key"), and a pattern matches a key whose words contain the
-// pattern's words in a row, each equal or followed by a plural "s". So
-// "token" matches "refreshToken" and "tokens", "api_key" matches "apiKey"
-// and "X-API-KEY", and "otp" matches "OTPCode" but not "footprint".
+// separators, camelCase and digit boundaries ("newPassword" is "new password",
+// "password2" is "password 2", "X-API-KEY" is "x api key"), and a pattern
+// matches a key whose words contain the pattern's words in a row, each equal
+// or followed by a plural "s". Multi-word patterns also match the words
+// written together without separators. So "token" matches "refreshToken" and
+// "tokens", "api_key" matches "apiKey", "X-API-KEY", and "apikey", and "otp"
+// matches "OTPCode" but not "footprint".
 type Policy struct {
 	// Remove patterns replace the whole value with Redacted, whatever its
 	// type.
@@ -125,10 +127,15 @@ func summary(b []byte) map[string]any {
 }
 
 func compile(patterns []string) [][]string {
-	out := make([][]string, 0, len(patterns))
+	out := make([][]string, 0, len(patterns)*2)
 	for _, p := range patterns {
 		if w := keyWords(p); len(w) > 0 {
 			out = append(out, w)
+			// Multi-word patterns also match when words are joined together.
+			if len(w) > 1 {
+				joined := strings.Join(w, "")
+				out = append(out, []string{joined})
+			}
 		}
 	}
 	return out
@@ -161,8 +168,9 @@ func containsRun(words, pattern []string) bool {
 	return false
 }
 
-// keyWords splits a key into lower-case words on non-alphanumerics and
-// camelCase boundaries: "newPassword" → [new password], "APIKey" → [api key].
+// keyWords splits a key into lower-case words on non-alphanumerics, camelCase
+// and digit-letter boundaries: "newPassword" → [new password], "password2" →
+// [password 2], "APIKey" → [api key].
 func keyWords(key string) []string {
 	runes := []rune(key)
 	var words []string
@@ -182,6 +190,12 @@ func keyWords(key string) []string {
 			prev := runes[i-1]
 			nextLower := i+1 < len(runes) && unicode.IsLower(runes[i+1])
 			if unicode.IsLower(prev) || unicode.IsDigit(prev) || nextLower {
+				flush()
+			}
+		}
+		if i > 0 {
+			prev := runes[i-1]
+			if unicode.IsDigit(r) != unicode.IsDigit(prev) {
 				flush()
 			}
 		}

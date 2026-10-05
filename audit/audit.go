@@ -202,8 +202,8 @@ type Completion struct {
 	Reason string
 	// Before is the touched resource's state before the action, as JSON.
 	Before json.RawMessage
-	// After is its state after the action. The Service redacts both sides
-	// and stores their [Diff].
+	// After is its state after the action. The Service stores the [Diff] of
+	// both sides, redacted: a changed secret keeps its path, not its values.
 	After json.RawMessage
 	// Resource is applied only when the event's own is empty.
 	Resource Resource
