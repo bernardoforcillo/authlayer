@@ -38,7 +38,7 @@ SQLSTATE, so a caller can tell it from any other failure:
 |---|---|---|
 | `AU001` | `AuditEventImmutable` | an `UPDATE` of an event other than its one completion (`completed_at` from NULL, completion columns only; resource and container only when empty) or the clearing of its `ip` and `user_agent` on retention, with every other column unchanged |
 | `AU002` | `AuditEventProtected` | a `DELETE` of an event outside a retention transaction, a `DELETE` of an event whose day is sealed and not yet marked purged (even inside one), and any `TRUNCATE` of events |
-| `AU003` | `AuditSealImmutable` | an `UPDATE` of a seal other than stamping `purged_at` once inside a retention transaction, and any `DELETE` or `TRUNCATE` |
+| `AU003` | `AuditSealImmutable` | an `UPDATE` of a seal other than stamping `purged_at` once inside a retention transaction (not later than the database clock plus `audit.PurgeClockSkew`), and any `DELETE` or `TRUNCATE` |
 | `AU004` | `AuditDaySealed` | an `INSERT` into a sealed (topic, day); `Insert` reports it as `ErrSealed` |
 | `AU005` | `AuditSealStale` | an `INSERT` of a seal whose event count or first/last `seq` no longer match its day, or whose day holds an open event; `InsertSeal` reports it as `ErrSealStale` |
 | `AU006` | `AuditIsolation` | an `INSERT` of an event or a seal in a transaction stricter than `READ COMMITTED` |
@@ -76,8 +76,12 @@ ORM cascade or a cleanup script cannot remove an event, sealed or not.
 `ApplyRetention` marks a day's seal purged first (the one seal update `AU003`
 allows), then deletes its events (which `AU002` now allows). The setting stops
 accidents, not an attacker holding the application's credentials, who can set
-it too: `Verify` reports a seal stamped purged before its topic's retention
-allowed it as a `mismatch` (`purged_early`).
+it too. Against them, `AU003` also refuses a `purged_at` later than the
+database clock by more than `audit.PurgeClockSkew` (five minutes), and `Verify`
+judges a purge stamp by its own clock: a seal stamped purged before its topic's
+retention allowed it, or stamped with a time after the `Service` clock plus that
+skew, is a `mismatch` (`purged_early`). A day younger than its retention
+therefore never reads as `purged`, whatever was written into `purged_at`.
 
 ### Subject keys
 

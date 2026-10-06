@@ -1,6 +1,12 @@
 package dropsstore
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/audit"
+)
 
 // SQLSTATEs the audit guard triggers raise. They are in the application
 // class space (AU) so a caller can tell a refused rewrite from any other
@@ -15,7 +21,8 @@ const (
 	// day is sealed and the seal is not marked purged.
 	AuditEventProtected = "AU002"
 	// AuditSealImmutable (AU003): an UPDATE of a seal other than stamping
-	// purged_at once inside a retention transaction, or any DELETE or
+	// purged_at once inside a retention transaction, with a time not later
+	// than the database clock plus [audit.PurgeClockSkew], or any DELETE or
 	// TRUNCATE of seals.
 	AuditSealImmutable = "AU003"
 	// AuditDaySealed (AU004): an INSERT of an event into a (topic, day) that
@@ -123,7 +130,8 @@ const auditSchemaLock = 0x617564697464646c // "auditddl"
 //     then not while its day's seal is unpurged; the events table may not be
 //     truncated.
 //   - AU003: a seal may only get purged_at stamped, once, inside a retention
-//     transaction; seals are never deleted or truncated.
+//     transaction, and not with a time ahead of the database clock by more
+//     than [audit.PurgeClockSkew]; seals are never deleted or truncated.
 //   - AU004: an event may not be inserted into a sealed (topic, day).
 //   - AU005: a seal may not be inserted unless the day's events still
 //     match it (count, first and last seq, none open).
@@ -327,6 +335,7 @@ BEGIN
   END IF;
   IF TG_OP = 'UPDATE' AND OLD.purged_at IS NULL AND NEW.purged_at IS NOT NULL
      AND current_setting('` + AuditRetentionSetting + `', true) IS NOT DISTINCT FROM 'on'
+     AND NEW.purged_at <= now() + interval '` + strconv.Itoa(int(audit.PurgeClockSkew/time.Second)) + ` seconds'
      AND NEW.topic = OLD.topic AND NEW.day = OLD.day AND NEW.event_count = OLD.event_count
      AND NEW.first_seq = OLD.first_seq AND NEW.last_seq = OLD.last_seq
      AND NEW.events_hash = OLD.events_hash AND NEW.prev_hash = OLD.prev_hash

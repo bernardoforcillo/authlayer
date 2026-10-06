@@ -64,7 +64,9 @@ once a 1.0 is cut. Until then, minor versions may break API.
   hash chain, empty days included; `Service.Verify` recomputes it and reports
   `ok`, `mismatch` (`events_hash`, `seal_hash`, `chain` or `purged_early`),
   `unsealed` or `purged` per day; a day missing between two seals is a
-  `chain` mismatch, not `unsealed`. `Seal` never seals a day that has not ended
+  `chain` mismatch, not `unsealed`, and a purge stamp dated after the
+  `Service` clock (beyond `PurgeClockSkew`, five minutes) is `purged_early`,
+  so a day younger than its retention never reads as `purged`. `Seal` never seals a day that has not ended
   on the Service clock, starts a topic's chain at its earliest event day, and
   digests a day again when the store refuses a seal as stale
   (`ErrSealStale`). `Service.Reconcile` closes the events a crashed process
@@ -76,7 +78,8 @@ once a 1.0 is cut. Until then, minor versions may break API.
   rewrites at the database with SQLSTATE `AU001` (event update), `AU002`
   (any delete outside a retention transaction — `AuditRetentionSetting`, set
   only by `Purge` — or of a sealed, unpurged day; truncate), `AU003` (seal
-  update other than a purge stamp inside retention, delete, truncate),
+  update other than a purge stamp inside retention and not ahead of the
+  database clock by more than `audit.PurgeClockSkew`, delete, truncate),
   `AU004` (insert into a sealed day), `AU005` (a seal that no longer matches its
   day's events, which `Seal` answers by digesting the day again) and `AU006`
   (an insert under an isolation stricter than READ COMMITTED). Event and seal

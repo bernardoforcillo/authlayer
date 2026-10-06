@@ -289,7 +289,8 @@ const (
 	DayUnsealed DayState = "unsealed"
 	// DayPurged: retention deleted the events; the seal still links, and it
 	// was marked purged only once the day was older than its topic's
-	// retention.
+	// retention, at a time not after the verifying Service's clock (plus
+	// PurgeClockSkew).
 	DayPurged DayState = "purged"
 )
 
@@ -305,9 +306,10 @@ type DayStatus struct {
 	// events changed), "seal_hash" (the seal changed: its hash, or the first
 	// and last Seq it records), "chain" (the seal does not link to the
 	// previous one, or a seal between two others is missing) or
-	// "purged_early" (the seal is
-	// marked purged although the day was younger than its topic's retention
-	// at PurgedAt).
+	// "purged_early" (the seal is marked purged although the day was younger
+	// than its topic's retention at PurgedAt, or PurgedAt is later than the
+	// Service clock by more than PurgeClockSkew, which no honest purge
+	// stamps).
 	Detail string
 }
 

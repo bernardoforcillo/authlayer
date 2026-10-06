@@ -125,15 +125,16 @@ The seals are.
 | `ok` | the day's events hash to its seal, which links to the previous day's |
 | `mismatch` | something no longer matches; `Detail` says what |
 | `unsealed` | no seal covers the day yet |
-| `purged` | retention deleted the events; the seal still links and was marked purged only once the day was past its topic's retention |
+| `purged` | retention deleted the events; the seal still links and was marked purged only once the day was past its topic's retention, at a time not after the `Service` clock |
 
 A `mismatch` names the check that failed: `events_hash` (an event was altered,
 inserted or deleted, or a stored event is unreadable), `seal_hash` (the seal row
 itself was edited, its first/last `Seq` included), `chain` (the seal no longer
 links to the previous one, or a day between two seals lost its own — a day was
 deleted or replaced), or `purged_early` (the seal was marked purged
-while the day was younger than its topic's retention, so its events went
-outside retention). Editing a seal to match an edited event does not help: the
+while the day was younger than its topic's retention, or with a `purged_at`
+later than the `Service` clock by more than `audit.PurgeClockSkew`, so its
+events went outside retention). Editing a seal to match an edited event does not help: the
 next day's `PrevHash` no longer matches.
 
 ## The hash format
@@ -203,7 +204,9 @@ undermining the thing it sits next to:
 Run `ApplyRetention` on a schedule too — after `Seal`, so the days it may purge
 are sealed.
 
-`Verify` checks a purged day against its topic's **current** retention: a seal
-marked purged while the day was younger than that is `purged_early`. Shortening
+`Verify` checks a purged day against its topic's **current** retention, by its
+own clock: a seal marked purged while the day was younger than that, or whose
+`purged_at` lies in the future (beyond `audit.PurgeClockSkew`, five minutes,
+for clock drift between replicas), is `purged_early`. Shortening
 a retention is therefore safe; lengthening one makes the days purged under the
 shorter value read as `purged_early`, so review them when you do.

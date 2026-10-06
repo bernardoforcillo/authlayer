@@ -325,6 +325,55 @@ func TestAuditDeleteAndPurgeStampNeedTheRetentionSettingLive(t *testing.T) {
 	}
 }
 
+// A purge stamp dated in the future is how a holder of the application's
+// credentials would make a young day pass the age check: the seals guard
+// refuses one beyond the database clock plus audit.PurgeClockSkew, and Verify,
+// judging by its own clock, calls any future stamp that does land
+// purged_early, never purged.
+func TestAuditFutureDatedPurgeStampIsRefusedLive(t *testing.T) {
+	st, db := newLiveAuditStore(t)
+	ctx := context.Background()
+	clock := time.Date(2026, 1, 10, 9, 0, 0, 0, time.UTC)
+	svc := audit.New(st, audit.WithRuntime(core.Runtime{Clock: func() time.Time { return clock }}),
+		audit.WithTopics(audit.Topic{Key: "t", Retention: 90 * 24 * time.Hour}))
+	e, err := svc.Record(ctx, audit.Event{Topic: "t", Action: "a.b", Origin: "x", Outcome: audit.OutcomeOK,
+		Actor: audit.Actor{Type: audit.ActorUser, ID: "u"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(24 * time.Hour)
+	if _, err := svc.Seal(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	day := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+
+	// The scenario of the review: retention setting on, a forged stamp, a DELETE.
+	err = db.InTx(ctx, func(tx *pg.DB) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config($1, 'on', true)`, dropsstore.AuditRetentionSetting); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE audit_seals SET purged_at = '2099-01-01' WHERE topic = 't' AND day = $1`, day); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM audit_events WHERE id = $1`, e.ID)
+		return err
+	})
+	wantCode(t, err, dropsstore.AuditSealImmutable)
+	err = st.MarkPurged(ctx, "t", day.Add(24*time.Hour), time.Now().Add(audit.PurgeClockSkew+time.Hour))
+	wantCode(t, err, dropsstore.AuditSealImmutable)
+
+	// A stamp inside the skew lands (the database cannot tell it from a
+	// replica's fast clock), but Verify's clock sits on 11 January, so the day
+	// reads as purged_early, not purged.
+	if err := st.MarkPurged(ctx, "t", day.Add(24*time.Hour), time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("MarkPurged inside the skew: %v", err)
+	}
+	sts, err := svc.Verify(ctx, nil, day, day)
+	if err != nil || sts[0].State != audit.DayMismatch || sts[0].Detail != "purged_early" {
+		t.Fatalf("Verify = %+v, %v; want mismatch purged_early", sts, err)
+	}
+}
+
 const rawAuditInsert = `INSERT INTO audit_events (id, occurred_at, completed_at, topic, action, source, origin, actor_type, outcome)
 VALUES ($1, $2, $2, 't', 'a.late', 'server', 'x', 'system', 'ok')`
 
