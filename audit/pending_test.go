@@ -13,8 +13,10 @@ func TestClaimSucceedsOnce(t *testing.T) {
 	if !p.Claim() {
 		t.Fatal("first Claim = false")
 	}
-	if p.Claim() || p.Claim() {
-		t.Fatal("a later Claim = true")
+	for i := 0; i < 2; i++ {
+		if p.Claim() {
+			t.Fatal("a later Claim = true")
+		}
 	}
 	if !audit.Annotate(audit.WithPending(context.Background(), audit.NewPending("ev2"))) {
 		t.Fatal("Annotate on an unclaimed pending event = false")
