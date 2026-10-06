@@ -20,8 +20,9 @@
 //
 // # Integrity
 //
-// A [Store] never rewrites an event and deletes one only through retention
-// ([Service.ApplyRetention]). On top of that, [Service.Seal] chains every
+// A [Store] never rewrites an event, apart from clearing its IP address and
+// user agent on retention ([Service.ScrubClientData]), and deletes one only
+// through retention ([Service.ApplyRetention]). On top of that, [Service.Seal] chains every
 // (topic, UTC day) into a hash chain and [Service.Verify] recomputes it: an
 // altered, inserted or deleted event, or a deleted day, breaks the day it
 // belongs to.
@@ -190,6 +191,11 @@ type Topic struct {
 	// Retention is how long the topic keeps its events; zero means the
 	// Service default ([WithDefaultRetention]).
 	Retention time.Duration
+	// ClientDataRetention is how long the topic keeps the IP address and
+	// user agent of its events; after it [Service.ApplyRetention] clears
+	// both and keeps the event. Zero means they live as long as the event.
+	// A value longer than the topic's Retention has no effect.
+	ClientDataRetention time.Duration
 }
 
 // Completion is what [Service.Complete] adds to an open event.
@@ -454,4 +460,10 @@ type Store interface {
 	// MarkPurged stamps PurgedAt = at on the topic's seals with Day
 	// strictly before before that have none yet.
 	MarkPurged(ctx context.Context, topic string, before, at time.Time) error
+	// ScrubClientData sets IP and UserAgent to "" on at most batch events of
+	// topic with OccurredAt strictly before before that still hold either,
+	// oldest first, and returns how many it cleared. It changes nothing else
+	// and is the only way those two fields are ever rewritten; they are
+	// outside the seals' hashes for that reason.
+	ScrubClientData(ctx context.Context, topic string, before time.Time, batch int) (int, error)
 }

@@ -34,11 +34,12 @@ const (
 	AuditDaySealed = "AU004"
 )
 
-// AuditNames are the two table names an AuditStore persists to; the zero
+// AuditNames are the table names the audit stores persist to; the zero
 // value means the defaults.
 type AuditNames struct {
 	Events string // default "audit_events"
 	Seals  string // default "audit_seals"
+	Keys   string // default "audit_subject_keys", used by [AuditKeyStore]
 }
 
 func (n AuditNames) withDefaults() AuditNames {
@@ -47,6 +48,9 @@ func (n AuditNames) withDefaults() AuditNames {
 	}
 	if n.Seals == "" {
 		n.Seals = "audit_seals"
+	}
+	if n.Keys == "" {
+		n.Keys = "audit_subject_keys"
 	}
 	return n
 }
@@ -93,7 +97,8 @@ func quoteIdent(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`)
 //
 //   - AU001: an event may only be updated by the one transition that
 //     completes it (completed_at NULL to set, the completion columns
-//     written, resource and container filled only when empty).
+//     written, resource and container filled only when empty), or by
+//     clearing its ip and user_agent on retention.
 //   - AU002: an event of a sealed day may not be deleted until the seal is
 //     marked purged, and the events table may not be truncated.
 //   - AU003: a seal may only get purged_at stamped, once; seals are never
@@ -164,11 +169,28 @@ func AuditDDL(opts ...AuditOption) []string {
 		`CREATE INDEX IF NOT EXISTS ` + q("_topic_time") + ` ON ` + ev + ` (topic, occurred_at)`,
 		`CREATE INDEX IF NOT EXISTS ` + q("_open") + ` ON ` + ev + ` (occurred_at) WHERE completed_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS ` + q("_container") + ` ON ` + ev + ` (container_id, seq DESC) WHERE container_id <> ''`,
+		`CREATE INDEX IF NOT EXISTS ` + q("_client") + ` ON ` + ev + ` (topic, occurred_at) WHERE ip <> '' OR user_agent <> ''`,
 		`CREATE INDEX IF NOT EXISTS ` + q("_actor") + ` ON ` + ev + ` (actor_id, seq DESC) WHERE actor_id <> ''`,
 
 		// events: AU001 on update.
 		`CREATE OR REPLACE FUNCTION ` + q("_guard_update") + `() RETURNS trigger LANGUAGE plpgsql AS $authlayer$
 BEGIN
+  -- Clearing the client data (IP, user agent) on retention: nothing else may differ.
+  IF NEW.ip = '' AND NEW.user_agent = '' AND (OLD.ip <> '' OR OLD.user_agent <> '')
+     AND NEW.id = OLD.id AND NEW.seq = OLD.seq AND NEW.occurred_at = OLD.occurred_at
+     AND NEW.completed_at IS NOT DISTINCT FROM OLD.completed_at
+     AND NEW.topic = OLD.topic AND NEW.action = OLD.action AND NEW.source = OLD.source
+     AND NEW.origin = OLD.origin AND NEW.procedure = OLD.procedure
+     AND NEW.actor_type = OLD.actor_type AND NEW.actor_id = OLD.actor_id
+     AND NEW.actor_display = OLD.actor_display AND NEW.on_behalf_of = OLD.on_behalf_of
+     AND NEW.session_id = OLD.session_id AND NEW.container_id = OLD.container_id
+     AND NEW.resource_type = OLD.resource_type AND NEW.resource_id = OLD.resource_id
+     AND NEW.outcome = OLD.outcome AND NEW.code = OLD.code AND NEW.reason = OLD.reason
+     AND NEW.request IS NOT DISTINCT FROM OLD.request AND NEW.changes IS NOT DISTINCT FROM OLD.changes
+     AND NEW.client_time IS NOT DISTINCT FROM OLD.client_time AND NEW.duration_ms = OLD.duration_ms
+  THEN
+    RETURN NEW;
+  END IF;
   IF OLD.completed_at IS NULL AND NEW.completed_at IS NOT NULL
      AND NEW.id = OLD.id AND NEW.seq = OLD.seq AND NEW.occurred_at = OLD.occurred_at
      AND NEW.topic = OLD.topic AND NEW.action = OLD.action AND NEW.source = OLD.source
@@ -677,5 +699,106 @@ func (st *AuditStore) MarkPurged(ctx context.Context, topic string, before, at t
 	_, err := st.db.Exec(ctx, `UPDATE `+st.sl+` SET purged_at = $3
 WHERE topic = $1 AND day::timestamp < ($2::timestamptz AT TIME ZONE 'UTC') AND purged_at IS NULL`,
 		topic, before.UTC(), at.UTC())
+	return err
+}
+
+// ScrubClientData clears ip and user_agent on at most batch events of topic
+// older than before, oldest first. The AU001 guard allows exactly this
+// rewrite and no other.
+func (st *AuditStore) ScrubClientData(ctx context.Context, topic string, before time.Time, batch int) (int, error) {
+	res, err := st.db.Exec(ctx, `UPDATE `+st.ev+` SET ip = '', user_agent = '' WHERE seq IN (
+ SELECT seq FROM `+st.ev+` WHERE topic = $1 AND occurred_at < $2 AND (ip <> '' OR user_agent <> '')
+ ORDER BY seq LIMIT NULLIF($3::bigint, 0))`, topic, before.UTC(), max(batch, 0))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
+// AuditKeyStore is a drops-backed audit.KeyStore: one row per data subject
+// holding the key that pseudonymizes them in the log. Erasure nulls the key
+// and keeps a tombstone, so keep this table out of backups that must honour a deletion
+// request, or encrypt the keys under a KMS key you can rotate.
+type AuditKeyStore struct {
+	db  *pg.DB
+	cfg auditSettings
+	tbl string
+}
+
+// Compile-time proof the drops key store satisfies the port.
+var _ audit.KeyStore = (*AuditKeyStore)(nil)
+
+// NewAuditKeyStore returns an AuditKeyStore over db.
+func NewAuditKeyStore(db *pg.DB, opts ...AuditOption) *AuditKeyStore {
+	cfg := newAuditSettings(opts)
+	return &AuditKeyStore{db: db, cfg: cfg, tbl: quoteIdent(cfg.names.Keys)}
+}
+
+// AuditKeyDDL returns the statement creating the key table.
+func AuditKeyDDL(opts ...AuditOption) []string {
+	cfg := newAuditSettings(opts)
+	return []string{`CREATE TABLE IF NOT EXISTS ` + quoteIdent(cfg.names.Keys) + ` (
+  subject text PRIMARY KEY,
+  key bytea,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  erased_at timestamptz
+)`}
+}
+
+// CreateSchema runs [AuditKeyDDL].
+func (st *AuditKeyStore) CreateSchema(ctx context.Context) error {
+	for _, stmt := range AuditKeyDDL(func(s *auditSettings) { *s = st.cfg }) {
+		if _, err := st.db.Exec(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DropSchema drops the key table.
+func (st *AuditKeyStore) DropSchema(ctx context.Context) error {
+	_, err := st.db.Exec(ctx, `DROP TABLE IF EXISTS `+st.tbl)
+	return err
+}
+
+// Key returns the subject's key, or audit.ErrNotFound.
+func (st *AuditKeyStore) Key(ctx context.Context, subject string) ([]byte, error) {
+	rows, err := st.db.Query(ctx, `SELECT key, erased_at FROM `+st.tbl+` WHERE subject = $1`, subject)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return nil, audit.ErrNotFound
+	}
+	var key []byte
+	var erased *time.Time
+	if err := rows.Scan(&key, &erased); err != nil {
+		return nil, err
+	}
+	if erased != nil || key == nil {
+		return nil, audit.ErrForgotten
+	}
+	return key, rows.Err()
+}
+
+// PutKey stores key unless the subject has one, and returns the stored key.
+func (st *AuditKeyStore) PutKey(ctx context.Context, subject string, key []byte) ([]byte, error) {
+	if _, err := st.db.Exec(ctx, `INSERT INTO `+st.tbl+` (subject, key) VALUES ($1, $2) ON CONFLICT (subject) DO NOTHING`,
+		subject, key); err != nil {
+		return nil, err
+	}
+	return st.Key(ctx, subject)
+}
+
+// DeleteKey erases the subject's key and leaves a tombstone row (the
+// subject's id and the erasure time) so a later event cannot mint a new one.
+func (st *AuditKeyStore) DeleteKey(ctx context.Context, subject string) error {
+	_, err := st.db.Exec(ctx, `INSERT INTO `+st.tbl+` (subject, key, erased_at) VALUES ($1, NULL, now())
+ON CONFLICT (subject) DO UPDATE SET key = NULL, erased_at = COALESCE(`+st.tbl+`.erased_at, now())`, subject)
 	return err
 }

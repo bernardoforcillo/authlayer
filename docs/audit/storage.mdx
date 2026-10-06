@@ -30,7 +30,7 @@ SQLSTATE, so a caller can tell it from any other failure:
 
 | SQLSTATE | Constant | Refuses |
 |---|---|---|
-| `AU001` | `AuditEventImmutable` | an `UPDATE` of an event other than its one completion (`completed_at` from NULL, completion columns only; resource and container only when empty) |
+| `AU001` | `AuditEventImmutable` | an `UPDATE` of an event other than its one completion (`completed_at` from NULL, completion columns only; resource and container only when empty) or the clearing of its `ip` and `user_agent` on retention, with every other column unchanged |
 | `AU002` | `AuditEventProtected` | a `DELETE` of an event whose day is sealed and not yet marked purged, and any `TRUNCATE` of events |
 | `AU003` | `AuditSealImmutable` | an `UPDATE` of a seal other than stamping `purged_at` once, and any `DELETE` or `TRUNCATE` |
 | `AU004` | `AuditDaySealed` | an `INSERT` into a sealed (topic, day); `Insert` reports it as `ErrSealed` |
@@ -50,6 +50,14 @@ Purging goes through the same guard: `ApplyRetention` marks a day's seal purged
 first (the one seal update `AU003` allows), then deletes its events (which
 `AU002` now allows).
 
+### Subject keys
+
+`dropsstore.NewAuditKeyStore(db)` is the `audit.KeyStore` behind
+[pseudonyms](/audit/personal-data): one row per person, the key nulled and the row
+kept as a tombstone on erasure. It lives in its own table
+(`audit_subject_keys`, `AuditNames.Keys`; `AuditKeyDDL` for migrations), outside
+the audit tables' guards on purpose — deleting a key is the erasure.
+
 ## Your own backend
 
 The `Store` MUSTs — one atomic step for the sealed-day check on `Insert`, an
@@ -68,7 +76,7 @@ func TestMyStoreSatisfiesTheAuditContract(t *testing.T) {
 }
 ```
 
-The factory must return an **empty** store each time: the checks count rows.
+A key store has its own suite, `audittest.RunKeyStoreContract`. The factory must return an **empty** store each time: the checks count rows.
 Event ids are UUIDv7, so a backend that types ids as `uuid` passes unchanged.
 The suite is sequential, so it does not race the atomicity of `Insert`'s
 sealed-day check — that one you have to reason about, as `store/drops` does with

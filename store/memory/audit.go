@@ -278,3 +278,77 @@ func (s *AuditStore) MarkPurged(_ context.Context, topic string, before, at time
 	}
 	return nil
 }
+
+// ScrubClientData clears IP and UserAgent on at most batch events of topic
+// older than before, oldest first.
+func (s *AuditStore) ScrubClientData(_ context.Context, topic string, before time.Time, batch int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var due []audit.Event
+	for _, e := range s.events {
+		if e.Topic == topic && e.OccurredAt.Before(before) && (e.IP != "" || e.UserAgent != "") {
+			due = append(due, e)
+		}
+	}
+	slices.SortFunc(due, func(a, b audit.Event) int { return cmp.Compare(a.Seq, b.Seq) })
+	if batch > 0 && len(due) > batch {
+		due = due[:batch]
+	}
+	for _, e := range due {
+		e.IP, e.UserAgent = "", ""
+		s.events[e.ID] = e
+	}
+	return len(due), nil
+}
+
+// AuditKeyStore is a concurrency-safe in-memory audit.KeyStore.
+type AuditKeyStore struct {
+	mu        sync.Mutex
+	keys      map[string][]byte
+	forgotten map[string]bool
+}
+
+// NewAuditKeyStore returns an empty in-memory audit.KeyStore.
+func NewAuditKeyStore() *AuditKeyStore {
+	return &AuditKeyStore{keys: map[string][]byte{}, forgotten: map[string]bool{}}
+}
+
+// Compile-time proof the memory key store satisfies the port.
+var _ audit.KeyStore = (*AuditKeyStore)(nil)
+
+// Key returns the subject's key, or audit.ErrNotFound.
+func (s *AuditKeyStore) Key(_ context.Context, subject string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.forgotten[subject] {
+		return nil, audit.ErrForgotten
+	}
+	k, ok := s.keys[subject]
+	if !ok {
+		return nil, audit.ErrNotFound
+	}
+	return slices.Clone(k), nil
+}
+
+// PutKey stores key unless the subject has one, and returns the stored key.
+func (s *AuditKeyStore) PutKey(_ context.Context, subject string, key []byte) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.forgotten[subject] {
+		return nil, audit.ErrForgotten
+	}
+	if k, ok := s.keys[subject]; ok {
+		return slices.Clone(k), nil
+	}
+	s.keys[subject] = slices.Clone(key)
+	return slices.Clone(key), nil
+}
+
+// DeleteKey removes the subject's key and tombstones the subject.
+func (s *AuditKeyStore) DeleteKey(_ context.Context, subject string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.keys, subject)
+	s.forgotten[subject] = true
+	return nil
+}

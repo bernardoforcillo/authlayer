@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/bernardoforcillo/authlayer/audit"
 	"github.com/bernardoforcillo/authlayer/store/memory"
@@ -53,6 +54,13 @@ func (s completeBlind) Complete(ctx context.Context, id string, _ audit.Closing)
 	return s.Get(ctx, id)
 }
 
+// scrubBlind clears nothing.
+type scrubBlind struct{ audit.Store }
+
+func (scrubBlind) ScrubClientData(context.Context, string, time.Time, int) (int, error) {
+	return 0, nil
+}
+
 func TestChecksBiteNonCompliantStores(t *testing.T) {
 	cases := []struct {
 		check string
@@ -60,6 +68,7 @@ func TestChecksBiteNonCompliantStores(t *testing.T) {
 	}{
 		{"Insert/RefusesASealedDay", sealBlind{memory.NewAuditStore()}},
 		{"Complete/WritesOnce", completeBlind{memory.NewAuditStore()}},
+		{"ScrubClientData/ClearsOnlyTheTopicBeforeAndNothingElse", scrubBlind{memory.NewAuditStore()}},
 	}
 	for _, c := range cases {
 		if !runCheck(t, c.check, c.store).failed {

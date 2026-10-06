@@ -1,0 +1,77 @@
+---
+title: "Data protection (GDPR)"
+description: "Which GDPR duty each authlayer call meets, the one place the library cannot help (rectification of what happened), and the long list that stays yours: lawful basis, notices, processors, breaches, backups."
+---
+
+No library makes a deployment compliant; most of the GDPR is about what your
+organization decides and documents. What a library can do is make the
+**technical** duties one call each, and refuse to be the thing in their way.
+This page maps each duty to the call that meets it, and is honest about what
+does not.
+
+## Duty to call
+
+| GDPR | Duty | authlayer |
+|---|---|---|
+| Art. 5(1)(c) | Data minimization | Hook events carry ids and a closed `Detail` vocabulary — never an email or a token. The audit log redacts secrets from `Request` and `Changes`, and can [truncate, hash or drop IPs](/audit/personal-data#ip-addresses-and-user-agents) and drop user agents. |
+| Art. 5(1)(e) | Storage limitation | `audit.Topic.Retention` and `ApplyRetention`; a shorter `ClientDataRetention` for [IP and user agent](/audit/personal-data#a-shorter-retention-for-client-data); `PurgeExpired` for sessions, verifications and invites. |
+| Art. 7 | Proof and withdrawal of consent | [`consent`](/privacy/consent): append-only records, `Accepted` before you act, `Withdraw` as easy as `Grant`. |
+| Arts. 15, 20 | Access and portability | [`privacy.Exporter`](/privacy/access-and-erasure): one JSON bundle across auth, memberships, grants, consent, the audit trail and your own tables — no credential in it, no other person's identity. |
+| Art. 16 | Rectification | The one personal field authlayer stores that a person controls is their email: `RequestEmailChange` and `VerifyEmail` move it, re-verified. See [below](#rectification). |
+| Art. 17 | Erasure | `DeleteAccount` (removed) and `AnonymizeAccount` (scrubbed); `RemoveUserSweeper` for memberships; [`privacy.ErasureSweeper`](/privacy/access-and-erasure#erasure) for the audit log and consent; `scope.WithAnonymizer` and `WithPseudonymKey` for contributions that must outlive the person. |
+| Art. 17 vs. an immutable log | Erase *from* the log | [Pseudonyms at write time, key destroyed on request](/audit/personal-data): the events and every seal stay; the link to the person goes. |
+| Arts. 4(5), 25 | Pseudonymization, data protection by design | The audit pseudonyms above; `scope.WithPseudonymKey` for a stable per-container pseudonym; hashed passwords, tokens and API keys at rest. |
+| Art. 32 | Security of processing | Refresh rotation with replay detection, step-up MFA, hashed secrets, a [tamper-evident audit log](/audit/integrity), database guards that refuse rewrites. |
+| Art. 5(2) | Accountability | The audit log, `Filter.Member` for one person's whole trail, the consent history. |
+
+## Rectification
+
+Art. 16 is the right to have *inaccurate* data corrected. authlayer stores one
+such field — the email address — and changes it with a re-verification
+(`RequestEmailChange`, `VerifyEmail`). Passkey and trusted-device labels are
+names the person chose; delete and re-register to rename. The `consent` store and
+the audit log are records of **what happened**, which does not become inaccurate:
+a person who accepted version 3 did, and a login that failed, failed. Both are
+append-only by design. If something was recorded wrongly, record the correction
+as a new event.
+
+## What stays yours
+
+None of this is in a library, and none of it is optional:
+
+- **A lawful basis for each purpose**, a **privacy notice**, and your **record
+  of processing** (Art. 30). Consent is only one basis; `consent` helps when you
+  chose it.
+- **Processors.** A data-processing agreement with your host, database, email and
+  analytics vendors, and a transfer mechanism if data leaves the EEA.
+- **Your own data.** Everything in your tables. Register it as a `SourceFunc`
+  for the export and an `EraserFunc` for the sweeper, or the person's request is
+  only partly answered.
+- **Sessions keep the full IP and user agent** of the sign-in until they expire
+  or are purged; the audit log's IP modes do not reach them. Keep session TTLs
+  short, run `PurgeExpired`, and mention them in your notice.
+- **Backups.** A deleted row survives in last night's backup. Decide how long
+  backups live, and how a restore re-applies erasures (replaying the erasure
+  requests since the backup is the usual answer). Destroyed audit keys must not
+  live on in a backup that outlives the request.
+- **Breach detection and notification** — 72 hours to the regulator (Art. 33).
+  The audit log and `token.reuse` / `session.reuse` events are your evidence,
+  not your process.
+- **Identity checks** before answering an access or erasure request that did not
+  come through a signed-in session, and answering within one month.
+- **A DPIA** where your processing is high-risk, and a DPO where you are required
+  to have one.
+- **Encryption at rest and in transit**, database roles, and — for the audit
+  tables — a role that [does not own them](/audit/storage#the-guards).
+
+<Note>
+This page is engineering guidance, not legal advice. Which of these duties
+applies to you, and how, depends on your processing; have it reviewed against
+your own situation.
+</Note>
+
+## Try it
+
+`go run ./examples/privacy` walks one person through consent, a pseudonymized
+and minimized audit trail, an access request and an erasure request, against
+in-memory stores.

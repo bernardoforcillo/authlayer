@@ -64,6 +64,13 @@ report()
 
 {/* verify:stdout "seal with an open event: true\nreconciled: 1 unknown reconciled\nsealed days: 1 events in the first: 2\nverify: ok \nretention deleted: 2\nverify: purged " */}
 
+<Note>
+The IP address and user agent of an event are **not** part of its hash: they are
+personal data that [clear on their own, shorter schedule](/audit/personal-data#a-shorter-retention-for-client-data),
+and a seal that covered them would call every scrub a tampering. Everything else
+about an event is covered.
+</Note>
+
 ## Reconcile
 
 `Begin` stores an event before the action runs; if the process dies, the

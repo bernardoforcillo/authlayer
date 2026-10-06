@@ -20,6 +20,8 @@ import (
 
 	"github.com/bernardoforcillo/authlayer/audit"
 	"github.com/bernardoforcillo/authlayer/audit/audittest"
+	"github.com/bernardoforcillo/authlayer/consent"
+	"github.com/bernardoforcillo/authlayer/consent/consenttest"
 	"github.com/bernardoforcillo/authlayer/core"
 	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
 )
@@ -157,4 +159,110 @@ func TestAuditStoreTextIDs(t *testing.T) {
 	if err != nil || e.ID != "evt-1" {
 		t.Fatalf("Record = %+v, %v", e, err)
 	}
+}
+
+func TestAuditGuardAllowsOnlyClearingClientData(t *testing.T) {
+	st, db := newLiveAuditStore(t)
+	ctx := context.Background()
+	clock := time.Date(2026, 1, 10, 9, 0, 0, 0, time.UTC)
+	svc := audit.New(st, audit.WithRuntime(core.Runtime{Clock: func() time.Time { return clock }}),
+		audit.WithTopics(audit.Topic{Key: "t", ClientDataRetention: time.Hour}))
+	e, err := svc.Record(ctx, audit.Event{Topic: "t", Action: "a.b", Origin: "x", Outcome: audit.OutcomeOK,
+		Actor: audit.Actor{Type: audit.ActorUser, ID: "u"}, IP: "203.0.113.7", UserAgent: "ua"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A rewrite that also touches anything else is refused, even with the client data cleared.
+	_, err = db.Exec(ctx, `UPDATE audit_events SET ip = '', user_agent = '', action = 'x.y' WHERE id = $1`, e.ID)
+	wantCode(t, err, dropsstore.AuditEventImmutable)
+	_, err = db.Exec(ctx, `UPDATE audit_events SET ip = '9.9.9.9' WHERE id = $1`, e.ID)
+	wantCode(t, err, dropsstore.AuditEventImmutable)
+
+	clock = clock.Add(48 * time.Hour)
+	if _, err := svc.Seal(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	cleared, err := svc.ScrubClientData(ctx)
+	if err != nil || cleared["t"] != 1 {
+		t.Fatalf("ScrubClientData = %v, %v", cleared, err)
+	}
+	if got, _ := svc.Get(ctx, e.ID); got.IP != "" || got.UserAgent != "" || got.Action != "a.b" {
+		t.Fatalf("event after scrub = %+v", got)
+	}
+	if sts, err := svc.Verify(ctx, nil, e.OccurredAt, e.OccurredAt); err != nil || sts[0].State != audit.DayOK {
+		t.Fatalf("Verify after scrub = %+v, %v", sts, err)
+	}
+}
+
+func TestAuditKeyStoreSatisfiesTheKeyContractLive(t *testing.T) {
+	_, db := newLiveAuditStore(t)
+	audittest.RunKeyStoreContract(t, func(t *testing.T) audit.KeyStore {
+		ks := dropsstore.NewAuditKeyStore(db)
+		_ = ks.DropSchema(context.Background())
+		if err := ks.CreateSchema(context.Background()); err != nil {
+			t.Fatalf("CreateSchema: %v", err)
+		}
+		t.Cleanup(func() { _ = ks.DropSchema(context.Background()) })
+		return ks
+	})
+}
+
+func TestAuditForgetErasesAPersonEndToEndLive(t *testing.T) {
+	st, db := newLiveAuditStore(t)
+	ks := dropsstore.NewAuditKeyStore(db)
+	ctx := context.Background()
+	_ = ks.DropSchema(ctx)
+	if err := ks.CreateSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ks.DropSchema(context.Background()) })
+	clock := time.Date(2026, 1, 10, 9, 0, 0, 0, time.UTC)
+	svc := audit.New(st, audit.WithSubjectKeys(ks),
+		audit.WithRuntime(core.Runtime{Clock: func() time.Time { return clock }}),
+		audit.WithTopics(audit.Topic{Key: "t"}))
+	if _, err := svc.Record(ctx, audit.Event{Topic: "t", Action: "a.b", Origin: "x", Outcome: audit.OutcomeOK,
+		Actor: audit.Actor{Type: audit.ActorUser, ID: "alice", Display: "alice@example.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(ctx, `SELECT actor_id, actor_display FROM audit_events`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id, display string
+	if !rows.Next() || rows.Scan(&id, &display) != nil {
+		t.Fatal("no row")
+	}
+	_ = rows.Close()
+	if id == "alice" || display != "" {
+		t.Fatalf("stored actor = %q / %q; want a pseudonym and no display", id, display)
+	}
+	if got, _, _ := svc.List(ctx, audit.Filter{Member: "alice"}, audit.Page{}); len(got) != 1 {
+		t.Fatalf("alice's trail = %d events, want 1", len(got))
+	}
+	if err := svc.Forget(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := svc.List(ctx, audit.Filter{Member: "alice"}, audit.Page{}); len(got) != 0 {
+		t.Fatalf("alice's trail after Forget = %d events, want 0", len(got))
+	}
+	clock = clock.Add(48 * time.Hour)
+	if _, err := svc.Seal(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	if sts, err := svc.Verify(ctx, nil, clock.Add(-48*time.Hour), clock.Add(-48*time.Hour)); err != nil || sts[0].State != audit.DayOK {
+		t.Fatalf("Verify = %+v, %v", sts, err)
+	}
+}
+
+func TestConsentStoreSatisfiesTheContractLive(t *testing.T) {
+	_, db := newLiveAuditStore(t)
+	consenttest.RunStoreContract(t, func(t *testing.T) consent.Store {
+		st := dropsstore.NewConsentStore(db, "")
+		_ = st.DropSchema(context.Background())
+		if err := st.CreateSchema(context.Background()); err != nil {
+			t.Fatalf("CreateSchema: %v", err)
+		}
+		t.Cleanup(func() { _ = st.DropSchema(context.Background()) })
+		return st
+	})
 }

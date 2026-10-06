@@ -20,6 +20,11 @@ func startOfDay(t time.Time) time.Time {
 
 // canonicalEvent fixes the order and spelling of the fields a seal hashes.
 // It is part of the stored format: changing it changes every hash.
+//
+// IP and UserAgent are deliberately NOT here. They are personal data that
+// [Service.ScrubClientData] clears on its own, shorter schedule, and a seal
+// that covered them would call every scrub a tampering. Everything else about
+// an event stays tamper-evident.
 type canonicalEvent struct {
 	ID           string          `json:"id"`
 	Seq          int64           `json:"seq"`
@@ -43,8 +48,6 @@ type canonicalEvent struct {
 	Reason       string          `json:"reason"`
 	Request      json.RawMessage `json:"request"`
 	Changes      json.RawMessage `json:"changes"`
-	IP           string          `json:"ip"`
-	UserAgent    string          `json:"user_agent"`
 	ClientTime   *string         `json:"client_time"`
 	DurationMS   int64           `json:"duration_ms"`
 }
@@ -85,7 +88,7 @@ func canonicalRow(e Event) ([]byte, error) {
 		OnBehalfOf: e.OnBehalfOf, SessionID: e.SessionID, ContainerID: e.ContainerID,
 		ResourceType: e.Resource.Type, ResourceID: e.Resource.ID,
 		Outcome: string(e.Outcome), Code: e.Code, Reason: e.Reason, Request: req, Changes: chg,
-		IP: e.IP, UserAgent: e.UserAgent, ClientTime: timeString(e.ClientTime), DurationMS: e.DurationMS,
+		ClientTime: timeString(e.ClientTime), DurationMS: e.DurationMS,
 	})
 }
 

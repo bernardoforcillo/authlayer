@@ -3,6 +3,7 @@ package audit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -20,6 +21,8 @@ type config struct {
 	topics           map[string]Topic
 	defaultRetention time.Duration
 	policy           Policy
+	client           clientConfig
+	keys             KeyStore
 }
 
 func defaultConfig() config {
@@ -29,6 +32,7 @@ func defaultConfig() config {
 		topics:           map[string]Topic{},
 		defaultRetention: DefaultRetention,
 		policy:           DefaultPolicy(),
+		client:           clientConfig{v4: 24, v6: 48},
 	}
 }
 
@@ -141,6 +145,7 @@ func (s *Service) prepare(e Event) Event {
 		e.ClientTime = &at
 	}
 	e.Request = Redact(e.Request, s.cfg.policy)
+	s.minimizeClient(&e)
 	return e
 }
 
@@ -184,6 +189,9 @@ func (s *Service) Begin(ctx context.Context, e Event) (Event, error) {
 		return Event{}, fmt.Errorf("%w: Begin with an outcome; use Record", ErrInvalidEvent)
 	}
 	e = s.prepare(e)
+	if err := s.pseudonymizeEvent(ctx, &e); err != nil {
+		return Event{}, err
+	}
 	e.CompletedAt, e.Changes, e.Code, e.Reason, e.DurationMS = nil, nil, "", "", 0
 	return s.insert(ctx, e)
 }
@@ -204,6 +212,16 @@ func (s *Service) Complete(ctx context.Context, id string, c Completion) error {
 	var changes json.RawMessage
 	if len(c.Before) > 0 || len(c.After) > 0 {
 		changes = Redact(Diff(c.Before, c.After), s.cfg.policy)
+	}
+	if c.Resource.Type == ResourceUser && c.Resource.ID != "" && s.cfg.keys != nil {
+		p, err := s.pseudonymFor(ctx, c.Resource.ID, true)
+		if errors.Is(err, ErrForgotten) {
+			p, err = ErasedPseudonym, nil
+		}
+		if err != nil {
+			return err
+		}
+		c.Resource.ID = p
 	}
 	_, err := s.store.Complete(ctx, id, Closing{
 		At: s.now(), Outcome: c.Outcome, Code: c.Code, Reason: c.Reason, Changes: changes,
@@ -226,6 +244,9 @@ func (s *Service) Record(ctx context.Context, e Event) (Event, error) {
 		return Event{}, fmt.Errorf("%w: outcome %q", ErrInvalidEvent, e.Outcome)
 	}
 	e = s.prepare(e)
+	if err := s.pseudonymizeEvent(ctx, &e); err != nil {
+		return Event{}, err
+	}
 	at := e.OccurredAt
 	e.CompletedAt = &at
 	e.Changes = Redact(e.Changes, s.cfg.policy)

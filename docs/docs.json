@@ -121,7 +121,17 @@
         "pages": [
           "audit/overview",
           "audit/integrity",
+          "audit/personal-data",
           "audit/storage"
+        ]
+      },
+      {
+        "group": "Data protection",
+        "icon": "user-shield",
+        "pages": [
+          "privacy/data-protection",
+          "privacy/access-and-erasure",
+          "privacy/consent"
         ]
       },
       {
