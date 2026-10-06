@@ -437,8 +437,10 @@ always strict.
 
 ## `store/drops`
 
-Seven separate option types, one per store, because the seven stores are
-independent.
+Nine separate option types for eleven independent stores: one per store,
+except that the audit store and its subject-key store share `AuditOption`, and
+the consent store takes its table name as an argument
+(`NewConsentStore(db, table)`).
 
 | Option | Type | Effect |
 |---|---|---|
@@ -460,6 +462,10 @@ independent.
 | `WithIdentityTextLibraryIDs()` | `IdentityOption` | Retype **both** identity id columns together |
 | `WithAuditNames(AuditNames{...})` | `AuditOption` | Rename `audit_events`, `audit_seals` and `audit_subject_keys` |
 | `WithAuditTextLibraryIDs()` | `AuditOption` | Retype the event `id` as text; without it only lowercase UUIDs are accepted |
+| `WithCredentialNames(CredentialNames{...})` | `CredentialOption` | Rename `credentials`, `passkey_challenges` |
+| `WithCredentialTextLibraryIDs()` | `CredentialOption` | Retype every passkey id column, `user_id` included (pass with `WithAuthTextLibraryIDs()`) |
+| `WithMFANames(MFANames{...})` | `MFAOption` | Rename `mfa_factors`, `mfa_recovery_codes`, `trusted_devices` |
+| `WithMFATextLibraryIDs()` | `MFAOption` | Retype the MFA id columns, `user_id` included (pass with `WithAuthTextLibraryIDs()`) |
 
 <Warning>
 The library-ids and user-ids options answer **independent** questions and do not

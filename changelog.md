@@ -34,7 +34,7 @@ once a 1.0 is cut. Until then, minor versions may break API.
     `Topic.ClientDataRetention` and `Service.ScrubClientData` (part of
     `ApplyRetention`) clear IP and user agent on a shorter schedule. **IP and
     user agent are no longer part of a seal's hash** — the one change to the
-    stored format — and the PostgreSQL `AU001` guard allows exactly that
+    stored format, breaking for seals made by v0.2.0 (see Changed) — and the PostgreSQL `AU001` guard allows exactly that
     rewrite. `audit.Store` gained `ScrubClientData`; custom stores must add it
     (the contract suite checks it). `Service.Count` was added.
   - `consent`: append-only consent records (`Grant`, `Withdraw`, `Accepted`,
@@ -64,7 +64,9 @@ once a 1.0 is cut. Until then, minor versions may break API.
   hash chain, empty days included; `Service.Verify` recomputes it and reports
   `ok`, `mismatch` (`events_hash`, `seal_hash`, `chain` or `purged_early`),
   `unsealed` or `purged` per day; a day missing between two seals is a
-  `chain` mismatch, not `unsealed`. `Seal` never seals a day that has not ended
+  `chain` mismatch, not `unsealed`, and a purge stamp dated after the
+  `Service` clock (beyond `PurgeClockSkew`, five minutes) is `purged_early`,
+  so a day younger than its retention never reads as `purged`. `Seal` never seals a day that has not ended
   on the Service clock, starts a topic's chain at its earliest event day, and
   digests a day again when the store refuses a seal as stale
   (`ErrSealStale`). `Service.Reconcile` closes the events a crashed process
@@ -76,11 +78,13 @@ once a 1.0 is cut. Until then, minor versions may break API.
   rewrites at the database with SQLSTATE `AU001` (event update), `AU002`
   (any delete outside a retention transaction — `AuditRetentionSetting`, set
   only by `Purge` — or of a sealed, unpurged day; truncate), `AU003` (seal
-  update other than a purge stamp inside retention, delete, truncate),
+  update other than a purge stamp inside retention and not ahead of the
+  database clock by more than `audit.PurgeClockSkew`, delete, truncate),
   `AU004` (insert into a sealed day), `AU005` (a seal that no longer matches its
   day's events, which `Seal` answers by digesting the day again) and `AU006`
   (an insert under an isolation stricter than READ COMMITTED). Event and seal
-  inserts share an advisory lock per (topic, day), so an event in flight while a
+  inserts share an advisory lock per (tables, topic, day) — independent of the
+  session's `DateStyle` — so an event in flight while a
   day is sealed is either covered by the seal or refused. `AuditDDL` returns
   the statements for a migration (PostgreSQL 14+, one transaction);
   `CreateSchema` applies them in one transaction under an advisory lock, and
@@ -92,9 +96,11 @@ once a 1.0 is cut. Until then, minor versions may break API.
   against `store/memory` and, in the integration lane, against PostgreSQL.
 - **`audit/audithook`.** Adapters from the lifecycle hooks of `auth`,
   `scope` (and so `org` and `team`), `apikey` and `oauth` to audit events.
-  Inside a call with a pending event they annotate it (resource, container,
-  reason, the role key as `Changes`); otherwise they record a standalone
-  event named `<package>.<kind in snake case>` (`auth.login_failed`,
+  Inside a call with a pending event the call's first hook event annotates
+  it (resource, container, reason, the role key as `Changes`) and every
+  further one is recorded on its own (`audit.Pending.Claim`), so a
+  multi-event call such as `RemoveUser` keeps every removal and transfer;
+  otherwise they record a standalone event named `<package>.<kind in snake case>` (`auth.login_failed`,
   `scope.member_role_changed`) under the topics `access`, `auth`, `apikey`
   and `oauth`. Refusals are `denied` and anonymous where the caller is not
   the account (a failed sign-in, a challenge, a token replay), the closed
@@ -105,6 +111,49 @@ once a 1.0 is cut. Until then, minor versions may break API.
 - `authlayer.Shared.Audit()` hands the audit `Service` the shared clock and id
   generator, and `examples/audit` is a runnable tour (run by CI), with a new
   [audit section](docs/audit/overview.mdx) in the docs.
+
+### Changed
+
+- **BREAKING — the audit seal format.** The canonical row an `events_hash`
+  covers no longer has the `"ip"` and `"user_agent"` keys (v0.2.0 wrote them,
+  as `""` when empty, between `changes` and `client_time`). Every non-empty
+  day sealed by v0.2.0 therefore reads as `mismatch` (`events_hash`) after the
+  upgrade; empty days and `seal_hash` itself are unchanged. There is no
+  fallback to the old row. To upgrade a log sealed by v0.2.0: run `Verify`
+  on v0.2.0 first, so nothing is laundered, then, as the owner of the tables,
+  move the old seals aside (the guards refuse to delete them for the
+  application role) and run `Seal`, which rebuilds each topic's chain from its
+  earliest remaining event day. Days v0.2.0 already purged cannot be re-sealed.
+  [`docs/audit/integrity`](docs/audit/integrity.mdx#the-hash-format) describes
+  the format as implemented.
+- **The audit core already in the v0.2.0 tag changed.** The `audit` package,
+  `audit/audittest` and `store/memory`'s audit store shipped in v0.2.0 without
+  a changelog entry; the API stays source-compatible, but behaviour moved. For
+  code built on them:
+  - **Custom `audit.Store`s must add two MUSTs** (the contract suite now fails
+    them): `InsertSeal` checks, atomically with the write, that the day still
+    matches the seal (count, first/last `Seq`, no open event) and returns the
+    new `ErrSealStale` otherwise; `Purge` with `batch <= 0` deletes nothing and
+    returns 0 (v0.2.0's memory store deleted everything). They must also add
+    `ScrubClientData` (see Added).
+  - `Seal` caps `until` at the start of the Service clock's day, starts a chain
+    at the earliest event day, and digests a day again on `ErrSealStale`.
+  - `Verify` reports a day missing between two seals, and a seal that claims a
+    missing predecessor, as `mismatch`/`chain`; checks `first_seq`/`last_seq`
+    (`seal_hash`); and reports an early or future-dated purge stamp as
+    `purged_early`.
+  - `EqualJSON` compares numbers by value (`1e2` equals `100`), so a retried
+    `Complete` whose store respelled a number is an identical retry.
+  - `DefaultPolicy` redacts many more keys (pwd, pass, jwt, bearer, the
+    signing/access/encryption/HMAC/master/session keys, TOTP and MFA codes,
+    PIN, device and user codes, PKCE verifiers, plaintext).
+  - `WithResource` fills type and id field by field; a taken id is a retry only
+    when the `Source` matches too; NUL characters in any text field, id,
+    `Request`, `Changes` or `Filter` string are `ErrInvalidEvent` (`Get`:
+    `ErrNotFound`).
+  - The seal hash format changed (above).
+  - `store/drops.AuditStore`, new in this release, needs PostgreSQL 14 or later
+    (`CREATE OR REPLACE TRIGGER`).
 
 ## [0.2.0] - 2026-10-02
 

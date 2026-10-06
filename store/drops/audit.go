@@ -28,7 +28,11 @@ type AuditStore struct {
 // Compile-time proof the drops audit store satisfies the port.
 var _ audit.Store = (*AuditStore)(nil)
 
-// NewAuditStore returns an AuditStore over db.
+// NewAuditStore returns an AuditStore over db, which must be a pool, not a
+// handle bound to a transaction: Insert and InsertSeal each run in a READ
+// COMMITTED transaction of their own, and a transaction-bound db cannot nest
+// one (the database/sql driver refuses nested transactions). Write audit
+// events outside the business transaction, so they survive its rollback.
 func NewAuditStore(db *pg.DB, opts ...AuditOption) *AuditStore {
 	cfg := newAuditSettings(opts)
 	return &AuditStore{db: db, cfg: cfg, ev: quoteIdent(cfg.names.Events), sl: quoteIdent(cfg.names.Seals)}

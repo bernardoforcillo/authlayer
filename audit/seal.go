@@ -13,6 +13,14 @@ import (
 
 const day = 24 * time.Hour
 
+// PurgeClockSkew is how far a seal's PurgedAt may lie after the Service clock
+// before [Service.Verify] calls it forged. Retention stamps the time it runs,
+// so only the clock difference between the replica that purged and the one
+// verifying can put an honest stamp in the future. The drops seals guard
+// refuses a purged_at further ahead than its database clock by the same
+// margin.
+const PurgeClockSkew = 5 * time.Minute
+
 func startOfDay(t time.Time) time.Time {
 	y, m, d := t.UTC().Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
@@ -262,8 +270,11 @@ func (s *Service) firstEventDay(ctx context.Context, topic string) (time.Time, e
 // does not link to the nearest earlier seal (or claims a predecessor that is
 // missing) is "chain"; one whose events no longer hash to it is
 // "events_hash". A purged day is checked for its link and for the age it was
-// purged at: a seal marked purged while PurgedAt - Day was still under the
-// topic's current retention is DayMismatch "purged_early". Shortening a
+// purged at, judged by this Service's clock: a seal marked purged while
+// PurgedAt - Day was still under the topic's current retention, or whose
+// PurgedAt lies after the Service clock by more than [PurgeClockSkew], is
+// DayMismatch "purged_early". A day younger than its retention therefore
+// never reads as purged, whatever was stamped. Shortening a
 // topic's retention is therefore safe; lengthening it makes the days purged
 // under the shorter one read as purged_early, which is worth a review.
 func (s *Service) Verify(ctx context.Context, topics []string, from, to time.Time) ([]DayStatus, error) {
@@ -359,8 +370,12 @@ func (s *Service) checkSeal(ctx context.Context, sl Seal, prev *Seal) (DayState,
 	}
 	if sl.PurgedAt != nil {
 		// Retention purges a day only once the whole day is older than the
-		// topic's retention, so an earlier stamp is a delete in disguise.
-		if sl.PurgedAt.Sub(d) < s.retention(sl.Topic) {
+		// topic's retention, and stamps the time it runs, so an earlier
+		// stamp is a delete in disguise. A stamp later than this Service's
+		// clock (beyond PurgeClockSkew) is forged: whoever wrote it could
+		// otherwise date it far enough ahead to pass the age check, so the
+		// age that counts is judged by Verify's own clock.
+		if sl.PurgedAt.Sub(d) < s.retention(sl.Topic) || sl.PurgedAt.After(s.now().Add(PurgeClockSkew)) {
 			return DayMismatch, "purged_early", nil
 		}
 		return DayPurged, "", nil

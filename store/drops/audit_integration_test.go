@@ -162,6 +162,16 @@ func TestAuditStoreTextIDs(t *testing.T) {
 	if err != nil || e.ID != "evt-1" {
 		t.Fatalf("Record = %+v, %v", e, err)
 	}
+	// A NUL never reaches PostgreSQL, which would answer with SQLSTATE 22021.
+	if err := svc.Complete(ctx, "a\x00b", audit.Completion{Outcome: audit.OutcomeOK}); !errors.Is(err, audit.ErrInvalidEvent) {
+		t.Errorf("Complete(NUL id) err = %v, want ErrInvalidEvent", err)
+	}
+	if _, err := svc.Get(ctx, "a\x00b"); !errors.Is(err, audit.ErrNotFound) {
+		t.Errorf("Get(NUL id) err = %v, want ErrNotFound", err)
+	}
+	if _, _, err := svc.List(ctx, audit.Filter{Member: "u\x00"}, audit.Page{}); !errors.Is(err, audit.ErrInvalidEvent) {
+		t.Errorf("List(NUL member) err = %v, want ErrInvalidEvent", err)
+	}
 }
 
 func TestAuditGuardAllowsOnlyClearingClientData(t *testing.T) {
@@ -325,13 +335,71 @@ func TestAuditDeleteAndPurgeStampNeedTheRetentionSettingLive(t *testing.T) {
 	}
 }
 
+// A purge stamp dated in the future is how a holder of the application's
+// credentials would make a young day pass the age check: the seals guard
+// refuses one beyond the database clock plus audit.PurgeClockSkew, and Verify,
+// judging by its own clock, calls any future stamp that does land
+// purged_early, never purged.
+func TestAuditFutureDatedPurgeStampIsRefusedLive(t *testing.T) {
+	st, db := newLiveAuditStore(t)
+	ctx := context.Background()
+	clock := time.Date(2026, 1, 10, 9, 0, 0, 0, time.UTC)
+	svc := audit.New(st, audit.WithRuntime(core.Runtime{Clock: func() time.Time { return clock }}),
+		audit.WithTopics(audit.Topic{Key: "t", Retention: 90 * 24 * time.Hour}))
+	e, err := svc.Record(ctx, audit.Event{Topic: "t", Action: "a.b", Origin: "x", Outcome: audit.OutcomeOK,
+		Actor: audit.Actor{Type: audit.ActorUser, ID: "u"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(24 * time.Hour)
+	if _, err := svc.Seal(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	day := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+
+	// The scenario of the review: retention setting on, a forged stamp, a DELETE.
+	err = db.InTx(ctx, func(tx *pg.DB) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config($1, 'on', true)`, dropsstore.AuditRetentionSetting); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE audit_seals SET purged_at = '2099-01-01' WHERE topic = 't' AND day = $1`, day); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM audit_events WHERE id = $1`, e.ID)
+		return err
+	})
+	wantCode(t, err, dropsstore.AuditSealImmutable)
+	err = st.MarkPurged(ctx, "t", day.Add(24*time.Hour), time.Now().Add(audit.PurgeClockSkew+time.Hour))
+	wantCode(t, err, dropsstore.AuditSealImmutable)
+
+	// A stamp inside the skew lands (the database cannot tell it from a
+	// replica's fast clock), but Verify's clock sits on 11 January, so the day
+	// reads as purged_early, not purged.
+	if err := st.MarkPurged(ctx, "t", day.Add(24*time.Hour), time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("MarkPurged inside the skew: %v", err)
+	}
+	sts, err := svc.Verify(ctx, nil, day, day)
+	if err != nil || sts[0].State != audit.DayMismatch || sts[0].Detail != "purged_early" {
+		t.Fatalf("Verify = %+v, %v; want mismatch purged_early", sts, err)
+	}
+}
+
 const rawAuditInsert = `INSERT INTO audit_events (id, occurred_at, completed_at, topic, action, source, origin, actor_type, outcome)
 VALUES ($1, $2, $2, 't', 'a.late', 'server', 'x', 'system', 'ok')`
 
 // An event whose insert is still in flight when its day is sealed either
 // makes the seal stale, so Seal digests the day again and covers it, or is
 // refused; it never lands in a day its seal does not cover.
+//
+// The inserting session may format dates differently from the sealing one
+// (DateStyle): the lock both take must not depend on it.
 func TestAuditSealCoversAnInsertInFlightLive(t *testing.T) {
+	for _, style := range []string{"", "SQL, DMY", "German"} {
+		t.Run("datestyle "+style, func(t *testing.T) { sealCoversAnInsertInFlight(t, style) })
+	}
+}
+
+func sealCoversAnInsertInFlight(t *testing.T, dateStyle string) {
 	st, db := newLiveAuditStore(t)
 	ctx := context.Background()
 	clock := time.Date(2026, 1, 11, 0, 0, 1, 0, time.UTC)
@@ -344,6 +412,11 @@ func TestAuditSealCoversAnInsertInFlightLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	if dateStyle != "" {
+		if _, err := txdb.Exec(ctx, `SELECT set_config('DateStyle', $1, true)`, dateStyle); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := txdb.Exec(ctx, rawAuditInsert, uid.NewV7(), yesterday); err != nil {
 		t.Fatalf("insert in flight: %v", err)
 	}
@@ -369,6 +442,51 @@ func TestAuditSealCoversAnInsertInFlightLive(t *testing.T) {
 	}
 	if sts, err := svc.Verify(ctx, nil, yesterday, yesterday); err != nil || sts[0].State != audit.DayOK {
 		t.Fatalf("Verify = %+v, %v; want ok", sts, err)
+	}
+}
+
+// The (topic, day) lock is scoped by the audit tables it guards: an insert in
+// flight into one pair of tables does not hold up sealing another pair that
+// uses the same topic.
+func TestAuditSealLockIsScopedByTableLive(t *testing.T) {
+	_, db := newLiveAuditStore(t)
+	ctx := context.Background()
+	other := dropsstore.NewAuditStore(db, dropsstore.WithAuditNames(dropsstore.AuditNames{
+		Events: "audit_events_b", Seals: "audit_seals_b", Keys: "audit_subject_keys_b"}))
+	_ = other.DropSchema(ctx)
+	if err := other.CreateSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.DropSchema(context.Background()) })
+	clock := time.Date(2026, 1, 10, 12, 0, 0, 0, time.UTC)
+	svc := audit.New(other, audit.WithRuntime(core.Runtime{Clock: func() time.Time { return clock }}),
+		audit.WithTopics(audit.Topic{Key: "t"}))
+	if _, err := svc.Record(ctx, audit.Event{Topic: "t", Action: "a.b", Origin: "x", Outcome: audit.OutcomeOK,
+		Actor: audit.Actor{Type: audit.ActorSystem}}); err != nil {
+		t.Fatal(err)
+	}
+	clock = time.Date(2026, 1, 11, 0, 0, 1, 0, time.UTC)
+
+	txdb, tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := txdb.Exec(ctx, rawAuditInsert, uid.NewV7(), time.Date(2026, 1, 10, 23, 59, 59, 0, time.UTC)); err != nil {
+		t.Fatalf("insert in flight: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.Seal(ctx, clock)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Seal: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("sealing audit_seals_b waits on an insert into audit_events")
 	}
 }
 

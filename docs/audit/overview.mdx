@@ -100,8 +100,11 @@ c := pending.Completion(audit.OutcomeOK, "", 4)
 fmt.Println(c.Resource.Type, c.Resource.ID, c.ContainerID, c.Reason)
 ```
 
-The first `WithResource` and `WithContainer` win — the action's own target, not
-a side effect's. The interceptor turns the `Pending` into a `Completion` with
+`WithContainer` and `WithResource` fill once — the action's own target, not a
+side effect's. `WithResource` does it field by field: a later call fills only a
+type or id still empty, and is ignored when both carry a type and the types
+differ, so a typeless id followed by a typed resource takes that type. Pass the
+type every time. The interceptor turns the `Pending` into a `Completion` with
 `pending.Completion(outcome, code, durationMS)`.
 
 {/* verify:stdout "open: true outcome: true\nok {\"api_key\":\"[REDACTED]\",\"name\":\"Lunch\"}\n{\"price\":{\"after\":12,\"before\":9}}\nmenu m1 acme owner_request" */}
@@ -135,12 +138,17 @@ keysSvc := apikey.New(orgSvc.Service, keyStore, apikey.WithHooks(audithook.APIKe
 oauthSvc := oauth.New(oauthStore, orgSvc, signer, oauth.WithHooks(audithook.OAuth(svc)))
 ```
 
-**Inside a recorded call, the hooks annotate.** When an interceptor has begun
-an event and put its `Pending` on the context, an adapter adds what the hook
-knows to that event — the resource (the member, the role, the key), the
-container, the `Detail` as its reason, a role key as `Changes` — and records
-nothing of its own. The interceptor completes the event with the call's real
-outcome.
+**Inside a recorded call, the first hook annotates.** When an interceptor has
+begun an event and put its `Pending` on the context, the call's first hook
+event claims it (`Pending.Claim`) and adds what the hook knows to it — the
+resource (the member, the role, the key), the container, the `Detail` as its
+reason, a role key as `Changes`. The interceptor completes the event with the
+call's real outcome. Every further hook event of the same call is recorded on
+its own, so an operation that fires several hooks keeps them all: `RemoveUser`
+records the removal from each other container, and the ownership transfer it
+makes on its way never claims the pending event, which keeps naming the removed
+user. An annotation has no `Request`, so the anonymized flag of a removal or the
+`client_id` of an OAuth grant event is kept only on standalone events.
 
 **Otherwise they record.** Hooks fire after the mutation, so these events are
 already over: a refusal — a failed login, a rejected key or token, a replayed

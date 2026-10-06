@@ -328,6 +328,51 @@ func TestVerifyReportsAPurgeBeforeRetentionAsMismatch(t *testing.T) {
 	}
 }
 
+// A purge stamp dated after the Service clock cannot be honest: retention
+// stamps the time it runs. Verify judges by its own clock, so a day younger
+// than its retention never reads as purged, whatever was written into
+// PurgedAt. A stamp within the clock skew allowance is still accepted.
+func TestVerifyReportsAFutureDatedPurgeAsMismatch(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name   string
+		now    time.Time
+		at     func(now time.Time) time.Time
+		state  audit.DayState
+		detail string
+	}{
+		{"forged far future", day(4), func(time.Time) time.Time { return time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC) },
+			audit.DayMismatch, "purged_early"},
+		{"past retention but ahead of the clock", day(1).AddDate(2, 0, 0),
+			func(now time.Time) time.Time { return now.Add(audit.PurgeClockSkew + time.Minute) },
+			audit.DayMismatch, "purged_early"},
+		{"past retention within the skew", day(1).AddDate(2, 0, 0),
+			func(now time.Time) time.Time { return now.Add(audit.PurgeClockSkew - time.Minute) },
+			audit.DayPurged, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, st, clk := newService(t)
+			threeDays(t, svc, clk)
+			clk.Set(day(4))
+			if _, err := svc.Seal(ctx, day(4)); err != nil {
+				t.Fatalf("Seal: %v", err)
+			}
+			clk.Set(tc.now)
+			if err := st.MarkPurged(ctx, "menus", day(2), tc.at(tc.now)); err != nil {
+				t.Fatal(err)
+			}
+			days, err := svc.Verify(ctx, []string{"menus"}, day(1), day(1))
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+			if days[0].State != tc.state || days[0].Detail != tc.detail {
+				t.Errorf("1 March = %s %q, want %s %q", days[0].State, days[0].Detail, tc.state, tc.detail)
+			}
+		})
+	}
+}
+
 // lateInsertStore lands one more event in a day between Seal's digest of the
 // day and its InsertSeal, the way an insert in flight at midnight commits.
 type lateInsertStore struct {

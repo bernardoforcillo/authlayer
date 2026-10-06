@@ -20,6 +20,7 @@ type Pending struct {
 	reason      string
 	before      json.RawMessage
 	after       json.RawMessage
+	claimed     bool
 }
 
 // NewPending returns the collector for the open event id.
@@ -27,6 +28,21 @@ func NewPending(id string) *Pending { return &Pending{id: id} }
 
 // ID is the open event's id.
 func (p *Pending) ID() string { return p.id }
+
+// Claim reports whether this is the first claim on p, and marks it claimed.
+// An adapter that turns side effects into annotations, such as audithook,
+// claims the pending event before annotating it: only the first of the
+// operation's events describes the event in flight, and every further one is
+// recorded as an event of its own, so an operation that fires several hooks
+// (a user removed from several containers) loses none of them. Annotate
+// itself never claims.
+func (p *Pending) Claim() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	first := !p.claimed
+	p.claimed = true
+	return first
+}
 
 // WithPending returns ctx carrying p.
 func WithPending(ctx context.Context, p *Pending) context.Context {
@@ -42,10 +58,13 @@ func PendingFrom(ctx context.Context) (*Pending, bool) {
 // Annotation adds one fact to a pending event.
 type Annotation func(*Pending)
 
-// WithResource names the resource the action touched. The first annotation
-// wins, field by field: the action's own target, not a side effect's. A
-// later annotation can still fill an ID left empty, when its type is the
-// same (or the type is still empty).
+// WithResource names the resource the action touched. It fills type and id
+// field by field, each once: a later annotation fills only a field still
+// empty, and is ignored when both it and the stored resource carry a type
+// and the types differ. The first annotation therefore wins — the action's
+// own target, not a side effect's — but the fields may come from two
+// annotations: a typeless id ("", "x") followed by ("menu", "m1") gives
+// {menu, x}. Annotate with a type to avoid that.
 func WithResource(typ, id string) Annotation {
 	return func(p *Pending) {
 		if p.resource.Type != "" && typ != "" && typ != p.resource.Type {

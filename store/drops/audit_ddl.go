@@ -1,6 +1,12 @@
 package dropsstore
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/audit"
+)
 
 // SQLSTATEs the audit guard triggers raise. They are in the application
 // class space (AU) so a caller can tell a refused rewrite from any other
@@ -15,7 +21,8 @@ const (
 	// day is sealed and the seal is not marked purged.
 	AuditEventProtected = "AU002"
 	// AuditSealImmutable (AU003): an UPDATE of a seal other than stamping
-	// purged_at once inside a retention transaction, or any DELETE or
+	// purged_at once inside a retention transaction, with a time not later
+	// than the database clock plus [audit.PurgeClockSkew], or any DELETE or
 	// TRUNCATE of seals.
 	AuditSealImmutable = "AU003"
 	// AuditDaySealed (AU004): an INSERT of an event into a (topic, day) that
@@ -123,14 +130,15 @@ const auditSchemaLock = 0x617564697464646c // "auditddl"
 //     then not while its day's seal is unpurged; the events table may not be
 //     truncated.
 //   - AU003: a seal may only get purged_at stamped, once, inside a retention
-//     transaction; seals are never deleted or truncated.
+//     transaction, and not with a time ahead of the database clock by more
+//     than [audit.PurgeClockSkew]; seals are never deleted or truncated.
 //   - AU004: an event may not be inserted into a sealed (topic, day).
 //   - AU005: a seal may not be inserted unless the day's events still
 //     match it (count, first and last seq, none open).
 //   - AU006: neither an event nor a seal may be inserted in a transaction
 //     stricter than READ COMMITTED.
 //
-// AU004 and AU005 share an advisory lock per (topic, day): an event insert
+// AU004 and AU005 share an advisory lock per (tables, topic, day): an event insert
 // holds it shared until it commits, the seal insert takes it exclusively and
 // then re-counts the day. An event in flight while Seal digested the day is
 // therefore either counted, which makes the seal stale so Seal digests the
@@ -161,6 +169,14 @@ func AuditDDL(opts ...AuditOption) []string {
 	// Every guard runs with this search_path and reaches the tables only as
 	// TG_TABLE_SCHEMA-qualified names, through format('%I.%I').
 	const guarded = ` LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $authlayer$`
+	// dayLock is the advisory lock key of a (topic, day) of these tables,
+	// shared by the event and seal insert guards: the schema-qualified events
+	// table and the topic hashed, and the day as days since 1970-01-01, so
+	// neither the session's DateStyle nor a second pair of audit tables in
+	// the database changes which inserts it serializes.
+	dayLock := func(dayExpr string) string {
+		return `hashtext(TG_TABLE_SCHEMA || '.' || ` + evLit + ` || '|' || NEW.topic), ` + dayExpr + ` - date '1970-01-01'`
+	}
 	trigger := func(name, when, table, each, fn string) string {
 		return `CREATE OR REPLACE TRIGGER ` + name + ` ` + when + ` ON ` + table +
 			` FOR EACH ` + each + ` EXECUTE FUNCTION ` + fn + `()`
@@ -290,7 +306,7 @@ BEGIN
   IF current_setting('transaction_isolation') <> 'read committed' THEN
     RAISE EXCEPTION 'authlayer audit: events must be inserted under READ COMMITTED' USING ERRCODE = '` + AuditIsolation + `';
   END IF;
-  PERFORM pg_advisory_xact_lock_shared(hashtextextended(NEW.topic || '|' || (NEW.occurred_at AT TIME ZONE 'UTC')::date::text, 0));
+  PERFORM pg_advisory_xact_lock_shared(` + dayLock("(NEW.occurred_at AT TIME ZONE 'UTC')::date") + `);
   EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I.%I s WHERE s.topic = $1 AND s.day = $2)', TG_TABLE_SCHEMA, ` + slLit + `)
      INTO sealed USING NEW.topic, (NEW.occurred_at AT TIME ZONE 'UTC')::date;
   IF sealed THEN
@@ -313,7 +329,7 @@ BEGIN
     END IF;
     -- Wait for every event insert in flight on the day, then check the seal
     -- still describes the day: under READ COMMITTED this statement sees them.
-    PERFORM pg_advisory_xact_lock(hashtextextended(NEW.topic || '|' || NEW.day::text, 0));
+    PERFORM pg_advisory_xact_lock(` + dayLock("NEW.day") + `);
     EXECUTE format('SELECT count(*), coalesce(min(e.seq), 0), coalesce(max(e.seq), 0),
                            count(*) FILTER (WHERE e.completed_at IS NULL)
                       FROM %I.%I e WHERE e.topic = $1 AND e.occurred_at >= $2 AND e.occurred_at < $3',
@@ -327,6 +343,7 @@ BEGIN
   END IF;
   IF TG_OP = 'UPDATE' AND OLD.purged_at IS NULL AND NEW.purged_at IS NOT NULL
      AND current_setting('` + AuditRetentionSetting + `', true) IS NOT DISTINCT FROM 'on'
+     AND NEW.purged_at <= now() + interval '` + strconv.Itoa(int(audit.PurgeClockSkew/time.Second)) + ` seconds'
      AND NEW.topic = OLD.topic AND NEW.day = OLD.day AND NEW.event_count = OLD.event_count
      AND NEW.first_seq = OLD.first_seq AND NEW.last_seq = OLD.last_seq
      AND NEW.events_hash = OLD.events_hash AND NEW.prev_hash = OLD.prev_hash

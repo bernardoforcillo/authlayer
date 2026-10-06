@@ -125,21 +125,25 @@ The seals are.
 | `ok` | the day's events hash to its seal, which links to the previous day's |
 | `mismatch` | something no longer matches; `Detail` says what |
 | `unsealed` | no seal covers the day yet |
-| `purged` | retention deleted the events; the seal still links and was marked purged only once the day was past its topic's retention |
+| `purged` | retention deleted the events; the seal still links and was marked purged only once the day was past its topic's retention, at a time not after the `Service` clock |
 
 A `mismatch` names the check that failed: `events_hash` (an event was altered,
 inserted or deleted, or a stored event is unreadable), `seal_hash` (the seal row
 itself was edited, its first/last `Seq` included), `chain` (the seal no longer
 links to the previous one, or a day between two seals lost its own — a day was
 deleted or replaced), or `purged_early` (the seal was marked purged
-while the day was younger than its topic's retention, so its events went
-outside retention). Editing a seal to match an edited event does not help: the
+while the day was younger than its topic's retention, or with a `purged_at`
+later than the `Service` clock by more than `audit.PurgeClockSkew`, so its
+events went outside retention). Editing a seal to match an edited event does not help: the
 next day's `PrevHash` no longer matches.
 
 ## The hash format
 
 The hashes are computed by the `Service`, in Go, from what the store returns, so
-every store produces the same ones and an outside verifier can recompute them.
+an outside verifier can recompute them, and the hash depends only on what the
+store returns: a store that respells JSON numbers, as PostgreSQL's `jsonb` does
+(`1e2` comes back as `100`), hashes its own spelling, so the same event may
+hash differently on two stores.
 
 - **Canonical row.** Each event is one JSON object with exactly these keys, in
   this order: `id`, `seq`, `occurred_at`, `completed_at`, `topic`, `action`,
@@ -152,13 +156,24 @@ every store produces the same ones and an outside verifier can recompute them.
   `2026-03-01T09:00:00Z`, `2026-03-01T09:00:00.5Z`). `request` and `changes`
   are re-encoded with sorted keys and no whitespace, numbers spelled as the
   store returns them. The encoding is Go's `encoding/json`, which escapes `<`,
-  `>` and `&` as `\u003c`, `\u003e` and `\u0026`. The IP address and user agent
+  `>` and `&` as `\u003c`, `\u003e` and `\u0026`, escapes U+2028 and U+2029
+  as `\u2028` and `\u2029`, and replaces invalid UTF-8 with U+FFFD. The IP address and user agent
   are not part of it.
 - **`events_hash`** = hex SHA-256 of the day's canonical rows in `Seq` order,
   each followed by `\n`. An empty day hashes the empty string.
 - **`seal_hash`** = hex SHA-256 of `prev_hash|topic|day|event_count|events_hash`,
   with `day` as `YYYY-MM-DD` and `event_count` in decimal. A topic's first seal
   has `prev_hash = ""`.
+
+<Warning>
+This is the format since the release after v0.2.0. v0.2.0's canonical row also
+had `"ip"` and `"user_agent"` (between `changes` and `client_time`), so a
+non-empty day sealed by v0.2.0 reads as `mismatch` (`events_hash`) on this
+version. There is no fallback to the old row: verify on v0.2.0 first, then
+re-seal — as the owner of the tables, move the old seals aside and run `Seal`,
+which rebuilds each chain from the topic's earliest remaining event day. Days
+already purged under v0.2.0 cannot be re-sealed. See the changelog.
+</Warning>
 
 {/* verify:main */}
 ```go
@@ -203,7 +218,9 @@ undermining the thing it sits next to:
 Run `ApplyRetention` on a schedule too — after `Seal`, so the days it may purge
 are sealed.
 
-`Verify` checks a purged day against its topic's **current** retention: a seal
-marked purged while the day was younger than that is `purged_early`. Shortening
+`Verify` checks a purged day against its topic's **current** retention, by its
+own clock: a seal marked purged while the day was younger than that, or whose
+`purged_at` lies in the future (beyond `audit.PurgeClockSkew`, five minutes,
+for clock drift between replicas), is `purged_early`. Shortening
 a retention is therefore safe; lengthening one makes the days purged under the
 shorter value read as `purged_early`, so review them when you do.

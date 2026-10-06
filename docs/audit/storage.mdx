@@ -29,6 +29,18 @@ accepted only in the lowercase hyphenated form the `Service` mints — another
 spelling is `ErrInvalidEvent` on insert and `ErrNotFound` on a lookup — or
 `text` with `WithAuditTextLibraryIDs` for a generator that does not mint UUIDs.
 
+Build the store over a pool, not over a `*pg.DB` bound to a transaction:
+`Insert` and `InsertSeal` open their own `READ COMMITTED` transaction (see
+below), which a transaction-bound handle cannot nest (`database/sql` refuses
+nested transactions). Audit events are meant to be written outside the business
+transaction anyway, so they survive its rollback.
+
+The `Filter` indexes on actor, on-behalf-of, resource and container are partial
+(`WHERE … <> ''`). A prepared statement under a generic plan cannot prove its
+parameter is non-empty, so with `plan_cache_mode = force_generic_plan` the
+planner skips them and scans the table; the default `auto` mode plans each
+`Member` or `ContainerID` read with its values and uses them.
+
 ### The guards
 
 The database itself refuses to rewrite the log. Each refusal is a distinct
@@ -38,14 +50,16 @@ SQLSTATE, so a caller can tell it from any other failure:
 |---|---|---|
 | `AU001` | `AuditEventImmutable` | an `UPDATE` of an event other than its one completion (`completed_at` from NULL, completion columns only; resource and container only when empty) or the clearing of its `ip` and `user_agent` on retention, with every other column unchanged |
 | `AU002` | `AuditEventProtected` | a `DELETE` of an event outside a retention transaction, a `DELETE` of an event whose day is sealed and not yet marked purged (even inside one), and any `TRUNCATE` of events |
-| `AU003` | `AuditSealImmutable` | an `UPDATE` of a seal other than stamping `purged_at` once inside a retention transaction, and any `DELETE` or `TRUNCATE` |
+| `AU003` | `AuditSealImmutable` | an `UPDATE` of a seal other than stamping `purged_at` once inside a retention transaction (not later than the database clock plus `audit.PurgeClockSkew`), and any `DELETE` or `TRUNCATE` |
 | `AU004` | `AuditDaySealed` | an `INSERT` into a sealed (topic, day); `Insert` reports it as `ErrSealed` |
 | `AU005` | `AuditSealStale` | an `INSERT` of a seal whose event count or first/last `seq` no longer match its day, or whose day holds an open event; `InsertSeal` reports it as `ErrSealStale` |
 | `AU006` | `AuditIsolation` | an `INSERT` of an event or a seal in a transaction stricter than `READ COMMITTED` |
 
 `Seal` digests a day, then inserts its seal, so an event insert can still be in
 flight in between. The event insert and the seal insert contend on an advisory
-lock for the (topic, day): the event holds it until it commits, and the seal
+lock for the (topic, day) of those tables — keyed by the schema-qualified table
+name, the topic and the day as a number, so neither another pair of audit tables
+nor a session's `DateStyle` changes it: the event holds it until it commits, and the seal
 takes it exclusively, then counts the day again. The event is therefore either
 counted, and the seal refused as stale so `Seal` digests the day again, or it
 starts after the seal committed and is refused with `ErrSealed`. It never lands
@@ -76,8 +90,12 @@ ORM cascade or a cleanup script cannot remove an event, sealed or not.
 `ApplyRetention` marks a day's seal purged first (the one seal update `AU003`
 allows), then deletes its events (which `AU002` now allows). The setting stops
 accidents, not an attacker holding the application's credentials, who can set
-it too: `Verify` reports a seal stamped purged before its topic's retention
-allowed it as a `mismatch` (`purged_early`).
+it too. Against them, `AU003` also refuses a `purged_at` later than the
+database clock by more than `audit.PurgeClockSkew` (five minutes), and `Verify`
+judges a purge stamp by its own clock: a seal stamped purged before its topic's
+retention allowed it, or stamped with a time after the `Service` clock plus that
+skew, is a `mismatch` (`purged_early`). A day younger than its retention
+therefore never reads as `purged`, whatever was written into `purged_at`.
 
 ### Subject keys
 

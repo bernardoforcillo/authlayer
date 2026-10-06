@@ -153,6 +153,39 @@ func TestNULCharactersAreInvalidEverywhere(t *testing.T) {
 	}
 }
 
+// A NUL in an id or a Filter string is refused by the Service, so every
+// store answers alike instead of PostgreSQL's raw "invalid byte sequence".
+func TestNULInIDsAndFiltersIsRefusedByTheService(t *testing.T) {
+	svc, _, _ := newService(t)
+	ctx := context.Background()
+	if err := svc.Complete(ctx, "a\x00b", audit.Completion{Outcome: audit.OutcomeOK}); !errors.Is(err, audit.ErrInvalidEvent) {
+		t.Errorf("Complete with a NUL in the id: err = %v, want ErrInvalidEvent", err)
+	}
+	if _, err := svc.Get(ctx, "a\x00b"); !errors.Is(err, audit.ErrNotFound) {
+		t.Errorf("Get with a NUL in the id: err = %v, want ErrNotFound", err)
+	}
+	for name, f := range map[string]audit.Filter{
+		"topic":         {Topics: []string{"menus\x00"}},
+		"container":     {ContainerID: "\x00"},
+		"member":        {Member: "u\x00"},
+		"actor":         {ActorID: "\x00"},
+		"resource":      {Resource: audit.Resource{Type: "menu", ID: "\x00"}},
+		"outcome":       {Outcomes: []audit.Outcome{"ok\x00"}},
+		"source":        {Source: "\x00"},
+		"action prefix": {ActionPrefix: "menu.\x00"},
+	} {
+		if _, _, err := svc.List(ctx, f, audit.Page{}); !errors.Is(err, audit.ErrInvalidEvent) {
+			t.Errorf("List with a NUL in the %s: err = %v, want ErrInvalidEvent", name, err)
+		}
+		if _, err := svc.Count(ctx, f); !errors.Is(err, audit.ErrInvalidEvent) {
+			t.Errorf("Count with a NUL in the %s: err = %v, want ErrInvalidEvent", name, err)
+		}
+		if err := svc.Export(ctx, f, 0, func(audit.Event) error { return nil }); !errors.Is(err, audit.ErrInvalidEvent) {
+			t.Errorf("Export with a NUL in the %s: err = %v, want ErrInvalidEvent", name, err)
+		}
+	}
+}
+
 func TestBeginIsIdempotentOnTheCallersID(t *testing.T) {
 	svc, st, _ := newService(t)
 	ctx := context.Background()
