@@ -10,6 +10,37 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Added
 
+- **Data protection (GDPR).** [`docs/privacy/data-protection`](docs/privacy/data-protection.mdx)
+  maps each duty to the call that meets it and lists what stays the
+  deployer's. New in the library:
+  - `privacy.Exporter` and its sources (`Account`, `Memberships`, `Grants`,
+    `Consents`, `AuditTrail`, `SourceFunc`) gather one JSON `Bundle` for an
+    access or portability request (Arts. 15, 20) — no password or token hash,
+    no passkey public key, no other person's identity; a failing source fails
+    the export. `scope.Service.Memberships` is the new out-of-band listing
+    behind it.
+  - `privacy.ErasureSweeper` plugs erasers (`AuditForget`, `ConsentErase`,
+    `EraserFunc`) into `auth.WithSweeper`, so deleting or anonymizing an account
+    also erases the audit identity and the consent records (Art. 17).
+  - `audit.WithSubjectKeys` pseudonymizes people at write time with a
+    per-person HMAC key; filters take real ids and are translated;
+    `Service.Forget` destroys the key and the trail becomes unreachable while
+    every event and seal stays valid. Events recorded after an erasure carry the
+    shared `ps_erased` label instead of minting a new key. `Service.Pseudonym`
+    looks one up. Key stores: `store/memory.AuditKeyStore`,
+    `store/drops.AuditKeyStore` (tombstoning), contract `audittest.RunKeyStoreContract`.
+  - `audit.WithIPMode` (keep, truncate, hash, drop), `WithIPTruncation`,
+    `WithIPHashKey` and `WithoutUserAgent` minimize client data on write;
+    `Topic.ClientDataRetention` and `Service.ScrubClientData` (part of
+    `ApplyRetention`) clear IP and user agent on a shorter schedule. **IP and
+    user agent are no longer part of a seal's hash** — the one change to the
+    stored format — and the PostgreSQL `AU001` guard allows exactly that
+    rewrite. `audit.Store` gained `ScrubClientData`; custom stores must add it
+    (the contract suite checks it). `Service.Count` was added.
+  - `consent`: append-only consent records (`Grant`, `Withdraw`, `Accepted`,
+    `History`, `Erase`) with `store/memory`, `store/drops` (a partial unique
+    index keeps one current record) and `consent/consenttest`.
+  - `examples/privacy` is a runnable tour, run by CI.
 - **`audit`: a tamper-evident audit log.** One immutable event per action
   (`Actor`, `OnBehalfOf`, `Topic`, `Action`, `Resource`, `ContainerID`,
   `Request`, `Changes`, `Outcome`), recorded in two phases: `Service.Begin`

@@ -25,12 +25,15 @@ Current release **v0.1.0**.
 | [`audit`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/audit) | The [audit log](/audit/overview) — two-phase events, redaction, a per-topic daily hash chain with `Verify`, `Reconcile` and retention | standard library |
 | [`audit/audithook`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/audit/audithook) | Adapters from the `auth`, `scope`/`org`/`team`, `apikey` and `oauth` hooks to audit events | — |
 | [`audit/audittest`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/audit/audittest) | `audit.Store`'s contract as an executable suite. **Test-only**; imports `testing` | standard library |
+| [`consent`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/consent) | [Consent records](/privacy/consent) — append-only acceptances of a purpose at a version, withdrawal, `Accepted` | standard library |
+| [`consent/consenttest`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/consent/consenttest) | `consent.Store`'s contract as an executable suite. **Test-only**; imports `testing` | standard library |
+| [`privacy`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/privacy) | [Access, portability and erasure](/privacy/access-and-erasure) — a JSON export across the modules and an erasure sweeper | — |
 | [`token`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/token) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled JWT behind one `Signer` interface with [one algorithm per constructor](/authentication/access-tokens#why-hand-rolling-this-jwt-is-defensible): `HS256` over a shared secret, [`EdDSA` with a published JWKS](/authentication/access-tokens#eddsa-and-the-jwks) | standard library |
 | [`password`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/password) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` | `x/crypto` — the **only** package that does |
-| [`store/memory`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/store/memory) | In-memory `scope.Store`, `invite.Store`, `apikey.Store`, `oauth.Store`, `auth.Store`, `auth.IdentityStore` and `audit.Store` | — |
+| [`store/memory`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/store/memory) | In-memory `scope.Store`, `invite.Store`, `apikey.Store`, `oauth.Store`, `auth.Store`, `auth.IdentityStore`, `audit.Store`, `audit.KeyStore` and `consent.Store` | — |
 | [`store/drops`](https://pkg.go.dev/github.com/bernardoforcillo/authlayer/store/drops) | PostgreSQL stores — declares **`package dropsstore`** | `drops`, `pgx/v5` |
 
-Ten runnable, database-free tours ship alongside them:
+Eleven runnable, database-free tours ship alongside them:
 
 ```sh
 go run ./examples/basic     # organization RBAC
@@ -43,6 +46,7 @@ go run ./examples/hooks     # lifecycle hooks, and an EdDSA signer with its JWKS
 go run ./examples/apikey    # service accounts and API keys, mint through cascade delete
 go run ./examples/agents    # agents and machine clients: three grants, delegation, replay, discovery
 go run ./examples/audit     # the audit log: hooks, two-phase events, reconcile, seal, verify, retention
+go run ./examples/privacy   # consent, a pseudonymized audit trail, an access request, erasure
 ```
 
 <Note>

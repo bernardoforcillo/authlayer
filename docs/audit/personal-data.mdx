@@ -1,0 +1,134 @@
+---
+title: "Personal data in the log"
+description: "An immutable log and the right to erasure pull in opposite directions. Pseudonyms written at write time, truncated IPs and a shorter retention for client data resolve it without breaking a single seal."
+---
+
+An audit log is supposed to be unchangeable; GDPR Art. 17 says a person's data
+must be erasable. The way out is not an exception to immutability but an
+event that never held the person in the first place: **pseudonymize at write
+time, with a key you can destroy**, and keep the rest of the personal data out
+or short-lived.
+
+## Pseudonyms and erasure
+
+`audit.WithSubjectKeys(keyStore)` gives every person their own secret key. On the
+way into the store, each person id an event carries — `Actor.ID`, `OnBehalfOf`
+and the id of a `user` resource — becomes `HMAC-SHA256(key, id)`, and
+`Actor.Display` is dropped. Seals are computed over what is stored, so they are
+untouched by anything that follows.
+
+Reads go the other way: a `Filter`'s `Member`, `ActorID` and user `Resource.ID`
+take **real ids** and are translated before the store is asked, so one person's
+trail is still one query. `Forget(ctx, id)` destroys the key — and the trail is
+unreachable, to everyone, for good.
+
+{/* verify:program stdout="stored actor is a pseudonym: true\ntrail before: 2\ntrail after Forget: 0\nevents kept: 3\nafter erasure: ps_erased\nverify: ok" */}
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/audit"
+	"github.com/bernardoforcillo/authlayer/core"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+
+func main() {
+	now := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	store := memory.NewAuditStore()
+	svc := audit.New(store,
+		audit.WithRuntime(core.Runtime{Clock: func() time.Time { return now }}),
+		audit.WithSubjectKeys(memory.NewAuditKeyStore()),
+		audit.WithTopics(audit.Topic{Key: "app"}))
+	ctx := context.Background()
+
+	record := func(who string) audit.Event {
+		e, _ := svc.Record(ctx, audit.Event{Topic: "app", Action: "menu.update", Origin: "backend",
+			Outcome: audit.OutcomeOK, Actor: audit.Actor{Type: audit.ActorUser, ID: who, Display: who + "@example.com"}})
+		return e
+	}
+	first := record("alice")
+	record("alice")
+	record("bob")
+	fmt.Println("stored actor is a pseudonym:", strings.HasPrefix(first.Actor.ID, audit.PseudonymPrefix) && first.Actor.Display == "")
+
+	trail := func() int {
+		n, _ := svc.Count(ctx, audit.Filter{Member: "alice"}) // a real id in, translated
+		return n
+	}
+	fmt.Println("trail before:", trail())
+
+	_ = svc.Forget(ctx, "alice") // the erasure request
+	fmt.Println("trail after Forget:", trail())
+	total, _ := svc.Count(ctx, audit.Filter{})
+	fmt.Println("events kept:", total)
+
+	// An event recorded afterwards — the deletion itself — cannot mint a new key.
+	after := record("alice")
+	fmt.Println("after erasure:", after.Actor.ID)
+
+	now = now.Add(48 * time.Hour)
+	_, _ = svc.Seal(ctx, now)
+	st, _ := svc.Verify(ctx, nil, now.Add(-48*time.Hour), now.Add(-48*time.Hour))
+	fmt.Println("verify:", st[0].State)
+}
+```
+
+Things to know:
+
+- **Keys are the erasure.** Keep the key store where deleting reaches — not
+  in a backup that outlives the request. `store/drops.NewAuditKeyStore` nulls the
+  key and keeps a tombstone row (the subject id and the erasure time) so an event
+  recorded later carries the shared `ps_erased` label rather than minting a fresh
+  key. Wrap the keys under your KMS if your threat model includes the database.
+- **People only.** Actors of type `system`, `service_account` and `anonymous`
+  keep their ids.
+- **What it does not reach:** ids inside `Request` and `Changes`, which are free
+  JSON. Keep person ids out of them — the `audithook` adapters do — or drop the
+  fields at the source.
+- `Pseudonym(ctx, id)` returns the pseudonym an event about `id` carries
+  (`ErrNotFound` if they never appeared, `ErrForgotten` once erased), for an
+  application that keeps it next to its own user record.
+- `privacy.AuditForget(svc)` is the [eraser](/privacy/access-and-erasure#erasure)
+  that calls `Forget` when an account is deleted.
+
+## IP addresses and user agents
+
+An IP address is personal data. Decide how much of it the log needs:
+
+| `WithIPMode` | Stores |
+|---|---|
+| `IPKeep` (default) | the address as given |
+| `IPTruncate` | the network: IPv4 `/24`, IPv6 `/48` (`WithIPTruncation` changes the widths) |
+| `IPHash` | a keyed hash (`WithIPHashKey`): events from one address correlate, the address is gone |
+| `IPDrop` | nothing |
+
+An address that does not parse is dropped under every mode but `IPKeep`, never
+stored half-minimized. `WithoutUserAgent()` drops the user agent. Both apply to
+every event the Service records.
+
+### A shorter retention for client data
+
+`Topic.ClientDataRetention` clears the **IP and user agent** of a topic's events
+after that long, while the event itself lives on for `Topic.Retention`.
+`ApplyRetention` does it, or call `ScrubClientData(ctx)` directly for the counts
+per topic.
+
+This is the one rewrite the log allows, and it is possible because **IP and user
+agent are deliberately outside the seal's hash**: everything else about an event
+stays tamper-evident, and clearing these two fields never turns a day into a
+mismatch. The PostgreSQL `AU001` guard permits exactly that update — every other
+column must be unchanged — and refuses any other.
+
+{/* verify:skip a configuration fragment: it declares topics and runs nothing; Topic.ClientDataRetention is exercised by the audit package tests and examples/privacy */}
+```go
+topics := []audit.Topic{{
+	Key:                 "auth",
+	Retention:           365 * 24 * time.Hour, // keep the event a year
+	ClientDataRetention: 30 * 24 * time.Hour,  // keep where it came from a month
+}}
+```

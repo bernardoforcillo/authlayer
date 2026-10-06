@@ -1,0 +1,114 @@
+---
+title: "Access, portability and erasure"
+description: "One call gathers everything held about a person into a JSON bundle with no credential in it; one sweeper makes deleting an account erase them from the audit log and the consent store too."
+---
+
+## Access and portability
+
+GDPR Arts. 15 and 20 give a person the right to a copy of their data in a
+structured, commonly used, machine-readable format. A `privacy.Exporter` runs
+a list of **sources** and puts each one's output in a named section of a
+`Bundle`:
+
+{/* verify:program stdout="sections: account consents memberships\nemail: alice@example.com\nconsent purposes: 1\nleaks a credential: false" */}
+```go
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/auth"
+	"github.com/bernardoforcillo/authlayer/consent"
+	"github.com/bernardoforcillo/authlayer/org"
+	"github.com/bernardoforcillo/authlayer/password"
+	"github.com/bernardoforcillo/authlayer/privacy"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+
+func main() {
+	ctx := context.Background()
+	authSvc := auth.New(memory.NewAuthStore(),
+		auth.WithHasher(password.Bcrypt(4)),
+		auth.WithJWT([][]byte{[]byte("32-bytes-or-more-from-your-vault")}, 15*time.Minute))
+	orgs := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member]())
+	consents := consent.New(memory.NewConsentStore())
+
+	su, _ := authSvc.SignUp(ctx, "alice@example.com", "Correct-Horse-Battery-9")
+	_, _ = orgs.CreateOrganization(org.WithSubject(ctx, su.User.ID), "Acme", "acme")
+	_, _ = consents.Grant(ctx, su.User.ID, "terms", "v1", "signup_form")
+
+	ex := privacy.Exporter{Sources: []privacy.Source{
+		privacy.Account(authSvc),     // the record, sessions, sign-in methods
+		privacy.Memberships(orgs),    // containers and roles
+		privacy.Consents(consents),   // the consent history
+		// privacy.Grants(oauthSvc)   // apps they connected
+		// privacy.AuditTrail(auditSvc, 10_000)
+		// privacy.SourceFunc("orders", loadOrders) // your own tables
+	}}
+	bundle, err := ex.Export(ctx, su.User.ID)
+	if err != nil {
+		panic(err)
+	}
+
+	var out bytes.Buffer
+	_ = bundle.WriteJSON(&out) // hand this to the person
+	fmt.Println("sections:", strings.Join(bundle.SectionNames(), " "))
+	account := bundle.Sections["account"].(privacy.AccountData)
+	fmt.Println("email:", account.Email)
+	fmt.Println("consent purposes:", len(bundle.Sections["consents"].([]privacy.ConsentData)))
+	fmt.Println("leaks a credential:", strings.Contains(out.String(), "$2a$"))
+}
+```
+
+What the built-in sources export, and what they never do:
+
+| Source | Section | Holds | Never holds |
+|---|---|---|---|
+| `Account(authSvc)` | `account` | email, verification and creation times; sessions (time, IP, user agent); linked identities; passkeys (label, times); trusted devices | password hash, token and refresh hashes, passkey public keys, MFA secrets |
+| `Memberships(orgSvc)` | `memberships` | each container, the role held, whether they own it | other members |
+| `Grants(oauthSvc)` | `oauth_grants` | live apps they connected, scope, times | tokens |
+| `Consents(consentSvc)` | `consents` | the full consent history | — |
+| `AuditTrail(auditSvc, limit)` | `audit` | events they performed or that concern them, oldest first | other people's identities — "user/(a person)" |
+
+A source that fails fails the whole export: an access request answered with a
+silently missing section is worse than an error. `AuditTrail` returns
+`audit.ErrExportTooLarge` past its limit for the same reason.
+
+<Warning>
+The export **performs no authorization**. Call it only with the id of the
+logged-in user, or of one a verified operator is acting for. Verify the person's
+identity before you answer an access request that arrives out of band.
+</Warning>
+
+## Erasure
+
+Deleting an account (`auth.DeleteAccount`) and anonymizing one
+(`auth.AnonymizeAccount`) already remove the user's sessions, verifications and
+linked identities, and `authlayer.RemoveUserSweeper` takes them out of their
+containers. Two stores outside the account row still hold them: the **audit
+log** and the **consent records**. `privacy.ErasureSweeper` runs erasers for
+both from the same `auth.WithSweeper` hook:
+
+{/* verify:skip a wiring fragment over services this page builds elsewhere; the same sweeper is compiled and run end to end by privacy's own tests and by examples/privacy */}
+```go
+authSvc := auth.New(authStore,
+	auth.WithSweeper(authlayer.RemoveUserSweeper(orgSvc)),
+	auth.WithSweeper(privacy.ErasureSweeper(
+		privacy.AuditForget(auditSvc),     // destroy the pseudonym key
+		privacy.ConsentErase(consentSvc), // delete the consent records
+		privacy.EraserFunc("orders", func(ctx context.Context, id string) error {
+			return orders.DeleteByUser(ctx, id) // your own tables
+		}),
+	)))
+```
+
+Erasers run in order and the first failure fails the account removal closed,
+like every other sweeper. Make each one idempotent: retrying the deletion then
+completes it.
+
+How the audit log can be erased without being edited is on
+[the audit log's personal-data page](/audit/personal-data).

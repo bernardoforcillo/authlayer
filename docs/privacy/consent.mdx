@@ -1,0 +1,90 @@
+---
+title: "Consent records"
+description: "Who accepted which purpose at which version, and when — appended, never edited, withdrawable as easily as it was given, with an Accepted check for the moment you act."
+---
+
+When consent is your lawful basis, GDPR Art. 7 asks you to be able to
+**demonstrate** it and to let the person **withdraw** it as easily as they gave
+it. `consent` is the small store for that: one `Record` per acceptance of one
+purpose at one version.
+
+A *purpose* and a *version* are strings you choose — `"terms"`,
+`"marketing_email"`, `"analytics"`; `"2026-03"`, `"v3"`. They are compared byte
+for byte. A record carries no IP address and no free text: the proof is the act,
+its time and its version, and every extra field is more personal data to guard.
+
+{/* verify:program stdout="v1 accepted: true\nafter v2: v1=false v2=true\nafter withdrawal: false\nhistory: terms/v1 superseded, terms/v2 withdrawn\nerased: 2, left: 0" */}
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/consent"
+	"github.com/bernardoforcillo/authlayer/core"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+
+func main() {
+	now := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	svc := consent.New(memory.NewConsentStore(),
+		consent.WithRuntime(core.Runtime{Clock: func() time.Time { return now }}))
+	ctx := context.Background()
+
+	// She accepts version v1 of the terms at sign-up.
+	_, _ = svc.Grant(ctx, "alice", "terms", "v1", "signup_form")
+	ok, _ := svc.Accepted(ctx, "alice", "terms", "v1")
+	fmt.Println("v1 accepted:", ok)
+
+	// A new version supersedes the old record: v1 no longer counts.
+	now = now.Add(time.Hour)
+	_, _ = svc.Grant(ctx, "alice", "terms", "v2", "banner")
+	v1, _ := svc.Accepted(ctx, "alice", "terms", "v1")
+	v2, _ := svc.Accepted(ctx, "alice", "terms", "v2")
+	fmt.Printf("after v2: v1=%v v2=%v\n", v1, v2)
+
+	// Withdrawal is one call, and ends the current record.
+	now = now.Add(time.Hour)
+	_ = svc.Withdraw(ctx, "alice", "terms")
+	ok, _ = svc.Accepted(ctx, "alice", "terms", "v2")
+	fmt.Println("after withdrawal:", ok)
+
+	// Nothing was edited: the history is the proof.
+	h, _ := svc.History(ctx, "alice")
+	fmt.Printf("history: %s/%s %s, %s/%s %s\n", h[0].Purpose, h[0].Version, h[0].EndReason,
+		h[1].Purpose, h[1].Version, h[1].EndReason)
+
+	n, _ := svc.Erase(ctx, "alice")
+	left, _ := svc.History(ctx, "alice")
+	fmt.Printf("erased: %d, left: %d\n", n, len(left))
+}
+```
+
+## The calls
+
+| Call | Does |
+|---|---|
+| `Grant(ctx, subject, purpose, version, source)` | Records the acceptance. The version already current is a no-op returning the existing record; a different one ends the old record as `superseded` first. |
+| `Withdraw(ctx, subject, purpose)` | Ends the current record as `withdrawn`. `ErrNotFound` when there is none, so a no-op is distinguishable. |
+| `Accepted(ctx, subject, purpose, version)` | The question to ask **before you act**: exactly this version, not withdrawn. A newer version in force, a withdrawal and no record all answer `false`. |
+| `Current`, `History` | The current record; the full history, oldest first — what an [access request](/privacy/access-and-erasure) returns. |
+| `Erase(ctx, subject)` | Deletes the person's records. |
+
+Two concurrent first grants for one (subject, purpose) cannot both become
+current: the store refuses the second with `ErrConflict` (a partial unique index
+in PostgreSQL) and `Grant` re-reads and returns the winner.
+
+<Note>
+Art. 7(1) asks you to demonstrate consent *while you rely on it*; Art. 17 asks
+you to erase it when you stop. `Erase` is yours to call when your own retention
+rule says the proof is no longer needed; the [erasure sweeper](/privacy/access-and-erasure#erasure)
+calls it when the account goes.
+</Note>
+
+## Storage
+
+`store/memory.NewConsentStore()` for tests; `dropsstore.NewConsentStore(db, "")`
+for PostgreSQL (`CreateSchema`, or `dropsstore.ConsentDDL` for your migrations).
+Your own backend runs `consent/consenttest.RunStoreContract`.

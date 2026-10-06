@@ -159,9 +159,18 @@ One setting is shared with the other modules: `authlayer.Shared{Runtime: …}`
 hands the audit `Service` the same clock and id generator through
 `sh.Audit()`.
 
+## Personal data in the log
+
+Events name people, and an IP address is personal data. `WithSubjectKeys`
+pseudonymizes them at write time so a person can be erased from an immutable
+log by destroying a key, and `WithIPMode` and `Topic.ClientDataRetention`
+minimize and expire the client data — see
+[Personal data in the log](/audit/personal-data).
+
 ## Where next
 
 - [Integrity and retention](/audit/integrity) — `Reconcile`, `Seal`, `Verify`
   and what each says about a rewrite.
+- [Personal data in the log](/audit/personal-data) — pseudonyms, erasure, IPs.
 - [Storage](/audit/storage) — the PostgreSQL store whose triggers refuse
   rewrites, and the contract suite for your own backend.

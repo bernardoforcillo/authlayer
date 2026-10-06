@@ -55,3 +55,13 @@ func (s *Service) Export(ctx context.Context, f Filter, limit int, yield func(Ev
 	}
 	return s.store.Scan(ctx, f, yield)
 }
+
+// Count returns how many events match f, with the same person-id translation
+// as [Service.List].
+func (s *Service) Count(ctx context.Context, f Filter) (int, error) {
+	f, err := s.translateFilter(ctx, f)
+	if err != nil {
+		return 0, err
+	}
+	return s.store.Count(ctx, f)
+}
