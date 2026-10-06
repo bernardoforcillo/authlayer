@@ -3,6 +3,7 @@ package audit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -214,6 +215,9 @@ func (s *Service) Complete(ctx context.Context, id string, c Completion) error {
 	}
 	if c.Resource.Type == ResourceUser && c.Resource.ID != "" && s.cfg.keys != nil {
 		p, err := s.pseudonymFor(ctx, c.Resource.ID, true)
+		if errors.Is(err, ErrForgotten) {
+			p, err = ErasedPseudonym, nil
+		}
 		if err != nil {
 			return err
 		}

@@ -21,7 +21,7 @@ func RunKeyStoreContract(t *testing.T, newStore func(t *testing.T) audit.KeyStor
 		{"Key/UnknownIsErrNotFound", keyUnknown},
 		{"PutKey/FirstWriteWinsAndIsReturned", keyFirstWins},
 		{"PutKey/ConcurrentWritersAgree", keyConcurrent},
-		{"DeleteKey/RemovesOnlyThatSubjectAndIsIdempotent", keyDelete},
+		{"DeleteKey/ForgetsOnlyThatSubjectAndIsIdempotent", keyDelete},
 	} {
 		t.Run(c.name, func(t *testing.T) { c.fn(t, newStore(t)) })
 	}
@@ -81,13 +81,19 @@ func keyDelete(t tb, ks audit.KeyStore) {
 			t.Fatalf("DeleteKey #%d: %v", i+1, err)
 		}
 	}
-	if _, err := ks.Key(ctx, "u1"); !errors.Is(err, audit.ErrNotFound) {
-		t.Errorf("Key after delete err = %v, want ErrNotFound", err)
+	if _, err := ks.Key(ctx, "u1"); !errors.Is(err, audit.ErrForgotten) {
+		t.Errorf("Key after delete err = %v, want ErrForgotten", err)
+	}
+	if _, err := ks.PutKey(ctx, "u1", []byte("a-new-key-padding-padding-padding")); !errors.Is(err, audit.ErrForgotten) {
+		t.Errorf("PutKey after delete err = %v, want ErrForgotten: an erased subject must not get a new key", err)
 	}
 	if _, err := ks.Key(ctx, "u2"); err != nil {
 		t.Errorf("another subject's key was removed: %v", err)
 	}
 	if err := ks.DeleteKey(ctx, "never"); err != nil {
 		t.Errorf("DeleteKey(unknown) = %v, want nil", err)
+	}
+	if _, err := ks.Key(ctx, "never"); !errors.Is(err, audit.ErrForgotten) {
+		t.Errorf("Key of a subject erased before they had a key err = %v, want ErrForgotten", err)
 	}
 }

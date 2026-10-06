@@ -10,20 +10,36 @@ import (
 	"fmt"
 )
 
+// ErrForgotten: the subject was erased with [Service.Forget]; no key exists
+// for them and none can be created.
+var ErrForgotten = errors.New("authlayer/audit: subject was forgotten")
+
+// ErasedPseudonym is what every event about a forgotten subject carries from
+// then on, whoever they were: the label is the same for all of them, so it
+// links nothing.
+const ErasedPseudonym = PseudonymPrefix + "erased"
+
 // KeyStore holds one secret key per data subject, for the pseudonyms
 // [WithSubjectKeys] writes into the log. Deleting a subject's key is what
 // erases them from the log: the events stay, sealed and verifiable, but the
 // pseudonym on them can no longer be recomputed from the person's id, so
 // nothing links the events to the person. Keep the keys where erasure reaches
 // — not in a backup that outlives the deletion request.
+//
+// Deletion leaves a tombstone, the subject's id and nothing else, so an event
+// recorded after the erasure — the "account deleted" event itself — does not
+// quietly mint a fresh key and make the person traceable again. Such events
+// carry [ErasedPseudonym].
 type KeyStore interface {
-	// Key returns the subject's key, or ErrNotFound.
+	// Key returns the subject's key, ErrNotFound if there never was one, or
+	// ErrForgotten once DeleteKey ran.
 	Key(ctx context.Context, subject string) ([]byte, error)
 	// PutKey stores key as the subject's key unless one exists, and returns
-	// the key now stored, so two concurrent first writes agree.
+	// the key now stored, so two concurrent first writes agree. A forgotten
+	// subject gets ErrForgotten.
 	PutKey(ctx context.Context, subject string, key []byte) ([]byte, error)
-	// DeleteKey removes the subject's key. A subject with none is not an
-	// error.
+	// DeleteKey removes the subject's key and records that it was erased. It
+	// is idempotent and works on a subject that never had a key.
 	DeleteKey(ctx context.Context, subject string) error
 }
 
@@ -68,7 +84,8 @@ func pseudonym(key []byte, id string) string {
 const forgottenPseudonym = PseudonymPrefix + "forgotten"
 
 // pseudonymFor returns id's pseudonym, creating the subject's key when create
-// is set. Without a key it returns ErrNotFound.
+// is set. Without a key it returns ErrNotFound, and for an erased subject
+// ErrForgotten.
 func (s *Service) pseudonymFor(ctx context.Context, id string, create bool) (string, error) {
 	key, err := s.cfg.keys.Key(ctx, id)
 	if errors.Is(err, ErrNotFound) && create {
@@ -84,8 +101,8 @@ func (s *Service) pseudonymFor(ctx context.Context, id string, create bool) (str
 	return pseudonym(key, id), nil
 }
 
-// Pseudonym returns the pseudonym events about id carry, or ErrNotFound when
-// the person has no key: they never appeared in the log, or were forgotten.
+// Pseudonym returns the pseudonym events about id carry, ErrNotFound when the
+// person never appeared in the log, or ErrForgotten once they were erased.
 // It is how an application keeps a pseudonym next to its own user record.
 func (s *Service) Pseudonym(ctx context.Context, id string) (string, error) {
 	if s.cfg.keys == nil {
@@ -119,6 +136,9 @@ func (s *Service) pseudonymizeEvent(ctx context.Context, e *Event) error {
 			return nil
 		}
 		p, err := s.pseudonymFor(ctx, *id, true)
+		if errors.Is(err, ErrForgotten) {
+			p, err = ErasedPseudonym, nil
+		}
 		if err != nil {
 			return err
 		}
@@ -150,7 +170,7 @@ func (s *Service) translateFilter(ctx context.Context, f Filter) (Filter, error)
 			return nil
 		}
 		p, err := s.pseudonymFor(ctx, *id, false)
-		if errors.Is(err, ErrNotFound) {
+		if errors.Is(err, ErrNotFound) || errors.Is(err, ErrForgotten) {
 			*id = forgottenPseudonym
 			return nil
 		}

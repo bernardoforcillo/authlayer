@@ -303,12 +303,15 @@ func (s *AuditStore) ScrubClientData(_ context.Context, topic string, before tim
 
 // AuditKeyStore is a concurrency-safe in-memory audit.KeyStore.
 type AuditKeyStore struct {
-	mu   sync.Mutex
-	keys map[string][]byte
+	mu        sync.Mutex
+	keys      map[string][]byte
+	forgotten map[string]bool
 }
 
 // NewAuditKeyStore returns an empty in-memory audit.KeyStore.
-func NewAuditKeyStore() *AuditKeyStore { return &AuditKeyStore{keys: map[string][]byte{}} }
+func NewAuditKeyStore() *AuditKeyStore {
+	return &AuditKeyStore{keys: map[string][]byte{}, forgotten: map[string]bool{}}
+}
 
 // Compile-time proof the memory key store satisfies the port.
 var _ audit.KeyStore = (*AuditKeyStore)(nil)
@@ -317,6 +320,9 @@ var _ audit.KeyStore = (*AuditKeyStore)(nil)
 func (s *AuditKeyStore) Key(_ context.Context, subject string) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.forgotten[subject] {
+		return nil, audit.ErrForgotten
+	}
 	k, ok := s.keys[subject]
 	if !ok {
 		return nil, audit.ErrNotFound
@@ -328,6 +334,9 @@ func (s *AuditKeyStore) Key(_ context.Context, subject string) ([]byte, error) {
 func (s *AuditKeyStore) PutKey(_ context.Context, subject string, key []byte) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.forgotten[subject] {
+		return nil, audit.ErrForgotten
+	}
 	if k, ok := s.keys[subject]; ok {
 		return slices.Clone(k), nil
 	}
@@ -335,10 +344,11 @@ func (s *AuditKeyStore) PutKey(_ context.Context, subject string, key []byte) ([
 	return slices.Clone(key), nil
 }
 
-// DeleteKey removes the subject's key.
+// DeleteKey removes the subject's key and tombstones the subject.
 func (s *AuditKeyStore) DeleteKey(_ context.Context, subject string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.keys, subject)
+	s.forgotten[subject] = true
 	return nil
 }

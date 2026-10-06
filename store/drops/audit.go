@@ -717,8 +717,8 @@ func (st *AuditStore) ScrubClientData(ctx context.Context, topic string, before 
 }
 
 // AuditKeyStore is a drops-backed audit.KeyStore: one row per data subject
-// holding the key that pseudonymizes them in the log. Deleting the row is the
-// erasure, so keep this table out of backups that must honour a deletion
+// holding the key that pseudonymizes them in the log. Erasure nulls the key
+// and keeps a tombstone, so keep this table out of backups that must honour a deletion
 // request, or encrypt the keys under a KMS key you can rotate.
 type AuditKeyStore struct {
 	db  *pg.DB
@@ -740,8 +740,9 @@ func AuditKeyDDL(opts ...AuditOption) []string {
 	cfg := newAuditSettings(opts)
 	return []string{`CREATE TABLE IF NOT EXISTS ` + quoteIdent(cfg.names.Keys) + ` (
   subject text PRIMARY KEY,
-  key bytea NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now()
+  key bytea,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  erased_at timestamptz
 )`}
 }
 
@@ -763,7 +764,7 @@ func (st *AuditKeyStore) DropSchema(ctx context.Context) error {
 
 // Key returns the subject's key, or audit.ErrNotFound.
 func (st *AuditKeyStore) Key(ctx context.Context, subject string) ([]byte, error) {
-	rows, err := st.db.Query(ctx, `SELECT key FROM `+st.tbl+` WHERE subject = $1`, subject)
+	rows, err := st.db.Query(ctx, `SELECT key, erased_at FROM `+st.tbl+` WHERE subject = $1`, subject)
 	if err != nil {
 		return nil, err
 	}
@@ -775,8 +776,12 @@ func (st *AuditKeyStore) Key(ctx context.Context, subject string) ([]byte, error
 		return nil, audit.ErrNotFound
 	}
 	var key []byte
-	if err := rows.Scan(&key); err != nil {
+	var erased *time.Time
+	if err := rows.Scan(&key, &erased); err != nil {
 		return nil, err
+	}
+	if erased != nil || key == nil {
+		return nil, audit.ErrForgotten
 	}
 	return key, rows.Err()
 }
@@ -790,8 +795,10 @@ func (st *AuditKeyStore) PutKey(ctx context.Context, subject string, key []byte)
 	return st.Key(ctx, subject)
 }
 
-// DeleteKey removes the subject's key.
+// DeleteKey erases the subject's key and leaves a tombstone row (the
+// subject's id and the erasure time) so a later event cannot mint a new one.
 func (st *AuditKeyStore) DeleteKey(ctx context.Context, subject string) error {
-	_, err := st.db.Exec(ctx, `DELETE FROM `+st.tbl+` WHERE subject = $1`, subject)
+	_, err := st.db.Exec(ctx, `INSERT INTO `+st.tbl+` (subject, key, erased_at) VALUES ($1, NULL, now())
+ON CONFLICT (subject) DO UPDATE SET key = NULL, erased_at = COALESCE(`+st.tbl+`.erased_at, now())`, subject)
 	return err
 }

@@ -98,8 +98,8 @@ func TestFiltersTakeRealIdsAndForgetMakesTheTrailUnreachable(t *testing.T) {
 	if n := trail(audit.Filter{Member: "alice"}); n != 0 {
 		t.Errorf("alice's trail after Forget = %d, want 0", n)
 	}
-	if _, err := svc.Pseudonym(ctx, "alice"); !errors.Is(err, audit.ErrNotFound) {
-		t.Errorf("Pseudonym after Forget err = %v, want ErrNotFound", err)
+	if _, err := svc.Pseudonym(ctx, "alice"); !errors.Is(err, audit.ErrForgotten) {
+		t.Errorf("Pseudonym after Forget err = %v, want ErrForgotten", err)
 	}
 	// The events and bob's trail are intact; only the link to alice is gone.
 	if n, _ := st.Count(ctx, audit.Filter{}); n != 4 {
@@ -108,12 +108,15 @@ func TestFiltersTakeRealIdsAndForgetMakesTheTrailUnreachable(t *testing.T) {
 	if n := trail(audit.Filter{ActorID: "bob"}); n != 2 {
 		t.Errorf("bob after alice's Forget = %d, want 2", n)
 	}
-	// A later event about her starts a new, unlinkable pseudonym.
+	// A later event about her — the deletion itself — carries the shared
+	// erased label, not a fresh key that would make her traceable again.
 	again, _ := svc.Record(ctx, action(func(e *audit.Event) { e.Outcome, e.Actor.ID = audit.OutcomeOK, "alice" }))
-	if again.Actor.ID == about.Resource.ID {
-		t.Error("a new event reused the forgotten pseudonym")
+	if again.Actor.ID != audit.ErasedPseudonym || again.Actor.ID == about.Resource.ID {
+		t.Errorf("event after Forget carries %q, want %q", again.Actor.ID, audit.ErasedPseudonym)
 	}
-	_ = ks
+	if _, err := ks.Key(ctx, "alice"); !errors.Is(err, audit.ErrForgotten) {
+		t.Errorf("a key was minted after Forget: %v", err)
+	}
 }
 
 func TestCompletePseudonymizesAFilledUserResource(t *testing.T) {
