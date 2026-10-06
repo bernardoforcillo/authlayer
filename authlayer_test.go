@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bernardoforcillo/authlayer"
+	"github.com/bernardoforcillo/authlayer/audit"
 	"github.com/bernardoforcillo/authlayer/auth"
 	"github.com/bernardoforcillo/authlayer/core"
 	"github.com/bernardoforcillo/authlayer/org"
@@ -33,6 +34,14 @@ func TestSharedRuntimeReachesModules(t *testing.T) {
 	}
 	// The other modules' adapters exist and are usable as options.
 	_, _, _ = sh.Scope(), sh.APIKey(), sh.OAuth()
+
+	// The audit Service takes its clock from the same Runtime.
+	aud := audit.New(memory.NewAuditStore(), sh.Audit(), audit.WithTopics(audit.Topic{Key: "t"}))
+	ev, err := aud.Record(context.Background(), audit.Event{Topic: "t", Action: "a.b", Origin: "x",
+		Outcome: audit.OutcomeOK, Actor: audit.Actor{Type: audit.ActorSystem}})
+	if err != nil || !ev.OccurredAt.Equal(at) || ev.ID != "fixed-id" {
+		t.Fatalf("audit event = %+v, %v; want the shared clock and id", ev, err)
+	}
 }
 
 func TestAccountRemovalLeavesContainers(t *testing.T) {

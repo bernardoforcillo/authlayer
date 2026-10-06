@@ -8,6 +8,7 @@
 //	scopeSvc := scope.New(ac, scopeStore, parent, sh.Scope())
 //	keysSvc := apikey.New(scopeSvc, keyStore, sh.APIKey())
 //	oauthSvc := oauth.New(oauthStore, scopeSvc, authSvc.Signer(), sh.OAuth())
+//	auditSvc := audit.New(auditStore, sh.Audit(), audit.WithTopics(audithook.Topics()...))
 //
 // Each module stays importable and usable alone; nothing here is required.
 // The package exists because the modules' options are different Go types
@@ -19,6 +20,7 @@ import (
 	"context"
 
 	"github.com/bernardoforcillo/authlayer/apikey"
+	"github.com/bernardoforcillo/authlayer/audit"
 	"github.com/bernardoforcillo/authlayer/auth"
 	"github.com/bernardoforcillo/authlayer/core"
 	"github.com/bernardoforcillo/authlayer/oauth"
@@ -43,6 +45,9 @@ func (s Shared) APIKey() apikey.Option { return apikey.WithRuntime(s.Runtime) }
 
 // OAuth returns the shared settings as an [oauth.Option].
 func (s Shared) OAuth() oauth.Option { return oauth.WithRuntime(s.Runtime) }
+
+// Audit returns the shared settings as an [audit.Option].
+func (s Shared) Audit() audit.Option { return audit.WithRuntime(s.Runtime) }
 
 // UserRemover is what the scope-family services ([scope.Service],
 // org.Service, team.Service — promoted through their embedded

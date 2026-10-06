@@ -8,6 +8,45 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ## [Unreleased]
 
+### Added
+
+- **`audit`: a tamper-evident audit log.** One immutable event per action
+  (`Actor`, `OnBehalfOf`, `Topic`, `Action`, `Resource`, `ContainerID`,
+  `Request`, `Changes`, `Outcome`), recorded in two phases: `Service.Begin`
+  stores the event before the action runs, `Service.Complete` writes its
+  outcome once, and `audit.Annotate` lets code inside the action add the
+  resource, container, reason and a before/after change. `Service.Record`
+  stores an event that is already over. `Request` and `Changes` are redacted
+  by key (`WithPolicy` replaces the policy) and `Changes` is a diff, so a
+  changed secret keeps its path and loses its values. Reads: `Get`, a
+  newest-first `List` with a cursor, a capped `Export`, and a `Filter` whose
+  `Member` is one person's whole trail.
+- **Integrity.** `Service.Seal` chains every (topic, UTC day) into a SHA-256
+  hash chain, empty days included; `Service.Verify` recomputes it and reports
+  `ok`, `mismatch` (`events_hash`, `seal_hash` or `chain`), `unsealed` or
+  `purged` per day. `Service.Reconcile` closes the events a crashed process
+  left open as `unknown`, which a day needs before it can be sealed.
+  `Service.ApplyRetention` purges per-topic retention, sealed days only, and
+  marks the seals purged before deleting the events so `Verify` never raises a
+  false alarm.
+- **`store/drops.AuditStore`.** PostgreSQL persistence whose triggers refuse
+  rewrites at the database with SQLSTATE `AU001` (event update), `AU002`
+  (delete of a sealed day, truncate), `AU003` (seal update, delete, truncate)
+  and `AU004` (insert into a sealed day, atomic with sealing through an
+  advisory lock). `AuditDDL` returns the statements for a migration;
+  `WithAuditNames` and `WithAuditTextIDs` adapt it. Run the application as a
+  role that does not own the tables.
+- **`audit/audittest`.** `audit.Store`'s contract as an executable suite, run
+  against `store/memory` and, in the integration lane, against PostgreSQL.
+- **`audit/audithook`.** Adapters from the lifecycle hooks of `auth`,
+  `scope` (and so `org` and `team`), `apikey` and `oauth` to audit events:
+  refusals are `denied`, the closed `Detail` vocabulary becomes the `Reason`,
+  and nothing else is copied. `WithTopic`, `WithOrigin`, `WithSkipActions`
+  and `WithBestEffort` tune them; a failed audit write is returned by default.
+- `authlayer.Shared.Audit()` hands the audit `Service` the shared clock and id
+  generator, and `examples/audit` is a runnable tour (run by CI), with a new
+  [audit section](docs/audit/overview.mdx) in the docs.
+
 ## [0.2.0] - 2026-10-02
 
 ### Added

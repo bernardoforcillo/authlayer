@@ -1,0 +1,75 @@
+---
+title: "Audit storage"
+description: "The Store port, the PostgreSQL store whose triggers refuse rewrites with SQLSTATE AU001–AU004, and the executable contract suite for a backend of your own."
+---
+
+`audit.Store` is the persistence port. `store/memory` ships the reference
+implementation; `store/drops` the PostgreSQL one. The port authorizes nothing and
+validates nothing the `Service` already validated.
+
+## PostgreSQL
+
+{/* verify:skip needs a live PostgreSQL *pg.DB; the identical calls run against a real server in store/drops' integration lane (audit_integration_test.go) */}
+```go
+st := dropsstore.NewAuditStore(db)
+if err := st.CreateSchema(ctx); err != nil { // development; own the DDL in production
+	return err
+}
+svc := audit.New(st, audit.WithTopics(audithook.Topics()...))
+```
+
+`dropsstore.AuditDDL()` returns the same statements for a migration. Two tables,
+`audit_events` and `audit_seals` (rename with `WithAuditNames`); event ids are
+`uuid`, or `text` with `WithAuditTextIDs` for a generator that does not mint
+UUIDs.
+
+### The guards
+
+The database itself refuses to rewrite the log. Each refusal is a distinct
+SQLSTATE, so a caller can tell it from any other failure:
+
+| SQLSTATE | Constant | Refuses |
+|---|---|---|
+| `AU001` | `AuditEventImmutable` | an `UPDATE` of an event other than its one completion (`completed_at` from NULL, completion columns only; resource and container only when empty) |
+| `AU002` | `AuditEventProtected` | a `DELETE` of an event whose day is sealed and not yet marked purged, and any `TRUNCATE` of events |
+| `AU003` | `AuditSealImmutable` | an `UPDATE` of a seal other than stamping `purged_at` once, and any `DELETE` or `TRUNCATE` |
+| `AU004` | `AuditDaySealed` | an `INSERT` into a sealed (topic, day); `Insert` reports it as `ErrSealed` |
+
+`AU004` is atomic with sealing: the event insert and the seal insert contend on
+an advisory lock for the (topic, day), so an event cannot slip into a day while
+it is being sealed.
+
+<Warning>
+Triggers stop mistakes and ordinary code; an owner of the table can drop them.
+Run the application as a role that **does not own** the audit tables, and rely
+on `Verify` for what a privileged rewrite leaves behind — it recomputes every
+hash from the rows, not from anything the triggers guarded.
+</Warning>
+
+Purging goes through the same guard: `ApplyRetention` marks a day's seal purged
+first (the one seal update `AU003` allows), then deletes its events (which
+`AU002` now allows).
+
+## Your own backend
+
+The `Store` MUSTs — one atomic step for the sealed-day check on `Insert`, an
+existing id returning the stored row, `Complete` writing once with an identical
+retry succeeding, `Scan` ascending and returning the callback's error unwrapped —
+are an executable suite, as for the other ports.
+
+{/* verify:skip a test function needing a *testing.T; the identical call is compiled and run by store/memory/audit_test.go and by store/drops' integration lane */}
+```go
+import "github.com/bernardoforcillo/authlayer/audit/audittest"
+
+func TestMyStoreSatisfiesTheAuditContract(t *testing.T) {
+	audittest.RunStoreContract(t, func(t *testing.T) audit.Store {
+		return myStoreWithEmptyTables(t) // called once per check
+	})
+}
+```
+
+The factory must return an **empty** store each time: the checks count rows.
+Event ids are UUIDv7, so a backend that types ids as `uuid` passes unchanged.
+The suite is sequential, so it does not race the atomicity of `Insert`'s
+sealed-day check — that one you have to reason about, as `store/drops` does with
+its lock.
