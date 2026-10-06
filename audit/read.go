@@ -1,0 +1,49 @@
+package audit
+
+import (
+	"context"
+	"fmt"
+)
+
+// Get loads one event, or ErrNotFound.
+func (s *Service) Get(ctx context.Context, id string) (Event, error) {
+	return s.store.Get(ctx, id)
+}
+
+// List returns the events matching f, newest first, and the cursor of the
+// next page: pass it as Page.Before. The cursor is zero when this page is the
+// last one; a full page may still be followed by an empty one. A Limit
+// outside 1..MaxPageSize means MaxPageSize.
+func (s *Service) List(ctx context.Context, f Filter, page Page) ([]Event, int64, error) {
+	if page.Limit <= 0 || page.Limit > MaxPageSize {
+		page.Limit = MaxPageSize
+	}
+	if page.Before < 0 {
+		page.Before = 0
+	}
+	events, err := s.store.List(ctx, f, page)
+	if err != nil {
+		return nil, 0, err
+	}
+	var next int64
+	if len(events) == page.Limit {
+		next = events[len(events)-1].Seq
+	}
+	return events, next, nil
+}
+
+// Export calls yield for every event matching f, oldest first, and stops at
+// the first error yield returns. When limit is positive and more events
+// match, it returns ErrExportTooLarge before yielding anything.
+func (s *Service) Export(ctx context.Context, f Filter, limit int, yield func(Event) error) error {
+	if limit > 0 {
+		n, err := s.store.Count(ctx, f)
+		if err != nil {
+			return err
+		}
+		if n > limit {
+			return fmt.Errorf("%w: %d events match, the limit is %d", ErrExportTooLarge, n, limit)
+		}
+	}
+	return s.store.Scan(ctx, f, yield)
+}
