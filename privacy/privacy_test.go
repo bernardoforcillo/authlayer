@@ -87,7 +87,7 @@ func TestExportGathersEverythingAndNoCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := buf.String()
-	for _, want := range []string{`"alice@example.com"`, `"terms"`, `"session.login"`, `"container_id": "` + acme.ID, `"owner": true`, `"203.0.113.0"`} {
+	for _, want := range []string{`"alice@example.com"`, `"terms"`, `"auth.logged_in"`, `"container_id": "` + acme.ID, `"owner": true`, `"203.0.113.0"`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("export lacks %s:\n%s", want, out)
 		}

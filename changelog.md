@@ -80,10 +80,17 @@ once a 1.0 is cut. Until then, minor versions may break API.
 - **`audit/audittest`.** `audit.Store`'s contract as an executable suite, run
   against `store/memory` and, in the integration lane, against PostgreSQL.
 - **`audit/audithook`.** Adapters from the lifecycle hooks of `auth`,
-  `scope` (and so `org` and `team`), `apikey` and `oauth` to audit events:
-  refusals are `denied`, the closed `Detail` vocabulary becomes the `Reason`,
-  and nothing else is copied. `WithTopic`, `WithOrigin`, `WithSkipActions`
-  and `WithBestEffort` tune them; a failed audit write is returned by default.
+  `scope` (and so `org` and `team`), `apikey` and `oauth` to audit events.
+  Inside a call with a pending event they annotate it (resource, container,
+  reason, the role key as `Changes`); otherwise they record a standalone
+  event named `<package>.<kind in snake case>` (`auth.login_failed`,
+  `scope.member_role_changed`) under the topics `access`, `auth`, `apikey`
+  and `oauth`. Refusals are `denied` and anonymous where the caller is not
+  the account (a failed sign-in, a challenge, a token replay), the closed
+  `Detail` vocabulary becomes the `Reason`, and no address or token is
+  copied. `WithTopic(func(action string) string)`, `WithOrigin`,
+  `WithSkipActions` and `WithBestEffort` tune them; a failed audit write is
+  returned by default.
 - `authlayer.Shared.Audit()` hands the audit `Service` the shared clock and id
   generator, and `examples/audit` is a runnable tour (run by CI), with a new
   [audit section](docs/audit/overview.mdx) in the docs.

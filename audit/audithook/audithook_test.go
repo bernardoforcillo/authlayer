@@ -2,7 +2,9 @@ package audithook_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +32,16 @@ func all(t *testing.T, svc *audit.Service) []audit.Event {
 		t.Fatal(err)
 	}
 	return evs
+}
+
+func TestTopicsAreTheSpecDefaults(t *testing.T) {
+	var keys []string
+	for _, tp := range audithook.Topics() {
+		keys = append(keys, tp.Key)
+	}
+	if got := strings.Join(keys, ","); got != "access,auth,apikey,oauth" {
+		t.Errorf("Topics = %s, want access,auth,apikey,oauth", got)
+	}
 }
 
 func TestAuthHookRecordsRealLoginFlow(t *testing.T) {
@@ -62,33 +74,63 @@ func TestAuthHookRecordsRealLoginFlow(t *testing.T) {
 			t.Errorf("event %+v: wrong topic/origin/completion", e)
 		}
 	}
-	for _, want := range []string{"user.signup:ok", "email.verify:ok", "session.login:denied", "session.login:ok"} {
+	for _, want := range []string{"auth.signed_up:ok", "auth.email_verified:ok", "auth.login_failed:denied", "auth.logged_in:ok"} {
 		if got[want] == 0 {
 			t.Errorf("no %s event in %v", want, got)
 		}
 	}
-	if got["session.login:denied"] != 2 {
-		t.Errorf("denied logins = %d, want 2", got["session.login:denied"])
+	if got["auth.login_failed:denied"] != 2 {
+		t.Errorf("denied logins = %d, want 2", got["auth.login_failed:denied"])
 	}
-	var unknown, ok *audit.Event
+	var unknown, wrong, ok *audit.Event
 	for i := range evs {
 		e := &evs[i]
-		if e.Action == "session.login" && e.Outcome == audit.OutcomeDenied && e.Reason == auth.DetailUnknownUser {
+		switch {
+		case e.Action == "auth.login_failed" && e.Reason == auth.DetailUnknownUser:
 			unknown = e
-		}
-		if e.Action == "session.login" && e.Outcome == audit.OutcomeOK {
+		case e.Action == "auth.login_failed" && e.Reason == auth.DetailWrongPassword:
+			wrong = e
+		case e.Action == "auth.logged_in":
 			ok = e
 		}
 	}
-	if unknown == nil || unknown.Actor.Type != audit.ActorAnonymous || unknown.Actor.ID != "" || unknown.IP != "203.0.113.9" {
+	if unknown == nil || unknown.Actor != (audit.Actor{Type: audit.ActorAnonymous}) || unknown.Resource != (audit.Resource{}) || unknown.IP != "203.0.113.9" {
 		t.Errorf("unknown-user login = %+v", unknown)
+	}
+	// The caller of a failed sign-in is not the account it targeted: the
+	// account is the resource, the actor is anonymous.
+	if wrong == nil || wrong.Actor != (audit.Actor{Type: audit.ActorAnonymous}) ||
+		wrong.Resource != (audit.Resource{Type: audit.ResourceUser, ID: su.User.ID}) {
+		t.Errorf("wrong-password login = %+v", wrong)
 	}
 	if ok == nil || ok.Actor.Type != audit.ActorUser || ok.Actor.ID != su.User.ID || ok.SessionID == "" ||
 		ok.Resource != (audit.Resource{Type: "session", ID: ok.SessionID}) || ok.Reason != auth.DetailPassword {
 		t.Errorf("login = %+v", ok)
 	}
-	if mine, _, _ := svc.List(ctx, audit.Filter{Member: su.User.ID}, audit.Page{}); len(mine) < 3 {
-		t.Errorf("alice's trail has %d events, want at least 3", len(mine))
+	if mine, _, _ := svc.List(ctx, audit.Filter{Member: su.User.ID}, audit.Page{}); len(mine) != 4 {
+		t.Errorf("alice's trail has %d events, want 4 (sign-up, verification, the failed and the good login)", len(mine))
+	}
+}
+
+func TestAuthRefusalsAndChallengesAreAnonymous(t *testing.T) {
+	ctx := context.Background()
+	svc := newAudit(t)
+	h := audithook.Auth(svc)
+	for _, ev := range []auth.Event{
+		{Kind: auth.TokenReuseDetected, UserID: "u1", SessionID: "s1", Detail: auth.DetailReuse},
+		{Kind: auth.MFAChallenged, UserID: "u1"},
+	} {
+		if err := h.On(ctx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, e := range all(t, svc) {
+		if e.Actor != (audit.Actor{Type: audit.ActorAnonymous}) || e.Resource != (audit.Resource{Type: audit.ResourceUser, ID: "u1"}) {
+			t.Errorf("%s = actor %+v resource %+v, want anonymous about user u1", e.Action, e.Actor, e.Resource)
+		}
+		if e.Action == "auth.token_reuse_detected" && e.Outcome != audit.OutcomeDenied {
+			t.Errorf("token reuse outcome = %s, want denied", e.Outcome)
+		}
 	}
 }
 
@@ -108,15 +150,70 @@ func TestScopeHookThroughOrg(t *testing.T) {
 		t.Fatalf("events = %+v", evs)
 	}
 	add, create := evs[0], evs[len(evs)-1]
-	if add.Action != "member.add" || add.Resource != (audit.Resource{Type: audit.ResourceUser, ID: "bob"}) ||
-		add.ContainerID != acme.ID || add.Actor.ID != "alice" || add.Topic != audithook.TopicScope {
-		t.Errorf("member.add = %+v", add)
+	if add.Action != "scope.member_added" || add.Resource != (audit.Resource{Type: audit.ResourceUser, ID: "bob"}) ||
+		add.ContainerID != acme.ID || add.Actor.ID != "alice" || add.Topic != audithook.TopicAccess ||
+		!audit.EqualJSON(add.Changes, json.RawMessage(`{"role_key":{"before":null,"after":"member"}}`)) {
+		t.Errorf("member added = %+v (changes %s)", add, add.Changes)
 	}
-	if create.Action != "container.create" || create.Resource.Type != "container" {
-		t.Errorf("container.create = %+v", create)
+	if create.Action != "scope.container_created" || create.Resource.Type != "container" {
+		t.Errorf("container created = %+v", create)
 	}
 	if bob, _, _ := svc.List(context.Background(), audit.Filter{Member: "bob"}, audit.Page{}); len(bob) != 1 {
 		t.Errorf("bob's trail = %d events, want 1", len(bob))
+	}
+}
+
+// With an event pending on the context, the adapter adds to it instead of
+// recording a second, standalone event.
+func TestHooksAnnotateTheEventInFlightInsteadOfRecording(t *testing.T) {
+	ctx := org.WithSubject(context.Background(), "alice")
+	svc := newAudit(t)
+	o := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member](), org.WithHooks(audithook.Scope(svc)))
+	acme, err := o.CreateOrganization(ctx, "Acme", "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := len(all(t, svc))
+
+	open, err := svc.Begin(ctx, audit.Event{Topic: audithook.TopicAccess, Action: "members.add", Origin: "backend",
+		Actor: audit.Actor{Type: audit.ActorUser, ID: "alice"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := audit.NewPending(open.ID)
+	if _, err := o.AddMember(org.WithOrg(audit.WithPending(ctx, pending), acme.ID), "bob", org.RoleMember); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Complete(ctx, open.ID, pending.Completion(audit.OutcomeOK, "", 3)); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(all(t, svc)); n != before+1 {
+		t.Fatalf("events = %d, want %d: the hook recorded a standalone event besides the pending one", n, before+1)
+	}
+	got, err := svc.Get(ctx, open.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Resource != (audit.Resource{Type: audit.ResourceUser, ID: "bob"}) || got.ContainerID != acme.ID ||
+		!audit.EqualJSON(got.Changes, json.RawMessage(`{"role_key":{"before":null,"after":"member"}}`)) {
+		t.Errorf("annotated event = %+v (changes %s)", got, got.Changes)
+	}
+}
+
+// A failed audit write aborts the authlayer operation it observes; for
+// CreateOrganization, whose hooks run inside its transaction, that is a
+// rollback.
+func TestHookErrorAbortsCreateOrganization(t *testing.T) {
+	ctx := org.WithSubject(context.Background(), "alice")
+	noAccess := audit.New(memory.NewAuditStore(), audit.WithTopics(audit.Topic{Key: audithook.TopicAuth}))
+	store := memory.New[org.Organization, org.Member]()
+	o := org.New(org.NewAccess(nil), store, org.WithHooks(audithook.Scope(noAccess)))
+	if _, err := o.CreateOrganization(ctx, "Acme", "acme"); !errors.Is(err, audit.ErrUnknownTopic) {
+		t.Fatalf("CreateOrganization err = %v, want the audit write's ErrUnknownTopic", err)
+	}
+	// The slug is free again: the organization was rolled back.
+	if _, err := org.New(org.NewAccess(nil), store).CreateOrganization(ctx, "Acme", "acme"); err != nil {
+		t.Errorf("recreating the rolled-back organization: %v", err)
 	}
 }
 
@@ -137,6 +234,7 @@ func TestAPIKeyAndOAuthMapping(t *testing.T) {
 	must(oa.On(ctx, oauth.Event{Kind: oauth.AuthenticationFailed, Detail: oauth.DetailTokenInvalid}))
 	must(oa.On(ctx, oauth.Event{Kind: oauth.TokenReuseDetected, ClientID: "cl1", GrantID: "g1", Detail: oauth.DetailRefreshReplayed}))
 	must(oa.On(ctx, oauth.Event{Kind: oauth.ClientCreated, ActorID: "alice", ClientID: "cl2"}))
+	must(oa.On(ctx, oauth.Event{Kind: oauth.ClientRegistered, ClientID: "cl3"}))
 
 	byKey := map[string]audit.Event{}
 	for _, e := range all(t, svc) {
@@ -152,42 +250,62 @@ func TestAPIKeyAndOAuthMapping(t *testing.T) {
 			t.Errorf("%s = %+v", key, e)
 		}
 	}
-	check("apikey/key.authenticate:ok:", func(e audit.Event) bool {
+	check("apikey/apikey.key_authenticated:ok:", func(e audit.Event) bool {
 		return e.Actor == audit.Actor{Type: audit.ActorServiceAccount, ID: "sa1"} && e.Resource == audit.Resource{Type: "key", ID: "k1"} && e.ContainerID == "c1"
 	})
-	check("apikey/key.authenticate:denied:"+apikey.DetailKeyRevoked, func(e audit.Event) bool {
+	check("apikey/apikey.key_authentication_failed:denied:"+apikey.DetailKeyRevoked, func(e audit.Event) bool {
 		return e.Actor.Type == audit.ActorAnonymous
 	})
-	check("apikey/service_account.role_change:ok:", func(e audit.Event) bool {
-		return e.Actor == audit.Actor{Type: audit.ActorSubject, ID: "alice"} && string(e.Request) == `{"role":"admin"}`
+	check("apikey/apikey.service_account_role_changed:ok:", func(e audit.Event) bool {
+		return e.Actor == audit.Actor{Type: audit.ActorSubject, ID: "alice"} &&
+			audit.EqualJSON(e.Changes, json.RawMessage(`{"role_key":{"before":null,"after":"admin"}}`))
 	})
-	check("oauth/token.issue:ok:authorization_code", func(e audit.Event) bool {
+	check("oauth/oauth.token_issued:ok:authorization_code", func(e audit.Event) bool {
 		return e.Resource == audit.Resource{Type: "grant", ID: "g1"} && e.Actor.ID == "u1"
 	})
-	check("oauth/token.authenticate:denied:"+oauth.DetailTokenInvalid, func(e audit.Event) bool {
+	check("oauth/oauth.authentication_failed:denied:"+oauth.DetailTokenInvalid, func(e audit.Event) bool {
 		return e.Actor.Type == audit.ActorAnonymous
 	})
-	check("oauth/token.reuse:denied:"+oauth.DetailRefreshReplayed, func(e audit.Event) bool {
+	check("oauth/oauth.token_reuse_detected:denied:"+oauth.DetailRefreshReplayed, func(e audit.Event) bool {
 		return e.Actor.Type == audit.ActorAnonymous
 	})
-	check("oauth/client.create:ok:", func(e audit.Event) bool {
+	check("oauth/oauth.client_created:ok:", func(e audit.Event) bool {
 		return e.Resource == audit.Resource{Type: "client", ID: "cl2"}
+	})
+	// A dynamically registered client did not exist before: it is the
+	// resource of its registration, not its own actor.
+	check("oauth/oauth.client_registered:ok:", func(e audit.Event) bool {
+		return e.Actor == audit.Actor{Type: audit.ActorAnonymous} && e.Resource == audit.Resource{Type: "client", ID: "cl3"}
 	})
 }
 
 func TestOptions(t *testing.T) {
 	ctx := context.Background()
-	svc := newAudit(t)
-	h := audithook.Scope(svc, audithook.WithTopic("auth"), audithook.WithOrigin("backend"),
-		audithook.WithSkipActions("role.delete", "member.add:ok"))
-	for _, k := range []scope.EventKind{scope.RoleDeleted, scope.MemberAdded, scope.MemberRemoved} {
+	svc := audit.New(memory.NewAuditStore(), audit.WithTopics(append(audithook.Topics(),
+		audit.Topic{Key: "members"}, audit.Topic{Key: "roles"})...))
+	route := func(action string) string {
+		if strings.HasPrefix(action, "scope.member_") {
+			return "members"
+		}
+		return "" // the adapter's default
+	}
+	h := audithook.Scope(svc, audithook.WithTopic(route), audithook.WithOrigin("backend"),
+		audithook.WithSkipActions("scope.role_deleted", "scope.member_added:ok"))
+	for _, k := range []scope.EventKind{scope.RoleDeleted, scope.MemberAdded, scope.MemberRemoved, scope.RoleCreated} {
 		if err := h.On(ctx, scope.Event{Kind: k, ContainerID: "c", TargetID: "u", RoleKey: "r"}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	evs := all(t, svc)
-	if len(evs) != 1 || evs[0].Action != "member.remove" || evs[0].Topic != "auth" || evs[0].Origin != "backend" {
-		t.Fatalf("events = %+v", evs)
+	if len(evs) != 2 {
+		t.Fatalf("events = %+v, want 2", evs)
+	}
+	created, removed := evs[0], evs[1]
+	if removed.Action != "scope.member_removed" || removed.Topic != "members" || removed.Origin != "backend" {
+		t.Errorf("removed = %+v, want topic members, origin backend", removed)
+	}
+	if created.Action != "scope.role_created" || created.Topic != audithook.TopicAccess {
+		t.Errorf("role created = %+v, want the default topic", created)
 	}
 }
 

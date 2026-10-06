@@ -109,7 +109,9 @@ a side effect's. The interceptor turns the `Pending` into a `Completion` with
 ## Reading it back
 
 `Get` loads one event. `List` pages **newest first** with a cursor: pass the
-returned cursor as `Page.Before`; it is zero on the last page. `Export` calls a
+returned cursor as `Page.Before`. It is zero once a page comes back short; a
+full page may be followed by an empty one, so a page whose size equals the
+limit does not prove there is more. `Export` calls a
 function for every match, oldest first, and refuses with `ErrExportTooLarge`
 before yielding anything when more than `limit` events match.
 
@@ -123,37 +125,62 @@ events *about* them (a resource of type `user`).
 `audit/audithook` turns the lifecycle hooks of `auth`, `scope` (so `org` and
 `team`), `apikey` and `oauth` into events, with no change to those packages:
 
-{/* verify:skip a wiring sketch over stores and keys this page does not construct; the same hooks are compiled and run, against real services, by audit/audithook's own tests and by examples/audit */}
+{/* verify:skip a wiring sketch over stores and keys this page does not construct; the Auth and Scope hooks are compiled and run against real services by examples/audit, and all four by audit/audithook's own tests */}
 ```go
 svc := audit.New(store, audit.WithTopics(audithook.Topics()...))
 
 authSvc := auth.New(authStore, auth.WithJWT(keys, ttl), auth.WithHooks(audithook.Auth(svc)))
 orgSvc := org.New(access, orgStore, org.WithHooks(audithook.Scope(svc)))
-keysSvc := apikey.New(orgSvc, keyStore, apikey.WithHooks(audithook.APIKey(svc)))
+keysSvc := apikey.New(orgSvc.Service, keyStore, apikey.WithHooks(audithook.APIKey(svc)))
 oauthSvc := oauth.New(oauthStore, orgSvc, signer, oauth.WithHooks(audithook.OAuth(svc)))
 ```
 
-Hooks fire after the mutation, so these are recorded already over: a refusal —
-a failed login, a rejected key or token, a replayed refresh token — is
-`OutcomeDenied`, everything else `OutcomeOK`. The source event's closed `Detail`
-vocabulary becomes the `Reason`; nothing else is copied, so there is still no
-address and no token in the log. An unknown-address login is an anonymous
-actor with `Reason: "unknown_user"` and nothing more.
+**Inside a recorded call, the hooks annotate.** When an interceptor has begun
+an event and put its `Pending` on the context, an adapter adds what the hook
+knows to that event — the resource (the member, the role, the key), the
+container, the `Detail` as its reason, a role key as `Changes` — and records
+nothing of its own. The interceptor completes the event with the call's real
+outcome.
 
-| Package | Topic | Actions |
+**Otherwise they record.** Hooks fire after the mutation, so these events are
+already over: a refusal — a failed login, a rejected key or token, a replayed
+refresh token — is `OutcomeDenied`, everything else `OutcomeOK`. The source
+event's closed `Detail` vocabulary becomes the `Reason`. Ids, the role key and,
+from `auth`, the caller's IP address, user agent and session id are copied; no
+email address and no token ever are. A failed sign-in, a second-factor
+challenge and a token replay are **anonymous** — whoever tried is not
+authenticated as the account — and name the account as their resource, so the
+account's trail still shows them; an unknown address has no account to name,
+only `Reason: "unknown_user"`. A session event names the session as its
+resource and the user as its actor; an account event names the user as both.
+Membership events name the member as a `user` resource even when it is a
+service account.
+
+Actions are `<package>.<kind in snake case>`:
+
+| Package | Default topic | Actions |
 |---|---|---|
-| `auth` | `auth` | `user.signup`, `email.verify`, `session.login`, `session.refresh`, `session.reuse`, `session.logout`, `password.change`, `mfa.enroll`, `account.delete`, … |
-| `scope`, `org`, `team` | `scope` | `container.create`, `member.add`, `member.role_change`, `member.remove`, `role.create`, `ownership.transfer`, … |
-| `apikey` | `apikey` | `service_account.create`, `key.create`, `key.revoke`, `key.authenticate` |
-| `oauth` | `oauth` | `client.create`, `grant.revoke`, `token.issue`, `token.refresh`, `token.reuse`, `token.authenticate` |
+| `auth` | `auth` | `auth.signed_up`, `auth.email_verified`, `auth.logged_in`, `auth.login_failed`, `auth.mfa_challenged`, `auth.session_refreshed`, `auth.token_reuse_detected`, `auth.logged_out`, `auth.password_changed`, `auth.account_deleted`, … |
+| `scope`, `org`, `team` | `access` | `scope.container_created`, `scope.member_added`, `scope.member_role_changed`, `scope.member_removed`, `scope.role_created`, `scope.ownership_transferred`, … |
+| `apikey` | `apikey` | `apikey.service_account_created`, `apikey.key_created`, `apikey.key_revoked`, `apikey.key_authenticated`, `apikey.key_authentication_failed`, … |
+| `oauth` | `oauth` | `oauth.client_created`, `oauth.client_registered`, `oauth.grant_revoked`, `oauth.token_issued`, `oauth.token_refreshed`, `oauth.token_reuse_detected`, `oauth.authentication_failed`, … |
 
-Options on every adapter: `WithTopic` and `WithOrigin` rename where and as whom
-events are recorded; `WithSkipActions("key.authenticate")` drops a noisy action
-(or `"key.authenticate:ok"` only its successes); `WithBestEffort(onErr)` makes a
+Options on every adapter: `WithTopic(func(action string) string)` routes each
+action to a topic (return `""` for the default), so member and role events can
+go to separate topics; `WithOrigin` names the reporting service;
+`WithSkipActions("apikey.key_authenticated")` drops a noisy action (or
+`"auth.logged_in:ok"` only its successes); `WithBestEffort(onErr)` makes a
 failed audit write non-fatal. **By default a failed write is returned**, which
-aborts the call the hook observes with the change already in place — an
-unrecorded action is loud rather than silent. Choose best-effort only for
-events whose loss you accept.
+aborts the call the hook observes — an unrecorded action is loud rather than
+silent. Choose best-effort only for events whose loss you accept.
+
+An aborted call keeps its change everywhere but in `CreateOrganization` (scope's
+`CreateContainer`), which runs its hooks inside its transaction and rolls back.
+The audit `Service` writes outside that transaction, so a standalone
+`scope.container_created` can outlive an organization that was rolled back
+because a hook registered after the audit one failed, or the commit did.
+Register the audit hook last; inside a recorded call the event carries the
+call's own outcome instead.
 
 One setting is shared with the other modules: `authlayer.Shared{Runtime: …}`
 hands the audit `Service` the same clock and id generator through
