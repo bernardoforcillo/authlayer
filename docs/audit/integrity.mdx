@@ -1,0 +1,130 @@
+---
+title: "Integrity and retention"
+description: "Crash recovery, a per-topic daily hash chain, verification that names what was rewritten, and retention that marks seals purged before it deletes — so Verify never raises a false alarm."
+---
+
+The `Store` never rewrites an event, and deletes one only through retention.
+That is a promise of the *port*. What lets you **prove** it afterwards is the
+seal.
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/audit"
+	"github.com/bernardoforcillo/authlayer/core"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+{/* verify:main */}
+```go
+clock := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+store := memory.NewAuditStore()
+svc := audit.New(store,
+	audit.WithRuntime(core.Runtime{Clock: func() time.Time { return clock }}),
+	audit.WithTopics(audit.Topic{Key: "menus", Retention: 30 * 24 * time.Hour}))
+ctx := context.Background()
+actor := audit.Actor{Type: audit.ActorUser, ID: "alice"}
+
+// Day one: one event that finishes, one whose process dies mid-action.
+_, _ = svc.Record(ctx, audit.Event{Topic: "menus", Action: "menu.create", Origin: "backend",
+	Actor: actor, Outcome: audit.OutcomeOK})
+crashed, _ := svc.Begin(ctx, audit.Event{Topic: "menus", Action: "menu.delete", Origin: "backend", Actor: actor})
+
+clock = clock.Add(26 * time.Hour) // the next day
+
+// A day holding an open event cannot be sealed.
+_, err := svc.Seal(ctx, clock)
+fmt.Println("seal with an open event:", err != nil)
+
+// Reconcile closes it as unknown.
+n, _ := svc.Reconcile(ctx, time.Hour)
+closed, _ := svc.Get(ctx, crashed.ID)
+fmt.Println("reconciled:", n, closed.Outcome, closed.Reason)
+
+seals, _ := svc.Seal(ctx, clock)
+fmt.Println("sealed days:", len(seals), "events in the first:", seals[0].EventCount)
+
+report := func() {
+	statuses, _ := svc.Verify(ctx, []string{"menus"}, seals[0].Day, seals[0].Day)
+	fmt.Println("verify:", statuses[0].State, statuses[0].Detail)
+}
+report()
+
+// Retention outlives the seal, not the other way round.
+clock = clock.AddDate(0, 0, 60)
+deleted, _ := svc.ApplyRetention(ctx)
+fmt.Println("retention deleted:", deleted["menus"])
+report()
+```
+
+{/* verify:stdout "seal with an open event: true\nreconciled: 1 unknown reconciled\nsealed days: 1 events in the first: 2\nverify: ok \nretention deleted: 2\nverify: purged " */}
+
+## Reconcile
+
+`Begin` stores an event before the action runs; if the process dies, the
+completion never arrives. `Reconcile(ctx, olderThan)` closes every open event
+that began more than `olderThan` ago with `OutcomeUnknown` and
+`Reason: "reconciled"`, and returns how many it closed. Choose an `olderThan`
+longer than any action can run. It is safe on several replicas at once: an
+event another replica completed first is skipped.
+
+It exists because a seal needs a finished day: **a day with an open event is not
+sealed** (`ErrOpenEvents`). The other topics are sealed regardless and the
+errors are joined, so one stuck topic never holds back the rest.
+
+## Seal
+
+`Seal(ctx, until)` seals, for every declared topic, each UTC day that ended at
+or before `until` and has no seal yet, oldest first. Each seal carries the
+day's event count and first/last `Seq`, a SHA-256 over the day's canonical
+events, and a `SealHash` that chains the **previous day's** seal. Empty days are
+sealed too, so removing a whole day is detected.
+
+Run it on a schedule — hourly is fine; it does nothing until a day has ended.
+Several replicas may run it at once: a day another replica sealed first is
+skipped, and the chain continues from that seal. Once a day is sealed the
+`Store` refuses a new event in it (`ErrSealed`).
+
+<Note>
+`Seq` is increasing, not gapless: a backend may consume a value on a duplicate
+or refused insert. A hole in `Seq` is therefore **not** evidence of a deletion.
+The seals are.
+</Note>
+
+## Verify
+
+`Verify(ctx, topics, from, to)` returns one `DayStatus` per topic and UTC day:
+
+| State | Meaning |
+|---|---|
+| `ok` | the day's events hash to its seal, which links to the previous day's |
+| `mismatch` | something no longer matches; `Detail` says what |
+| `unsealed` | no seal covers the day yet |
+| `purged` | retention deleted the events; the seal still links |
+
+A `mismatch` names the check that failed: `events_hash` (an event was altered,
+inserted or deleted, or a stored event is unreadable), `seal_hash` (the seal row
+itself was edited) or `chain` (the seal no longer links to the previous day's —
+a day was deleted or replaced). Editing a seal to match an edited event does
+not help: the next day's `PrevHash` no longer matches.
+
+## Retention
+
+Each topic keeps its events for `Topic.Retention`, falling back to
+`WithDefaultRetention` (one year by default). `ApplyRetention(ctx)` deletes, per
+topic, what is older, and returns the count per topic. Two rules keep it from
+undermining the thing it sits next to:
+
+- **Only sealed days are purged.** A topic with no seal keeps everything, so an
+  event is never deleted before the seal that covers it exists.
+- **Seals are marked purged before their events go**, in that order. `Verify`
+  then reports the day as `purged` instead of finding events missing from a
+  seal that thinks it still has them. The seals themselves stay forever.
+
+Run `ApplyRetention` on a schedule too — after `Seal`, so the days it may purge
+are sealed.

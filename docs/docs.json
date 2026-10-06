@@ -116,6 +116,15 @@
         ]
       },
       {
+        "group": "Audit log",
+        "icon": "clipboard-list",
+        "pages": [
+          "audit/overview",
+          "audit/integrity",
+          "audit/storage"
+        ]
+      },
+      {
         "group": "Storage",
         "icon": "database",
         "pages": [

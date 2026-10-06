@@ -1,0 +1,167 @@
+---
+title: "Audit log"
+description: "One immutable event per action — who did what, to which resource, in which container, with what input and how it ended — recorded in two phases so an action never runs unrecorded, and sealed into a hash chain so a rewrite is detectable."
+---
+
+`audit` answers "who did that, and can I prove nobody edited the record?". It
+is a library, like the rest of authlayer: a `Service` over a `Store` port, with
+no transport and no UI.
+
+An **`Event`** says who acted (`Actor`, and `OnBehalfOf` when an operator acts
+as someone else), what they did (`Topic`, `Action` as `<noun>.<verb>`,
+`Resource`), where (`ContainerID`), with which input (`Request`, redacted) and
+how it ended (`Outcome`, and `Changes`, a redacted before→after diff).
+
+{/* verify:import */}
+```go
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/bernardoforcillo/authlayer/audit"
+	"github.com/bernardoforcillo/authlayer/core"
+	"github.com/bernardoforcillo/authlayer/store/memory"
+)
+```
+
+## Recording an action in two phases
+
+`Begin` stores the event **before** the action runs; `Complete` writes the
+outcome afterwards, once. If the event cannot be stored, do not run the
+action — that is the point of beginning first.
+
+{/* verify:main */}
+```go
+at := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+svc := audit.New(memory.NewAuditStore(),
+	audit.WithRuntime(core.Fixed(at)),
+	audit.WithTopics(audit.Topic{Key: "menus"}))
+ctx := context.Background()
+
+open, _ := svc.Begin(ctx, audit.Event{
+	Topic: "menus", Action: "menu.update", Origin: "backend",
+	Actor:   audit.Actor{Type: audit.ActorUser, ID: "alice"},
+	Request: json.RawMessage(`{"name":"Lunch","api_key":"sk-live-1234"}`),
+})
+fmt.Println("open:", open.CompletedAt == nil, "outcome:", open.Outcome == "")
+
+_ = svc.Complete(ctx, open.ID, audit.Completion{
+	Outcome: audit.OutcomeOK,
+	Before:  json.RawMessage(`{"name":"Lunch","price":9}`),
+	After:   json.RawMessage(`{"name":"Lunch","price":12}`),
+})
+done, _ := svc.Get(ctx, open.ID)
+fmt.Println(done.Outcome, string(done.Request))
+fmt.Println(string(done.Changes))
+```
+
+Two things happened to the data on its way in. `Request` was **redacted**: any
+key that looks like a secret (`password`, `token`, `api_key`, `authorization`,
+digit-suffixed and joined spellings included) keeps its path and loses its
+value. And `Changes` is not the two states but their **diff**, redacted the same
+way, so a changed password shows as a changed path with both values withheld.
+`WithPolicy` replaces the redaction policy.
+
+A retried call is a no-op, not a second event: send the same `ID` and the
+stored event comes back. The same id on a *different* event is
+`ErrInvalidEvent`, refused rather than silently dropped.
+
+<Note>
+`Record` stores an event that is already over in one step — `CompletedAt`
+equals `OccurredAt`. Use it for what you observed after the fact, such as a
+refused sign-in. Use `Begin`/`Complete` for anything that could die mid-way.
+</Note>
+
+## Annotating from inside the action
+
+Code running inside an action knows things the interceptor that called `Begin`
+does not: which menu it touched, what the row looked like before and after.
+`Annotate` adds them to the pending event on the context, and does nothing when
+there is none, so library code may call it unconditionally:
+
+{/* verify:decl */}
+```go
+func deleteMenu(ctx context.Context, id string) {
+	// ... the real work ...
+	audit.Annotate(ctx,
+		audit.WithResource("menu", id),
+		audit.WithContainer("acme"),
+		audit.WithReason("owner_request"))
+}
+```
+
+{/* verify:main */}
+```go
+pending := audit.NewPending("")
+deleteMenu(audit.WithPending(ctx, pending), "m1")
+c := pending.Completion(audit.OutcomeOK, "", 4)
+fmt.Println(c.Resource.Type, c.Resource.ID, c.ContainerID, c.Reason)
+```
+
+The first `WithResource` and `WithContainer` win — the action's own target, not
+a side effect's. The interceptor turns the `Pending` into a `Completion` with
+`pending.Completion(outcome, code, durationMS)`.
+
+{/* verify:stdout "open: true outcome: true\nok {\"api_key\":\"[REDACTED]\",\"name\":\"Lunch\"}\n{\"price\":{\"after\":12,\"before\":9}}\nmenu m1 acme owner_request" */}
+
+## Reading it back
+
+`Get` loads one event. `List` pages **newest first** with a cursor: pass the
+returned cursor as `Page.Before`; it is zero on the last page. `Export` calls a
+function for every match, oldest first, and refuses with `ErrExportTooLarge`
+before yielding anything when more than `limit` events match.
+
+A `Filter` selects by `Topics`, a `From`/`To` window, `ContainerID`, `ActorID`,
+`Resource`, `Outcomes`, `Source` and `ActionPrefix`. **`Member`** is one
+person's whole trail: events they performed, events performed *as* them, and
+events *about* them (a resource of type `user`).
+
+## Feeding it from the other packages
+
+`audit/audithook` turns the lifecycle hooks of `auth`, `scope` (so `org` and
+`team`), `apikey` and `oauth` into events, with no change to those packages:
+
+{/* verify:skip a wiring sketch over stores and keys this page does not construct; the same hooks are compiled and run, against real services, by audit/audithook's own tests and by examples/audit */}
+```go
+svc := audit.New(store, audit.WithTopics(audithook.Topics()...))
+
+authSvc := auth.New(authStore, auth.WithJWT(keys, ttl), auth.WithHooks(audithook.Auth(svc)))
+orgSvc := org.New(access, orgStore, org.WithHooks(audithook.Scope(svc)))
+keysSvc := apikey.New(orgSvc, keyStore, apikey.WithHooks(audithook.APIKey(svc)))
+oauthSvc := oauth.New(oauthStore, orgSvc, signer, oauth.WithHooks(audithook.OAuth(svc)))
+```
+
+Hooks fire after the mutation, so these are recorded already over: a refusal —
+a failed login, a rejected key or token, a replayed refresh token — is
+`OutcomeDenied`, everything else `OutcomeOK`. The source event's closed `Detail`
+vocabulary becomes the `Reason`; nothing else is copied, so there is still no
+address and no token in the log. An unknown-address login is an anonymous
+actor with `Reason: "unknown_user"` and nothing more.
+
+| Package | Topic | Actions |
+|---|---|---|
+| `auth` | `auth` | `user.signup`, `email.verify`, `session.login`, `session.refresh`, `session.reuse`, `session.logout`, `password.change`, `mfa.enroll`, `account.delete`, … |
+| `scope`, `org`, `team` | `scope` | `container.create`, `member.add`, `member.role_change`, `member.remove`, `role.create`, `ownership.transfer`, … |
+| `apikey` | `apikey` | `service_account.create`, `key.create`, `key.revoke`, `key.authenticate` |
+| `oauth` | `oauth` | `client.create`, `grant.revoke`, `token.issue`, `token.refresh`, `token.reuse`, `token.authenticate` |
+
+Options on every adapter: `WithTopic` and `WithOrigin` rename where and as whom
+events are recorded; `WithSkipActions("key.authenticate")` drops a noisy action
+(or `"key.authenticate:ok"` only its successes); `WithBestEffort(onErr)` makes a
+failed audit write non-fatal. **By default a failed write is returned**, which
+aborts the call the hook observes with the change already in place — an
+unrecorded action is loud rather than silent. Choose best-effort only for
+events whose loss you accept.
+
+One setting is shared with the other modules: `authlayer.Shared{Runtime: …}`
+hands the audit `Service` the same clock and id generator through
+`sh.Audit()`.
+
+## Where next
+
+- [Integrity and retention](/audit/integrity) — `Reconcile`, `Seal`, `Verify`
+  and what each says about a rewrite.
+- [Storage](/audit/storage) — the PostgreSQL store whose triggers refuse
+  rewrites, and the contract suite for your own backend.
