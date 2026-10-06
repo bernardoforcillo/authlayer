@@ -20,6 +20,7 @@ type Pending struct {
 	reason      string
 	before      json.RawMessage
 	after       json.RawMessage
+	claimed     bool
 }
 
 // NewPending returns the collector for the open event id.
@@ -27,6 +28,21 @@ func NewPending(id string) *Pending { return &Pending{id: id} }
 
 // ID is the open event's id.
 func (p *Pending) ID() string { return p.id }
+
+// Claim reports whether this is the first claim on p, and marks it claimed.
+// An adapter that turns side effects into annotations, such as audithook,
+// claims the pending event before annotating it: only the first of the
+// operation's events describes the event in flight, and every further one is
+// recorded as an event of its own, so an operation that fires several hooks
+// (a user removed from several containers) loses none of them. Annotate
+// itself never claims.
+func (p *Pending) Claim() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	first := !p.claimed
+	p.claimed = true
+	return first
+}
 
 // WithPending returns ctx carrying p.
 func WithPending(ctx context.Context, p *Pending) context.Context {

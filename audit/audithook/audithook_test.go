@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -197,6 +198,120 @@ func TestHooksAnnotateTheEventInFlightInsteadOfRecording(t *testing.T) {
 	if got.Resource != (audit.Resource{Type: audit.ResourceUser, ID: "bob"}) || got.ContainerID != acme.ID ||
 		!audit.EqualJSON(got.Changes, json.RawMessage(`{"role_key":{"before":null,"after":"member"}}`)) {
 		t.Errorf("annotated event = %+v (changes %s)", got, got.Changes)
+	}
+}
+
+// An operation that fires several hooks under one pending event keeps every
+// one of them: the first membership event of the call annotates the pending
+// event, every further one is recorded on its own, and the succession that
+// RemoveUser performs as a side effect never claims the pending event, so
+// its resource stays the removed user.
+func TestEveryHookOfAMultiEventCallIsKept(t *testing.T) {
+	for _, anonymize := range []bool{false, true} {
+		svc := newAudit(t)
+		o := org.New(org.NewAccess(nil), memory.New[org.Organization, org.Member](),
+			org.WithHooks(audithook.Scope(svc)), scope.WithOrphanPolicy(scope.SuccessorFirstMember))
+		alice := org.WithSubject(context.Background(), "alice")
+		carol := org.WithSubject(context.Background(), "carol")
+		a1, err := o.CreateOrganization(alice, "A1", "a1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := o.AddMember(org.WithOrg(alice, a1.ID), "bob", org.RoleMember); err != nil {
+			t.Fatal(err)
+		}
+		var others []string
+		for _, slug := range []string{"c1", "d1"} {
+			c, err := o.CreateOrganization(carol, strings.ToUpper(slug), slug)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := o.AddMember(org.WithOrg(carol, c.ID), "alice", org.RoleMember); err != nil {
+				t.Fatal(err)
+			}
+			others = append(others, c.ID)
+		}
+		before := len(all(t, svc))
+
+		ctx := context.Background()
+		open, err := svc.Begin(ctx, audit.Event{Topic: audithook.TopicAccess, Action: "users.delete", Origin: "backend",
+			Actor: audit.Actor{Type: audit.ActorUser, ID: "admin"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := audit.NewPending(open.ID)
+		remove := o.RemoveUser
+		if anonymize {
+			remove = o.RemoveUserAnonymized
+		}
+		if err := remove(audit.WithPending(ctx, p), "alice"); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.Complete(ctx, open.ID, p.Completion(audit.OutcomeOK, "", 1)); err != nil {
+			t.Fatal(err)
+		}
+
+		evs := all(t, svc)
+		fresh := evs[:len(evs)-before] // newest first
+		if len(fresh) != 4 {
+			t.Fatalf("anonymize=%v: %d new events, want 4 (the pending one, the transfer, two removals): %+v", anonymize, len(fresh), fresh)
+		}
+		got, err := svc.Get(ctx, open.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// RemoveUser walks alice's containers in no fixed order: the first
+		// removal annotates the pending event, the other two are standalone.
+		if got.Resource != (audit.Resource{Type: audit.ResourceUser, ID: "alice"}) ||
+			!slices.Contains(append([]string{a1.ID}, others...), got.ContainerID) {
+			t.Errorf("anonymize=%v: pending event = resource %+v container %s, want user/alice in one of her containers",
+				anonymize, got.Resource, got.ContainerID)
+		}
+		removed := map[string]bool{got.ContainerID: true}
+		transferred := false
+		for _, e := range fresh {
+			if e.ID == open.ID {
+				continue
+			}
+			if e.Origin != audithook.DefaultOrigin || e.Topic != audithook.TopicAccess || e.Outcome != audit.OutcomeOK {
+				t.Errorf("standalone %s = %+v", e.Action, e)
+			}
+			switch e.Action {
+			case "scope.ownership_transferred":
+				transferred = e.ContainerID == a1.ID && e.Resource == (audit.Resource{Type: audit.ResourceUser, ID: "bob"})
+			case "scope.member_removed":
+				if e.Resource != (audit.Resource{Type: audit.ResourceUser, ID: "alice"}) || removed[e.ContainerID] {
+					t.Errorf("anonymize=%v: removal = %+v", anonymize, e)
+				}
+				removed[e.ContainerID] = true
+				if anonymize && !audit.EqualJSON(e.Request, json.RawMessage(`{"anonymized":true}`)) {
+					t.Errorf("removal from %s request = %s, want the anonymized flag", e.ContainerID, e.Request)
+				}
+			default:
+				t.Errorf("unexpected event %s", e.Action)
+			}
+		}
+		if !transferred {
+			t.Errorf("anonymize=%v: no standalone transfer of A1 to bob in %+v", anonymize, fresh)
+		}
+		for _, c := range append([]string{a1.ID}, others...) {
+			if !removed[c] {
+				t.Errorf("anonymize=%v: alice's removal from %s is not in the log", anonymize, c)
+			}
+		}
+		trail, _, err := svc.List(ctx, audit.Filter{Member: "alice"}, audit.Page{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, e := range trail {
+			if e.ID == open.ID || e.Action == "scope.member_removed" {
+				n++
+			}
+		}
+		if n != 3 {
+			t.Errorf("anonymize=%v: alice's trail holds %d of the deletion and her two other removals, want 3", anonymize, n)
+		}
 	}
 }
 

@@ -10,11 +10,19 @@
 //
 // When an event is pending on the context — an interceptor called
 // [audit.Recorder.Begin] and put an [audit.Pending] there with
-// [audit.WithPending] — the adapter adds what the hook knows to that event
-// with [audit.Annotate]: the resource (the target user, the role, the key…),
-// the container, the Detail as the reason, and a role key as Changes
-// ({"role_key": …}). It records nothing of its own, and the interceptor
-// completes the event with the call's real outcome.
+// [audit.WithPending] — the first hook event of the call claims it
+// ([audit.Pending.Claim]) and adds what the hook knows to it with
+// [audit.Annotate]: the resource (the target user, the role, the key…), the
+// container, the Detail as the reason, and a role key as Changes
+// ({"role_key": …}). The interceptor completes the event with the call's real
+// outcome. Every further hook event of the same call is recorded as a
+// standalone event, so an operation that fires several hooks loses none:
+// RemoveUser's removal from each container, an ownership transfer. The
+// transfer RemoveUser makes on its way (an OwnershipTransferred without an
+// actor) is a side effect and never claims the pending event, which keeps
+// naming the removed user. An annotation carries no Request, so the first
+// event's anonymized flag (a scope removal) or client_id (an OAuth grant
+// event) is not on the pending event; standalone events keep theirs.
 //
 // Otherwise it records a standalone event with [audit.Recorder.Record],
 // already over: hooks fire after the mutation they describe. A refusal
@@ -163,9 +171,12 @@ func newConfig(topic string, opts []Option) config {
 }
 
 // emit annotates the pending event on ctx with e's resource, container and
-// reason and roleKey as Changes, or, with none pending, records e. It
-// applies the skip list first and the failure policy last.
-func (c config) emit(ctx context.Context, rec audit.Recorder, e audit.Event, roleKey string) error {
+// reason and roleKey as Changes when e is the first event of the call to
+// claim it ([audit.Pending.Claim]), and records e otherwise: with no event
+// pending, for every later event of the same call, and for a side effect
+// (sideEffect), which never claims. It applies the skip list first and the
+// failure policy last.
+func (c config) emit(ctx context.Context, rec audit.Recorder, e audit.Event, roleKey string, sideEffect bool) error {
 	if slices.Contains(c.skip, e.Action) || slices.Contains(c.skip, e.Action+":"+string(e.Outcome)) {
 		return nil
 	}
@@ -173,7 +184,7 @@ func (c config) emit(ctx context.Context, rec audit.Recorder, e audit.Event, rol
 	if roleKey != "" {
 		after, _ = json.Marshal(map[string]string{"role_key": roleKey})
 	}
-	if _, ok := audit.PendingFrom(ctx); ok {
+	if p, ok := audit.PendingFrom(ctx); ok && !sideEffect && p.Claim() {
 		var anns []audit.Annotation
 		if e.Resource != (audit.Resource{}) {
 			anns = append(anns, audit.WithResource(e.Resource.Type, e.Resource.ID))
@@ -294,7 +305,11 @@ func Scope(rec audit.Recorder, opts ...Option) scope.Hook {
 		if ev.Anonymized {
 			e.Request = request(map[string]any{"anonymized": true})
 		}
-		return c.emit(ctx, rec, e, roleKey)
+		// RemoveUser hands an owned container to a successor on its way:
+		// that transfer (the one without an actor) is a side effect of the
+		// removal, recorded on its own, never the event in flight.
+		sideEffect := ev.Kind == scope.OwnershipTransferred && ev.ActorID == ""
+		return c.emit(ctx, rec, e, roleKey, sideEffect)
 	})
 }
 
@@ -355,7 +370,7 @@ func Auth(rec audit.Recorder, opts ...Option) auth.Hook {
 		case ev.UserID != "":
 			e.Resource = audit.Resource{Type: audit.ResourceUser, ID: ev.UserID}
 		}
-		return c.emit(ctx, rec, e, "")
+		return c.emit(ctx, rec, e, "", false)
 	})
 }
 
@@ -398,7 +413,7 @@ func APIKey(rec audit.Recorder, opts ...Option) apikey.Hook {
 		case ev.ServiceAccountID != "":
 			e.Resource = audit.Resource{Type: ResourceServiceAccount, ID: ev.ServiceAccountID}
 		}
-		return c.emit(ctx, rec, e, ev.RoleKey)
+		return c.emit(ctx, rec, e, ev.RoleKey, false)
 	})
 }
 
@@ -452,6 +467,6 @@ func OAuth(rec audit.Recorder, opts ...Option) oauth.Hook {
 		if ev.ClientID != "" && e.Resource.Type == ResourceGrant {
 			e.Request = request(map[string]any{"client_id": ev.ClientID})
 		}
-		return c.emit(ctx, rec, e, "")
+		return c.emit(ctx, rec, e, "", false)
 	})
 }

@@ -95,9 +95,11 @@ once a 1.0 is cut. Until then, minor versions may break API.
   against `store/memory` and, in the integration lane, against PostgreSQL.
 - **`audit/audithook`.** Adapters from the lifecycle hooks of `auth`,
   `scope` (and so `org` and `team`), `apikey` and `oauth` to audit events.
-  Inside a call with a pending event they annotate it (resource, container,
-  reason, the role key as `Changes`); otherwise they record a standalone
-  event named `<package>.<kind in snake case>` (`auth.login_failed`,
+  Inside a call with a pending event the call's first hook event annotates
+  it (resource, container, reason, the role key as `Changes`) and every
+  further one is recorded on its own (`audit.Pending.Claim`), so a
+  multi-event call such as `RemoveUser` keeps every removal and transfer;
+  otherwise they record a standalone event named `<package>.<kind in snake case>` (`auth.login_failed`,
   `scope.member_role_changed`) under the topics `access`, `auth`, `apikey`
   and `oauth`. Refusals are `denied` and anonymous where the caller is not
   the account (a failed sign-in, a challenge, a token replay), the closed
