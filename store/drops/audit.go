@@ -93,7 +93,8 @@ func quoteIdent(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`)
 //
 //   - AU001: an event may only be updated by the one transition that
 //     completes it (completed_at NULL to set, the completion columns
-//     written, resource and container filled only when empty).
+//     written, resource and container filled only when empty), or by
+//     clearing its ip and user_agent on retention.
 //   - AU002: an event of a sealed day may not be deleted until the seal is
 //     marked purged, and the events table may not be truncated.
 //   - AU003: a seal may only get purged_at stamped, once; seals are never
@@ -164,11 +165,28 @@ func AuditDDL(opts ...AuditOption) []string {
 		`CREATE INDEX IF NOT EXISTS ` + q("_topic_time") + ` ON ` + ev + ` (topic, occurred_at)`,
 		`CREATE INDEX IF NOT EXISTS ` + q("_open") + ` ON ` + ev + ` (occurred_at) WHERE completed_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS ` + q("_container") + ` ON ` + ev + ` (container_id, seq DESC) WHERE container_id <> ''`,
+		`CREATE INDEX IF NOT EXISTS ` + q("_client") + ` ON ` + ev + ` (topic, occurred_at) WHERE ip <> '' OR user_agent <> ''`,
 		`CREATE INDEX IF NOT EXISTS ` + q("_actor") + ` ON ` + ev + ` (actor_id, seq DESC) WHERE actor_id <> ''`,
 
 		// events: AU001 on update.
 		`CREATE OR REPLACE FUNCTION ` + q("_guard_update") + `() RETURNS trigger LANGUAGE plpgsql AS $authlayer$
 BEGIN
+  -- Clearing the client data (IP, user agent) on retention: nothing else may differ.
+  IF NEW.ip = '' AND NEW.user_agent = '' AND (OLD.ip <> '' OR OLD.user_agent <> '')
+     AND NEW.id = OLD.id AND NEW.seq = OLD.seq AND NEW.occurred_at = OLD.occurred_at
+     AND NEW.completed_at IS NOT DISTINCT FROM OLD.completed_at
+     AND NEW.topic = OLD.topic AND NEW.action = OLD.action AND NEW.source = OLD.source
+     AND NEW.origin = OLD.origin AND NEW.procedure = OLD.procedure
+     AND NEW.actor_type = OLD.actor_type AND NEW.actor_id = OLD.actor_id
+     AND NEW.actor_display = OLD.actor_display AND NEW.on_behalf_of = OLD.on_behalf_of
+     AND NEW.session_id = OLD.session_id AND NEW.container_id = OLD.container_id
+     AND NEW.resource_type = OLD.resource_type AND NEW.resource_id = OLD.resource_id
+     AND NEW.outcome = OLD.outcome AND NEW.code = OLD.code AND NEW.reason = OLD.reason
+     AND NEW.request IS NOT DISTINCT FROM OLD.request AND NEW.changes IS NOT DISTINCT FROM OLD.changes
+     AND NEW.client_time IS NOT DISTINCT FROM OLD.client_time AND NEW.duration_ms = OLD.duration_ms
+  THEN
+    RETURN NEW;
+  END IF;
   IF OLD.completed_at IS NULL AND NEW.completed_at IS NOT NULL
      AND NEW.id = OLD.id AND NEW.seq = OLD.seq AND NEW.occurred_at = OLD.occurred_at
      AND NEW.topic = OLD.topic AND NEW.action = OLD.action AND NEW.source = OLD.source
@@ -678,4 +696,18 @@ func (st *AuditStore) MarkPurged(ctx context.Context, topic string, before, at t
 WHERE topic = $1 AND day::timestamp < ($2::timestamptz AT TIME ZONE 'UTC') AND purged_at IS NULL`,
 		topic, before.UTC(), at.UTC())
 	return err
+}
+
+// ScrubClientData clears ip and user_agent on at most batch events of topic
+// older than before, oldest first. The AU001 guard allows exactly this
+// rewrite and no other.
+func (st *AuditStore) ScrubClientData(ctx context.Context, topic string, before time.Time, batch int) (int, error) {
+	res, err := st.db.Exec(ctx, `UPDATE `+st.ev+` SET ip = '', user_agent = '' WHERE seq IN (
+ SELECT seq FROM `+st.ev+` WHERE topic = $1 AND occurred_at < $2 AND (ip <> '' OR user_agent <> '')
+ ORDER BY seq LIMIT NULLIF($3::bigint, 0))`, topic, before.UTC(), max(batch, 0))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
 }

@@ -67,6 +67,7 @@ var checks = []check{
 	{"Seals/InsertOnceListAndLast", sealsInsertOnceListAndLast},
 	{"Purge/DeletesOnlyTheTopicBeforeInBatches", purgeDeletesOnlyTopicBefore},
 	{"MarkPurged/StampsOnlyEarlierUnpurged", markPurgedStampsOnlyEarlier},
+	{"ScrubClientData/ClearsOnlyTheTopicBeforeAndNothingElse", scrubClearsOnlyClientData},
 }
 
 var day0 = time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
@@ -549,5 +550,45 @@ func markPurgedStampsOnlyEarlier(t tb, st audit.Store) {
 	}
 	if u, _ := st.Seals(ctx, "u", day0, day0); len(u) != 1 || u[0].PurgedAt != nil {
 		t.Errorf("topic u seal = %+v, want unpurged", u)
+	}
+}
+
+func scrubClearsOnlyClientData(t tb, st audit.Store) {
+	ctx := context.Background()
+	withClient := func(topic string, at time.Time) audit.Event {
+		return mustInsert(t, st, ev(topic, at, closeAs(audit.OutcomeOK), func(e *audit.Event) {
+			e.IP, e.UserAgent = "203.0.113.7", "agent/1"
+			e.Request = json.RawMessage(`{"a":1}`)
+			e.Reason = "why"
+		}))
+	}
+	old1, old2 := withClient("t", day0), withClient("t", day0.Add(time.Hour))
+	recent := withClient("t", day0.Add(25*time.Hour))
+	other := withClient("u", day0)
+	before := day0.Add(24 * time.Hour)
+	for _, want := range []struct{ batch, n int }{{1, 1}, {10, 1}, {10, 0}} {
+		n, err := st.ScrubClientData(ctx, "t", before, want.batch)
+		if err != nil || n != want.n {
+			t.Fatalf("ScrubClientData(batch %d) = %d, %v; want %d", want.batch, n, err, want.n)
+		}
+	}
+	for _, c := range []struct {
+		e     audit.Event
+		clear bool
+	}{{old1, true}, {old2, true}, {recent, false}, {other, false}} {
+		got, err := st.Get(ctx, c.e.ID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if c.clear != (got.IP == "" && got.UserAgent == "") {
+			t.Errorf("event %s IP=%q UserAgent=%q, cleared want %v", c.e.ID, got.IP, got.UserAgent, c.clear)
+		}
+		want := c.e
+		if c.clear {
+			want.IP, want.UserAgent = "", ""
+		}
+		if field := diffEvent(got, want); field != "" {
+			t.Errorf("event %s: %s changed beyond the client data", c.e.ID, field)
+		}
 	}
 }

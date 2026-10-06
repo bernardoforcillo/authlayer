@@ -20,6 +20,7 @@ type config struct {
 	topics           map[string]Topic
 	defaultRetention time.Duration
 	policy           Policy
+	client           clientConfig
 }
 
 func defaultConfig() config {
@@ -29,6 +30,7 @@ func defaultConfig() config {
 		topics:           map[string]Topic{},
 		defaultRetention: DefaultRetention,
 		policy:           DefaultPolicy(),
+		client:           clientConfig{v4: 24, v6: 48},
 	}
 }
 
@@ -141,6 +143,7 @@ func (s *Service) prepare(e Event) Event {
 		e.ClientTime = &at
 	}
 	e.Request = Redact(e.Request, s.cfg.policy)
+	s.minimizeClient(&e)
 	return e
 }
 

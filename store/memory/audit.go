@@ -278,3 +278,25 @@ func (s *AuditStore) MarkPurged(_ context.Context, topic string, before, at time
 	}
 	return nil
 }
+
+// ScrubClientData clears IP and UserAgent on at most batch events of topic
+// older than before, oldest first.
+func (s *AuditStore) ScrubClientData(_ context.Context, topic string, before time.Time, batch int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var due []audit.Event
+	for _, e := range s.events {
+		if e.Topic == topic && e.OccurredAt.Before(before) && (e.IP != "" || e.UserAgent != "") {
+			due = append(due, e)
+		}
+	}
+	slices.SortFunc(due, func(a, b audit.Event) int { return cmp.Compare(a.Seq, b.Seq) })
+	if batch > 0 && len(due) > batch {
+		due = due[:batch]
+	}
+	for _, e := range due {
+		e.IP, e.UserAgent = "", ""
+		s.events[e.ID] = e
+	}
+	return len(due), nil
+}

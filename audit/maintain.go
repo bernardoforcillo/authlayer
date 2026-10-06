@@ -46,8 +46,10 @@ func (s *Service) Reconcile(ctx context.Context, olderThan time.Duration) (int, 
 	}
 }
 
-// ApplyRetention deletes, per declared topic, the events older than the
-// topic's retention and returns how many it deleted per topic. Only whole
+// ApplyRetention first clears the IP address and user agent of events past
+// their topic's ClientDataRetention ([Service.ScrubClientData]), then deletes,
+// per declared topic, the events older than the topic's retention and returns
+// how many it deleted per topic. Only whole
 // UTC days that are already sealed are purged, so an event is never deleted
 // before the seal that covers it exists; a topic with no seal keeps
 // everything. The seals of the purged days are marked purged first, then the
@@ -57,6 +59,9 @@ func (s *Service) ApplyRetention(ctx context.Context) (map[string]int, error) {
 	now := s.now()
 	deleted := map[string]int{}
 	var errs []error
+	if _, err := s.ScrubClientData(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	for _, topic := range s.keys {
 		n, err := s.purgeTopic(ctx, topic, now)
 		if n > 0 {
