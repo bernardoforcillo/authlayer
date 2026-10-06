@@ -161,6 +161,16 @@ every store produces the same ones and an outside verifier can recompute them.
   with `day` as `YYYY-MM-DD` and `event_count` in decimal. A topic's first seal
   has `prev_hash = ""`.
 
+<Warning>
+This is the format since the release after v0.2.0. v0.2.0's canonical row also
+had `"ip"` and `"user_agent"` (between `changes` and `client_time`), so a
+non-empty day sealed by v0.2.0 reads as `mismatch` (`events_hash`) on this
+version. There is no fallback to the old row: verify on v0.2.0 first, then
+re-seal — as the owner of the tables, move the old seals aside and run `Seal`,
+which rebuilds each chain from the topic's earliest remaining event day. Days
+already purged under v0.2.0 cannot be re-sealed. See the changelog.
+</Warning>
+
 {/* verify:main */}
 ```go
 at := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)

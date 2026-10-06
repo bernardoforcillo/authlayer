@@ -34,7 +34,7 @@ once a 1.0 is cut. Until then, minor versions may break API.
     `Topic.ClientDataRetention` and `Service.ScrubClientData` (part of
     `ApplyRetention`) clear IP and user agent on a shorter schedule. **IP and
     user agent are no longer part of a seal's hash** — the one change to the
-    stored format — and the PostgreSQL `AU001` guard allows exactly that
+    stored format, breaking for seals made by v0.2.0 (see Changed) — and the PostgreSQL `AU001` guard allows exactly that
     rewrite. `audit.Store` gained `ScrubClientData`; custom stores must add it
     (the contract suite checks it). `Service.Count` was added.
   - `consent`: append-only consent records (`Grant`, `Withdraw`, `Accepted`,
@@ -108,6 +108,21 @@ once a 1.0 is cut. Until then, minor versions may break API.
 - `authlayer.Shared.Audit()` hands the audit `Service` the shared clock and id
   generator, and `examples/audit` is a runnable tour (run by CI), with a new
   [audit section](docs/audit/overview.mdx) in the docs.
+
+### Changed
+
+- **BREAKING — the audit seal format.** The canonical row an `events_hash`
+  covers no longer has the `"ip"` and `"user_agent"` keys (v0.2.0 wrote them,
+  as `""` when empty, between `changes` and `client_time`). Every non-empty
+  day sealed by v0.2.0 therefore reads as `mismatch` (`events_hash`) after the
+  upgrade; empty days and `seal_hash` itself are unchanged. There is no
+  fallback to the old row. To upgrade a log sealed by v0.2.0: run `Verify`
+  on v0.2.0 first, so nothing is laundered, then, as the owner of the tables,
+  move the old seals aside (the guards refuse to delete them for the
+  application role) and run `Seal`, which rebuilds each topic's chain from its
+  earliest remaining event day. Days v0.2.0 already purged cannot be re-sealed.
+  [`docs/audit/integrity`](docs/audit/integrity.mdx#the-hash-format) describes
+  the format as implemented.
 
 ## [0.2.0] - 2026-10-02
 
