@@ -162,6 +162,16 @@ func TestAuditStoreTextIDs(t *testing.T) {
 	if err != nil || e.ID != "evt-1" {
 		t.Fatalf("Record = %+v, %v", e, err)
 	}
+	// A NUL never reaches PostgreSQL, which would answer with SQLSTATE 22021.
+	if err := svc.Complete(ctx, "a\x00b", audit.Completion{Outcome: audit.OutcomeOK}); !errors.Is(err, audit.ErrInvalidEvent) {
+		t.Errorf("Complete(NUL id) err = %v, want ErrInvalidEvent", err)
+	}
+	if _, err := svc.Get(ctx, "a\x00b"); !errors.Is(err, audit.ErrNotFound) {
+		t.Errorf("Get(NUL id) err = %v, want ErrNotFound", err)
+	}
+	if _, _, err := svc.List(ctx, audit.Filter{Member: "u\x00"}, audit.Page{}); !errors.Is(err, audit.ErrInvalidEvent) {
+		t.Errorf("List(NUL member) err = %v, want ErrInvalidEvent", err)
+	}
 }
 
 func TestAuditGuardAllowsOnlyClearingClientData(t *testing.T) {

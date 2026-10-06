@@ -100,8 +100,11 @@ c := pending.Completion(audit.OutcomeOK, "", 4)
 fmt.Println(c.Resource.Type, c.Resource.ID, c.ContainerID, c.Reason)
 ```
 
-The first `WithResource` and `WithContainer` win — the action's own target, not
-a side effect's. The interceptor turns the `Pending` into a `Completion` with
+`WithContainer` and `WithResource` fill once — the action's own target, not a
+side effect's. `WithResource` does it field by field: a later call fills only a
+type or id still empty, and is ignored when both carry a type and the types
+differ, so a typeless id followed by a typed resource takes that type. Pass the
+type every time. The interceptor turns the `Pending` into a `Completion` with
 `pending.Completion(outcome, code, durationMS)`.
 
 {/* verify:stdout "open: true outcome: true\nok {\"api_key\":\"[REDACTED]\",\"name\":\"Lunch\"}\n{\"price\":{\"after\":12,\"before\":9}}\nmenu m1 acme owner_request" */}

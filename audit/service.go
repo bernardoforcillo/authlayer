@@ -257,12 +257,12 @@ func (s *Service) Begin(ctx context.Context, e Event) (Event, error) {
 // Before and After is stored redacted, so a changed secret still shows as a
 // changed path whose values are withheld; Resource and ContainerID fill only
 // the event's empty ones. An identical retry succeeds; a different second
-// completion is ErrCompleted. Errors: ErrInvalidEvent (a NUL character in a
-// text field or the diff included), ErrNotFound, ErrCompleted, and the
-// Store's.
+// completion is ErrCompleted. Errors: ErrInvalidEvent (an empty id, and a
+// NUL character in the id, a text field or the diff), ErrNotFound,
+// ErrCompleted, and the Store's.
 func (s *Service) Complete(ctx context.Context, id string, c Completion) error {
-	if id == "" {
-		return fmt.Errorf("%w: empty id", ErrInvalidEvent)
+	if id == "" || hasNUL(id) {
+		return fmt.Errorf("%w: id %q", ErrInvalidEvent, id)
 	}
 	if !c.Outcome.Valid() {
 		return fmt.Errorf("%w: outcome %q", ErrInvalidEvent, c.Outcome)

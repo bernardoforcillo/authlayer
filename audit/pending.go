@@ -58,10 +58,13 @@ func PendingFrom(ctx context.Context) (*Pending, bool) {
 // Annotation adds one fact to a pending event.
 type Annotation func(*Pending)
 
-// WithResource names the resource the action touched. The first annotation
-// wins, field by field: the action's own target, not a side effect's. A
-// later annotation can still fill an ID left empty, when its type is the
-// same (or the type is still empty).
+// WithResource names the resource the action touched. It fills type and id
+// field by field, each once: a later annotation fills only a field still
+// empty, and is ignored when both it and the stored resource carry a type
+// and the types differ. The first annotation therefore wins — the action's
+// own target, not a side effect's — but the fields may come from two
+// annotations: a typeless id ("", "x") followed by ("menu", "m1") gives
+// {menu, x}. Annotate with a type to avoid that.
 func WithResource(typ, id string) Annotation {
 	return func(p *Pending) {
 		if p.resource.Type != "" && typ != "" && typ != p.resource.Type {

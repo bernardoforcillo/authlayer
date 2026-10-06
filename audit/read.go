@@ -23,16 +23,38 @@ func microBounds(f Filter) Filter {
 	return f
 }
 
-// Get loads one event, or ErrNotFound.
+// filterNUL refuses a Filter holding a NUL character, which no stored event
+// can match and PostgreSQL cannot even receive.
+func filterNUL(f Filter) error {
+	bad := hasNUL(f.ContainerID, f.Member, f.ActorID, f.Resource.Type, f.Resource.ID, string(f.Source), f.ActionPrefix) ||
+		hasNUL(f.Topics...)
+	for _, o := range f.Outcomes {
+		bad = bad || hasNUL(string(o))
+	}
+	if bad {
+		return fmt.Errorf("%w: a NUL character in the filter", ErrInvalidEvent)
+	}
+	return nil
+}
+
+// Get loads one event, or ErrNotFound (also for an id holding a NUL
+// character, which no event has).
 func (s *Service) Get(ctx context.Context, id string) (Event, error) {
+	if hasNUL(id) {
+		return Event{}, ErrNotFound
+	}
 	return s.store.Get(ctx, id)
 }
 
 // List returns the events matching f, newest first, and the cursor of the
 // next page: pass it as Page.Before. The cursor is zero when this page is the
 // last one; a full page may still be followed by an empty one. A Limit
-// outside 1..MaxPageSize means MaxPageSize.
+// outside 1..MaxPageSize means MaxPageSize. A NUL character in a Filter
+// string is ErrInvalidEvent, here and in Export and Count.
 func (s *Service) List(ctx context.Context, f Filter, page Page) ([]Event, int64, error) {
+	if err := filterNUL(f); err != nil {
+		return nil, 0, err
+	}
 	if page.Limit <= 0 || page.Limit > MaxPageSize {
 		page.Limit = MaxPageSize
 	}
@@ -58,6 +80,9 @@ func (s *Service) List(ctx context.Context, f Filter, page Page) ([]Event, int64
 // the first error yield returns. When limit is positive and more events
 // match, it returns ErrExportTooLarge before yielding anything.
 func (s *Service) Export(ctx context.Context, f Filter, limit int, yield func(Event) error) error {
+	if err := filterNUL(f); err != nil {
+		return err
+	}
 	f, err := s.translateFilter(ctx, microBounds(f))
 	if err != nil {
 		return err
@@ -77,6 +102,9 @@ func (s *Service) Export(ctx context.Context, f Filter, limit int, yield func(Ev
 // Count returns how many events match f, with the same person-id translation
 // as [Service.List].
 func (s *Service) Count(ctx context.Context, f Filter) (int, error) {
+	if err := filterNUL(f); err != nil {
+		return 0, err
+	}
 	f, err := s.translateFilter(ctx, microBounds(f))
 	if err != nil {
 		return 0, err

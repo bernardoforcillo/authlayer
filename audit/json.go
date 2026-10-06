@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"strconv"
+	"math/big"
 	"strings"
 )
 
@@ -92,32 +92,33 @@ func equalValue(a, b any) bool {
 
 // decimalKey spells a JSON number canonically — sign, significant digits
 // without leading or trailing zeros, and the exponent of the last one — so
-// two spellings of one value have one key. It never builds the number, so a
-// huge exponent costs nothing; one that overflows int64 keeps its spelling.
+// two spellings of one value have one key, and two values never share one.
+// It never builds the number: the exponent is kept as an arbitrary-precision
+// integer, whose size is bounded by the spelling, so a huge exponent neither
+// costs much nor overflows.
 func decimalKey(n string) string {
 	neg := strings.HasPrefix(n, "-")
 	n = strings.TrimPrefix(n, "-")
-	mant, exp := n, int64(0)
+	mant, exp := n, new(big.Int)
 	if i := strings.IndexAny(n, "eE"); i >= 0 {
-		e, err := strconv.ParseInt(strings.TrimPrefix(n[i+1:], "+"), 10, 64)
-		if err != nil {
-			return n
+		if _, ok := exp.SetString(strings.TrimPrefix(n[i+1:], "+"), 10); !ok {
+			return "invalid:" + n // json.Number is valid JSON; unreachable
 		}
-		mant, exp = n[:i], e
+		mant = n[:i]
 	}
 	digits := mant
 	if i := strings.IndexByte(mant, '.'); i >= 0 {
 		digits = mant[:i] + mant[i+1:]
-		exp -= int64(len(mant) - i - 1)
+		exp.Sub(exp, big.NewInt(int64(len(mant)-i-1)))
 	}
 	digits = strings.TrimLeft(digits, "0")
 	if digits == "" {
 		return "0"
 	}
 	trimmed := strings.TrimRight(digits, "0")
-	exp += int64(len(digits) - len(trimmed))
+	exp.Add(exp, big.NewInt(int64(len(digits)-len(trimmed))))
 	if neg {
 		trimmed = "-" + trimmed
 	}
-	return trimmed + "e" + strconv.FormatInt(exp, 10)
+	return trimmed + "e" + exp.String()
 }
