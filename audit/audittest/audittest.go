@@ -65,6 +65,7 @@ var checks = []check{
 	{"Scan/AscendingAndStopsOnError", scanAscendingAndStops},
 	{"OpenBefore/OldestOpenFirst", openBeforeOldestOpenFirst},
 	{"Seals/InsertOnceListAndLast", sealsInsertOnceListAndLast},
+	{"Seals/InsertRefusesAStaleSeal", sealsInsertRefusesAStaleSeal},
 	{"Purge/DeletesOnlyTheTopicBeforeInBatches", purgeDeletesOnlyTopicBefore},
 	{"MarkPurged/StampsOnlyEarlierUnpurged", markPurgedStampsOnlyEarlier},
 	{"ScrubClientData/ClearsOnlyTheTopicBeforeAndNothingElse", scrubClearsOnlyClientData},
@@ -462,8 +463,10 @@ func openBeforeOldestOpenFirst(t tb, st audit.Store) {
 	}
 }
 
+// seal is a seal of an empty day: InsertSeal checks the day's events against
+// it, so a fixture that names events it does not hold is refused as stale.
 func seal(topic string, d time.Time, prev, hash string) audit.Seal {
-	return audit.Seal{Topic: topic, Day: d, EventCount: 2, FirstSeq: 1, LastSeq: 2,
+	return audit.Seal{Topic: topic, Day: d,
 		EventsHash: "e-" + hash, PrevHash: prev, SealHash: hash, SealedAt: d.Add(30 * time.Hour)}
 }
 
@@ -482,7 +485,7 @@ func sealsInsertOnceListAndLast(t tb, st audit.Store) {
 		t.Errorf("LastSeal(other) err = %v, want ErrNotFound", err)
 	}
 	last, err := st.LastSeal(ctx, "t")
-	if err != nil || last.SealHash != "s2" || !last.Day.Equal(s2.Day) || last.PrevHash != "s1" || last.EventCount != 2 {
+	if err != nil || last.SealHash != "s2" || !last.Day.Equal(s2.Day) || last.PrevHash != "s1" || last.EventsHash != "e-s2" {
 		t.Errorf("LastSeal = %+v, %v; want s2", last, err)
 	}
 	all, err := st.Seals(ctx, "t", day0, day0.Add(24*time.Hour))
@@ -491,6 +494,42 @@ func sealsInsertOnceListAndLast(t tb, st audit.Store) {
 	}
 	if one, _ := st.Seals(ctx, "t", day0.Add(24*time.Hour), day0.Add(24*time.Hour)); len(one) != 1 || one[0].SealHash != "s2" {
 		t.Errorf("Seals(day1) = %+v, want [s2]", one)
+	}
+}
+
+// sealsInsertRefusesAStaleSeal: a seal whose count or Seq range no longer
+// matches the day's events, or a day still holding an open event, is
+// ErrSealStale and stores nothing; the matching seal is accepted.
+func sealsInsertRefusesAStaleSeal(t tb, st audit.Store) {
+	ctx := context.Background()
+	a := mustInsert(t, st, ev("t", day0.Add(time.Hour), closeAs(audit.OutcomeOK)))
+	b := mustInsert(t, st, ev("t", day0.Add(2*time.Hour), closeAs(audit.OutcomeOK)))
+	mustInsert(t, st, ev("u", day0.Add(time.Hour)))                                   // another topic's open event
+	nextOpen := mustInsert(t, st, ev("t", day0.Add(25*time.Hour)))                    // the next day's open event
+	mustInsert(t, st, ev("t", day0.Add(-time.Microsecond), closeAs(audit.OutcomeOK))) // the day before
+	good := audit.Seal{Topic: "t", Day: day0, EventCount: 2, FirstSeq: a.Seq, LastSeq: b.Seq,
+		EventsHash: "e", SealHash: "s", SealedAt: day0.Add(30 * time.Hour)}
+	for name, stale := range map[string]audit.Seal{
+		"count": func() audit.Seal { s := good; s.EventCount = 1; return s }(),
+		"first": func() audit.Seal { s := good; s.FirstSeq = b.Seq; return s }(),
+		"last":  func() audit.Seal { s := good; s.LastSeq = a.Seq; return s }(),
+		"empty": func() audit.Seal { s := good; s.EventCount, s.FirstSeq, s.LastSeq = 0, 0, 0; return s }(),
+	} {
+		if err := st.InsertSeal(ctx, stale); !errors.Is(err, audit.ErrSealStale) {
+			t.Errorf("InsertSeal with a stale %s err = %v, want ErrSealStale", name, err)
+		}
+	}
+	if _, err := st.LastSeal(ctx, "t"); !errors.Is(err, audit.ErrNotFound) {
+		t.Fatalf("a stale seal was stored: LastSeal err = %v, want ErrNotFound", err)
+	}
+	if err := st.InsertSeal(ctx, good); err != nil {
+		t.Fatalf("InsertSeal of the matching seal: %v", err)
+	}
+	open := mustInsert(t, st, ev("t", day0.Add(25*time.Hour+time.Minute)))
+	next := audit.Seal{Topic: "t", Day: day0.Add(24 * time.Hour), EventCount: 2, FirstSeq: nextOpen.Seq, LastSeq: open.Seq,
+		EventsHash: "e", SealHash: "s2", PrevHash: "s", SealedAt: day0.Add(54 * time.Hour)}
+	if err := st.InsertSeal(ctx, next); !errors.Is(err, audit.ErrSealStale) {
+		t.Errorf("InsertSeal over a day holding open events err = %v, want ErrSealStale", err)
 	}
 }
 

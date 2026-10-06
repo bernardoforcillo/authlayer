@@ -302,8 +302,10 @@ type DayStatus struct {
 	// State is the verdict.
 	State DayState
 	// Detail names the failed check on DayMismatch: "events_hash" (the
-	// events changed), "seal_hash" (the seal changed), "chain" (the seal
-	// does not link to the previous day's) or "purged_early" (the seal is
+	// events changed), "seal_hash" (the seal changed: its hash, or the first
+	// and last Seq it records), "chain" (the seal does not link to the
+	// previous one, or a seal between two others is missing) or
+	// "purged_early" (the seal is
 	// marked purged although the day was younger than its topic's retention
 	// at PurgedAt).
 	Detail string
@@ -398,6 +400,10 @@ var (
 	ErrSealed = errors.New("authlayer/audit: day is sealed")
 	// ErrSealExists: a seal for that (topic, day) already exists.
 	ErrSealExists = errors.New("authlayer/audit: seal already exists")
+	// ErrSealStale: the day's events changed between the digest a seal was
+	// built from and the seal's insert, so the seal would not cover them.
+	// [Service.Seal] digests the day again.
+	ErrSealStale = errors.New("authlayer/audit: seal no longer matches the day")
 	// ErrExportTooLarge: more events match than the export allows.
 	ErrExportTooLarge = errors.New("authlayer/audit: export exceeds the limit")
 )
@@ -419,8 +425,8 @@ type Recorder interface {
 // The MUSTs below are normative, and
 // [github.com/bernardoforcillo/authlayer/audit/audittest] exercises them as
 // far as a sequential suite can (the atomicity of Insert's sealed-day check
-// is not raced). Run that suite against a backend rather than trusting this
-// comment.
+// and of InsertSeal's day check is not raced). Run that suite against a
+// backend rather than trusting this comment.
 type Store interface {
 	// Insert stores e, assigning Seq from an increasing sequence, and
 	// returns the stored row. An event whose ID already exists MUST NOT be
@@ -454,7 +460,12 @@ type Store interface {
 	// LastSeal returns the topic's latest seal, or ErrNotFound.
 	LastSeal(ctx context.Context, topic string) (Seal, error)
 	// InsertSeal stores s; a seal for the same (Topic, Day) is
-	// ErrSealExists.
+	// ErrSealExists. The day's events MUST still match s when it is written
+	// — EventCount events, FirstSeq and LastSeq their lowest and highest Seq
+	// (zero for none), none of them open — or it is ErrSealStale and nothing
+	// is stored. That check and the write MUST be one atomic step against
+	// Insert, so an event in flight when the seal was digested is either
+	// counted (and the seal refused as stale) or refused with ErrSealed.
 	InsertSeal(ctx context.Context, s Seal) error
 	// Seals returns the topic's seals with Day in [from, to], ascending.
 	Seals(ctx context.Context, topic string, from, to time.Time) ([]Seal, error)

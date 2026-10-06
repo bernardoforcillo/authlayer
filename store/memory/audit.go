@@ -216,13 +216,33 @@ func (s *AuditStore) LastSeal(_ context.Context, topic string) (audit.Seal, erro
 	return cloneAuditSeal(last), nil
 }
 
-// InsertSeal stores sl; an existing (topic, day) is audit.ErrSealExists.
+// InsertSeal stores sl; an existing (topic, day) is audit.ErrSealExists, and
+// a day whose events no longer match sl's count and Seq range, or that holds
+// an open event, is audit.ErrSealStale. The check and the write share mu, so
+// no Insert can come between them.
 func (s *AuditStore) InsertSeal(_ context.Context, sl audit.Seal) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k := auditSealKey{sl.Topic, auditDayKey(sl.Day)}
 	if _, ok := s.seals[k]; ok {
 		return audit.ErrSealExists
+	}
+	var count, first, last int64
+	for _, e := range s.events {
+		if e.Topic != sl.Topic || auditDayKey(e.OccurredAt) != k.day {
+			continue
+		}
+		if e.CompletedAt == nil {
+			return audit.ErrSealStale
+		}
+		if count == 0 || e.Seq < first {
+			first = e.Seq
+		}
+		last = max(last, e.Seq)
+		count++
+	}
+	if count != sl.EventCount || first != sl.FirstSeq || last != sl.LastSeq {
+		return audit.ErrSealStale
 	}
 	sl.Day = auditMidnight(sl.Day)
 	s.seals[k] = cloneAuditSeal(sl)

@@ -34,6 +34,16 @@ const (
 	// AuditDaySealed (AU004): an INSERT of an event into a (topic, day) that
 	// is already sealed. [AuditStore.Insert] reports it as audit.ErrSealed.
 	AuditDaySealed = "AU004"
+	// AuditSealStale (AU005): an INSERT of a seal whose event count or first
+	// and last Seq no longer match its day's events, or whose day holds an
+	// open event. [AuditStore.InsertSeal] reports it as audit.ErrSealStale.
+	AuditSealStale = "AU005"
+	// AuditIsolation (AU006): an INSERT of an event or a seal in a
+	// transaction stricter than READ COMMITTED, where the guards' checks
+	// would read a snapshot taken before a concurrent seal or event committed.
+	// The store runs its own writes under READ COMMITTED whatever the
+	// database's default.
+	AuditIsolation = "AU006"
 )
 
 // AuditRetentionSetting is the transaction-local setting that opens the
@@ -114,9 +124,20 @@ func quoteIdent(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`)
 //     truncated.
 //   - AU003: a seal may only get purged_at stamped, once, inside a retention
 //     transaction; seals are never deleted or truncated.
-//   - AU004: an event may not be inserted into a sealed (topic, day); the
-//     check and the insert are serialized against the seal insert with an
-//     advisory lock.
+//   - AU004: an event may not be inserted into a sealed (topic, day).
+//   - AU005: a seal may not be inserted unless the day's events still
+//     match it (count, first and last seq, none open).
+//   - AU006: neither an event nor a seal may be inserted in a transaction
+//     stricter than READ COMMITTED.
+//
+// AU004 and AU005 share an advisory lock per (topic, day): an event insert
+// holds it shared until it commits, the seal insert takes it exclusively and
+// then re-counts the day. An event in flight while Seal digested the day is
+// therefore either counted, which makes the seal stale so Seal digests the
+// day again, or starts after the seal committed and is refused. Both checks
+// need READ COMMITTED to see what committed while they waited for the lock,
+// hence AU006; [AuditStore] runs its own writes under READ COMMITTED whatever
+// the database's default_transaction_isolation.
 //
 // A role with ownership of the tables can still drop a trigger: the guards
 // stop mistakes and ordinary code, and the hash chain ([audit.Service.Verify])
@@ -252,6 +273,9 @@ $authlayer$`,
 		// events: AU004 on insert into a sealed day.
 		`CREATE OR REPLACE FUNCTION ` + q("_guard_insert") + `() RETURNS trigger LANGUAGE plpgsql AS $authlayer$
 BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'authlayer audit: events must be inserted under READ COMMITTED' USING ERRCODE = '` + AuditIsolation + `';
+  END IF;
   PERFORM pg_advisory_xact_lock_shared(hashtextextended(NEW.topic || '|' || ` + newDay + `::text, 0));
   IF EXISTS (SELECT 1 FROM ` + sl + ` s WHERE s.topic = NEW.topic AND s.day = ` + newDay + `) THEN
     RAISE EXCEPTION 'authlayer audit: the day is sealed' USING ERRCODE = '` + AuditDaySealed + `';
@@ -266,9 +290,25 @@ $authlayer$`,
 		// seals: AU003 on update, delete and truncate; the insert takes the
 		// exclusive side of the lock the event insert shares.
 		`CREATE OR REPLACE FUNCTION ` + qs("_guard") + `() RETURNS trigger LANGUAGE plpgsql AS $authlayer$
+DECLARE
+  n bigint; lo bigint; hi bigint; open bigint;
 BEGIN
   IF TG_OP = 'INSERT' THEN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+      RAISE EXCEPTION 'authlayer audit: seals must be inserted under READ COMMITTED' USING ERRCODE = '` + AuditIsolation + `';
+    END IF;
+    -- Wait for every event insert in flight on the day, then check the seal
+    -- still describes the day: under READ COMMITTED this statement sees them.
     PERFORM pg_advisory_xact_lock(hashtextextended(NEW.topic || '|' || NEW.day::text, 0));
+    SELECT count(*), coalesce(min(e.seq), 0), coalesce(max(e.seq), 0), count(*) FILTER (WHERE e.completed_at IS NULL)
+      INTO n, lo, hi, open
+      FROM ` + ev + ` e
+     WHERE e.topic = NEW.topic
+       AND e.occurred_at >= (NEW.day::timestamp AT TIME ZONE 'UTC')
+       AND e.occurred_at < ((NEW.day + 1)::timestamp AT TIME ZONE 'UTC');
+    IF n <> NEW.event_count OR lo <> NEW.first_seq OR hi <> NEW.last_seq OR open > 0 THEN
+      RAISE EXCEPTION 'authlayer audit: the seal no longer matches its day' USING ERRCODE = '` + AuditSealStale + `';
+    END IF;
     RETURN NEW;
   END IF;
   IF TG_OP = 'UPDATE' AND OLD.purged_at IS NULL AND NEW.purged_at IS NOT NULL
@@ -399,7 +439,11 @@ func scanAuditEvent(rows drops.Rows) (audit.Event, error) {
 }
 
 func (st *AuditStore) queryEvents(ctx context.Context, sql string, args ...any) ([]audit.Event, error) {
-	rows, err := st.db.Query(ctx, sql, args...)
+	return queryEvents(ctx, st.db, sql, args...)
+}
+
+func queryEvents(ctx context.Context, db *pg.DB, sql string, args ...any) ([]audit.Event, error) {
+	rows, err := db.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -481,18 +525,23 @@ func (st *AuditStore) Insert(ctx context.Context, e audit.Event) (audit.Event, e
 	} else if !errors.Is(err, audit.ErrNotFound) {
 		return audit.Event{}, err
 	}
-	rows, err := st.queryEvents(ctx,
-		`INSERT INTO `+st.ev+` (id, occurred_at, completed_at, topic, action, source, origin, procedure,
+	var rows []audit.Event
+	err := st.readCommitted(ctx, func(tx *pg.DB) error {
+		var err error
+		rows, err = queryEvents(ctx, tx,
+			`INSERT INTO `+st.ev+` (id, occurred_at, completed_at, topic, action, source, origin, procedure,
  actor_type, actor_id, actor_display, on_behalf_of, session_id, container_id, resource_type, resource_id,
  outcome, code, reason, request, changes, ip, user_agent, client_time, duration_ms)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
  $20::jsonb, $21::jsonb, $22, $23, $24, $25)
 ON CONFLICT (id) DO NOTHING
 RETURNING `+auditEventCols,
-		e.ID, e.OccurredAt.UTC(), utcPtr(e.CompletedAt), e.Topic, e.Action, string(e.Source), e.Origin, e.Procedure,
-		e.Actor.Type, e.Actor.ID, e.Actor.Display, e.OnBehalfOf, e.SessionID, e.ContainerID,
-		e.Resource.Type, e.Resource.ID, string(e.Outcome), e.Code, e.Reason,
-		jsonArg(e.Request), jsonArg(e.Changes), e.IP, e.UserAgent, utcPtr(e.ClientTime), e.DurationMS)
+			e.ID, e.OccurredAt.UTC(), utcPtr(e.CompletedAt), e.Topic, e.Action, string(e.Source), e.Origin, e.Procedure,
+			e.Actor.Type, e.Actor.ID, e.Actor.Display, e.OnBehalfOf, e.SessionID, e.ContainerID,
+			e.Resource.Type, e.Resource.ID, string(e.Outcome), e.Code, e.Reason,
+			jsonArg(e.Request), jsonArg(e.Changes), e.IP, e.UserAgent, utcPtr(e.ClientTime), e.DurationMS)
+		return err
+	})
 	switch {
 	case pgCode(err) == AuditDaySealed:
 		return audit.Event{}, audit.ErrSealed
@@ -676,16 +725,37 @@ func (st *AuditStore) LastSeal(ctx context.Context, topic string) (audit.Seal, e
 	return seals[0], nil
 }
 
-// InsertSeal stores s; an existing (topic, day) is audit.ErrSealExists.
+// InsertSeal stores s; an existing (topic, day) is audit.ErrSealExists. The
+// seals guard waits for the day's event inserts in flight and re-counts the
+// day under the same lock, so a seal that no longer matches its day is
+// audit.ErrSealStale.
 func (st *AuditStore) InsertSeal(ctx context.Context, s audit.Seal) error {
-	_, err := st.db.Exec(ctx, `INSERT INTO `+st.sl+` (`+auditSealCols+`)
+	err := st.readCommitted(ctx, func(tx *pg.DB) error {
+		_, err := tx.Exec(ctx, `INSERT INTO `+st.sl+` (`+auditSealCols+`)
 VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, $9, $10)`,
-		s.Topic, utcDay(s.Day), s.EventCount, s.FirstSeq, s.LastSeq, s.EventsHash, s.PrevHash, s.SealHash,
-		s.SealedAt.UTC(), utcPtr(s.PurgedAt))
-	if pgCode(err) == "23505" {
+			s.Topic, utcDay(s.Day), s.EventCount, s.FirstSeq, s.LastSeq, s.EventsHash, s.PrevHash, s.SealHash,
+			s.SealedAt.UTC(), utcPtr(s.PurgedAt))
+		return err
+	})
+	switch pgCode(err) {
+	case "23505":
 		return audit.ErrSealExists
+	case AuditSealStale:
+		return audit.ErrSealStale
 	}
 	return err
+}
+
+// readCommitted runs fn in a READ COMMITTED transaction, whatever the
+// database's default: the sealed-day and stale-seal checks in the guards must
+// see what committed while they waited for their lock.
+func (st *AuditStore) readCommitted(ctx context.Context, fn func(tx *pg.DB) error) error {
+	return st.db.InTx(ctx, func(tx *pg.DB) error {
+		if _, err := tx.Exec(ctx, `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
 }
 
 // Seals returns the topic's seals with Day in [from, to], ascending.

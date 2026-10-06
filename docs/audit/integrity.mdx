@@ -92,10 +92,20 @@ day's event count and first/last `Seq`, a SHA-256 over the day's canonical
 events, and a `SealHash` that chains the **previous day's** seal. Empty days are
 sealed too, so removing a whole day is detected.
 
-Run it on a schedule — hourly is fine; it does nothing until a day has ended.
-Several replicas may run it at once: a day another replica sealed first is
-skipped, and the chain continues from that seal. Once a day is sealed the
-`Store` refuses a new event in it (`ErrSealed`).
+Run it on a schedule — hourly is fine. `until` is capped at the start of the
+`Service` clock's current day, so a day that has not ended on this replica's
+clock is never sealed, whatever you pass. Several replicas may run it at once:
+a day another replica sealed first is skipped, and the chain continues from
+that seal. Once a day is sealed the `Store` refuses a new event in it
+(`ErrSealed`).
+
+An event stamped just before midnight can still be on its way to the store when
+its day is sealed. The store then refuses the seal as stale (`ErrSealStale`) and
+`Seal` digests the day again, so the seal covers the event; an insert that
+arrives after the seal instead fails with `ErrSealed`, and its action with it.
+Passing a `until` a few minutes in the past — `Seal(ctx, time.Now().Add(-10*time.Minute))`
+— leaves such stragglers time to land first. The chain of a new topic starts at
+the earliest day any of its events occurred on.
 
 <Note>
 `Seq` is increasing, not gapless: a backend may consume a value on a duplicate
@@ -116,8 +126,9 @@ The seals are.
 
 A `mismatch` names the check that failed: `events_hash` (an event was altered,
 inserted or deleted, or a stored event is unreadable), `seal_hash` (the seal row
-itself was edited) or `chain` (the seal no longer links to the previous day's —
-a day was deleted or replaced), or `purged_early` (the seal was marked purged
+itself was edited, its first/last `Seq` included), `chain` (the seal no longer
+links to the previous one, or a day between two seals lost its own — a day was
+deleted or replaced), or `purged_early` (the seal was marked purged
 while the day was younger than its topic's retention, so its events went
 outside retention). Editing a seal to match an edited event does not help: the
 next day's `PrevHash` no longer matches.

@@ -130,17 +130,32 @@ func (s *Service) digestDay(ctx context.Context, topic string, d time.Time) (day
 	return dg, nil
 }
 
+// sealAttempts bounds how often Seal digests one day again after the store
+// found the day changed under the digest (ErrSealStale).
+const sealAttempts = 3
+
 // Seal seals, for every declared topic, each UTC day that ended at or before
 // until and has no seal yet, oldest first, and returns the new seals. Empty
 // days are sealed too, so removing a whole day is detected. A topic's chain
-// starts at the day of its first event, or at the last full day if it has
-// none yet.
+// starts at the earliest UTC day any of its events occurred on, or at the
+// last full day if it has none yet.
+//
+// until is capped at the start of the Service clock's current UTC day: a day
+// that has not ended on this Service's clock is never sealed, whatever the
+// caller passes. An event stamped just before midnight may still be on its
+// way to the store when its day is sealed; the store then refuses the seal
+// (ErrSealStale) and Seal digests the day again, up to three times. Passing
+// a until a few minutes in the past, as a scheduled job naturally does,
+// keeps such an event from being refused with ErrSealed instead.
 //
 // A day still holding open events stops that topic with ErrOpenEvents (run
 // Reconcile first); the other topics are sealed regardless and the errors
 // are joined. Several replicas may run Seal at once: a day another replica
 // sealed first is skipped, and the chain continues from its seal.
 func (s *Service) Seal(ctx context.Context, until time.Time) ([]Seal, error) {
+	if today := startOfDay(s.now()); until.After(today) {
+		until = today
+	}
 	var sealed []Seal
 	var errs []error
 	for _, topic := range s.keys {
@@ -159,7 +174,7 @@ func (s *Service) sealTopic(ctx context.Context, topic string, until time.Time) 
 		return nil, err
 	}
 	var out []Seal
-	for !next.Add(day).After(until) {
+	for attempt := 1; !next.Add(day).After(until); {
 		dg, err := s.digestDay(ctx, topic, next)
 		if err != nil {
 			return out, err
@@ -170,13 +185,15 @@ func (s *Service) sealTopic(ctx context.Context, topic string, until time.Time) 
 		switch err := s.store.InsertSeal(ctx, sl); {
 		case err == nil:
 			out = append(out, sl)
-			prev, next = sl.SealHash, next.Add(day)
+			prev, next, attempt = sl.SealHash, next.Add(day), 1
 		case errors.Is(err, ErrSealExists):
 			last, lerr := s.store.LastSeal(ctx, topic)
 			if lerr != nil {
 				return out, lerr
 			}
-			prev, next = last.SealHash, startOfDay(last.Day).Add(day)
+			prev, next, attempt = last.SealHash, startOfDay(last.Day).Add(day), 1
+		case errors.Is(err, ErrSealStale) && attempt < sealAttempts:
+			attempt++
 		default:
 			return out, err
 		}
@@ -205,26 +222,48 @@ func (s *Service) sealStart(ctx context.Context, topic string, until time.Time) 
 
 var errStopScan = errors.New("authlayer/audit: stop scan")
 
+// firstEventDay is the UTC day of the topic's earliest OccurredAt, or zero
+// for a topic without events. Seq order is insert order, and replicas stamp
+// OccurredAt before inserting, so the first event by Seq may not be the
+// earliest: the second scan looks for anything dated before its day, which
+// is normally nothing.
 func (s *Service) firstEventDay(ctx context.Context, topic string) (time.Time, error) {
 	var first time.Time
 	err := s.store.Scan(ctx, Filter{Topics: []string{topic}}, func(e Event) error {
-		first = startOfDay(e.OccurredAt)
+		first = e.OccurredAt
 		return errStopScan
 	})
 	if err != nil && !errors.Is(err, errStopScan) {
 		return time.Time{}, err
 	}
-	return first, nil
+	if first.IsZero() {
+		return time.Time{}, nil
+	}
+	err = s.store.Scan(ctx, Filter{Topics: []string{topic}, To: startOfDay(first)}, func(e Event) error {
+		if e.OccurredAt.Before(first) {
+			first = e.OccurredAt
+		}
+		return nil
+	})
+	if err != nil {
+		return time.Time{}, err
+	}
+	return startOfDay(first), nil
 }
 
 // Verify checks each UTC day from from's day through to's day, both
 // included, for topics (every declared topic when empty), and returns one
-// DayStatus per day, topic by topic. A day without a seal is DayUnsealed; a
-// seal that no longer hashes, that no longer links to the previous day's
-// seal, or whose events no longer hash to it is DayMismatch with the failed
-// check in Detail. A purged day is checked for its link and for the age it
-// was purged at: a seal marked purged while PurgedAt - Day was still under
-// the topic's current retention is DayMismatch "purged_early". Shortening a
+// DayStatus per day, topic by topic.
+//
+// A day without a seal is DayUnsealed, unless the topic has a seal both
+// before and after it: a chain has no holes, so that day's seal was deleted
+// and the day is DayMismatch "chain". A seal that no longer hashes, or whose
+// first and last Seq no longer match its events, is "seal_hash"; one that
+// does not link to the nearest earlier seal (or claims a predecessor that is
+// missing) is "chain"; one whose events no longer hash to it is
+// "events_hash". A purged day is checked for its link and for the age it was
+// purged at: a seal marked purged while PurgedAt - Day was still under the
+// topic's current retention is DayMismatch "purged_early". Shortening a
 // topic's retention is therefore safe; lengthening it makes the days purged
 // under the shorter one read as purged_early, which is worth a review.
 func (s *Service) Verify(ctx context.Context, topics []string, from, to time.Time) ([]DayStatus, error) {
@@ -234,41 +273,88 @@ func (s *Service) Verify(ctx context.Context, topics []string, from, to time.Tim
 	from, to = startOfDay(from), startOfDay(to)
 	var out []DayStatus
 	for _, topic := range topics {
-		seals, err := s.store.Seals(ctx, topic, from.Add(-day), to)
+		days, err := s.verifyTopic(ctx, topic, from, to)
 		if err != nil {
 			return nil, err
 		}
-		byDay := make(map[string]Seal, len(seals))
-		for _, sl := range seals {
-			byDay[sl.Day.UTC().Format(time.DateOnly)] = sl
-		}
-		for d := from; !d.After(to); d = d.Add(day) {
-			st := DayStatus{Topic: topic, Day: d}
-			sl, ok := byDay[d.Format(time.DateOnly)]
-			if !ok {
-				st.State = DayUnsealed
-				out = append(out, st)
-				continue
-			}
-			var prev *Seal
-			if p, ok := byDay[d.Add(-day).Format(time.DateOnly)]; ok {
-				prev = &p
-			}
-			if st.State, st.Detail, err = s.checkSeal(ctx, sl, prev); err != nil {
-				return nil, err
-			}
-			out = append(out, st)
-		}
+		out = append(out, days...)
 	}
 	return out, nil
 }
 
+func (s *Service) verifyTopic(ctx context.Context, topic string, from, to time.Time) ([]DayStatus, error) {
+	// The day before from is fetched too, so the first day's link is checked.
+	seals, err := s.store.Seals(ctx, topic, from.Add(-day), to)
+	if err != nil {
+		return nil, err
+	}
+	var lastDay time.Time
+	switch last, err := s.store.LastSeal(ctx, topic); {
+	case err == nil:
+		lastDay = startOfDay(last.Day)
+	case !errors.Is(err, ErrNotFound):
+		return nil, err
+	}
+	// sealedBefore(i): whether the topic has a seal before the day whose
+	// earlier fetched seals are seals[:i]. Only a day with none needs the
+	// store again, once.
+	var anyBeforeRange *bool
+	sealedBefore := func(i int) (bool, error) {
+		if i > 0 {
+			return true, nil
+		}
+		if anyBeforeRange == nil {
+			older, err := s.store.Seals(ctx, topic, time.Time{}, from.Add(-2*day))
+			if err != nil {
+				return false, err
+			}
+			found := len(older) > 0
+			anyBeforeRange = &found
+		}
+		return *anyBeforeRange, nil
+	}
+	var out []DayStatus
+	i := 0 // seals[:i] are before d
+	for d := from; !d.After(to); d = d.Add(day) {
+		for i < len(seals) && startOfDay(seals[i].Day).Before(d) {
+			i++
+		}
+		st := DayStatus{Topic: topic, Day: d}
+		if i < len(seals) && startOfDay(seals[i].Day).Equal(d) {
+			var prev *Seal
+			if i > 0 {
+				prev = &seals[i-1]
+			}
+			if st.State, st.Detail, err = s.checkSeal(ctx, seals[i], prev); err != nil {
+				return nil, err
+			}
+			out = append(out, st)
+			continue
+		}
+		st.State = DayUnsealed
+		if lastDay.After(d) {
+			before, err := sealedBefore(i)
+			if err != nil {
+				return nil, err
+			}
+			if before {
+				st.State, st.Detail = DayMismatch, "chain"
+			}
+		}
+		out = append(out, st)
+	}
+	return out, nil
+}
+
+// checkSeal verifies one seal against its nearest earlier fetched seal, prev,
+// which is the day before unless that seal is missing. The fetched range
+// always includes the day before, so a nil prev means no predecessor exists.
 func (s *Service) checkSeal(ctx context.Context, sl Seal, prev *Seal) (DayState, string, error) {
 	d := startOfDay(sl.Day)
 	if sealHash(sl.PrevHash, sl.Topic, d, sl.EventCount, sl.EventsHash) != sl.SealHash {
 		return DayMismatch, "seal_hash", nil
 	}
-	if prev != nil && prev.SealHash != sl.PrevHash {
+	if (prev == nil && sl.PrevHash != "") || (prev != nil && prev.SealHash != sl.PrevHash) {
 		return DayMismatch, "chain", nil
 	}
 	if sl.PurgedAt != nil {
@@ -287,6 +373,10 @@ func (s *Service) checkSeal(ctx context.Context, sl Seal, prev *Seal) (DayState,
 		return "", "", err
 	case dg.hash != sl.EventsHash || dg.count != sl.EventCount:
 		return DayMismatch, "events_hash", nil
+	case dg.first != sl.FirstSeq || dg.last != sl.LastSeq:
+		// first_seq and last_seq are not in the seal hash (its format is
+		// fixed), so they are checked against the events instead.
+		return DayMismatch, "seal_hash", nil
 	}
 	return DayOK, "", nil
 }

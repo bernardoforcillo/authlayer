@@ -56,6 +56,7 @@ func menusSeals(t *testing.T, st audit.Store, from, to time.Time) []audit.Seal {
 func TestSealChainsEveryDayIncludingEmptyOnes(t *testing.T) {
 	svc, st, clk := newService(t)
 	events := threeDays(t, svc, clk)
+	clk.Set(day(4))
 	sealed, err := svc.Seal(context.Background(), day(4))
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
@@ -91,10 +92,12 @@ func TestSealChainsEveryDayIncludingEmptyOnes(t *testing.T) {
 func TestSealResumesWhereItStopped(t *testing.T) {
 	svc, st, clk := newService(t)
 	threeDays(t, svc, clk)
+	clk.Set(day(4))
 	if _, err := svc.Seal(context.Background(), day(4)); err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
 	recordAt(t, svc, clk, day(4).Add(12*time.Hour))
+	clk.Set(day(5))
 	sealed, err := svc.Seal(context.Background(), day(5))
 	if err != nil || len(sealed) != 2 {
 		t.Fatalf("second Seal = %d seals, %v; want 2 (auth and menus, 4 March)", len(sealed), err)
@@ -113,6 +116,7 @@ func TestSealRefusesADayWithOpenEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
+	clk.Set(day(2))
 	if _, err := svc.Seal(ctx, day(2)); !errors.Is(err, audit.ErrOpenEvents) {
 		t.Fatalf("Seal err = %v, want ErrOpenEvents", err)
 	}
@@ -130,6 +134,7 @@ func TestSealRefusesADayWithOpenEvents(t *testing.T) {
 func TestSealOnTwoReplicasAtOnce(t *testing.T) {
 	svc, st, clk := newService(t)
 	threeDays(t, svc, clk)
+	clk.Set(day(4))
 	other := audit.New(st, audit.WithRuntime(core.Runtime{Clock: clk.Now}),
 		audit.WithTopics(audit.Topic{Key: "menus"}, audit.Topic{Key: "auth", Retention: thirtyDays}))
 	var wg sync.WaitGroup
@@ -164,6 +169,7 @@ func TestSealOnTwoReplicasAtOnce(t *testing.T) {
 func TestVerifyReportsOKAndUnsealedDays(t *testing.T) {
 	svc, _, clk := newService(t)
 	threeDays(t, svc, clk)
+	clk.Set(day(4))
 	if _, err := svc.Seal(context.Background(), day(4)); err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
@@ -271,6 +277,7 @@ func TestVerifyDetectsTampering(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, st, clk := newService(t)
 			events := threeDays(t, svc, clk)
+			clk.Set(day(4))
 			if _, err := svc.Seal(context.Background(), day(4)); err != nil {
 				t.Fatalf("Seal: %v", err)
 			}
@@ -318,5 +325,166 @@ func TestVerifyReportsAPurgeBeforeRetentionAsMismatch(t *testing.T) {
 	}
 	if days[1].State != audit.DayOK {
 		t.Errorf("2 March = %s %q, want ok", days[1].State, days[1].Detail)
+	}
+}
+
+// lateInsertStore lands one more event in a day between Seal's digest of the
+// day and its InsertSeal, the way an insert in flight at midnight commits.
+type lateInsertStore struct {
+	audit.Store
+	late *audit.Event
+}
+
+func (s *lateInsertStore) InsertSeal(ctx context.Context, sl audit.Seal) error {
+	if s.late != nil && sl.Day.Equal(startOf(s.late.OccurredAt)) {
+		if _, err := s.Insert(ctx, *s.late); err != nil {
+			return err
+		}
+		s.late = nil
+	}
+	return s.Store.InsertSeal(ctx, sl)
+}
+
+func startOf(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+func TestSealDigestsTheDayAgainWhenAnEventLandsWhileSealing(t *testing.T) {
+	_, st, clk := newService(t)
+	late := &lateInsertStore{Store: st}
+	svc := audit.New(late, audit.WithRuntime(core.Runtime{Clock: clk.Now}), audit.WithTopics(audit.Topic{Key: "menus"}))
+	threeDays(t, svc, clk)
+	at := day(1).Add(23*time.Hour + 59*time.Minute)
+	done := at.Add(time.Second)
+	late.late = &audit.Event{ID: "late", OccurredAt: at, CompletedAt: &done, Topic: "menus", Action: "menu.update",
+		Source: audit.SourceServer, Origin: "test", Actor: audit.Actor{Type: audit.ActorUser, ID: "bob"}, Outcome: audit.OutcomeOK}
+	clk.Set(day(4))
+	if _, err := svc.Seal(context.Background(), day(4)); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if seals := menusSeals(t, st, day(1), day(1)); len(seals) != 1 || seals[0].EventCount != 3 {
+		t.Fatalf("1 March seal = %+v, want it to cover the late event (3 events)", seals)
+	}
+	days, err := svc.Verify(context.Background(), []string{"menus"}, day(1), day(3))
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	for _, d := range days {
+		if d.State != audit.DayOK {
+			t.Errorf("%s = %s %q, want ok", d.Day.Format(time.DateOnly), d.State, d.Detail)
+		}
+	}
+}
+
+// Seal never seals a day the Service clock says has not ended, whatever
+// until the caller passes.
+func TestSealStopsAtTheServiceClocksDay(t *testing.T) {
+	svc, st, clk := newService(t)
+	ctx := context.Background()
+	threeDays(t, svc, clk) // the clock is now 3 March, 10:00
+	if _, err := svc.Seal(ctx, day(10)); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if last, err := st.LastSeal(ctx, "menus"); err != nil || !last.Day.Equal(day(2)) {
+		t.Fatalf("last menus seal = %v, %v; want 2 March, the last day that ended", last.Day, err)
+	}
+	if _, err := svc.Record(ctx, action(func(e *audit.Event) { e.Outcome = audit.OutcomeOK })); err != nil {
+		t.Errorf("Record today after Seal(far future) err = %v, want nil", err)
+	}
+}
+
+// The chain starts at the earliest day an event occurred, even when an event
+// of that day was stored after one of the next day.
+func TestSealStartsAtTheEarliestOccurredDay(t *testing.T) {
+	svc, st, clk := newService(t)
+	ctx := context.Background()
+	recordAt(t, svc, clk, day(2).Add(time.Hour))             // lower Seq, later day
+	early := recordAt(t, svc, clk, day(1).Add(23*time.Hour)) // higher Seq, earlier day
+	clk.Set(day(3))
+	if _, err := svc.Seal(ctx, day(3)); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	seals := menusSeals(t, st, day(1), day(2))
+	if len(seals) != 2 || seals[0].EventCount != 1 || seals[0].LastSeq != early.Seq || seals[0].PrevHash != "" {
+		t.Fatalf("menus seals = %+v, want the chain to start on 1 March with the late-stored event", seals)
+	}
+}
+
+func TestVerifyFindsAMissingSealBetweenTwoOthers(t *testing.T) {
+	svc, st, clk := newService(t)
+	ctx := context.Background()
+	threeDays(t, svc, clk)
+	clk.Set(day(4))
+	if _, err := svc.Seal(ctx, day(4)); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	hide2 := tamperStore{Store: st, seals: func(seals []audit.Seal) []audit.Seal {
+		var out []audit.Seal
+		for _, s := range seals {
+			if !s.Day.Equal(day(2)) {
+				out = append(out, s)
+			}
+		}
+		return out
+	}}
+	auditor := audit.New(hide2, audit.WithRuntime(core.Runtime{Clock: clk.Now}), audit.WithTopics(audit.Topic{Key: "menus"}))
+	for _, tc := range []struct {
+		name     string
+		from, to time.Time
+		want     map[int]string // day of the month → state[/detail]
+	}{
+		{"whole range", day(1).AddDate(0, 0, -1), day(4), map[int]string{28: "unsealed", 1: "ok", 2: "mismatch/chain", 3: "mismatch/chain", 4: "unsealed"}},
+		{"after the hole", day(3), day(3), map[int]string{3: "mismatch/chain"}},
+		{"the hole at the end of the range", day(1), day(2), map[int]string{1: "ok", 2: "mismatch/chain"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			days, err := auditor.Verify(ctx, []string{"menus"}, tc.from, tc.to)
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+			if len(days) != len(tc.want) {
+				t.Fatalf("Verify = %+v, want %d days", days, len(tc.want))
+			}
+			for _, d := range days {
+				got := string(d.State)
+				if d.Detail != "" {
+					got += "/" + d.Detail
+				}
+				if want := tc.want[d.Day.Day()]; got != want {
+					t.Errorf("%s = %s, want %s", d.Day.Format(time.DateOnly), got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestVerifyChecksTheSealsSeqRange(t *testing.T) {
+	svc, st, clk := newService(t)
+	ctx := context.Background()
+	threeDays(t, svc, clk)
+	clk.Set(day(4))
+	if _, err := svc.Seal(ctx, day(4)); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	for _, edit := range []func(*audit.Seal){
+		func(s *audit.Seal) { s.FirstSeq++ },
+		func(s *audit.Seal) { s.LastSeq += 7 },
+	} {
+		ts := tamperStore{Store: st, seals: func(seals []audit.Seal) []audit.Seal {
+			for i := range seals {
+				if seals[i].Day.Equal(day(1)) {
+					edit(&seals[i])
+				}
+			}
+			return seals
+		}}
+		auditor := audit.New(ts, audit.WithRuntime(core.Runtime{Clock: clk.Now}), audit.WithTopics(audit.Topic{Key: "menus"}))
+		days, err := auditor.Verify(ctx, []string{"menus"}, day(1), day(1))
+		if err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		if days[0].State != audit.DayMismatch || days[0].Detail != "seal_hash" {
+			t.Errorf("1 March with an edited Seq range = %s %q, want mismatch seal_hash", days[0].State, days[0].Detail)
+		}
 	}
 }

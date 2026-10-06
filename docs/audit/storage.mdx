@@ -34,10 +34,23 @@ SQLSTATE, so a caller can tell it from any other failure:
 | `AU002` | `AuditEventProtected` | a `DELETE` of an event outside a retention transaction, a `DELETE` of an event whose day is sealed and not yet marked purged (even inside one), and any `TRUNCATE` of events |
 | `AU003` | `AuditSealImmutable` | an `UPDATE` of a seal other than stamping `purged_at` once inside a retention transaction, and any `DELETE` or `TRUNCATE` |
 | `AU004` | `AuditDaySealed` | an `INSERT` into a sealed (topic, day); `Insert` reports it as `ErrSealed` |
+| `AU005` | `AuditSealStale` | an `INSERT` of a seal whose event count or first/last `seq` no longer match its day, or whose day holds an open event; `InsertSeal` reports it as `ErrSealStale` |
+| `AU006` | `AuditIsolation` | an `INSERT` of an event or a seal in a transaction stricter than `READ COMMITTED` |
 
-`AU004` is atomic with sealing: the event insert and the seal insert contend on
-an advisory lock for the (topic, day), so an event cannot slip into a day while
-it is being sealed.
+`Seal` digests a day, then inserts its seal, so an event insert can still be in
+flight in between. The event insert and the seal insert contend on an advisory
+lock for the (topic, day): the event holds it until it commits, and the seal
+takes it exclusively, then counts the day again. The event is therefore either
+counted, and the seal refused as stale so `Seal` digests the day again, or it
+starts after the seal committed and is refused with `ErrSealed`. It never lands
+in a day its seal does not cover.
+
+Both checks read what committed while they waited for the lock, which only
+`READ COMMITTED` guarantees: under `REPEATABLE READ` the check would read a
+snapshot taken before the seal. `AuditStore` therefore runs its inserts in
+`READ COMMITTED` transactions whatever the database's
+`default_transaction_isolation`, and the guards refuse (`AU006`) an insert
+written by hand in a stricter transaction.
 
 <Warning>
 Triggers stop mistakes and ordinary code; an owner of the table can drop them.

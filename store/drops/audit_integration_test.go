@@ -23,6 +23,7 @@ import (
 	"github.com/bernardoforcillo/authlayer/consent"
 	"github.com/bernardoforcillo/authlayer/consent/consenttest"
 	"github.com/bernardoforcillo/authlayer/core"
+	"github.com/bernardoforcillo/authlayer/internal/uid"
 	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
 )
 
@@ -319,5 +320,101 @@ func TestAuditDeleteAndPurgeStampNeedTheRetentionSettingLive(t *testing.T) {
 	}
 	if sts, err := svc.Verify(ctx, nil, e.OccurredAt, e.OccurredAt); err != nil || sts[0].State != audit.DayPurged {
 		t.Fatalf("Verify after retention = %+v, %v; want purged", sts, err)
+	}
+}
+
+const rawAuditInsert = `INSERT INTO audit_events (id, occurred_at, completed_at, topic, action, source, origin, actor_type, outcome)
+VALUES ($1, $2, $2, 't', 'a.late', 'server', 'x', 'system', 'ok')`
+
+// An event whose insert is still in flight when its day is sealed either
+// makes the seal stale, so Seal digests the day again and covers it, or is
+// refused; it never lands in a day its seal does not cover.
+func TestAuditSealCoversAnInsertInFlightLive(t *testing.T) {
+	st, db := newLiveAuditStore(t)
+	ctx := context.Background()
+	clock := time.Date(2026, 1, 11, 0, 0, 1, 0, time.UTC)
+	svc := audit.New(st, audit.WithRuntime(core.Runtime{Clock: func() time.Time { return clock }}),
+		audit.WithTopics(audit.Topic{Key: "t"}))
+	yesterday := time.Date(2026, 1, 10, 23, 59, 59, 0, time.UTC)
+
+	txdb, tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := txdb.Exec(ctx, rawAuditInsert, uid.NewV7(), yesterday); err != nil {
+		t.Fatalf("insert in flight: %v", err)
+	}
+	type result struct {
+		seals []audit.Seal
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		seals, err := svc.Seal(ctx, clock)
+		done <- result{seals, err}
+	}()
+	time.Sleep(300 * time.Millisecond) // Seal digests the day, then waits on the insert's lock
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("Seal: %v", r.err)
+	}
+	if len(r.seals) != 1 || r.seals[0].EventCount != 1 {
+		t.Fatalf("Seal = %+v, want the day sealed with the event that was in flight", r.seals)
+	}
+	if sts, err := svc.Verify(ctx, nil, yesterday, yesterday); err != nil || sts[0].State != audit.DayOK {
+		t.Fatalf("Verify = %+v, %v; want ok", sts, err)
+	}
+}
+
+// Under REPEATABLE READ the sealed-day check would read a snapshot older than
+// the seal, so the guard refuses such an insert outright; the store runs its
+// own writes under READ COMMITTED, so it works whatever the database default.
+func TestAuditGuardsHoldUnderRepeatableReadLive(t *testing.T) {
+	st, db := newLiveAuditStore(t)
+	ctx := context.Background()
+	d := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+
+	txdb, tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := txdb.Exec(ctx, `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txdb.Exec(ctx, `SELECT 1`); err != nil { // takes the snapshot
+		t.Fatal(err)
+	}
+	if err := st.InsertSeal(ctx, audit.Seal{Topic: "t", Day: d, EventsHash: "e", SealHash: "s", SealedAt: d.Add(30 * time.Hour)}); err != nil {
+		t.Fatalf("InsertSeal: %v", err)
+	}
+	_, err = txdb.Exec(ctx, rawAuditInsert, uid.NewV7(), d.Add(time.Hour))
+	if err == nil {
+		t.Fatal("an insert under REPEATABLE READ landed in a day sealed after its snapshot")
+	}
+	wantCode(t, err, dropsstore.AuditIsolation)
+	_ = tx.Rollback(ctx)
+
+	// The store itself, on a connection whose default is REPEATABLE READ.
+	rrDB, err := sql.Open("pgx", os.Getenv("AUTHLAYER_TEST_DSN")+"&default_transaction_isolation=repeatable%20read")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rrDB.Close() })
+	rr := dropsstore.NewAuditStore(pg.New(stdlib.New(rrDB)))
+	clock := d.Add(26 * time.Hour)
+	svc := audit.New(rr, audit.WithRuntime(core.Runtime{Clock: func() time.Time { return clock }}),
+		audit.WithTopics(audit.Topic{Key: "t"}, audit.Topic{Key: "u"}))
+	if _, err := svc.Record(ctx, audit.Event{Topic: "u", Action: "a.b", Origin: "x", Outcome: audit.OutcomeOK,
+		Actor: audit.Actor{Type: audit.ActorSystem}}); err != nil {
+		t.Fatalf("Record on a REPEATABLE READ default: %v", err)
+	}
+	clock = clock.Add(24 * time.Hour)
+	if _, err := svc.Seal(ctx, clock); err != nil {
+		t.Fatalf("Seal on a REPEATABLE READ default: %v", err)
 	}
 }
