@@ -67,6 +67,7 @@ retype columns, because they answer two independent questions:
 |---|---|---|
 | `WithTextLibraryIDs()` | `id`, `container_id`, `parent_id` | You overrode `WithIDGenerator` with something a `uuid` column will not hold. |
 | `WithTextUserIDs()` | `user_id`, `owner_id` (and `invited_by`, `created_by` via `WithInviteTextUserIDs()`) | You use only the RBAC half, against an existing user table whose ids are not UUIDs. |
+| `WithAuditTextLibraryIDs()` | the audit event `id` | You gave the audit `Service` a non-UUID generator (`audit.WithRuntime`). Without it the audit store refuses such an id with `audit.ErrInvalidEvent` — and any UUID not in the lowercase, hyphenated form the `Service` mints — rather than a raw `22P02`. |
 
 They compose, and a deployment minting non-UUID ids for **both** wants both:
 
@@ -80,9 +81,11 @@ inviteSt := dropsstore.NewInviteStore(db,
 	dropsstore.WithInviteTextLibraryIDs(), dropsstore.WithInviteTextUserIDs())
 authSt := dropsstore.NewAuthStore(db, dropsstore.WithAuthTextLibraryIDs())
 identitySt := dropsstore.NewIdentityStore(db, dropsstore.WithIdentityTextLibraryIDs())
+auditSt := dropsstore.NewAuditStore(db, dropsstore.WithAuditTextLibraryIDs())
 
 orgSvc := org.New(ac, scopeSt, org.WithIDGenerator(newID))
 authSvc := auth.New(authSt, auth.WithIdentityStore(identitySt), auth.WithIDGenerator(newID))
+auditSvc := audit.New(auditSt, audit.WithRuntime(core.Runtime{IDs: newID}))
 ```
 
 <Note>

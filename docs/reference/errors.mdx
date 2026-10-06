@@ -276,6 +276,27 @@ refuses the whole call if any one of them is short — so a misconfigured
 `auth.Service.VerifyAccessToken` hands these back **unwrapped**, so you can tell
 an expired token from a forged one, and an unknown key from either.
 
+## `audit` — ten
+
+An audit write that fails should stop the action it describes — that is what
+recording first is for — so most of these are a 500 to the end user and an
+alert to you. `store/drops` raises its guards' refusals as SQLSTATEs `AU001`–`AU006`
+([storage](/audit/storage#the-guards)); `Insert`, `InsertSeal` and the lookups
+map the ones a caller can meet onto these sentinels.
+
+| Error | Meaning | Suggested status |
+|---|---|---|
+| `ErrUnknownTopic` | The event names a topic the `Service` was not built with (`WithTopics`) | 500 |
+| `ErrInvalidEvent` | A required field is missing, a value is out of range or holds a NUL character, an id is taken by a different event, or (on a `uuid` table) the id is not a lowercase UUID | 400 for a client-reported event, else 500 |
+| `ErrNotFound` | No event, or no seal, matches — including an id that cannot be a stored one | 404 |
+| `ErrCompleted` | `Complete` on an event already completed differently: another outcome, code, reason, duration or diff | 409 |
+| `ErrOpenEvents` | `Seal` met a day still holding an open event; run `Reconcile` | — (maintenance) |
+| `ErrSealed` | The event's (topic, UTC day) is already sealed, so the store refuses it; the action must not run | 500 |
+| `ErrSealExists` | A seal for that (topic, day) already exists; `Seal` handles it by continuing from that seal | — (maintenance) |
+| `ErrSealStale` | The day's events changed between the digest and the seal's insert; `Seal` digests the day again, three times at most | — (maintenance) |
+| `ErrExportTooLarge` | More events match than the export's limit | 413 |
+| `ErrForgotten` | The subject was erased with `Forget`; their pseudonym can no longer be computed | 404 |
+
 ## `password` — none
 
 `Validate` returns the **names** of the failed rules (`min_length`, `upper`,
@@ -298,7 +319,8 @@ differently on purpose:
 
 Match on your backend's own error if you need to distinguish these. `store/drops`
 also surfaces `SQLSTATE 22P02` verbatim when a non-UUID id meets a `uuid` column
-— see [Ids](/concepts/ids).
+— see [Ids](/concepts/ids) — except the audit store, which checks the id first
+and answers `audit.ErrInvalidEvent` (insert) or `audit.ErrNotFound` (lookup).
 
 ## Next
 

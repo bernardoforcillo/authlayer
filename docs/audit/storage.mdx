@@ -89,10 +89,12 @@ the audit tables' guards on purpose — deleting a key is the erasure.
 
 ## Your own backend
 
-The `Store` MUSTs — one atomic step for the sealed-day check on `Insert`, an
-existing id returning the stored row, `Complete` writing once with an identical
-retry succeeding, `Scan` ascending and returning the callback's error unwrapped —
-are an executable suite, as for the other ports.
+The `Store` MUSTs — one atomic step for the sealed-day check on `Insert`, and
+for `InsertSeal`'s check that the day still matches the seal (`ErrSealStale`
+otherwise), an existing id returning the stored row, `Complete` writing once
+with an identical retry succeeding (JSON compared by value), `Scan` ascending
+and returning the callback's error unwrapped, `Purge` deleting nothing for a
+batch of zero or less — are an executable suite, as for the other ports.
 
 {/* verify:skip a test function needing a *testing.T; the identical call is compiled and run by store/memory/audit_test.go and by store/drops' integration lane */}
 ```go
@@ -108,5 +110,5 @@ func TestMyStoreSatisfiesTheAuditContract(t *testing.T) {
 A key store has its own suite, `audittest.RunKeyStoreContract`. The factory must return an **empty** store each time: the checks count rows.
 Event ids are UUIDv7, so a backend that types ids as `uuid` passes unchanged.
 The suite is sequential, so it does not race the atomicity of `Insert`'s
-sealed-day check — that one you have to reason about, as `store/drops` does with
-its lock.
+sealed-day check or of `InsertSeal`'s day check — those you have to reason
+about, as `store/drops` does with its lock.
