@@ -21,6 +21,10 @@ func (s *Service) List(ctx context.Context, f Filter, page Page) ([]Event, int64
 	if page.Before < 0 {
 		page.Before = 0
 	}
+	f, err := s.translateFilter(ctx, f)
+	if err != nil {
+		return nil, 0, err
+	}
 	events, err := s.store.List(ctx, f, page)
 	if err != nil {
 		return nil, 0, err
@@ -36,6 +40,10 @@ func (s *Service) List(ctx context.Context, f Filter, page Page) ([]Event, int64
 // the first error yield returns. When limit is positive and more events
 // match, it returns ErrExportTooLarge before yielding anything.
 func (s *Service) Export(ctx context.Context, f Filter, limit int, yield func(Event) error) error {
+	f, err := s.translateFilter(ctx, f)
+	if err != nil {
+		return err
+	}
 	if limit > 0 {
 		n, err := s.store.Count(ctx, f)
 		if err != nil {

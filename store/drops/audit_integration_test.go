@@ -191,3 +191,63 @@ func TestAuditGuardAllowsOnlyClearingClientData(t *testing.T) {
 		t.Fatalf("Verify after scrub = %+v, %v", sts, err)
 	}
 }
+
+func TestAuditKeyStoreSatisfiesTheKeyContractLive(t *testing.T) {
+	_, db := newLiveAuditStore(t)
+	audittest.RunKeyStoreContract(t, func(t *testing.T) audit.KeyStore {
+		ks := dropsstore.NewAuditKeyStore(db)
+		_ = ks.DropSchema(context.Background())
+		if err := ks.CreateSchema(context.Background()); err != nil {
+			t.Fatalf("CreateSchema: %v", err)
+		}
+		t.Cleanup(func() { _ = ks.DropSchema(context.Background()) })
+		return ks
+	})
+}
+
+func TestAuditForgetErasesAPersonEndToEndLive(t *testing.T) {
+	st, db := newLiveAuditStore(t)
+	ks := dropsstore.NewAuditKeyStore(db)
+	ctx := context.Background()
+	_ = ks.DropSchema(ctx)
+	if err := ks.CreateSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ks.DropSchema(context.Background()) })
+	clock := time.Date(2026, 1, 10, 9, 0, 0, 0, time.UTC)
+	svc := audit.New(st, audit.WithSubjectKeys(ks),
+		audit.WithRuntime(core.Runtime{Clock: func() time.Time { return clock }}),
+		audit.WithTopics(audit.Topic{Key: "t"}))
+	if _, err := svc.Record(ctx, audit.Event{Topic: "t", Action: "a.b", Origin: "x", Outcome: audit.OutcomeOK,
+		Actor: audit.Actor{Type: audit.ActorUser, ID: "alice", Display: "alice@example.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(ctx, `SELECT actor_id, actor_display FROM audit_events`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id, display string
+	if !rows.Next() || rows.Scan(&id, &display) != nil {
+		t.Fatal("no row")
+	}
+	_ = rows.Close()
+	if id == "alice" || display != "" {
+		t.Fatalf("stored actor = %q / %q; want a pseudonym and no display", id, display)
+	}
+	if got, _, _ := svc.List(ctx, audit.Filter{Member: "alice"}, audit.Page{}); len(got) != 1 {
+		t.Fatalf("alice's trail = %d events, want 1", len(got))
+	}
+	if err := svc.Forget(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := svc.List(ctx, audit.Filter{Member: "alice"}, audit.Page{}); len(got) != 0 {
+		t.Fatalf("alice's trail after Forget = %d events, want 0", len(got))
+	}
+	clock = clock.Add(48 * time.Hour)
+	if _, err := svc.Seal(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	if sts, err := svc.Verify(ctx, nil, clock.Add(-48*time.Hour), clock.Add(-48*time.Hour)); err != nil || sts[0].State != audit.DayOK {
+		t.Fatalf("Verify = %+v, %v", sts, err)
+	}
+}

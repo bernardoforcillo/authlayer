@@ -300,3 +300,45 @@ func (s *AuditStore) ScrubClientData(_ context.Context, topic string, before tim
 	}
 	return len(due), nil
 }
+
+// AuditKeyStore is a concurrency-safe in-memory audit.KeyStore.
+type AuditKeyStore struct {
+	mu   sync.Mutex
+	keys map[string][]byte
+}
+
+// NewAuditKeyStore returns an empty in-memory audit.KeyStore.
+func NewAuditKeyStore() *AuditKeyStore { return &AuditKeyStore{keys: map[string][]byte{}} }
+
+// Compile-time proof the memory key store satisfies the port.
+var _ audit.KeyStore = (*AuditKeyStore)(nil)
+
+// Key returns the subject's key, or audit.ErrNotFound.
+func (s *AuditKeyStore) Key(_ context.Context, subject string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k, ok := s.keys[subject]
+	if !ok {
+		return nil, audit.ErrNotFound
+	}
+	return slices.Clone(k), nil
+}
+
+// PutKey stores key unless the subject has one, and returns the stored key.
+func (s *AuditKeyStore) PutKey(_ context.Context, subject string, key []byte) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if k, ok := s.keys[subject]; ok {
+		return slices.Clone(k), nil
+	}
+	s.keys[subject] = slices.Clone(key)
+	return slices.Clone(key), nil
+}
+
+// DeleteKey removes the subject's key.
+func (s *AuditKeyStore) DeleteKey(_ context.Context, subject string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.keys, subject)
+	return nil
+}

@@ -34,11 +34,12 @@ const (
 	AuditDaySealed = "AU004"
 )
 
-// AuditNames are the two table names an AuditStore persists to; the zero
+// AuditNames are the table names the audit stores persist to; the zero
 // value means the defaults.
 type AuditNames struct {
 	Events string // default "audit_events"
 	Seals  string // default "audit_seals"
+	Keys   string // default "audit_subject_keys", used by [AuditKeyStore]
 }
 
 func (n AuditNames) withDefaults() AuditNames {
@@ -47,6 +48,9 @@ func (n AuditNames) withDefaults() AuditNames {
 	}
 	if n.Seals == "" {
 		n.Seals = "audit_seals"
+	}
+	if n.Keys == "" {
+		n.Keys = "audit_subject_keys"
 	}
 	return n
 }
@@ -710,4 +714,84 @@ func (st *AuditStore) ScrubClientData(ctx context.Context, topic string, before 
 	}
 	n, err := res.RowsAffected()
 	return int(n), err
+}
+
+// AuditKeyStore is a drops-backed audit.KeyStore: one row per data subject
+// holding the key that pseudonymizes them in the log. Deleting the row is the
+// erasure, so keep this table out of backups that must honour a deletion
+// request, or encrypt the keys under a KMS key you can rotate.
+type AuditKeyStore struct {
+	db  *pg.DB
+	cfg auditSettings
+	tbl string
+}
+
+// Compile-time proof the drops key store satisfies the port.
+var _ audit.KeyStore = (*AuditKeyStore)(nil)
+
+// NewAuditKeyStore returns an AuditKeyStore over db.
+func NewAuditKeyStore(db *pg.DB, opts ...AuditOption) *AuditKeyStore {
+	cfg := newAuditSettings(opts)
+	return &AuditKeyStore{db: db, cfg: cfg, tbl: quoteIdent(cfg.names.Keys)}
+}
+
+// AuditKeyDDL returns the statement creating the key table.
+func AuditKeyDDL(opts ...AuditOption) []string {
+	cfg := newAuditSettings(opts)
+	return []string{`CREATE TABLE IF NOT EXISTS ` + quoteIdent(cfg.names.Keys) + ` (
+  subject text PRIMARY KEY,
+  key bytea NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+)`}
+}
+
+// CreateSchema runs [AuditKeyDDL].
+func (st *AuditKeyStore) CreateSchema(ctx context.Context) error {
+	for _, stmt := range AuditKeyDDL(func(s *auditSettings) { *s = st.cfg }) {
+		if _, err := st.db.Exec(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DropSchema drops the key table.
+func (st *AuditKeyStore) DropSchema(ctx context.Context) error {
+	_, err := st.db.Exec(ctx, `DROP TABLE IF EXISTS `+st.tbl)
+	return err
+}
+
+// Key returns the subject's key, or audit.ErrNotFound.
+func (st *AuditKeyStore) Key(ctx context.Context, subject string) ([]byte, error) {
+	rows, err := st.db.Query(ctx, `SELECT key FROM `+st.tbl+` WHERE subject = $1`, subject)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return nil, audit.ErrNotFound
+	}
+	var key []byte
+	if err := rows.Scan(&key); err != nil {
+		return nil, err
+	}
+	return key, rows.Err()
+}
+
+// PutKey stores key unless the subject has one, and returns the stored key.
+func (st *AuditKeyStore) PutKey(ctx context.Context, subject string, key []byte) ([]byte, error) {
+	if _, err := st.db.Exec(ctx, `INSERT INTO `+st.tbl+` (subject, key) VALUES ($1, $2) ON CONFLICT (subject) DO NOTHING`,
+		subject, key); err != nil {
+		return nil, err
+	}
+	return st.Key(ctx, subject)
+}
+
+// DeleteKey removes the subject's key.
+func (st *AuditKeyStore) DeleteKey(ctx context.Context, subject string) error {
+	_, err := st.db.Exec(ctx, `DELETE FROM `+st.tbl+` WHERE subject = $1`, subject)
+	return err
 }
