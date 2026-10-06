@@ -1,9 +1,13 @@
 ---
 title: "The schema"
-description: "Nineteen tables across eight independent stores, printed from the code that defines them — and which constraint or index is load-bearing rather than decorative."
+description: "The tables of the independent drops stores, printed from the code that defines them — and which constraint or index is load-bearing rather than decorative."
 ---
 
-Eight stores own nineteen tables between them, and none of them declares a foreign
+`store/drops` has eleven independent stores owning twenty-five tables. This page
+prints nineteen of them, from eight stores; the passkey (`credentials`,
+`passkey_challenges`), MFA (`mfa_factors`, `mfa_recovery_codes`,
+`trusted_devices`) and consent tables are documented on their stores' godoc.
+None of the stores declares a foreign
 key to another store's table — not to a users table from the RBAC side, which
 authlayer does not own, not between the three auth tables, and not from
 `identities` to `users` (that one is also forced: the auth store may be an

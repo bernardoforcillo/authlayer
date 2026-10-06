@@ -140,7 +140,10 @@ next day's `PrevHash` no longer matches.
 ## The hash format
 
 The hashes are computed by the `Service`, in Go, from what the store returns, so
-every store produces the same ones and an outside verifier can recompute them.
+an outside verifier can recompute them, and the hash depends only on what the
+store returns: a store that respells JSON numbers, as PostgreSQL's `jsonb` does
+(`1e2` comes back as `100`), hashes its own spelling, so the same event may
+hash differently on two stores.
 
 - **Canonical row.** Each event is one JSON object with exactly these keys, in
   this order: `id`, `seq`, `occurred_at`, `completed_at`, `topic`, `action`,
@@ -153,7 +156,8 @@ every store produces the same ones and an outside verifier can recompute them.
   `2026-03-01T09:00:00Z`, `2026-03-01T09:00:00.5Z`). `request` and `changes`
   are re-encoded with sorted keys and no whitespace, numbers spelled as the
   store returns them. The encoding is Go's `encoding/json`, which escapes `<`,
-  `>` and `&` as `\u003c`, `\u003e` and `\u0026`. The IP address and user agent
+  `>` and `&` as `\u003c`, `\u003e` and `\u0026`, escapes U+2028 and U+2029
+  as `\u2028` and `\u2029`, and replaces invalid UTF-8 with U+FFFD. The IP address and user agent
   are not part of it.
 - **`events_hash`** = hex SHA-256 of the day's canonical rows in `Seq` order,
   each followed by `\n`. An empty day hashes the empty string.

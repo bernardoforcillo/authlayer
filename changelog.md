@@ -126,6 +126,34 @@ once a 1.0 is cut. Until then, minor versions may break API.
   earliest remaining event day. Days v0.2.0 already purged cannot be re-sealed.
   [`docs/audit/integrity`](docs/audit/integrity.mdx#the-hash-format) describes
   the format as implemented.
+- **The audit core already in the v0.2.0 tag changed.** The `audit` package,
+  `audit/audittest` and `store/memory`'s audit store shipped in v0.2.0 without
+  a changelog entry; the API stays source-compatible, but behaviour moved. For
+  code built on them:
+  - **Custom `audit.Store`s must add two MUSTs** (the contract suite now fails
+    them): `InsertSeal` checks, atomically with the write, that the day still
+    matches the seal (count, first/last `Seq`, no open event) and returns the
+    new `ErrSealStale` otherwise; `Purge` with `batch <= 0` deletes nothing and
+    returns 0 (v0.2.0's memory store deleted everything). They must also add
+    `ScrubClientData` (see Added).
+  - `Seal` caps `until` at the start of the Service clock's day, starts a chain
+    at the earliest event day, and digests a day again on `ErrSealStale`.
+  - `Verify` reports a day missing between two seals, and a seal that claims a
+    missing predecessor, as `mismatch`/`chain`; checks `first_seq`/`last_seq`
+    (`seal_hash`); and reports an early or future-dated purge stamp as
+    `purged_early`.
+  - `EqualJSON` compares numbers by value (`1e2` equals `100`), so a retried
+    `Complete` whose store respelled a number is an identical retry.
+  - `DefaultPolicy` redacts many more keys (pwd, pass, jwt, bearer, the
+    signing/access/encryption/HMAC/master/session keys, TOTP and MFA codes,
+    PIN, device and user codes, PKCE verifiers, plaintext).
+  - `WithResource` fills type and id field by field; a taken id is a retry only
+    when the `Source` matches too; NUL characters in any text field, id,
+    `Request`, `Changes` or `Filter` string are `ErrInvalidEvent` (`Get`:
+    `ErrNotFound`).
+  - The seal hash format changed (above).
+  - `store/drops.AuditStore`, new in this release, needs PostgreSQL 14 or later
+    (`CREATE OR REPLACE TRIGGER`).
 
 ## [0.2.0] - 2026-10-02
 
