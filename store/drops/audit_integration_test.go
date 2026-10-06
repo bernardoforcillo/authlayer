@@ -20,6 +20,8 @@ import (
 
 	"github.com/bernardoforcillo/authlayer/audit"
 	"github.com/bernardoforcillo/authlayer/audit/audittest"
+	"github.com/bernardoforcillo/authlayer/consent"
+	"github.com/bernardoforcillo/authlayer/consent/consenttest"
 	"github.com/bernardoforcillo/authlayer/core"
 	dropsstore "github.com/bernardoforcillo/authlayer/store/drops"
 )
@@ -250,4 +252,17 @@ func TestAuditForgetErasesAPersonEndToEndLive(t *testing.T) {
 	if sts, err := svc.Verify(ctx, nil, clock.Add(-48*time.Hour), clock.Add(-48*time.Hour)); err != nil || sts[0].State != audit.DayOK {
 		t.Fatalf("Verify = %+v, %v", sts, err)
 	}
+}
+
+func TestConsentStoreSatisfiesTheContractLive(t *testing.T) {
+	_, db := newLiveAuditStore(t)
+	consenttest.RunStoreContract(t, func(t *testing.T) consent.Store {
+		st := dropsstore.NewConsentStore(db, "")
+		_ = st.DropSchema(context.Background())
+		if err := st.CreateSchema(context.Background()); err != nil {
+			t.Fatalf("CreateSchema: %v", err)
+		}
+		t.Cleanup(func() { _ = st.DropSchema(context.Background()) })
+		return st
+	})
 }
