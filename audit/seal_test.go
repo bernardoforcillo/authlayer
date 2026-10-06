@@ -294,3 +294,29 @@ func TestVerifyDetectsTampering(t *testing.T) {
 		})
 	}
 }
+
+// A seal marked purged before its topic's retention allowed it is not the
+// benign "purged" state: someone opened the day to a delete early.
+func TestVerifyReportsAPurgeBeforeRetentionAsMismatch(t *testing.T) {
+	svc, st, clk := newService(t)
+	ctx := context.Background()
+	threeDays(t, svc, clk)
+	clk.Set(day(4))
+	if _, err := svc.Seal(ctx, day(4)); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	// "menus" keeps 365 days; the 1 March seal is stamped purged on 5 March.
+	if err := st.MarkPurged(ctx, "menus", day(2), day(5)); err != nil {
+		t.Fatal(err)
+	}
+	days, err := svc.Verify(ctx, []string{"menus"}, day(1), day(2))
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if days[0].State != audit.DayMismatch || days[0].Detail != "purged_early" {
+		t.Errorf("1 March = %s %q, want mismatch purged_early", days[0].State, days[0].Detail)
+	}
+	if days[1].State != audit.DayOK {
+		t.Errorf("2 March = %s %q, want ok", days[1].State, days[1].Detail)
+	}
+}

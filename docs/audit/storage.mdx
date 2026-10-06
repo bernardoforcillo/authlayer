@@ -31,8 +31,8 @@ SQLSTATE, so a caller can tell it from any other failure:
 | SQLSTATE | Constant | Refuses |
 |---|---|---|
 | `AU001` | `AuditEventImmutable` | an `UPDATE` of an event other than its one completion (`completed_at` from NULL, completion columns only; resource and container only when empty) or the clearing of its `ip` and `user_agent` on retention, with every other column unchanged |
-| `AU002` | `AuditEventProtected` | a `DELETE` of an event whose day is sealed and not yet marked purged, and any `TRUNCATE` of events |
-| `AU003` | `AuditSealImmutable` | an `UPDATE` of a seal other than stamping `purged_at` once, and any `DELETE` or `TRUNCATE` |
+| `AU002` | `AuditEventProtected` | a `DELETE` of an event outside a retention transaction, a `DELETE` of an event whose day is sealed and not yet marked purged (even inside one), and any `TRUNCATE` of events |
+| `AU003` | `AuditSealImmutable` | an `UPDATE` of a seal other than stamping `purged_at` once inside a retention transaction, and any `DELETE` or `TRUNCATE` |
 | `AU004` | `AuditDaySealed` | an `INSERT` into a sealed (topic, day); `Insert` reports it as `ErrSealed` |
 
 `AU004` is atomic with sealing: the event insert and the seal insert contend on
@@ -46,9 +46,15 @@ on `Verify` for what a privileged rewrite leaves behind — it recomputes every
 hash from the rows, not from anything the triggers guarded.
 </Warning>
 
-Purging goes through the same guard: `ApplyRetention` marks a day's seal purged
-first (the one seal update `AU003` allows), then deletes its events (which
-`AU002` now allows).
+A retention transaction is one that sets `authlayer.audit_retention` to `on`
+for itself (`set_config(dropsstore.AuditRetentionSetting, 'on', true)`). Only
+`Purge` and `MarkPurged` do, each in its own transaction, so a stray `DELETE`, an
+ORM cascade or a cleanup script cannot remove an event, sealed or not.
+`ApplyRetention` marks a day's seal purged first (the one seal update `AU003`
+allows), then deletes its events (which `AU002` now allows). The setting stops
+accidents, not an attacker holding the application's credentials, who can set
+it too: `Verify` reports a seal stamped purged before its topic's retention
+allowed it as a `mismatch` (`purged_early`).
 
 ### Subject keys
 

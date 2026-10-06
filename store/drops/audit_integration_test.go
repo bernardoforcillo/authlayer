@@ -266,3 +266,58 @@ func TestConsentStoreSatisfiesTheContractLive(t *testing.T) {
 		return st
 	})
 }
+
+// A delete outside retention is refused whether or not the day is sealed, and
+// so is stamping purged_at: both need the transaction-local retention
+// setting, which only Purge and MarkPurged set. Retention itself still works.
+func TestAuditDeleteAndPurgeStampNeedTheRetentionSettingLive(t *testing.T) {
+	st, db := newLiveAuditStore(t)
+	ctx := context.Background()
+	clock := time.Date(2026, 1, 10, 9, 0, 0, 0, time.UTC)
+	svc := audit.New(st, audit.WithRuntime(core.Runtime{Clock: func() time.Time { return clock }}),
+		audit.WithTopics(audit.Topic{Key: "t", Retention: 24 * time.Hour}))
+	record := func() audit.Event {
+		t.Helper()
+		e, err := svc.Record(ctx, audit.Event{Topic: "t", Action: "a.b", Origin: "x", Outcome: audit.OutcomeOK,
+			Actor: audit.Actor{Type: audit.ActorUser, ID: "u"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	e := record()
+
+	// The day is not sealed yet: a plain DELETE is still refused.
+	_, err := db.Exec(ctx, `DELETE FROM audit_events WHERE id = $1`, e.ID)
+	wantCode(t, err, dropsstore.AuditEventProtected)
+	if _, err := svc.Get(ctx, e.ID); err != nil {
+		t.Fatalf("the unsealed event is gone after a refused DELETE: %v", err)
+	}
+
+	clock = clock.Add(48 * time.Hour)
+	if _, err := svc.Seal(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	// Stamping purged_at by hand is refused, so it cannot open the day to a DELETE.
+	_, err = db.Exec(ctx, `UPDATE audit_seals SET purged_at = now()`)
+	wantCode(t, err, dropsstore.AuditSealImmutable)
+	// Even with the setting on, a sealed day whose seal is not purged keeps its events.
+	err = db.InTx(ctx, func(tx *pg.DB) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config($1, 'on', true)`, dropsstore.AuditRetentionSetting); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM audit_events WHERE id = $1`, e.ID)
+		return err
+	})
+	wantCode(t, err, dropsstore.AuditEventProtected)
+
+	// Retention, which sets it, still purges.
+	clock = clock.Add(72 * time.Hour)
+	deleted, err := svc.ApplyRetention(ctx)
+	if err != nil || deleted["t"] != 1 {
+		t.Fatalf("ApplyRetention = %v, %v; want 1 deleted", deleted, err)
+	}
+	if sts, err := svc.Verify(ctx, nil, e.OccurredAt, e.OccurredAt); err != nil || sts[0].State != audit.DayPurged {
+		t.Fatalf("Verify after retention = %+v, %v; want purged", sts, err)
+	}
+}

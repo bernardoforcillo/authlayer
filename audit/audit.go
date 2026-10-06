@@ -30,8 +30,9 @@
 // # Storage
 //
 // [Store] is the persistence port. store/memory holds the reference
-// implementation and store/drops the PostgreSQL one, whose triggers refuse
-// every rewrite at the database.
+// implementation and store/drops the PostgreSQL one, whose triggers refuse at
+// the database every update but a completion or a client-data scrub, and
+// every delete outside retention.
 // [github.com/bernardoforcillo/authlayer/audit/audittest] is the port's
 // contract as an executable suite, and
 // [github.com/bernardoforcillo/authlayer/audit/audithook] turns the lifecycle
@@ -286,7 +287,9 @@ const (
 	DayMismatch DayState = "mismatch"
 	// DayUnsealed: no seal covers the day yet.
 	DayUnsealed DayState = "unsealed"
-	// DayPurged: retention deleted the events; the seal still links.
+	// DayPurged: retention deleted the events; the seal still links, and it
+	// was marked purged only once the day was older than its topic's
+	// retention.
 	DayPurged DayState = "purged"
 )
 
@@ -299,8 +302,10 @@ type DayStatus struct {
 	// State is the verdict.
 	State DayState
 	// Detail names the failed check on DayMismatch: "events_hash" (the
-	// events changed), "seal_hash" (the seal changed) or "chain" (the seal
-	// does not link to the previous day's).
+	// events changed), "seal_hash" (the seal changed), "chain" (the seal
+	// does not link to the previous day's) or "purged_early" (the seal is
+	// marked purged although the day was younger than its topic's retention
+	// at PurgedAt).
 	Detail string
 }
 

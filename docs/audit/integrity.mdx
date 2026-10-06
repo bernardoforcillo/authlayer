@@ -112,13 +112,15 @@ The seals are.
 | `ok` | the day's events hash to its seal, which links to the previous day's |
 | `mismatch` | something no longer matches; `Detail` says what |
 | `unsealed` | no seal covers the day yet |
-| `purged` | retention deleted the events; the seal still links |
+| `purged` | retention deleted the events; the seal still links and was marked purged only once the day was past its topic's retention |
 
 A `mismatch` names the check that failed: `events_hash` (an event was altered,
 inserted or deleted, or a stored event is unreadable), `seal_hash` (the seal row
 itself was edited) or `chain` (the seal no longer links to the previous day's —
-a day was deleted or replaced). Editing a seal to match an edited event does
-not help: the next day's `PrevHash` no longer matches.
+a day was deleted or replaced), or `purged_early` (the seal was marked purged
+while the day was younger than its topic's retention, so its events went
+outside retention). Editing a seal to match an edited event does not help: the
+next day's `PrevHash` no longer matches.
 
 ## Retention
 
@@ -135,3 +137,8 @@ undermining the thing it sits next to:
 
 Run `ApplyRetention` on a schedule too — after `Seal`, so the days it may purge
 are sealed.
+
+`Verify` checks a purged day against its topic's **current** retention: a seal
+marked purged while the day was younger than that is `purged_early`. Shortening
+a retention is therefore safe; lengthening one makes the days purged under the
+shorter value read as `purged_early`, so review them when you do.

@@ -54,15 +54,17 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `Member` is one person's whole trail.
 - **Integrity.** `Service.Seal` chains every (topic, UTC day) into a SHA-256
   hash chain, empty days included; `Service.Verify` recomputes it and reports
-  `ok`, `mismatch` (`events_hash`, `seal_hash` or `chain`), `unsealed` or
-  `purged` per day. `Service.Reconcile` closes the events a crashed process
+  `ok`, `mismatch` (`events_hash`, `seal_hash`, `chain` or `purged_early`),
+  `unsealed` or `purged` per day. `Service.Reconcile` closes the events a crashed process
   left open as `unknown`, which a day needs before it can be sealed.
   `Service.ApplyRetention` purges per-topic retention, sealed days only, and
   marks the seals purged before deleting the events so `Verify` never raises a
   false alarm.
 - **`store/drops.AuditStore`.** PostgreSQL persistence whose triggers refuse
   rewrites at the database with SQLSTATE `AU001` (event update), `AU002`
-  (delete of a sealed day, truncate), `AU003` (seal update, delete, truncate)
+  (any delete outside a retention transaction — `AuditRetentionSetting`, set
+  only by `Purge` — or of a sealed, unpurged day; truncate), `AU003` (seal
+  update other than a purge stamp inside retention, delete, truncate)
   and `AU004` (insert into a sealed day, atomic with sealing through an
   advisory lock). `AuditDDL` returns the statements for a migration;
   `WithAuditNames` and `WithAuditTextIDs` adapt it. Run the application as a

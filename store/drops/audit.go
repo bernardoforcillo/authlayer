@@ -22,17 +22,26 @@ const (
 	// AuditEventImmutable (AU001): an UPDATE of an event other than the one
 	// completion of an open event.
 	AuditEventImmutable = "AU001"
-	// AuditEventProtected (AU002): a DELETE or TRUNCATE of events that a seal
-	// still vouches for — the day is sealed and retention has not marked it
-	// purged.
+	// AuditEventProtected (AU002): any TRUNCATE of events, a DELETE outside a
+	// retention transaction ([AuditRetentionSetting] not 'on'), and, even
+	// inside one, a DELETE of an event that a seal still vouches for — its
+	// day is sealed and the seal is not marked purged.
 	AuditEventProtected = "AU002"
 	// AuditSealImmutable (AU003): an UPDATE of a seal other than stamping
-	// purged_at once, or any DELETE or TRUNCATE of seals.
+	// purged_at once inside a retention transaction, or any DELETE or
+	// TRUNCATE of seals.
 	AuditSealImmutable = "AU003"
 	// AuditDaySealed (AU004): an INSERT of an event into a (topic, day) that
 	// is already sealed. [AuditStore.Insert] reports it as audit.ErrSealed.
 	AuditDaySealed = "AU004"
 )
+
+// AuditRetentionSetting is the transaction-local setting that opens the
+// audit tables to retention: the AU002 guard refuses every DELETE of an event,
+// and the AU003 guard every purged_at stamp, unless it is 'on'.
+// [AuditStore.Purge] and [AuditStore.MarkPurged] set it with set_config(...,
+// true) inside their own transaction, so it never outlives them.
+const AuditRetentionSetting = "authlayer.audit_retention"
 
 // AuditNames are the table names the audit stores persist to; the zero
 // value means the defaults.
@@ -99,10 +108,12 @@ func quoteIdent(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`)
 //     completes it (completed_at NULL to set, the completion columns
 //     written, resource and container filled only when empty), or by
 //     clearing its ip and user_agent on retention.
-//   - AU002: an event of a sealed day may not be deleted until the seal is
-//     marked purged, and the events table may not be truncated.
-//   - AU003: a seal may only get purged_at stamped, once; seals are never
-//     deleted or truncated.
+//   - AU002: an event may be deleted only inside a retention transaction
+//     ([AuditRetentionSetting] on, as [AuditStore.Purge] sets it), and even
+//     then not while its day's seal is unpurged; the events table may not be
+//     truncated.
+//   - AU003: a seal may only get purged_at stamped, once, inside a retention
+//     transaction; seals are never deleted or truncated.
 //   - AU004: an event may not be inserted into a sealed (topic, day); the
 //     check and the insert are serialized against the seal insert with an
 //     advisory lock.
@@ -220,6 +231,9 @@ BEGIN
   IF TG_OP = 'TRUNCATE' THEN
     RAISE EXCEPTION 'authlayer audit: events cannot be truncated' USING ERRCODE = '` + AuditEventProtected + `';
   END IF;
+  IF current_setting('` + AuditRetentionSetting + `', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'authlayer audit: events are deleted only by retention' USING ERRCODE = '` + AuditEventProtected + `';
+  END IF;
   IF EXISTS (SELECT 1 FROM ` + sl + ` s
               WHERE s.topic = OLD.topic AND s.day = ` + oldDay + ` AND s.purged_at IS NULL) THEN
     RAISE EXCEPTION 'authlayer audit: an event of a sealed day cannot be deleted before retention purges it'
@@ -258,6 +272,7 @@ BEGIN
     RETURN NEW;
   END IF;
   IF TG_OP = 'UPDATE' AND OLD.purged_at IS NULL AND NEW.purged_at IS NOT NULL
+     AND current_setting('` + AuditRetentionSetting + `', true) IS NOT DISTINCT FROM 'on'
      AND NEW.topic = OLD.topic AND NEW.day = OLD.day AND NEW.event_count = OLD.event_count
      AND NEW.first_seq = OLD.first_seq AND NEW.last_seq = OLD.last_seq
      AND NEW.events_hash = OLD.events_hash AND NEW.prev_hash = OLD.prev_hash
@@ -681,25 +696,43 @@ func (st *AuditStore) Seals(ctx context.Context, topic string, from, to time.Tim
 }
 
 // Purge deletes at most batch events of topic older than before, oldest
-// first. The AU002 guard refuses events of a sealed day that is not marked
-// purged.
+// first, inside its own retention transaction ([AuditRetentionSetting]). The
+// AU002 guard still refuses events of a sealed day that is not marked purged.
 func (st *AuditStore) Purge(ctx context.Context, topic string, before time.Time, batch int) (int, error) {
-	res, err := st.db.Exec(ctx, `DELETE FROM `+st.ev+` WHERE seq IN (
+	var n int64
+	err := st.inRetention(ctx, func(tx *pg.DB) error {
+		res, err := tx.Exec(ctx, `DELETE FROM `+st.ev+` WHERE seq IN (
  SELECT seq FROM `+st.ev+` WHERE topic = $1 AND occurred_at < $2 ORDER BY seq LIMIT NULLIF($3::bigint, 0))`,
-		topic, before.UTC(), max(batch, 0))
-	if err != nil {
-		return 0, err
-	}
-	n, err := res.RowsAffected()
+			topic, before.UTC(), max(batch, 0))
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
 	return int(n), err
 }
 
-// MarkPurged stamps at on the topic's unpurged seals before before.
+// MarkPurged stamps at on the topic's unpurged seals before before, inside
+// its own retention transaction.
 func (st *AuditStore) MarkPurged(ctx context.Context, topic string, before, at time.Time) error {
-	_, err := st.db.Exec(ctx, `UPDATE `+st.sl+` SET purged_at = $3
+	return st.inRetention(ctx, func(tx *pg.DB) error {
+		_, err := tx.Exec(ctx, `UPDATE `+st.sl+` SET purged_at = $3
 WHERE topic = $1 AND day::timestamp < ($2::timestamptz AT TIME ZONE 'UTC') AND purged_at IS NULL`,
-		topic, before.UTC(), at.UTC())
-	return err
+			topic, before.UTC(), at.UTC())
+		return err
+	})
+}
+
+// inRetention runs fn in a transaction with [AuditRetentionSetting] on, the
+// only state in which the guards let an event go or a seal be marked purged.
+func (st *AuditStore) inRetention(ctx context.Context, fn func(tx *pg.DB) error) error {
+	return st.db.InTx(ctx, func(tx *pg.DB) error {
+		if _, err := tx.Exec(ctx, `SELECT set_config($1, 'on', true)`, AuditRetentionSetting); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
 }
 
 // ScrubClientData clears ip and user_agent on at most batch events of topic

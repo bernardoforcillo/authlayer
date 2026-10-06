@@ -222,7 +222,11 @@ func (s *Service) firstEventDay(ctx context.Context, topic string) (time.Time, e
 // DayStatus per day, topic by topic. A day without a seal is DayUnsealed; a
 // seal that no longer hashes, that no longer links to the previous day's
 // seal, or whose events no longer hash to it is DayMismatch with the failed
-// check in Detail. A purged day is checked for its link only.
+// check in Detail. A purged day is checked for its link and for the age it
+// was purged at: a seal marked purged while PurgedAt - Day was still under
+// the topic's current retention is DayMismatch "purged_early". Shortening a
+// topic's retention is therefore safe; lengthening it makes the days purged
+// under the shorter one read as purged_early, which is worth a review.
 func (s *Service) Verify(ctx context.Context, topics []string, from, to time.Time) ([]DayStatus, error) {
 	if len(topics) == 0 {
 		topics = s.keys
@@ -268,6 +272,11 @@ func (s *Service) checkSeal(ctx context.Context, sl Seal, prev *Seal) (DayState,
 		return DayMismatch, "chain", nil
 	}
 	if sl.PurgedAt != nil {
+		// Retention purges a day only once the whole day is older than the
+		// topic's retention, so an earlier stamp is a delete in disguise.
+		if sl.PurgedAt.Sub(d) < s.retention(sl.Topic) {
+			return DayMismatch, "purged_early", nil
+		}
 		return DayPurged, "", nil
 	}
 	dg, err := s.digestDay(ctx, sl.Topic, d)
