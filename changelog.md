@@ -83,7 +83,8 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `AU004` (insert into a sealed day), `AU005` (a seal that no longer matches its
   day's events, which `Seal` answers by digesting the day again) and `AU006`
   (an insert under an isolation stricter than READ COMMITTED). Event and seal
-  inserts share an advisory lock per (topic, day), so an event in flight while a
+  inserts share an advisory lock per (tables, topic, day) — independent of the
+  session's `DateStyle` — so an event in flight while a
   day is sealed is either covered by the seal or refused. `AuditDDL` returns
   the statements for a migration (PostgreSQL 14+, one transaction);
   `CreateSchema` applies them in one transaction under an advisory lock, and
