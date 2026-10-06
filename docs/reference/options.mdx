@@ -384,9 +384,60 @@ always strict.
   is then honoured until the access token expires — one `WithAccessTTL`.
 </ResponseField>
 
+## `audit`
+
+<ResponseField name="WithTopics(topics ...Topic)" type="Option" default="none — required">
+  The closed set of topics. `Begin` and `Record` refuse any other with
+  `ErrUnknownTopic`. Calls accumulate; a later key replaces an earlier one.
+  `Topic.Retention` and `Topic.ClientDataRetention` set per-topic retention.
+</ResponseField>
+
+<ResponseField name="WithDefaultRetention(d time.Duration)" type="Option" default="365 days">
+  The retention of a topic that declares none. A non-positive value is ignored.
+</ResponseField>
+
+<ResponseField name="WithPolicy(p Policy)" type="Option" default="DefaultPolicy()">
+  The redaction applied to `Request` and to the diff in `Changes`. The `Service`
+  keeps its own copy of `p`'s slices. `Policy{}` redacts nothing.
+</ResponseField>
+
+<ResponseField name="WithRuntime(r core.Runtime)" type="Option" default="time.Now().UTC(), UUIDv7">
+  The clock (every `OccurredAt`, and the day `Seal` stops at) and the id
+  generator. `authlayer.Shared.Audit()` passes the shared one. Against
+  `store/drops` a non-UUID generator needs `WithAuditTextLibraryIDs()`.
+</ResponseField>
+
+<ResponseField name="WithSubjectKeys(ks KeyStore)" type="Option" default="off">
+  Pseudonymize people at write time — see
+  [personal data](/audit/personal-data).
+</ResponseField>
+
+<ResponseField name="WithIPMode(m IPMode) · WithIPTruncation(v4, v6 int) · WithIPHashKey(key []byte) · WithoutUserAgent()" type="Option" default="IPKeep, /24 and /48, no key, keep">
+  Minimize the client data stored with each event.
+</ResponseField>
+
+## `audit/audithook`
+
+<ResponseField name="WithTopic(route func(action string) string)" type="Option" default="access, auth, apikey or oauth">
+  The topic of each standalone event, by action (`"scope.member_role_changed"`);
+  an empty result keeps the adapter's default.
+</ResponseField>
+
+<ResponseField name="WithOrigin(origin string)" type="Option" default="authlayer">
+  `Event.Origin` of every event.
+</ResponseField>
+
+<ResponseField name="WithSkipActions(actions ...string)" type="Option" default="none">
+  Drop an action, or `"action:outcome"`, before it annotates or records.
+</ResponseField>
+
+<ResponseField name="WithBestEffort(onErr func(ctx, err))" type="Option" default="off — a failed write is returned">
+  Make a failed audit write non-fatal; `onErr` receives it.
+</ResponseField>
+
 ## `store/drops`
 
-Six separate option types, one per store, because the six stores are
+Seven separate option types, one per store, because the seven stores are
 independent.
 
 | Option | Type | Effect |
@@ -407,6 +458,8 @@ independent.
 | `WithAuthTextLibraryIDs()` | `AuthOption` | Retype **all five** auth id columns together |
 | `WithIdentityNames(IdentityNames{...})` | `IdentityOption` | Rename `identities` |
 | `WithIdentityTextLibraryIDs()` | `IdentityOption` | Retype **both** identity id columns together |
+| `WithAuditNames(AuditNames{...})` | `AuditOption` | Rename `audit_events`, `audit_seals` and `audit_subject_keys` |
+| `WithAuditTextLibraryIDs()` | `AuditOption` | Retype the event `id` as text; without it only lowercase UUIDs are accepted |
 
 <Warning>
 The library-ids and user-ids options answer **independent** questions and do not

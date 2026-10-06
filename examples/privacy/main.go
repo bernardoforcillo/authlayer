@@ -98,7 +98,7 @@ func main() {
 
 	// -- 3. What the log really holds ---------------------------------------
 	step("what is stored in the audit log")
-	stored, _, err := auditSvc.List(ctx, audit.Filter{ActorID: uid, ActionPrefix: "session."}, audit.Page{Limit: 1})
+	stored, _, err := auditSvc.List(ctx, audit.Filter{ActorID: uid, ActionPrefix: "auth.logged_in"}, audit.Page{Limit: 1})
 	must(err)
 	e := stored[0]
 	fmt.Printf("  actor=%.8s… (a pseudonym, not %q) ip=%q display=%q\n", e.Actor.ID, uid[:8], e.IP, e.Actor.Display)

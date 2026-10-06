@@ -43,11 +43,19 @@ func PendingFrom(ctx context.Context) (*Pending, bool) {
 type Annotation func(*Pending)
 
 // WithResource names the resource the action touched. The first annotation
-// wins: the action's own target, not a side effect's.
+// wins, field by field: the action's own target, not a side effect's. A
+// later annotation can still fill an ID left empty, when its type is the
+// same (or the type is still empty).
 func WithResource(typ, id string) Annotation {
 	return func(p *Pending) {
-		if p.resource == (Resource{}) {
-			p.resource = Resource{Type: typ, ID: id}
+		if p.resource.Type != "" && typ != "" && typ != p.resource.Type {
+			return
+		}
+		if p.resource.Type == "" {
+			p.resource.Type = typ
+		}
+		if p.resource.ID == "" {
+			p.resource.ID = id
 		}
 	}
 }

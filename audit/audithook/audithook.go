@@ -3,30 +3,64 @@
 // ready for that package's WithHooks:
 //
 //	rec := audit.New(store, audit.WithTopics(audithook.Topics()...))
-//	authSvc := auth.New(authStore, signer, auth.WithHooks(audithook.Auth(rec)))
+//	authSvc := auth.New(authStore, auth.WithJWT(keys, ttl), auth.WithHooks(audithook.Auth(rec)))
 //	orgSvc := org.New(access, orgStore, org.WithHooks(audithook.Scope(rec)))
 //
-// # What gets recorded
+// # Annotating or recording
 //
-// Hooks fire after the mutation they describe, so every event is stored with
-// [audit.Recorder.Record], already over: a refusal ([auth.LoginFailed], a
-// rejected key or token, a detected token replay) is [audit.OutcomeDenied]
-// and everything else [audit.OutcomeOK]. The closed [Detail] vocabulary of
-// the source event becomes [audit.Event.Reason]; nothing else is copied — no
-// email address, no token, no secret — because the source events carry none.
+// When an event is pending on the context — an interceptor called
+// [audit.Recorder.Begin] and put an [audit.Pending] there with
+// [audit.WithPending] — the adapter adds what the hook knows to that event
+// with [audit.Annotate]: the resource (the target user, the role, the key…),
+// the container, the Detail as the reason, and a role key as Changes
+// ({"role_key": …}). It records nothing of its own, and the interceptor
+// completes the event with the call's real outcome.
 //
-// Actions are "<noun>.<verb>" and stable: "session.login", "member.add",
-// "key.authenticate", "token.issue". A user's own events (their sign-in,
-// their removal from a container) name that user as the resource so the whole
-// trail is reachable with [audit.Filter.Member].
+// Otherwise it records a standalone event with [audit.Recorder.Record],
+// already over: hooks fire after the mutation they describe. A refusal
+// ([auth.LoginFailed], a rejected key or token, a detected token replay) is
+// [audit.OutcomeDenied] and everything else [audit.OutcomeOK].
+//
+// Actions are "<package>.<kind in snake case>" and stable:
+// "auth.logged_in", "auth.login_failed", "scope.member_role_changed",
+// "apikey.key_authenticated", "oauth.token_issued". The default topics are
+// [TopicAccess] for scope, org and team, and [TopicAuth], [TopicAPIKey] and
+// [TopicOAuth]; [WithTopic] routes per action.
+//
+// # Who and what
+//
+// A session event (a sign-in, a refresh, a sign-out) names the session as
+// its resource and the user as its actor; an account event (a password
+// change, a deletion) names the user as both. A failed sign-in, a second
+// factor challenge and a replayed refresh token are anonymous — whoever made
+// the attempt is not authenticated as the account — and name the account as
+// their resource, so [audit.Filter.Member] still finds them. Membership
+// events name the member as a resource of type [audit.ResourceUser] even
+// when the member is a service account, so one Member filter covers both. A
+// dynamically registered OAuth client is the resource of its registration,
+// with an anonymous actor.
+//
+// What is copied: ids, the closed Detail vocabulary as the Reason, the role
+// key, and from auth the caller's IP address, user agent and session id. No
+// email address, no token, no secret — the source events carry none.
 //
 // # Failure policy
 //
-// A hook error aborts the call it observes, with the change already in
-// place. By default a failed audit write is returned, so an unrecorded action
-// is loud. [WithBestEffort] swallows it into a callback instead, the right
-// choice for a high-volume event whose loss is acceptable. [WithSkipActions]
-// drops events you do not want at all, such as "key.authenticate".
+// A hook error aborts the call it observes. By default a failed audit write
+// is returned, so an unrecorded action is loud. [WithBestEffort] swallows it
+// into a callback instead, the right choice for a high-volume event whose
+// loss is acceptable. [WithSkipActions] drops events you do not want at all,
+// such as "apikey.key_authenticated".
+//
+// The change the hook observed is already in place when the hook runs, with
+// one exception: scope's CreateContainer (and so org.CreateOrganization)
+// runs its hooks inside its transaction and rolls back when a hook fails.
+// That is why a standalone "scope.container_created" can outlive its
+// organization: it is written by the audit Service outside that transaction,
+// so if a hook registered after this one fails, or the commit itself does,
+// the creation is rolled back and the event stays. Register the audit hook
+// last, and record inside a pending event when you need the outcome to be the
+// call's own: an annotation ends with whatever the interceptor observed.
 package audithook
 
 import (
@@ -45,8 +79,8 @@ import (
 // The default topic of each adapter. Declare them on the audit.Service with
 // [Topics] (or your own audit.WithTopics) before using an adapter.
 const (
+	TopicAccess = "access" // scope, org and team
 	TopicAuth   = "auth"
-	TopicScope  = "scope"
 	TopicAPIKey = "apikey"
 	TopicOAuth  = "oauth"
 )
@@ -70,11 +104,12 @@ const (
 // Topics returns the four default topics with the Service's default
 // retention, for audit.WithTopics.
 func Topics() []audit.Topic {
-	return []audit.Topic{{Key: TopicAuth}, {Key: TopicScope}, {Key: TopicAPIKey}, {Key: TopicOAuth}}
+	return []audit.Topic{{Key: TopicAccess}, {Key: TopicAuth}, {Key: TopicAPIKey}, {Key: TopicOAuth}}
 }
 
 type config struct {
 	topic  string
+	route  func(action string) string
 	origin string
 	skip   []string
 	onErr  func(context.Context, error)
@@ -84,13 +119,11 @@ type config struct {
 // Option customizes an adapter.
 type Option func(*config)
 
-// WithTopic records the adapter's events under topic instead of its default.
-func WithTopic(topic string) Option {
-	return func(c *config) {
-		if topic != "" {
-			c.topic = topic
-		}
-	}
+// WithTopic routes each standalone event to the topic route returns for its
+// action ("scope.member_role_changed"); an empty result keeps the adapter's
+// default topic. Every topic it can return must be declared on the Service.
+func WithTopic(route func(action string) string) Option {
+	return func(c *config) { c.route = route }
 }
 
 // WithOrigin names the reporting service, [DefaultOrigin] otherwise.
@@ -103,8 +136,9 @@ func WithOrigin(origin string) Option {
 }
 
 // WithSkipActions drops events whose action, or "action:outcome", is listed:
-// "key.authenticate" drops every API-key authentication, while
-// "key.authenticate:ok" drops only the successful ones.
+// "apikey.key_authenticated" drops every successful API-key authentication,
+// "auth.logged_in:ok" every successful sign-in. A skipped event neither
+// annotates nor records.
 func WithSkipActions(actions ...string) Option {
 	return func(c *config) { c.skip = append(c.skip, actions...) }
 }
@@ -128,13 +162,43 @@ func newConfig(topic string, opts []Option) config {
 	return c
 }
 
-// record stores one finished event, applying the skip list and the failure
-// policy.
-func (c config) record(ctx context.Context, rec audit.Recorder, e audit.Event) error {
+// emit annotates the pending event on ctx with e's resource, container and
+// reason and roleKey as Changes, or, with none pending, records e. It
+// applies the skip list first and the failure policy last.
+func (c config) emit(ctx context.Context, rec audit.Recorder, e audit.Event, roleKey string) error {
 	if slices.Contains(c.skip, e.Action) || slices.Contains(c.skip, e.Action+":"+string(e.Outcome)) {
 		return nil
 	}
+	var after json.RawMessage
+	if roleKey != "" {
+		after, _ = json.Marshal(map[string]string{"role_key": roleKey})
+	}
+	if _, ok := audit.PendingFrom(ctx); ok {
+		var anns []audit.Annotation
+		if e.Resource != (audit.Resource{}) {
+			anns = append(anns, audit.WithResource(e.Resource.Type, e.Resource.ID))
+		}
+		if e.ContainerID != "" {
+			anns = append(anns, audit.WithContainer(e.ContainerID))
+		}
+		if e.Reason != "" {
+			anns = append(anns, audit.WithReason(e.Reason))
+		}
+		if after != nil {
+			anns = append(anns, audit.WithChanges(nil, after))
+		}
+		audit.Annotate(ctx, anns...)
+		return nil
+	}
+	if after != nil {
+		e.Changes = audit.Diff(nil, after)
+	}
 	e.Topic, e.Origin = c.topic, c.origin
+	if c.route != nil {
+		if t := c.route(e.Action); t != "" {
+			e.Topic = t
+		}
+	}
 	if _, err := rec.Record(ctx, e); err != nil {
 		if c.hasErr {
 			if c.onErr != nil {
@@ -174,104 +238,115 @@ func subjectActor(id string) audit.Actor {
 	return audit.Actor{Type: audit.ActorSubject, ID: id}
 }
 
-// ── scope / org / team ──────────────────────────────────────────────────────
-
+// action is one kind of a package's events: its name in snake case, whether
+// it is a refusal, and the type of resource it names.
 type action struct {
-	name     string
+	kind     string
 	denied   bool
-	resource string // resource type; the id comes from the adapter
+	resource string
 }
 
+func (a action) name(pkg string) string { return pkg + "." + a.kind }
+
+// lookup finds kind's row; an unknown kind (one added upstream after this
+// table) is "kind_<n>", so it is still recorded.
+func lookup[K ~int](table map[K]action, kind K) action {
+	if a, ok := table[kind]; ok {
+		return a
+	}
+	return action{kind: fmt.Sprintf("kind_%d", kind)}
+}
+
+// ── scope / org / team ──────────────────────────────────────────────────────
+
 var scopeActions = map[scope.EventKind]action{
-	scope.ContainerCreated:     {name: "container.create", resource: ResourceContainer},
-	scope.MemberAdded:          {name: "member.add", resource: audit.ResourceUser},
-	scope.MemberRoleChanged:    {name: "member.role_change", resource: audit.ResourceUser},
-	scope.MemberRemoved:        {name: "member.remove", resource: audit.ResourceUser},
-	scope.RoleCreated:          {name: "role.create", resource: ResourceRole},
-	scope.RoleUpdated:          {name: "role.update", resource: ResourceRole},
-	scope.RoleDeleted:          {name: "role.delete", resource: ResourceRole},
-	scope.OwnershipTransferred: {name: "ownership.transfer", resource: audit.ResourceUser},
+	scope.ContainerCreated:     {kind: "container_created", resource: ResourceContainer},
+	scope.MemberAdded:          {kind: "member_added", resource: audit.ResourceUser},
+	scope.MemberRoleChanged:    {kind: "member_role_changed", resource: audit.ResourceUser},
+	scope.MemberRemoved:        {kind: "member_removed", resource: audit.ResourceUser},
+	scope.RoleCreated:          {kind: "role_created", resource: ResourceRole},
+	scope.RoleUpdated:          {kind: "role_updated", resource: ResourceRole},
+	scope.RoleDeleted:          {kind: "role_deleted", resource: ResourceRole},
+	scope.OwnershipTransferred: {kind: "ownership_transferred", resource: audit.ResourceUser},
 }
 
 // Scope adapts the hooks of scope, and so of org and team, which alias them.
-// Member and ownership events name the affected subject as a user resource;
-// role events name the role key; container creation names the container.
+// Member and ownership events name the affected subject — a user or a
+// service account — as a resource of type audit.ResourceUser, with the role
+// key as Changes; role events name the role key; container creation names
+// the container.
 func Scope(rec audit.Recorder, opts ...Option) scope.Hook {
-	c := newConfig(TopicScope, opts)
+	c := newConfig(TopicAccess, opts)
 	return scope.HookFunc(func(ctx context.Context, ev scope.Event) error {
-		a, ok := scopeActions[ev.Kind]
-		if !ok {
-			a = action{name: fmt.Sprintf("event.kind_%d", ev.Kind)}
-		}
+		a := lookup(scopeActions, ev.Kind)
 		e := audit.Event{
-			Action: a.name, Outcome: audit.OutcomeOK, Actor: subjectActor(ev.ActorID), ContainerID: ev.ContainerID,
+			Action: a.name("scope"), Outcome: audit.OutcomeOK, Actor: subjectActor(ev.ActorID), ContainerID: ev.ContainerID,
 		}
+		roleKey := ev.RoleKey
 		switch a.resource {
 		case ResourceContainer:
 			e.Resource = audit.Resource{Type: ResourceContainer, ID: ev.ContainerID}
 		case ResourceRole:
-			e.Resource = audit.Resource{Type: ResourceRole, ID: ev.RoleKey}
+			e.Resource, roleKey = audit.Resource{Type: ResourceRole, ID: ev.RoleKey}, ""
 		case audit.ResourceUser:
 			e.Resource = audit.Resource{Type: audit.ResourceUser, ID: ev.TargetID}
 		}
-		kv := map[string]any{}
-		if ev.RoleKey != "" && a.resource != ResourceRole {
-			kv["role"] = ev.RoleKey
-		}
 		if ev.Anonymized {
-			kv["anonymized"] = true
+			e.Request = request(map[string]any{"anonymized": true})
 		}
-		e.Request = request(kv)
-		return c.record(ctx, rec, e)
+		return c.emit(ctx, rec, e, roleKey)
 	})
 }
 
 // ── auth ────────────────────────────────────────────────────────────────────
 
 var authActions = map[auth.EventKind]action{
-	auth.SignedUp:             {name: "user.signup", resource: audit.ResourceUser},
-	auth.EmailVerified:        {name: "email.verify", resource: audit.ResourceUser},
-	auth.LoggedIn:             {name: "session.login", resource: ResourceSession},
-	auth.LoginFailed:          {name: "session.login", denied: true, resource: ResourceSession},
-	auth.MFAChallenged:        {name: "mfa.challenge", resource: ResourceSession},
-	auth.SessionRefreshed:     {name: "session.refresh", resource: ResourceSession},
-	auth.TokenReuseDetected:   {name: "session.reuse", denied: true, resource: ResourceSession},
-	auth.LoggedOut:            {name: "session.logout", resource: ResourceSession},
-	auth.LoggedOutAll:         {name: "session.logout_all", resource: audit.ResourceUser},
-	auth.SessionRevoked:       {name: "session.revoke", resource: ResourceSession},
-	auth.PasswordChanged:      {name: "password.change", resource: audit.ResourceUser},
-	auth.PasswordReset:        {name: "password.reset", resource: audit.ResourceUser},
-	auth.EmailChanged:         {name: "email.change", resource: audit.ResourceUser},
-	auth.MagicLinkRedeemed:    {name: "magiclink.redeem", resource: ResourceSession},
-	auth.IdentityLinked:       {name: "identity.link", resource: audit.ResourceUser},
-	auth.IdentityUnlinked:     {name: "identity.unlink", resource: audit.ResourceUser},
-	auth.MFAEnrolled:          {name: "mfa.enroll", resource: audit.ResourceUser},
-	auth.MFADisabled:          {name: "mfa.disable", resource: audit.ResourceUser},
-	auth.PasskeyRegistered:    {name: "passkey.register", resource: audit.ResourceUser},
-	auth.PasskeyDeleted:       {name: "passkey.delete", resource: audit.ResourceUser},
-	auth.DeviceTrusted:        {name: "device.trust", resource: audit.ResourceUser},
-	auth.TrustedDeviceRevoked: {name: "device.revoke", resource: audit.ResourceUser},
-	auth.AccountDeleted:       {name: "account.delete", resource: audit.ResourceUser},
-	auth.AccountAnonymized:    {name: "account.anonymize", resource: audit.ResourceUser},
+	auth.SignedUp:             {kind: "signed_up", resource: audit.ResourceUser},
+	auth.EmailVerified:        {kind: "email_verified", resource: audit.ResourceUser},
+	auth.LoggedIn:             {kind: "logged_in", resource: ResourceSession},
+	auth.LoginFailed:          {kind: "login_failed", denied: true, resource: audit.ResourceUser},
+	auth.MFAChallenged:        {kind: "mfa_challenged", resource: audit.ResourceUser},
+	auth.SessionRefreshed:     {kind: "session_refreshed", resource: ResourceSession},
+	auth.TokenReuseDetected:   {kind: "token_reuse_detected", denied: true, resource: audit.ResourceUser},
+	auth.LoggedOut:            {kind: "logged_out", resource: ResourceSession},
+	auth.LoggedOutAll:         {kind: "logged_out_all", resource: audit.ResourceUser},
+	auth.SessionRevoked:       {kind: "session_revoked", resource: ResourceSession},
+	auth.PasswordChanged:      {kind: "password_changed", resource: audit.ResourceUser},
+	auth.PasswordReset:        {kind: "password_reset", resource: audit.ResourceUser},
+	auth.EmailChanged:         {kind: "email_changed", resource: audit.ResourceUser},
+	auth.MagicLinkRedeemed:    {kind: "magic_link_redeemed", resource: audit.ResourceUser},
+	auth.IdentityLinked:       {kind: "identity_linked", resource: audit.ResourceUser},
+	auth.IdentityUnlinked:     {kind: "identity_unlinked", resource: audit.ResourceUser},
+	auth.MFAEnrolled:          {kind: "mfa_enrolled", resource: audit.ResourceUser},
+	auth.MFADisabled:          {kind: "mfa_disabled", resource: audit.ResourceUser},
+	auth.PasskeyRegistered:    {kind: "passkey_registered", resource: audit.ResourceUser},
+	auth.PasskeyDeleted:       {kind: "passkey_deleted", resource: audit.ResourceUser},
+	auth.DeviceTrusted:        {kind: "device_trusted", resource: audit.ResourceUser},
+	auth.TrustedDeviceRevoked: {kind: "trusted_device_revoked", resource: audit.ResourceUser},
+	auth.AccountDeleted:       {kind: "account_deleted", resource: audit.ResourceUser},
+	auth.AccountAnonymized:    {kind: "account_anonymized", resource: audit.ResourceUser},
 }
 
+// anonymousAuth are the kinds whose caller is not authenticated as the
+// account they concern: a refused sign-in, a sign-in stopped at its second
+// factor, a replayed refresh token.
+var anonymousAuth = []auth.EventKind{auth.LoginFailed, auth.MFAChallenged, auth.TokenReuseDetected}
+
 // Auth adapts auth's hooks. The account is the actor, as a user, and the
-// session (when there is one) goes on audit.Event.SessionID; a login with no
-// account to name, such as an unknown address, is an anonymous actor. The
-// source's Detail becomes the Reason.
+// session (when there is one) goes on audit.Event.SessionID; a failed
+// sign-in, a challenged one and a token replay are anonymous with the account
+// as their resource. The source's Detail becomes the Reason, and IP and user
+// agent are copied.
 func Auth(rec audit.Recorder, opts ...Option) auth.Hook {
 	c := newConfig(TopicAuth, opts)
 	return auth.HookFunc(func(ctx context.Context, ev auth.Event) error {
-		a, ok := authActions[ev.Kind]
-		if !ok {
-			a = action{name: fmt.Sprintf("event.kind_%d", ev.Kind)}
-		}
+		a := lookup(authActions, ev.Kind)
 		actor := audit.Actor{Type: audit.ActorAnonymous}
-		if ev.UserID != "" {
+		if ev.UserID != "" && !slices.Contains(anonymousAuth, ev.Kind) {
 			actor = audit.Actor{Type: audit.ActorUser, ID: ev.UserID}
 		}
 		e := audit.Event{
-			Action: a.name, Outcome: outcome(a.denied), Actor: actor, SessionID: ev.SessionID,
+			Action: a.name("auth"), Outcome: outcome(a.denied), Actor: actor, SessionID: ev.SessionID,
 			Reason: ev.Detail, IP: ev.IP, UserAgent: ev.UserAgent,
 		}
 		switch {
@@ -280,34 +355,31 @@ func Auth(rec audit.Recorder, opts ...Option) auth.Hook {
 		case ev.UserID != "":
 			e.Resource = audit.Resource{Type: audit.ResourceUser, ID: ev.UserID}
 		}
-		return c.record(ctx, rec, e)
+		return c.emit(ctx, rec, e, "")
 	})
 }
 
 // ── apikey ──────────────────────────────────────────────────────────────────
 
 var apikeyActions = map[apikey.EventKind]action{
-	apikey.ServiceAccountCreated:     {name: "service_account.create", resource: ResourceServiceAccount},
-	apikey.ServiceAccountDisabled:    {name: "service_account.disable", resource: ResourceServiceAccount},
-	apikey.ServiceAccountEnabled:     {name: "service_account.enable", resource: ResourceServiceAccount},
-	apikey.ServiceAccountRoleChanged: {name: "service_account.role_change", resource: ResourceServiceAccount},
-	apikey.ServiceAccountDeleted:     {name: "service_account.delete", resource: ResourceServiceAccount},
-	apikey.KeyCreated:                {name: "key.create", resource: ResourceKey},
-	apikey.KeyRevoked:                {name: "key.revoke", resource: ResourceKey},
-	apikey.KeyAuthenticated:          {name: "key.authenticate", resource: ResourceKey},
-	apikey.KeyAuthenticationFailed:   {name: "key.authenticate", denied: true, resource: ResourceKey},
+	apikey.ServiceAccountCreated:     {kind: "service_account_created", resource: ResourceServiceAccount},
+	apikey.ServiceAccountDisabled:    {kind: "service_account_disabled", resource: ResourceServiceAccount},
+	apikey.ServiceAccountEnabled:     {kind: "service_account_enabled", resource: ResourceServiceAccount},
+	apikey.ServiceAccountRoleChanged: {kind: "service_account_role_changed", resource: ResourceServiceAccount},
+	apikey.ServiceAccountDeleted:     {kind: "service_account_deleted", resource: ResourceServiceAccount},
+	apikey.KeyCreated:                {kind: "key_created", resource: ResourceKey},
+	apikey.KeyRevoked:                {kind: "key_revoked", resource: ResourceKey},
+	apikey.KeyAuthenticated:          {kind: "key_authenticated", resource: ResourceKey},
+	apikey.KeyAuthenticationFailed:   {kind: "key_authentication_failed", denied: true, resource: ResourceKey},
 }
 
 // APIKey adapts apikey's hooks. A key authenticating is the service account
 // acting as itself; a refused authentication has no actor; management calls
-// are acted by the subject on the context.
+// are acted by the subject on the context. A role key goes to Changes.
 func APIKey(rec audit.Recorder, opts ...Option) apikey.Hook {
 	c := newConfig(TopicAPIKey, opts)
 	return apikey.HookFunc(func(ctx context.Context, ev apikey.Event) error {
-		a, ok := apikeyActions[ev.Kind]
-		if !ok {
-			a = action{name: fmt.Sprintf("event.kind_%d", ev.Kind)}
-		}
+		a := lookup(apikeyActions, ev.Kind)
 		var actor audit.Actor
 		switch {
 		case ev.Kind == apikey.KeyAuthenticated && ev.ActorID != "":
@@ -318,7 +390,7 @@ func APIKey(rec audit.Recorder, opts ...Option) apikey.Hook {
 			actor = subjectActor(ev.ActorID)
 		}
 		e := audit.Event{
-			Action: a.name, Outcome: outcome(a.denied), Actor: actor, ContainerID: ev.ContainerID, Reason: ev.Detail,
+			Action: a.name("apikey"), Outcome: outcome(a.denied), Actor: actor, ContainerID: ev.ContainerID, Reason: ev.Detail,
 		}
 		switch {
 		case a.resource == ResourceKey && ev.KeyID != "":
@@ -326,54 +398,50 @@ func APIKey(rec audit.Recorder, opts ...Option) apikey.Hook {
 		case ev.ServiceAccountID != "":
 			e.Resource = audit.Resource{Type: ResourceServiceAccount, ID: ev.ServiceAccountID}
 		}
-		if ev.RoleKey != "" {
-			e.Request = request(map[string]any{"role": ev.RoleKey})
-		}
-		return c.record(ctx, rec, e)
+		return c.emit(ctx, rec, e, ev.RoleKey)
 	})
 }
 
 // ── oauth ───────────────────────────────────────────────────────────────────
 
 var oauthActions = map[oauth.EventKind]action{
-	oauth.ClientCreated:        {name: "client.create", resource: ResourceClient},
-	oauth.ClientRegistered:     {name: "client.register", resource: ResourceClient},
-	oauth.ClientDisabled:       {name: "client.disable", resource: ResourceClient},
-	oauth.ClientEnabled:        {name: "client.enable", resource: ResourceClient},
-	oauth.ClientDeleted:        {name: "client.delete", resource: ResourceClient},
-	oauth.GrantCreated:         {name: "grant.create", resource: ResourceGrant},
-	oauth.GrantRevoked:         {name: "grant.revoke", resource: ResourceGrant},
-	oauth.TokenIssued:          {name: "token.issue", resource: ResourceGrant},
-	oauth.TokenRefreshed:       {name: "token.refresh", resource: ResourceGrant},
-	oauth.TokenReuseDetected:   {name: "token.reuse", denied: true, resource: ResourceGrant},
-	oauth.DeviceApproved:       {name: "device.approve", resource: ResourceGrant},
-	oauth.DeviceDenied:         {name: "device.deny", resource: ResourceGrant},
-	oauth.TokenAuthenticated:   {name: "token.authenticate", resource: ResourceGrant},
-	oauth.AuthenticationFailed: {name: "token.authenticate", denied: true, resource: ResourceGrant},
+	oauth.ClientCreated:        {kind: "client_created", resource: ResourceClient},
+	oauth.ClientRegistered:     {kind: "client_registered", resource: ResourceClient},
+	oauth.ClientDisabled:       {kind: "client_disabled", resource: ResourceClient},
+	oauth.ClientEnabled:        {kind: "client_enabled", resource: ResourceClient},
+	oauth.ClientDeleted:        {kind: "client_deleted", resource: ResourceClient},
+	oauth.GrantCreated:         {kind: "grant_created", resource: ResourceGrant},
+	oauth.GrantRevoked:         {kind: "grant_revoked", resource: ResourceGrant},
+	oauth.TokenIssued:          {kind: "token_issued", resource: ResourceGrant},
+	oauth.TokenRefreshed:       {kind: "token_refreshed", resource: ResourceGrant},
+	oauth.TokenReuseDetected:   {kind: "token_reuse_detected", denied: true, resource: ResourceGrant},
+	oauth.DeviceApproved:       {kind: "device_approved", resource: ResourceGrant},
+	oauth.DeviceDenied:         {kind: "device_denied", resource: ResourceGrant},
+	oauth.TokenAuthenticated:   {kind: "token_authenticated", resource: ResourceGrant},
+	oauth.AuthenticationFailed: {kind: "authentication_failed", denied: true, resource: ResourceGrant},
 }
 
 // OAuth adapts oauth's hooks. Grant-bound events name the grant (the client
 // when there is none); with no subject, an event is attributed to the client
-// when one is known and is anonymous otherwise. Detail — the grant type, the
-// refusal reason, the revocation path — becomes the Reason.
+// when one is known and is anonymous otherwise, except a dynamic
+// registration, whose new client is its resource and never its own actor.
+// Detail — the grant type, the refusal reason, the revocation path — becomes
+// the Reason.
 func OAuth(rec audit.Recorder, opts ...Option) oauth.Hook {
 	c := newConfig(TopicOAuth, opts)
 	return oauth.HookFunc(func(ctx context.Context, ev oauth.Event) error {
-		a, ok := oauthActions[ev.Kind]
-		if !ok {
-			a = action{name: fmt.Sprintf("event.kind_%d", ev.Kind)}
-		}
+		a := lookup(oauthActions, ev.Kind)
 		var actor audit.Actor
 		switch {
 		case ev.ActorID != "":
 			actor = audit.Actor{Type: audit.ActorSubject, ID: ev.ActorID}
-		case ev.ClientID != "" && !a.denied:
+		case ev.ClientID != "" && !a.denied && ev.Kind != oauth.ClientRegistered:
 			actor = audit.Actor{Type: ActorOAuthClient, ID: ev.ClientID}
 		default:
 			actor = audit.Actor{Type: audit.ActorAnonymous}
 		}
 		e := audit.Event{
-			Action: a.name, Outcome: outcome(a.denied), Actor: actor, ContainerID: ev.ContainerID, Reason: ev.Detail,
+			Action: a.name("oauth"), Outcome: outcome(a.denied), Actor: actor, ContainerID: ev.ContainerID, Reason: ev.Detail,
 		}
 		switch {
 		case a.resource == ResourceGrant && ev.GrantID != "":
@@ -384,6 +452,6 @@ func OAuth(rec audit.Recorder, opts ...Option) oauth.Hook {
 		if ev.ClientID != "" && e.Resource.Type == ResourceGrant {
 			e.Request = request(map[string]any{"client_id": ev.ClientID})
 		}
-		return c.record(ctx, rec, e)
+		return c.emit(ctx, rec, e, "")
 	})
 }

@@ -46,7 +46,7 @@ RBAC engine pulls in `drops`, and `pgx/v5` comes with the PostgreSQL store.
   [Service accounts & API keys](#service-accounts--api-keys) ·
   [Agents & machine clients](#agents--machine-clients) ·
   [Authentication](#authentication) · [Magic links](#magic-links) · [OAuth](#oauth) ·
-  [Account deletion](#account-deletion) · [Errors](#errors) ·
+  [Account deletion](#account-deletion) · [Audit](#audit) · [Errors](#errors) ·
   [Packages](#packages)
 
 ## The model
@@ -409,10 +409,13 @@ trails, webhooks, cache invalidation, or a transactional outbox.
 ```go
 svc := org.New(ac, store, org.WithHooks(scope.HookFunc(
     func(ctx context.Context, e scope.Event) error {
-        return audit.Write(ctx, e.Kind, e.ContainerID, e.ActorID, e.TargetID)
+        return outbox.Write(ctx, e.Kind, e.ContainerID, e.ActorID, e.TargetID) // your own sink
     },
 )))
 ```
+
+For an audit trail, [`audit/audithook`](#audit) already adapts these hooks:
+`org.WithHooks(audithook.Scope(auditSvc))`.
 
 | Kind | Emitted by | `TargetID` / `RoleKey` |
 |---|---|---|
@@ -3252,6 +3255,44 @@ single hole in "nobody may authenticate as this account", it is bounded, and
 the per-request `sid`-claim lookup that closes it is
 [described above](#what-revocable-actually-means).
 
+## Audit
+
+`audit` is a tamper-evident audit log: one immutable event per action — who
+(`Actor`, `OnBehalfOf`), what (`Topic`, `Action`, `Resource`), where
+(`ContainerID`), with which input (`Request`, redacted) and how it ended
+(`Outcome`, and `Changes`, a redacted before→after diff). The full guide is
+[docs/audit](docs/audit/overview.mdx); [`examples/audit`](examples/audit/main.go)
+walks it end to end — `go run ./examples/audit`.
+
+```go
+svc := audit.New(store, sh.Audit(), audit.WithTopics(audit.Topic{Key: "menus"}))
+
+open, err := svc.Begin(ctx, audit.Event{Topic: "menus", Action: "menu.update",
+    Origin: "backend", Actor: audit.Actor{Type: audit.ActorUser, ID: userID}})
+if err != nil {
+    return err // an action that cannot be recorded does not run
+}
+// ... the action; code inside it calls audit.Annotate(ctx, audit.WithResource("menu", id)) ...
+err = svc.Complete(ctx, open.ID, audit.Completion{Outcome: audit.OutcomeOK, Before: before, After: after})
+```
+
+- **Two phases.** `Begin` stores the event before the action, `Complete`
+  writes its outcome once; `Reconcile` closes what a crashed process left open
+  as `unknown`. `Record` stores an event that is already over.
+- **Integrity.** `Seal` chains every (topic, UTC day) into a SHA-256 hash
+  chain, empty days included; `Verify` recomputes it and names what changed
+  (`events_hash`, `seal_hash`, `chain`, `purged_early`). `ApplyRetention`
+  purges per topic, sealed days only.
+- **Storage.** `store/memory` holds the reference store; `store/drops` the
+  PostgreSQL one, whose triggers refuse every rewrite and every delete outside
+  retention (SQLSTATE `AU001`–`AU006`). `audit/audittest` is the port's
+  contract suite.
+- **Hooks.** `audit/audithook` turns the hooks of `auth`, `scope`/`org`/`team`,
+  `apikey` and `oauth` into events: `auth.WithHooks(audithook.Auth(svc))`.
+- **Personal data.** `WithSubjectKeys` pseudonymizes people so `Forget` can
+  erase one from an immutable log; `WithIPMode` and
+  `Topic.ClientDataRetention` minimize client data.
+
 ## Errors
 
 Compare with `errors.Is`, never by string. `org` re-exports these as *aliases*,
@@ -3464,8 +3505,11 @@ rules and `Verify` returns a bool, so there is nothing to compare with
 | [`auth/authtest`](auth/authtest/) | `auth.Store`'s contract as an executable suite — [write your own backend](#writing-your-own-authstore) and run it. Test-only; imports `testing`. |
 | [`token`](token/) | Opaque bearer tokens (32 random bytes, sha256 stored) and a hand-rolled JWT behind one `Signer` interface with [one algorithm per constructor](#the-jwt-and-why-hand-rolling-it-is-defensible): `HS256` over a shared secret, `EdDSA` with a published JWKS for verifiers that are not the issuer. Standard library only. |
 | [`password`](password/) | The `Hasher` port with a bcrypt default, plus `Rules`/`Validate` for a strength policy. The only package that pulls in `golang.org/x/crypto`. |
-| [`store/memory`](store/memory/) | In-memory `scope.Store`, `invite.Store`, `apikey.Store`, `oauth.Store`, `auth.Store` and `auth.IdentityStore` for dev, tests, and examples. |
-| [`store/drops`](store/drops/) | PostgreSQL stores built on drops — RBAC (composite-key membership), invitations, service accounts and keys, the five OAuth tables, the three auth tables, and the [`identities`](#the-identities-table) table. |
+| [`audit`](audit/) | The [audit log](#audit) — `Service`, the `Store` port, two-phase recording, redaction, the daily hash chain (`Seal`, `Verify`), retention and pseudonyms. |
+| [`audit/audithook`](audit/audithook/) | Adapters from the hooks of `auth`, `scope` (so `org` and `team`), `apikey` and `oauth` to audit events. |
+| [`audit/audittest`](audit/audittest/) | `audit.Store`'s and `audit.KeyStore`'s contracts as executable suites. Test-only; imports `testing`. |
+| [`store/memory`](store/memory/) | In-memory `scope.Store`, `invite.Store`, `apikey.Store`, `oauth.Store`, `auth.Store`, `auth.IdentityStore`, `audit.Store` and `audit.KeyStore` for dev, tests, and examples. |
+| [`store/drops`](store/drops/) | PostgreSQL stores built on drops — RBAC (composite-key membership), invitations, service accounts and keys, the five OAuth tables, the three auth tables, the [`identities`](#the-identities-table) table, and the audit tables with their guard triggers. |
 | [`examples/basic`](examples/basic/) | Runnable, database-free tour of the RBAC half. |
 | [`examples/auth`](examples/auth/) | Runnable, database-free tour of `auth` + `org` + `invite` wired together. |
 | [`examples/reset`](examples/reset/) | Runnable, database-free tour of [the password lifecycle](#the-password-lifecycle) — `RequestPasswordReset`, `ResetPassword`, `RequestEmailChange`. |
@@ -3473,6 +3517,7 @@ rules and `Verify` returns a bool, so there is nothing to compare with
 | [`examples/hooks`](examples/hooks/) | Runnable, database-free tour of [lifecycle hooks](#hooks) and an [EdDSA signer](#the-jwt-and-why-hand-rolling-it-is-defensible) — every event a sign-up-to-sign-out flow emits, then the JWKS published and verified from the other side. |
 | [`examples/apikey`](examples/apikey/) | Runnable, database-free tour of [service accounts & API keys](#service-accounts--api-keys) — mint, cap, authenticate, revoke, disable, cascade delete. |
 | [`examples/agents`](examples/agents/) | Runnable, database-free tour of [agents & machine clients](#agents--machine-clients) — client credentials, the device flow approved with a cap, refresh replay, an MCP-style client through PKCE, introspection, discovery. |
+| [`examples/audit`](examples/audit/) | Runnable, database-free tour of the [audit log](#audit) — hooks feeding it, a two-phase action, a crash reconciled, seal, verify, retention. |
 
 Every exported symbol carries a doc comment; `go doc ./scope` is the reference.
 
@@ -3486,7 +3531,7 @@ golangci-lint run ./...         # v2 required; the config is .golangci.yml
 go run ./examples/basic && go run ./examples/auth && go run ./examples/reset
 go run ./examples/oauth && go run ./examples/magiclink && go run ./examples/deletion
 go run ./examples/hooks && go run ./examples/apikey
-go run ./examples/agents
+go run ./examples/agents && go run ./examples/audit && go run ./examples/privacy
 go run ./docs/_verify           # every Go sample under docs/, compiled and run
 ```
 

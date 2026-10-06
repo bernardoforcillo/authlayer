@@ -1,11 +1,14 @@
 package audit
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/bernardoforcillo/authlayer/internal/uid"
@@ -64,8 +67,10 @@ func WithDefaultRetention(d time.Duration) Option {
 	}
 }
 
-// WithPolicy replaces the redaction policy, DefaultPolicy() by default.
+// WithPolicy replaces the redaction policy, DefaultPolicy() by default. The
+// Service keeps its own copy: editing p's slices afterwards changes nothing.
 func WithPolicy(p Policy) Option {
+	p.Remove, p.Mask = slices.Clone(p.Remove), slices.Clone(p.Mask)
 	return func(c *config) { c.policy = p }
 }
 
@@ -129,8 +134,56 @@ func (s *Service) validate(e Event) error {
 		return fmt.Errorf("%w: empty actor type", ErrInvalidEvent)
 	case e.Source != SourceServer && e.Source != SourceClient:
 		return fmt.Errorf("%w: source %q", ErrInvalidEvent, e.Source)
+	case hasNUL(e.ID, e.Topic, e.Action, e.Origin, e.Procedure, e.Actor.Type, e.Actor.ID, e.Actor.Display,
+		e.OnBehalfOf, e.SessionID, e.ContainerID, e.Resource.Type, e.Resource.ID, e.Code, e.Reason, e.IP, e.UserAgent):
+		return fmt.Errorf("%w: a NUL character in a text field", ErrInvalidEvent)
 	}
 	return nil
+}
+
+// hasNUL reports whether any of ss holds a NUL character, which no
+// PostgreSQL text or jsonb value can hold: refusing it here keeps every
+// Store's behaviour the same.
+func hasNUL(ss ...string) bool {
+	for _, s := range ss {
+		if strings.IndexByte(s, 0) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// jsonHasNUL reports whether a key or string of raw holds a NUL character.
+// Unreadable JSON holds none: Redact has already replaced it.
+func jsonHasNUL(raw json.RawMessage) bool {
+	if bytes.IndexByte(raw, 0) < 0 && !bytes.Contains(raw, []byte(`\u0000`)) {
+		return false
+	}
+	v, err := decodeJSON(raw)
+	if err != nil {
+		return false
+	}
+	var walk func(any) bool
+	walk = func(v any) bool {
+		switch x := v.(type) {
+		case string:
+			return hasNUL(x)
+		case []any:
+			return slices.ContainsFunc(x, walk)
+		case map[string]any:
+			for k, child := range x {
+				if hasNUL(k) || walk(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(v)
+}
+
+func errNULInJSON(field string) error {
+	return fmt.Errorf("%w: a NUL character in %s", ErrInvalidEvent, field)
 }
 
 // prepare stamps what the Service owns: id, time, redaction.
@@ -150,15 +203,15 @@ func (s *Service) prepare(e Event) Event {
 }
 
 // insert stores e. A taken id is a retry of the same call only when the
-// stored event has the same topic, action, origin and actor — and, for an
-// event that is already over, the same outcome; anything else is another
-// event under that id, refused rather than silently dropped.
+// stored event has the same topic, action, source, origin and actor — and,
+// for an event that is already over, the same outcome; anything else is
+// another event under that id, refused rather than silently dropped.
 func (s *Service) insert(ctx context.Context, e Event) (Event, error) {
 	stored, err := s.store.Insert(ctx, e)
 	if err != nil {
 		return Event{}, err
 	}
-	if stored.Topic != e.Topic || stored.Action != e.Action || stored.Origin != e.Origin ||
+	if stored.Topic != e.Topic || stored.Action != e.Action || stored.Source != e.Source || stored.Origin != e.Origin ||
 		stored.Actor.Type != e.Actor.Type || stored.Actor.ID != e.Actor.ID ||
 		(e.CompletedAt != nil && stored.Outcome != e.Outcome) {
 		return Event{}, fmt.Errorf("%w: id %q belongs to another event", ErrInvalidEvent, e.ID)
@@ -172,12 +225,13 @@ func (s *Service) insert(ctx context.Context, e Event) (Event, error) {
 //
 // The Service stamps OccurredAt and, when e.ID is empty, a UUIDv7 id; it
 // redacts Request with its Policy. Source defaults to SourceServer. A
-// second Begin with the same id, topic, action, origin and actor returns the
+// second Begin with the same id, topic, action, source, origin and actor returns the
 // stored event and stores nothing; the same id on a different event is
 // ErrInvalidEvent. An id generator that repeats ids therefore collapses
 // events of the same shape. Errors: ErrUnknownTopic, ErrInvalidEvent
-// (including an event that already has an Outcome — use Record), and the
-// Store's.
+// (including an event that already has an Outcome — use Record — and a NUL
+// character in any text field or in Request, which PostgreSQL cannot store),
+// and the Store's.
 func (s *Service) Begin(ctx context.Context, e Event) (Event, error) {
 	if e.Source == "" {
 		e.Source = SourceServer
@@ -189,6 +243,9 @@ func (s *Service) Begin(ctx context.Context, e Event) (Event, error) {
 		return Event{}, fmt.Errorf("%w: Begin with an outcome; use Record", ErrInvalidEvent)
 	}
 	e = s.prepare(e)
+	if jsonHasNUL(e.Request) {
+		return Event{}, errNULInJSON("Request")
+	}
 	if err := s.pseudonymizeEvent(ctx, &e); err != nil {
 		return Event{}, err
 	}
@@ -200,8 +257,9 @@ func (s *Service) Begin(ctx context.Context, e Event) (Event, error) {
 // Before and After is stored redacted, so a changed secret still shows as a
 // changed path whose values are withheld; Resource and ContainerID fill only
 // the event's empty ones. An identical retry succeeds; a different second
-// completion is ErrCompleted. Errors: ErrInvalidEvent, ErrNotFound,
-// ErrCompleted, and the Store's.
+// completion is ErrCompleted. Errors: ErrInvalidEvent (a NUL character in a
+// text field or the diff included), ErrNotFound, ErrCompleted, and the
+// Store's.
 func (s *Service) Complete(ctx context.Context, id string, c Completion) error {
 	if id == "" {
 		return fmt.Errorf("%w: empty id", ErrInvalidEvent)
@@ -209,9 +267,15 @@ func (s *Service) Complete(ctx context.Context, id string, c Completion) error {
 	if !c.Outcome.Valid() {
 		return fmt.Errorf("%w: outcome %q", ErrInvalidEvent, c.Outcome)
 	}
+	if hasNUL(c.Code, c.Reason, c.Resource.Type, c.Resource.ID, c.ContainerID) {
+		return fmt.Errorf("%w: a NUL character in a text field", ErrInvalidEvent)
+	}
 	var changes json.RawMessage
 	if len(c.Before) > 0 || len(c.After) > 0 {
 		changes = Redact(Diff(c.Before, c.After), s.cfg.policy)
+	}
+	if jsonHasNUL(changes) {
+		return errNULInJSON("Changes")
 	}
 	if c.Resource.Type == ResourceUser && c.Resource.ID != "" && s.cfg.keys != nil {
 		p, err := s.pseudonymFor(ctx, c.Resource.ID, true)
@@ -250,5 +314,11 @@ func (s *Service) Record(ctx context.Context, e Event) (Event, error) {
 	at := e.OccurredAt
 	e.CompletedAt = &at
 	e.Changes = Redact(e.Changes, s.cfg.policy)
+	if jsonHasNUL(e.Request) {
+		return Event{}, errNULInJSON("Request")
+	}
+	if jsonHasNUL(e.Changes) {
+		return Event{}, errNULInJSON("Changes")
+	}
 	return s.insert(ctx, e)
 }

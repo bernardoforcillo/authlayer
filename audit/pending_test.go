@@ -33,3 +33,21 @@ func TestAnnotateCollectsIntoThePendingEvent(t *testing.T) {
 		t.Errorf("Completion = %+v: want the first resource and container, the last reason, the changes", c)
 	}
 }
+
+func TestWithResourceFillsEachFieldOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		anns []audit.Annotation
+		want audit.Resource
+	}{
+		{"type first, id later", []audit.Annotation{audit.WithResource("menu", ""), audit.WithResource("menu", "m2")}, audit.Resource{Type: "menu", ID: "m2"}},
+		{"another type's id is not taken", []audit.Annotation{audit.WithResource("menu", ""), audit.WithResource("lot", "l1")}, audit.Resource{Type: "menu"}},
+		{"first full one wins", []audit.Annotation{audit.WithResource("menu", "m1"), audit.WithResource("menu", "m2")}, audit.Resource{Type: "menu", ID: "m1"}},
+	} {
+		p := audit.NewPending("ev")
+		audit.Annotate(audit.WithPending(context.Background(), p), tc.anns...)
+		if got := p.Completion(audit.OutcomeOK, "", 0).Resource; got != tc.want {
+			t.Errorf("%s: Resource = %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+}

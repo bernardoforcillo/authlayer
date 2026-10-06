@@ -17,11 +17,11 @@ import (
 func Diff(before, after json.RawMessage) json.RawMessage {
 	b, err := leaves(before)
 	if err != nil {
-		return redactionError
+		return redactionError()
 	}
 	a, err := leaves(after)
 	if err != nil {
-		return redactionError
+		return redactionError()
 	}
 	out := map[string]any{}
 	for path, bv := range b {
@@ -43,7 +43,7 @@ func Diff(before, after json.RawMessage) json.RawMessage {
 	}
 	raw, err := json.Marshal(out)
 	if err != nil {
-		return redactionError
+		return redactionError()
 	}
 	return raw
 }

@@ -20,7 +20,7 @@
 //
 // A transport, and tampering with the store: the memory store is a Go map,
 // so there is nothing to guard. The PostgreSQL store (store/drops) refuses
-// rewrites with SQLSTATE AU001-AU004, and docs/audit/integrity shows what
+// rewrites with SQLSTATE AU001-AU006, and docs/audit/integrity shows what
 // Verify reports when a row is changed behind the library's back.
 package main
 
@@ -137,7 +137,7 @@ func main() {
 	must(err)
 	deleted, err := svc.ApplyRetention(ctx)
 	must(err)
-	fmt.Printf("  deleted: auth=%d menus=%d scope=%d\n", deleted["auth"], deleted["menus"], deleted["scope"])
+	fmt.Printf("  deleted: auth=%d menus=%d access=%d\n", deleted["auth"], deleted["menus"], deleted["access"])
 	verify(ctx, svc, "auth", time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 3, 2, 0, 0, 0, 0, time.UTC))
 }
 
@@ -152,8 +152,12 @@ func dump(ctx context.Context, svc *audit.Service, names map[string]string) {
 	must(err)
 	for i := len(events) - 1; i >= 0; i-- { // oldest first
 		e := events[i]
-		fmt.Printf("  %-6s %-18s %-7s actor=%-6s resource=%s/%s reason=%s\n",
-			e.Topic, e.Action, e.Outcome, name(e.Actor.ID), e.Resource.Type, name(e.Resource.ID), e.Reason)
+		actor := name(e.Actor.ID)
+		if actor == "" {
+			actor = e.Actor.Type
+		}
+		fmt.Printf("  %-6s %-23s %-7s actor=%-9s resource=%s/%s reason=%s\n",
+			e.Topic, e.Action, e.Outcome, actor, e.Resource.Type, name(e.Resource.ID), e.Reason)
 	}
 }
 

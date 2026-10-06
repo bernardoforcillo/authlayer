@@ -92,3 +92,40 @@ func TestRedactEdgeCases(t *testing.T) {
 		t.Errorf("Redact changed a number: %s", got)
 	}
 }
+
+func TestDefaultPolicyRemovesTheCommonSecretShapes(t *testing.T) {
+	secrets := []string{"totp", "mfa_code", "mfaCode", "passphrase", "pwd", "jwt", "pin", "signing_key", "signingKey",
+		"access_key", "accessKey", "AWS_ACCESS_KEY", "code_verifier", "codeVerifier", "pass", "plaintext", "bearer",
+		"device_code", "user_code", "encryption_key", "hmac_key", "master_key", "session_key", "smtp_pass"}
+	kept := []string{"footprint", "tokenizer", "secretary", "sha256", "role_key", "key", "code", "pinned",
+		"passenger", "compass", "error_code", "session_id", "spinner"}
+	in := map[string]string{}
+	for _, k := range append(append([]string{}, secrets...), kept...) {
+		in[k] = "v"
+	}
+	raw, _ := json.Marshal(in)
+	var out map[string]string
+	if err := json.Unmarshal(audit.Redact(raw, audit.DefaultPolicy()), &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range secrets {
+		if out[k] != audit.Redacted {
+			t.Errorf("%s = %q, want redacted", k, out[k])
+		}
+	}
+	for _, k := range kept {
+		if out[k] != "v" {
+			t.Errorf("%s = %q, want kept", k, out[k])
+		}
+	}
+}
+
+func TestRedactionErrorIsAFreshCopy(t *testing.T) {
+	first := audit.Redact(json.RawMessage(`not json`), audit.DefaultPolicy())
+	for i := range first {
+		first[i] = 'x'
+	}
+	if got := string(audit.Redact(json.RawMessage(`not json`), audit.DefaultPolicy())); got != `{"redaction_error":true}` {
+		t.Errorf("Redact after a caller mutated an earlier result = %s", got)
+	}
+}

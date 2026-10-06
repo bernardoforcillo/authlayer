@@ -18,10 +18,16 @@ if err := st.CreateSchema(ctx); err != nil { // development; own the DDL in prod
 svc := audit.New(st, audit.WithTopics(audithook.Topics()...))
 ```
 
-`dropsstore.AuditDDL()` returns the same statements for a migration. Two tables,
-`audit_events` and `audit_seals` (rename with `WithAuditNames`); event ids are
-`uuid`, or `text` with `WithAuditTextIDs` for a generator that does not mint
-UUIDs.
+`dropsstore.AuditDDL()` returns the same statements for a deployment that owns
+its migrations: apply them all in one transaction, as the role that will own the
+tables (PostgreSQL 14 or later). Re-applying them on an upgrade replaces the
+guard functions and triggers in place, never leaving a table unguarded;
+`CreateSchema` does the same in one transaction under an advisory lock, so
+replicas may run it at once. Two tables, `audit_events` and `audit_seals`
+(rename with `WithAuditNames`; keep both in one schema). Event ids are `uuid`,
+accepted only in the lowercase hyphenated form the `Service` mints — another
+spelling is `ErrInvalidEvent` on insert and `ErrNotFound` on a lookup — or
+`text` with `WithAuditTextLibraryIDs` for a generator that does not mint UUIDs.
 
 ### The guards
 
@@ -31,13 +37,30 @@ SQLSTATE, so a caller can tell it from any other failure:
 | SQLSTATE | Constant | Refuses |
 |---|---|---|
 | `AU001` | `AuditEventImmutable` | an `UPDATE` of an event other than its one completion (`completed_at` from NULL, completion columns only; resource and container only when empty) or the clearing of its `ip` and `user_agent` on retention, with every other column unchanged |
-| `AU002` | `AuditEventProtected` | a `DELETE` of an event whose day is sealed and not yet marked purged, and any `TRUNCATE` of events |
-| `AU003` | `AuditSealImmutable` | an `UPDATE` of a seal other than stamping `purged_at` once, and any `DELETE` or `TRUNCATE` |
+| `AU002` | `AuditEventProtected` | a `DELETE` of an event outside a retention transaction, a `DELETE` of an event whose day is sealed and not yet marked purged (even inside one), and any `TRUNCATE` of events |
+| `AU003` | `AuditSealImmutable` | an `UPDATE` of a seal other than stamping `purged_at` once inside a retention transaction, and any `DELETE` or `TRUNCATE` |
 | `AU004` | `AuditDaySealed` | an `INSERT` into a sealed (topic, day); `Insert` reports it as `ErrSealed` |
+| `AU005` | `AuditSealStale` | an `INSERT` of a seal whose event count or first/last `seq` no longer match its day, or whose day holds an open event; `InsertSeal` reports it as `ErrSealStale` |
+| `AU006` | `AuditIsolation` | an `INSERT` of an event or a seal in a transaction stricter than `READ COMMITTED` |
 
-`AU004` is atomic with sealing: the event insert and the seal insert contend on
-an advisory lock for the (topic, day), so an event cannot slip into a day while
-it is being sealed.
+`Seal` digests a day, then inserts its seal, so an event insert can still be in
+flight in between. The event insert and the seal insert contend on an advisory
+lock for the (topic, day): the event holds it until it commits, and the seal
+takes it exclusively, then counts the day again. The event is therefore either
+counted, and the seal refused as stale so `Seal` digests the day again, or it
+starts after the seal committed and is refused with `ErrSealed`. It never lands
+in a day its seal does not cover.
+
+Both checks read what committed while they waited for the lock, which only
+`READ COMMITTED` guarantees: under `REPEATABLE READ` the check would read a
+snapshot taken before the seal. `AuditStore` therefore runs its inserts in
+`READ COMMITTED` transactions whatever the database's
+`default_transaction_isolation`, and the guards refuse (`AU006`) an insert
+written by hand in a stricter transaction.
+
+The guard functions run with a fixed `search_path` and find the other audit table
+in the schema of the table they fire on, so neither a caller's `search_path` nor
+a `TEMP` table named like an audit table can redirect them.
 
 <Warning>
 Triggers stop mistakes and ordinary code; an owner of the table can drop them.
@@ -46,9 +69,15 @@ on `Verify` for what a privileged rewrite leaves behind — it recomputes every
 hash from the rows, not from anything the triggers guarded.
 </Warning>
 
-Purging goes through the same guard: `ApplyRetention` marks a day's seal purged
-first (the one seal update `AU003` allows), then deletes its events (which
-`AU002` now allows).
+A retention transaction is one that sets `authlayer.audit_retention` to `on`
+for itself (`set_config(dropsstore.AuditRetentionSetting, 'on', true)`). Only
+`Purge` and `MarkPurged` do, each in its own transaction, so a stray `DELETE`, an
+ORM cascade or a cleanup script cannot remove an event, sealed or not.
+`ApplyRetention` marks a day's seal purged first (the one seal update `AU003`
+allows), then deletes its events (which `AU002` now allows). The setting stops
+accidents, not an attacker holding the application's credentials, who can set
+it too: `Verify` reports a seal stamped purged before its topic's retention
+allowed it as a `mismatch` (`purged_early`).
 
 ### Subject keys
 
@@ -60,10 +89,12 @@ the audit tables' guards on purpose — deleting a key is the erasure.
 
 ## Your own backend
 
-The `Store` MUSTs — one atomic step for the sealed-day check on `Insert`, an
-existing id returning the stored row, `Complete` writing once with an identical
-retry succeeding, `Scan` ascending and returning the callback's error unwrapped —
-are an executable suite, as for the other ports.
+The `Store` MUSTs — one atomic step for the sealed-day check on `Insert`, and
+for `InsertSeal`'s check that the day still matches the seal (`ErrSealStale`
+otherwise), an existing id returning the stored row, `Complete` writing once
+with an identical retry succeeding (JSON compared by value), `Scan` ascending
+and returning the callback's error unwrapped, `Purge` deleting nothing for a
+batch of zero or less — are an executable suite, as for the other ports.
 
 {/* verify:skip a test function needing a *testing.T; the identical call is compiled and run by store/memory/audit_test.go and by store/drops' integration lane */}
 ```go
@@ -79,5 +110,5 @@ func TestMyStoreSatisfiesTheAuditContract(t *testing.T) {
 A key store has its own suite, `audittest.RunKeyStoreContract`. The factory must return an **empty** store each time: the checks count rows.
 Event ids are UUIDv7, so a backend that types ids as `uuid` passes unchanged.
 The suite is sequential, so it does not race the atomicity of `Insert`'s
-sealed-day check — that one you have to reason about, as `store/drops` does with
-its lock.
+sealed-day check or of `InsertSeal`'s day check — those you have to reason
+about, as `store/drops` does with its lock.

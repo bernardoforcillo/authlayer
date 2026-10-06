@@ -11,6 +11,9 @@ seal.
 ```go
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -62,7 +65,7 @@ fmt.Println("retention deleted:", deleted["menus"])
 report()
 ```
 
-{/* verify:stdout "seal with an open event: true\nreconciled: 1 unknown reconciled\nsealed days: 1 events in the first: 2\nverify: ok \nretention deleted: 2\nverify: purged " */}
+{/* verify:stdout "seal with an open event: true\nreconciled: 1 unknown reconciled\nsealed days: 1 events in the first: 2\nverify: ok \nretention deleted: 2\nverify: purged \nevents_hash: true seal_hash: true" */}
 
 <Note>
 The IP address and user agent of an event are **not** part of its hash: they are
@@ -92,10 +95,20 @@ day's event count and first/last `Seq`, a SHA-256 over the day's canonical
 events, and a `SealHash` that chains the **previous day's** seal. Empty days are
 sealed too, so removing a whole day is detected.
 
-Run it on a schedule — hourly is fine; it does nothing until a day has ended.
-Several replicas may run it at once: a day another replica sealed first is
-skipped, and the chain continues from that seal. Once a day is sealed the
-`Store` refuses a new event in it (`ErrSealed`).
+Run it on a schedule — hourly is fine. `until` is capped at the start of the
+`Service` clock's current day, so a day that has not ended on this replica's
+clock is never sealed, whatever you pass. Several replicas may run it at once:
+a day another replica sealed first is skipped, and the chain continues from
+that seal. Once a day is sealed the `Store` refuses a new event in it
+(`ErrSealed`).
+
+An event stamped just before midnight can still be on its way to the store when
+its day is sealed. The store then refuses the seal as stale (`ErrSealStale`) and
+`Seal` digests the day again, so the seal covers the event; an insert that
+arrives after the seal instead fails with `ErrSealed`, and its action with it.
+Passing a `until` a few minutes in the past — `Seal(ctx, time.Now().Add(-10*time.Minute))`
+— leaves such stragglers time to land first. The chain of a new topic starts at
+the earliest day any of its events occurred on.
 
 <Note>
 `Seq` is increasing, not gapless: a backend may consume a value on a duplicate
@@ -112,13 +125,67 @@ The seals are.
 | `ok` | the day's events hash to its seal, which links to the previous day's |
 | `mismatch` | something no longer matches; `Detail` says what |
 | `unsealed` | no seal covers the day yet |
-| `purged` | retention deleted the events; the seal still links |
+| `purged` | retention deleted the events; the seal still links and was marked purged only once the day was past its topic's retention |
 
 A `mismatch` names the check that failed: `events_hash` (an event was altered,
 inserted or deleted, or a stored event is unreadable), `seal_hash` (the seal row
-itself was edited) or `chain` (the seal no longer links to the previous day's —
-a day was deleted or replaced). Editing a seal to match an edited event does
-not help: the next day's `PrevHash` no longer matches.
+itself was edited, its first/last `Seq` included), `chain` (the seal no longer
+links to the previous one, or a day between two seals lost its own — a day was
+deleted or replaced), or `purged_early` (the seal was marked purged
+while the day was younger than its topic's retention, so its events went
+outside retention). Editing a seal to match an edited event does not help: the
+next day's `PrevHash` no longer matches.
+
+## The hash format
+
+The hashes are computed by the `Service`, in Go, from what the store returns, so
+every store produces the same ones and an outside verifier can recompute them.
+
+- **Canonical row.** Each event is one JSON object with exactly these keys, in
+  this order: `id`, `seq`, `occurred_at`, `completed_at`, `topic`, `action`,
+  `source`, `origin`, `procedure`, `actor_type`, `actor_id`, `actor_display`,
+  `on_behalf_of`, `session_id`, `container_id`, `resource_type`, `resource_id`,
+  `outcome`, `code`, `reason`, `request`, `changes`, `client_time`,
+  `duration_ms`. An empty string field is `""`; only `completed_at`,
+  `client_time`, `request` and `changes` are ever `null`. Times are UTC in
+  RFC 3339 with the fraction's trailing zeros dropped (Go's `time.RFC3339Nano`:
+  `2026-03-01T09:00:00Z`, `2026-03-01T09:00:00.5Z`). `request` and `changes`
+  are re-encoded with sorted keys and no whitespace, numbers spelled as the
+  store returns them. The encoding is Go's `encoding/json`, which escapes `<`,
+  `>` and `&` as `\u003c`, `\u003e` and `\u0026`. The IP address and user agent
+  are not part of it.
+- **`events_hash`** = hex SHA-256 of the day's canonical rows in `Seq` order,
+  each followed by `\n`. An empty day hashes the empty string.
+- **`seal_hash`** = hex SHA-256 of `prev_hash|topic|day|event_count|events_hash`,
+  with `day` as `YYYY-MM-DD` and `event_count` in decimal. A topic's first seal
+  has `prev_hash = ""`.
+
+{/* verify:main */}
+```go
+at := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+s2 := audit.New(memory.NewAuditStore(),
+	audit.WithRuntime(core.Runtime{Clock: func() time.Time { return at }, IDs: func() string { return "e1" }}),
+	audit.WithTopics(audit.Topic{Key: "t"}))
+_, _ = s2.Record(ctx, audit.Event{Topic: "t", Action: "menu.create", Origin: "backend",
+	Actor: audit.Actor{Type: audit.ActorUser, ID: "alice"}, Outcome: audit.OutcomeOK,
+	Request: json.RawMessage(`{"b": 1, "a": "x"}`)})
+at = at.Add(24 * time.Hour)
+day1, _ := s2.Seal(ctx, at)
+
+row := `{"id":"e1","seq":1,"occurred_at":"2026-03-01T09:00:00Z","completed_at":"2026-03-01T09:00:00Z",` +
+	`"topic":"t","action":"menu.create","source":"server","origin":"backend","procedure":"",` +
+	`"actor_type":"user","actor_id":"alice","actor_display":"","on_behalf_of":"","session_id":"",` +
+	`"container_id":"","resource_type":"","resource_id":"","outcome":"ok","code":"","reason":"",` +
+	`"request":{"a":"x","b":1},"changes":null,"client_time":null,"duration_ms":0}`
+eh := sha256.Sum256([]byte(row + "\n"))
+eventsHash := hex.EncodeToString(eh[:])
+sh := sha256.Sum256([]byte("" + "|" + "t" + "|" + "2026-03-01" + "|" + "1" + "|" + eventsHash))
+fmt.Println("events_hash:", eventsHash == day1[0].EventsHash, "seal_hash:", hex.EncodeToString(sh[:]) == day1[0].SealHash)
+```
+
+`first_seq`, `last_seq`, `sealed_at` and `purged_at` are stored beside the
+hashes but are not part of them; `Verify` checks the first two against the
+events and `purged_at` against the topic's retention.
 
 ## Retention
 
@@ -135,3 +202,8 @@ undermining the thing it sits next to:
 
 Run `ApplyRetention` on a schedule too — after `Seal`, so the days it may purge
 are sealed.
+
+`Verify` checks a purged day against its topic's **current** retention: a seal
+marked purged while the day was younger than that is `purged_early`. Shortening
+a retention is therefore safe; lengthening one makes the days purged under the
+shorter value read as `purged_early`, so review them when you do.

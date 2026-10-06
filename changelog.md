@@ -51,29 +51,57 @@ once a 1.0 is cut. Until then, minor versions may break API.
   by key (`WithPolicy` replaces the policy) and `Changes` is a diff, so a
   changed secret keeps its path and loses its values. Reads: `Get`, a
   newest-first `List` with a cursor, a capped `Export`, and a `Filter` whose
-  `Member` is one person's whole trail.
+  `Member` is one person's whole trail; its `From`/`To` are rounded to the
+  microsecond every store keeps. `DefaultPolicy` removes passwords and
+  passphrases, tokens, JWTs and bearer values, API, private, signing, access,
+  encryption, HMAC, master and session keys, credentials, OTP/TOTP/MFA codes,
+  PINs, recovery, device and user codes, PKCE verifiers, cookies,
+  authorization headers and plaintext, and masks emails. A taken id is a retry
+  only for the same topic, action, source, origin, actor and outcome; NUL
+  characters are refused; `EqualJSON` compares numbers by value.
+  `Reconcile` counts only the events it closed itself.
 - **Integrity.** `Service.Seal` chains every (topic, UTC day) into a SHA-256
   hash chain, empty days included; `Service.Verify` recomputes it and reports
-  `ok`, `mismatch` (`events_hash`, `seal_hash` or `chain`), `unsealed` or
-  `purged` per day. `Service.Reconcile` closes the events a crashed process
+  `ok`, `mismatch` (`events_hash`, `seal_hash`, `chain` or `purged_early`),
+  `unsealed` or `purged` per day; a day missing between two seals is a
+  `chain` mismatch, not `unsealed`. `Seal` never seals a day that has not ended
+  on the Service clock, starts a topic's chain at its earliest event day, and
+  digests a day again when the store refuses a seal as stale
+  (`ErrSealStale`). `Service.Reconcile` closes the events a crashed process
   left open as `unknown`, which a day needs before it can be sealed.
   `Service.ApplyRetention` purges per-topic retention, sealed days only, and
   marks the seals purged before deleting the events so `Verify` never raises a
   false alarm.
 - **`store/drops.AuditStore`.** PostgreSQL persistence whose triggers refuse
   rewrites at the database with SQLSTATE `AU001` (event update), `AU002`
-  (delete of a sealed day, truncate), `AU003` (seal update, delete, truncate)
-  and `AU004` (insert into a sealed day, atomic with sealing through an
-  advisory lock). `AuditDDL` returns the statements for a migration;
-  `WithAuditNames` and `WithAuditTextIDs` adapt it. Run the application as a
-  role that does not own the tables.
+  (any delete outside a retention transaction — `AuditRetentionSetting`, set
+  only by `Purge` — or of a sealed, unpurged day; truncate), `AU003` (seal
+  update other than a purge stamp inside retention, delete, truncate),
+  `AU004` (insert into a sealed day), `AU005` (a seal that no longer matches its
+  day's events, which `Seal` answers by digesting the day again) and `AU006`
+  (an insert under an isolation stricter than READ COMMITTED). Event and seal
+  inserts share an advisory lock per (topic, day), so an event in flight while a
+  day is sealed is either covered by the seal or refused. `AuditDDL` returns
+  the statements for a migration (PostgreSQL 14+, one transaction);
+  `CreateSchema` applies them in one transaction under an advisory lock, and
+  the guards pin their `search_path`. `WithAuditNames` and
+  `WithAuditTextLibraryIDs` adapt it. Indexes cover every `Filter` field a
+  trail is read by, `Member` included. Run the application as a role that does
+  not own the tables.
 - **`audit/audittest`.** `audit.Store`'s contract as an executable suite, run
   against `store/memory` and, in the integration lane, against PostgreSQL.
 - **`audit/audithook`.** Adapters from the lifecycle hooks of `auth`,
-  `scope` (and so `org` and `team`), `apikey` and `oauth` to audit events:
-  refusals are `denied`, the closed `Detail` vocabulary becomes the `Reason`,
-  and nothing else is copied. `WithTopic`, `WithOrigin`, `WithSkipActions`
-  and `WithBestEffort` tune them; a failed audit write is returned by default.
+  `scope` (and so `org` and `team`), `apikey` and `oauth` to audit events.
+  Inside a call with a pending event they annotate it (resource, container,
+  reason, the role key as `Changes`); otherwise they record a standalone
+  event named `<package>.<kind in snake case>` (`auth.login_failed`,
+  `scope.member_role_changed`) under the topics `access`, `auth`, `apikey`
+  and `oauth`. Refusals are `denied` and anonymous where the caller is not
+  the account (a failed sign-in, a challenge, a token replay), the closed
+  `Detail` vocabulary becomes the `Reason`, and no address or token is
+  copied. `WithTopic(func(action string) string)`, `WithOrigin`,
+  `WithSkipActions` and `WithBestEffort` tune them; a failed audit write is
+  returned by default.
 - `authlayer.Shared.Audit()` hands the audit `Service` the shared clock and id
   generator, and `examples/audit` is a runnable tour (run by CI), with a new
   [audit section](docs/audit/overview.mdx) in the docs.

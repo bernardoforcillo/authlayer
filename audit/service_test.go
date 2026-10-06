@@ -108,6 +108,51 @@ func TestBeginRefusesInvalidEvents(t *testing.T) {
 	}
 }
 
+// PostgreSQL text and jsonb cannot hold a NUL character, so the Service
+// refuses one everywhere a store would have to, whichever store it runs on.
+func TestNULCharactersAreInvalidEverywhere(t *testing.T) {
+	svc, _, _ := newService(t)
+	ctx := context.Background()
+	for name, mod := range map[string]func(*audit.Event){
+		"action":       func(e *audit.Event) { e.Action = "menu.\x00update" },
+		"actor id":     func(e *audit.Event) { e.Actor.ID = "al\x00ice" },
+		"resource":     func(e *audit.Event) { e.Resource = audit.Resource{Type: "menu", ID: "m\x001"} },
+		"user agent":   func(e *audit.Event) { e.UserAgent = "ua\x00" },
+		"request":      func(e *audit.Event) { e.Request = json.RawMessage(`{"name":"a\u0000b"}`) },
+		"request key":  func(e *audit.Event) { e.Request = json.RawMessage(`{"a\u0000":1}`) },
+		"id":           func(e *audit.Event) { e.ID = "id\x00" },
+		"display":      func(e *audit.Event) { e.Actor.Display = "\x00" },
+		"on behalf of": func(e *audit.Event) { e.OnBehalfOf = "\x00" },
+	} {
+		if _, err := svc.Begin(ctx, action(mod)); !errors.Is(err, audit.ErrInvalidEvent) {
+			t.Errorf("Begin with a NUL in the %s: err = %v, want ErrInvalidEvent", name, err)
+		}
+	}
+	if _, err := svc.Record(ctx, action(func(e *audit.Event) {
+		e.Outcome, e.Changes = audit.OutcomeOK, json.RawMessage(`{"x":{"before":"\u0000","after":1}}`)
+	})); !errors.Is(err, audit.ErrInvalidEvent) {
+		t.Errorf("Record with a NUL in Changes: err = %v, want ErrInvalidEvent", err)
+	}
+	// An escaped backslash before u0000 is plain text, not a NUL.
+	if _, err := svc.Begin(ctx, action(func(e *audit.Event) { e.Request = json.RawMessage(`{"path":"C:\\u0000"}`) })); err != nil {
+		t.Errorf("Begin with an escaped backslash: %v", err)
+	}
+	open, err := svc.Begin(ctx, action())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]audit.Completion{
+		"reason":   {Outcome: audit.OutcomeOK, Reason: "\x00"},
+		"code":     {Outcome: audit.OutcomeOK, Code: "\x00"},
+		"resource": {Outcome: audit.OutcomeOK, Resource: audit.Resource{Type: "menu", ID: "\x00"}},
+		"after":    {Outcome: audit.OutcomeOK, After: json.RawMessage(`{"a":"\u0000"}`)},
+	} {
+		if err := svc.Complete(ctx, open.ID, c); !errors.Is(err, audit.ErrInvalidEvent) {
+			t.Errorf("Complete with a NUL in the %s: err = %v, want ErrInvalidEvent", name, err)
+		}
+	}
+}
+
 func TestBeginIsIdempotentOnTheCallersID(t *testing.T) {
 	svc, st, _ := newService(t)
 	ctx := context.Background()
@@ -217,5 +262,35 @@ func TestBeginAndRecordRefuseAnIDTakenByAnotherEvent(t *testing.T) {
 	}
 	if n, _ := st.Count(ctx, audit.Filter{}); n != 1 {
 		t.Errorf("events = %d, want 1", n)
+	}
+}
+
+func TestWithPolicyKeepsItsOwnCopy(t *testing.T) {
+	p := audit.Policy{Remove: []string{"password"}}
+	svc, _, _ := newService(t, audit.WithPolicy(p))
+	p.Remove[0] = "nothing"
+	e, err := svc.Begin(context.Background(), action(func(e *audit.Event) { e.Request = json.RawMessage(`{"password":"p"}`) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !audit.EqualJSON(e.Request, json.RawMessage(`{"password":"[REDACTED]"}`)) {
+		t.Errorf("Request = %s: the caller's later edit of its Policy changed the Service's", e.Request)
+	}
+}
+
+// A client-reported event under a server event's id is another event, not a
+// retry of it, even when everything else matches.
+func TestATakenIDComparesTheSource(t *testing.T) {
+	svc, _, _ := newService(t)
+	ctx := context.Background()
+	id := "0192a3b4-c5d6-7e8f-9a0b-1c2d3e4f5a6b"
+	server := action(func(e *audit.Event) { e.ID, e.Outcome = id, audit.OutcomeOK })
+	if _, err := svc.Record(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	client := server
+	client.Source = audit.SourceClient
+	if _, err := svc.Record(ctx, client); !errors.Is(err, audit.ErrInvalidEvent) {
+		t.Errorf("client Record under the server event's id err = %v, want ErrInvalidEvent", err)
 	}
 }

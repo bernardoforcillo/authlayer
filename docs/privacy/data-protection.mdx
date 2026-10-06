@@ -55,7 +55,7 @@ None of this is in a library, and none of it is optional:
   requests since the backup is the usual answer). Destroyed audit keys must not
   live on in a backup that outlives the request.
 - **Breach detection and notification** — 72 hours to the regulator (Art. 33).
-  The audit log and `token.reuse` / `session.reuse` events are your evidence,
+  The audit log and `oauth.token_reuse_detected` / `auth.token_reuse_detected` events are your evidence,
   not your process.
 - **Identity checks** before answering an access or erasure request that did not
   come through a signed-in session, and answering within one month.

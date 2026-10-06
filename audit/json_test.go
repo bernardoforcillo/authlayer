@@ -19,6 +19,17 @@ func TestEqualJSON(t *testing.T) {
 		{``, `{}`, false},
 		{`not json`, `not json`, false},
 		{`{"a":1} {"b":2}`, `{"a":1}`, false},
+		// Numbers compare by value: jsonb and other stores rewrite their spelling.
+		{`{"n":1e2}`, `{"n":100}`, true},
+		{`{"n":1E+2}`, `{"n":100.0}`, true},
+		{`{"n":1e-7}`, `{"n":0.0000001}`, true},
+		{`{"n":1.50}`, `{"n":1.5}`, true},
+		{`[-0]`, `[0]`, true},
+		{`{"n":12345678901234567890}`, `{"n":12345678901234567891}`, false},
+		{`{"n":1e2}`, `{"n":1e3}`, false},
+		{`{"n":0.1}`, `{"n":0.10000000000000001}`, false},
+		{`{"n":1}`, `{"n":"1"}`, false},
+		{`{"a":[1,2]}`, `{"a":[2,1]}`, false},
 	}
 	for _, tt := range tests {
 		if got := audit.EqualJSON(json.RawMessage(tt.a), json.RawMessage(tt.b)); got != tt.want {

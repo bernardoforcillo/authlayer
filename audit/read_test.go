@@ -82,3 +82,27 @@ func TestExportRefusesAboveTheLimitBeforeYielding(t *testing.T) {
 		t.Errorf("Export = %v after %d yields, want ErrExportTooLarge after none", err, calls)
 	}
 }
+
+// Stores keep microseconds: a bound with a sub-microsecond part is rounded
+// the same way for every store, From down and To up.
+func TestFilterBoundsAreNormalisedToMicroseconds(t *testing.T) {
+	svc, _, clk := newService(t)
+	ctx := context.Background()
+	e := record(t, svc, clk, 1)[0]
+	for name, f := range map[string]audit.Filter{
+		"from": {From: e.OccurredAt.Add(500 * time.Nanosecond)},
+		"to":   {To: e.OccurredAt.Add(500 * time.Nanosecond)},
+	} {
+		events, _, err := svc.List(ctx, f, audit.Page{})
+		if err != nil || len(events) != 1 {
+			t.Errorf("List with a sub-microsecond %s = %d events, %v; want the event", name, len(events), err)
+		}
+		if n, err := svc.Count(ctx, f); err != nil || n != 1 {
+			t.Errorf("Count with a sub-microsecond %s = %d, %v; want 1", name, n, err)
+		}
+		got := 0
+		if err := svc.Export(ctx, f, 0, func(audit.Event) error { got++; return nil }); err != nil || got != 1 {
+			t.Errorf("Export with a sub-microsecond %s = %d, %v; want 1", name, got, err)
+		}
+	}
+}

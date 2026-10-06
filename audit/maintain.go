@@ -8,14 +8,16 @@ import (
 )
 
 // maintainBatch bounds one store round trip of Reconcile and ApplyRetention.
-const maintainBatch = 500
+// It is a variable so tests can cross a batch boundary cheaply.
+var maintainBatch = 500
 
 // Reconcile closes, with OutcomeUnknown and ReasonReconciled, every open
 // event that began more than olderThan ago, and returns how many it closed.
 // It is how a process that died mid-action stops blocking Seal: pick an
 // olderThan longer than any action can run. An event another replica
-// completed in the meantime is skipped; a non-positive olderThan reconciles
-// every open event.
+// completed in the meantime is skipped and not counted, even when that
+// replica closed it the same way; a non-positive olderThan reconciles every
+// open event.
 func (s *Service) Reconcile(ctx context.Context, olderThan time.Duration) (int, error) {
 	if olderThan < 0 {
 		olderThan = 0
@@ -29,10 +31,15 @@ func (s *Service) Reconcile(ctx context.Context, olderThan time.Duration) (int, 
 		}
 		progressed := false
 		for _, id := range ids {
-			_, err := s.store.Complete(ctx, id, Closing{At: s.now(), Outcome: OutcomeUnknown, Reason: ReasonReconciled})
+			at := s.now()
+			row, err := s.store.Complete(ctx, id, Closing{At: at, Outcome: OutcomeUnknown, Reason: ReasonReconciled})
 			switch {
 			case err == nil:
-				closed++
+				// An identical closing by another replica also returns nil;
+				// only a row stamped with this call's time was closed here.
+				if row.CompletedAt != nil && row.CompletedAt.Equal(at) {
+					closed++
+				}
 				progressed = true
 			case errors.Is(err, ErrCompleted), errors.Is(err, ErrNotFound):
 				// another replica completed or purged it first
