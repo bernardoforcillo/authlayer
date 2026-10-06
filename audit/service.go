@@ -67,8 +67,10 @@ func WithDefaultRetention(d time.Duration) Option {
 	}
 }
 
-// WithPolicy replaces the redaction policy, DefaultPolicy() by default.
+// WithPolicy replaces the redaction policy, DefaultPolicy() by default. The
+// Service keeps its own copy: editing p's slices afterwards changes nothing.
 func WithPolicy(p Policy) Option {
+	p.Remove, p.Mask = slices.Clone(p.Remove), slices.Clone(p.Mask)
 	return func(c *config) { c.policy = p }
 }
 
@@ -201,15 +203,15 @@ func (s *Service) prepare(e Event) Event {
 }
 
 // insert stores e. A taken id is a retry of the same call only when the
-// stored event has the same topic, action, origin and actor — and, for an
-// event that is already over, the same outcome; anything else is another
-// event under that id, refused rather than silently dropped.
+// stored event has the same topic, action, source, origin and actor — and,
+// for an event that is already over, the same outcome; anything else is
+// another event under that id, refused rather than silently dropped.
 func (s *Service) insert(ctx context.Context, e Event) (Event, error) {
 	stored, err := s.store.Insert(ctx, e)
 	if err != nil {
 		return Event{}, err
 	}
-	if stored.Topic != e.Topic || stored.Action != e.Action || stored.Origin != e.Origin ||
+	if stored.Topic != e.Topic || stored.Action != e.Action || stored.Source != e.Source || stored.Origin != e.Origin ||
 		stored.Actor.Type != e.Actor.Type || stored.Actor.ID != e.Actor.ID ||
 		(e.CompletedAt != nil && stored.Outcome != e.Outcome) {
 		return Event{}, fmt.Errorf("%w: id %q belongs to another event", ErrInvalidEvent, e.ID)
@@ -223,7 +225,7 @@ func (s *Service) insert(ctx context.Context, e Event) (Event, error) {
 //
 // The Service stamps OccurredAt and, when e.ID is empty, a UUIDv7 id; it
 // redacts Request with its Policy. Source defaults to SourceServer. A
-// second Begin with the same id, topic, action, origin and actor returns the
+// second Begin with the same id, topic, action, source, origin and actor returns the
 // stored event and stores nothing; the same id on a different event is
 // ErrInvalidEvent. An id generator that repeats ids therefore collapses
 // events of the same shape. Errors: ErrUnknownTopic, ErrInvalidEvent

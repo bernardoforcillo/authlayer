@@ -67,6 +67,7 @@ var checks = []check{
 	{"Seals/InsertOnceListAndLast", sealsInsertOnceListAndLast},
 	{"Seals/InsertRefusesAStaleSeal", sealsInsertRefusesAStaleSeal},
 	{"Purge/DeletesOnlyTheTopicBeforeInBatches", purgeDeletesOnlyTopicBefore},
+	{"Purge/NonPositiveBatchDeletesNothing", purgeNonPositiveBatchDeletesNothing},
 	{"MarkPurged/StampsOnlyEarlierUnpurged", markPurgedStampsOnlyEarlier},
 	{"ScrubClientData/ClearsOnlyTheTopicBeforeAndNothingElse", scrubClearsOnlyClientData},
 }
@@ -558,6 +559,19 @@ func purgeDeletesOnlyTopicBefore(t tb, st audit.Store) {
 	}
 	if n, _ := st.Count(ctx, audit.Filter{Topics: []string{"u"}}); n != 1 {
 		t.Errorf("topic u left %d events, want 1", n)
+	}
+}
+
+func purgeNonPositiveBatchDeletesNothing(t tb, st audit.Store) {
+	ctx := context.Background()
+	mustInsert(t, st, ev("t", day0, closeAs(audit.OutcomeOK)))
+	for _, batch := range []int{0, -1} {
+		if n, err := st.Purge(ctx, "t", day0.Add(time.Hour), batch); err != nil || n != 0 {
+			t.Errorf("Purge(batch %d) = %d, %v; want 0, nil", batch, n, err)
+		}
+	}
+	if n, _ := st.Count(ctx, audit.Filter{}); n != 1 {
+		t.Errorf("events left = %d, want 1", n)
 	}
 }
 

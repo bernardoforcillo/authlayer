@@ -51,7 +51,15 @@ once a 1.0 is cut. Until then, minor versions may break API.
   by key (`WithPolicy` replaces the policy) and `Changes` is a diff, so a
   changed secret keeps its path and loses its values. Reads: `Get`, a
   newest-first `List` with a cursor, a capped `Export`, and a `Filter` whose
-  `Member` is one person's whole trail.
+  `Member` is one person's whole trail; its `From`/`To` are rounded to the
+  microsecond every store keeps. `DefaultPolicy` removes passwords and
+  passphrases, tokens, JWTs and bearer values, API, private, signing, access,
+  encryption, HMAC, master and session keys, credentials, OTP/TOTP/MFA codes,
+  PINs, recovery, device and user codes, PKCE verifiers, cookies,
+  authorization headers and plaintext, and masks emails. A taken id is a retry
+  only for the same topic, action, source, origin, actor and outcome; NUL
+  characters are refused; `EqualJSON` compares numbers by value.
+  `Reconcile` counts only the events it closed itself.
 - **Integrity.** `Service.Seal` chains every (topic, UTC day) into a SHA-256
   hash chain, empty days included; `Service.Verify` recomputes it and reports
   `ok`, `mismatch` (`events_hash`, `seal_hash`, `chain` or `purged_early`),

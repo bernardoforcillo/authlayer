@@ -3,7 +3,25 @@ package audit
 import (
 	"context"
 	"fmt"
+	"time"
 )
+
+// microBounds rounds f's time bounds to the microsecond every store keeps —
+// From down, To up — so the window means the same on every store, whatever
+// the caller's clock resolution.
+func microBounds(f Filter) Filter {
+	if !f.From.IsZero() {
+		f.From = f.From.UTC().Truncate(time.Microsecond)
+	}
+	if !f.To.IsZero() {
+		to := f.To.UTC()
+		if t := to.Truncate(time.Microsecond); !t.Equal(to) {
+			to = t.Add(time.Microsecond)
+		}
+		f.To = to
+	}
+	return f
+}
 
 // Get loads one event, or ErrNotFound.
 func (s *Service) Get(ctx context.Context, id string) (Event, error) {
@@ -21,7 +39,7 @@ func (s *Service) List(ctx context.Context, f Filter, page Page) ([]Event, int64
 	if page.Before < 0 {
 		page.Before = 0
 	}
-	f, err := s.translateFilter(ctx, f)
+	f, err := s.translateFilter(ctx, microBounds(f))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -40,7 +58,7 @@ func (s *Service) List(ctx context.Context, f Filter, page Page) ([]Event, int64
 // the first error yield returns. When limit is positive and more events
 // match, it returns ErrExportTooLarge before yielding anything.
 func (s *Service) Export(ctx context.Context, f Filter, limit int, yield func(Event) error) error {
-	f, err := s.translateFilter(ctx, f)
+	f, err := s.translateFilter(ctx, microBounds(f))
 	if err != nil {
 		return err
 	}
@@ -59,7 +77,7 @@ func (s *Service) Export(ctx context.Context, f Filter, limit int, yield func(Ev
 // Count returns how many events match f, with the same person-id translation
 // as [Service.List].
 func (s *Service) Count(ctx context.Context, f Filter) (int, error) {
-	f, err := s.translateFilter(ctx, f)
+	f, err := s.translateFilter(ctx, microBounds(f))
 	if err != nil {
 		return 0, err
 	}

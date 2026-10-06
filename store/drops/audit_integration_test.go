@@ -579,3 +579,24 @@ WHERE (actor_id = 'u' OR on_behalf_of = 'u' OR (resource_type = 'user' AND resou
 		}
 	}
 }
+
+// A filter bound with a sub-microsecond part selects what it selects on the
+// memory store: the Service rounds it before the driver would truncate it.
+func TestAuditFilterBoundsMatchTheMemoryStoreLive(t *testing.T) {
+	st, _ := newLiveAuditStore(t)
+	ctx := context.Background()
+	svc := audit.New(st, audit.WithTopics(audit.Topic{Key: "t"}))
+	e, err := svc.Record(ctx, audit.Event{Topic: "t", Action: "a.b", Origin: "x", Outcome: audit.OutcomeOK,
+		Actor: audit.Actor{Type: audit.ActorSystem}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, f := range map[string]audit.Filter{
+		"from": {From: e.OccurredAt.Add(500 * time.Nanosecond)},
+		"to":   {To: e.OccurredAt.Add(500 * time.Nanosecond)},
+	} {
+		if n, err := svc.Count(ctx, f); err != nil || n != 1 {
+			t.Errorf("Count with a sub-microsecond %s = %d, %v; want 1", name, n, err)
+		}
+	}
+}

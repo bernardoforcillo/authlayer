@@ -264,3 +264,33 @@ func TestBeginAndRecordRefuseAnIDTakenByAnotherEvent(t *testing.T) {
 		t.Errorf("events = %d, want 1", n)
 	}
 }
+
+func TestWithPolicyKeepsItsOwnCopy(t *testing.T) {
+	p := audit.Policy{Remove: []string{"password"}}
+	svc, _, _ := newService(t, audit.WithPolicy(p))
+	p.Remove[0] = "nothing"
+	e, err := svc.Begin(context.Background(), action(func(e *audit.Event) { e.Request = json.RawMessage(`{"password":"p"}`) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !audit.EqualJSON(e.Request, json.RawMessage(`{"password":"[REDACTED]"}`)) {
+		t.Errorf("Request = %s: the caller's later edit of its Policy changed the Service's", e.Request)
+	}
+}
+
+// A client-reported event under a server event's id is another event, not a
+// retry of it, even when everything else matches.
+func TestATakenIDComparesTheSource(t *testing.T) {
+	svc, _, _ := newService(t)
+	ctx := context.Background()
+	id := "0192a3b4-c5d6-7e8f-9a0b-1c2d3e4f5a6b"
+	server := action(func(e *audit.Event) { e.ID, e.Outcome = id, audit.OutcomeOK })
+	if _, err := svc.Record(ctx, server); err != nil {
+		t.Fatal(err)
+	}
+	client := server
+	client.Source = audit.SourceClient
+	if _, err := svc.Record(ctx, client); !errors.Is(err, audit.ErrInvalidEvent) {
+		t.Errorf("client Record under the server event's id err = %v, want ErrInvalidEvent", err)
+	}
+}

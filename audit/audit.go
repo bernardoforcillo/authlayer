@@ -221,7 +221,7 @@ type Completion struct {
 }
 
 // Closing is what [Store.Complete] writes: the completion columns of one
-// event, already redacted and diffed.
+// event, with Changes already diffed and then redacted.
 type Closing struct {
 	// At is the completion time.
 	At time.Time
@@ -317,9 +317,11 @@ type DayStatus struct {
 type Filter struct {
 	// Topics matches any of these topics.
 	Topics []string
-	// From is the inclusive lower bound of OccurredAt.
+	// From is the inclusive lower bound of OccurredAt. The Service rounds it
+	// down to the microsecond stores keep.
 	From time.Time
-	// To is the exclusive upper bound of OccurredAt.
+	// To is the exclusive upper bound of OccurredAt. The Service rounds it
+	// up to the microsecond.
 	To time.Time
 	// ContainerID matches the tenant.
 	ContainerID string
@@ -392,7 +394,8 @@ var (
 	ErrInvalidEvent = errors.New("authlayer/audit: invalid event")
 	// ErrNotFound: no event, or no seal, matches.
 	ErrNotFound = errors.New("authlayer/audit: not found")
-	// ErrCompleted: the event is already completed with a different outcome.
+	// ErrCompleted: the event is already completed, and differently: another
+	// outcome, code, reason, duration or Changes.
 	ErrCompleted = errors.New("authlayer/audit: event already completed differently")
 	// ErrOpenEvents: a day still holds open events and cannot be sealed.
 	ErrOpenEvents = errors.New("authlayer/audit: day still holds open events")
@@ -470,8 +473,9 @@ type Store interface {
 	// Seals returns the topic's seals with Day in [from, to], ascending.
 	Seals(ctx context.Context, topic string, from, to time.Time) ([]Seal, error)
 	// Purge deletes, oldest first, at most batch events of topic with
-	// OccurredAt strictly before before, and returns how many went. It is
-	// the only way an event is ever deleted.
+	// OccurredAt strictly before before, and returns how many went; a batch
+	// of zero or less deletes nothing. It is the only way an event is ever
+	// deleted.
 	Purge(ctx context.Context, topic string, before time.Time, batch int) (int, error)
 	// MarkPurged stamps PurgedAt = at on the topic's seals with Day
 	// strictly before before that have none yet.

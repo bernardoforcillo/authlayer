@@ -267,6 +267,9 @@ func (s *AuditStore) Seals(_ context.Context, topic string, from, to time.Time) 
 // Purge deletes at most batch events of topic older than before, oldest
 // first.
 func (s *AuditStore) Purge(_ context.Context, topic string, before time.Time, batch int) (int, error) {
+	if batch <= 0 {
+		return 0, nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var doomed []audit.Event
@@ -276,7 +279,7 @@ func (s *AuditStore) Purge(_ context.Context, topic string, before time.Time, ba
 		}
 	}
 	slices.SortFunc(doomed, func(a, b audit.Event) int { return cmp.Compare(a.Seq, b.Seq) })
-	if batch > 0 && len(doomed) > batch {
+	if len(doomed) > batch {
 		doomed = doomed[:batch]
 	}
 	for _, e := range doomed {

@@ -487,11 +487,14 @@ func (st *AuditStore) Seals(ctx context.Context, topic string, from, to time.Tim
 // first, inside its own retention transaction ([AuditRetentionSetting]). The
 // AU002 guard still refuses events of a sealed day that is not marked purged.
 func (st *AuditStore) Purge(ctx context.Context, topic string, before time.Time, batch int) (int, error) {
+	if batch <= 0 {
+		return 0, nil
+	}
 	var n int64
 	err := st.inRetention(ctx, func(tx *pg.DB) error {
 		res, err := tx.Exec(ctx, `DELETE FROM `+st.ev+` WHERE seq IN (
- SELECT seq FROM `+st.ev+` WHERE topic = $1 AND occurred_at < $2 ORDER BY seq LIMIT NULLIF($3::bigint, 0))`,
-			topic, before.UTC(), max(batch, 0))
+ SELECT seq FROM `+st.ev+` WHERE topic = $1 AND occurred_at < $2 ORDER BY seq LIMIT $3)`,
+			topic, before.UTC(), batch)
 		if err != nil {
 			return err
 		}

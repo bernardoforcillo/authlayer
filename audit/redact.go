@@ -14,8 +14,9 @@ import (
 const Redacted = "[REDACTED]"
 
 // redactionError is what Redact and Diff return for input they cannot read,
-// so a recorder never fails on a payload it was handed.
-var redactionError = json.RawMessage(`{"redaction_error":true}`)
+// so a recorder never fails on a payload it was handed. Each call returns its
+// own copy, so a caller editing one cannot change the next.
+func redactionError() json.RawMessage { return json.RawMessage(`{"redaction_error":true}`) }
 
 // Policy says what [Redact] removes, masks and truncates.
 //
@@ -45,11 +46,19 @@ type Policy struct {
 
 // DefaultPolicy removes the usual secrets, masks emails, and truncates
 // strings over 1 KiB and payloads over 16 KiB.
+//
+// Only keys are matched: a secret stored under a key that does not look like
+// one — the value of a {"name":"Authorization","value":"…"} pair, or JSON
+// embedded in a string — passes through. Redact such payloads yourself, or
+// add their keys to the policy.
 func DefaultPolicy() Policy {
 	return Policy{
 		Remove: []string{
-			"password", "passwd", "secret", "token", "api_key", "private_key",
-			"credential", "otp", "cookie", "authorization", "recovery_code",
+			"password", "passwd", "pwd", "pass", "passphrase", "secret", "token", "jwt", "bearer",
+			"api_key", "private_key", "signing_key", "access_key", "encryption_key", "hmac_key",
+			"master_key", "session_key", "credential", "otp", "totp", "mfa_code", "pin",
+			"recovery_code", "device_code", "user_code", "code_verifier", "cookie",
+			"authorization", "plaintext",
 		},
 		Mask:      []string{"email"},
 		MaxString: 1024,
@@ -66,17 +75,17 @@ func Redact(raw json.RawMessage, p Policy) json.RawMessage {
 	}
 	v, err := decodeJSON(raw)
 	if err != nil {
-		return redactionError
+		return redactionError()
 	}
 	r := redactor{remove: compile(p.Remove), mask: compile(p.Mask), maxString: p.MaxString}
 	out, err := json.Marshal(r.value(v, false))
 	if err != nil {
-		return redactionError
+		return redactionError()
 	}
 	if p.MaxBytes > 0 && len(out) > p.MaxBytes {
 		capped, err := json.Marshal(summary(out))
 		if err != nil {
-			return redactionError
+			return redactionError()
 		}
 		return capped
 	}
@@ -189,7 +198,7 @@ func keyWords(key string) []string {
 		if unicode.IsUpper(r) && len(cur) > 0 {
 			prev := runes[i-1]
 			nextLower := i+1 < len(runes) && unicode.IsLower(runes[i+1])
-			if unicode.IsLower(prev) || unicode.IsDigit(prev) || nextLower {
+			if unicode.IsLower(prev) || nextLower {
 				flush()
 			}
 		}
