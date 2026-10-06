@@ -15,323 +15,6 @@ import (
 	"github.com/bernardoforcillo/authlayer/audit"
 )
 
-// SQLSTATEs the audit guard triggers raise. They are in the application
-// class space (AU) so a caller can tell a refused rewrite from any other
-// failure with errors.As on *pgconn.PgError.
-const (
-	// AuditEventImmutable (AU001): an UPDATE of an event other than the one
-	// completion of an open event.
-	AuditEventImmutable = "AU001"
-	// AuditEventProtected (AU002): any TRUNCATE of events, a DELETE outside a
-	// retention transaction ([AuditRetentionSetting] not 'on'), and, even
-	// inside one, a DELETE of an event that a seal still vouches for — its
-	// day is sealed and the seal is not marked purged.
-	AuditEventProtected = "AU002"
-	// AuditSealImmutable (AU003): an UPDATE of a seal other than stamping
-	// purged_at once inside a retention transaction, or any DELETE or
-	// TRUNCATE of seals.
-	AuditSealImmutable = "AU003"
-	// AuditDaySealed (AU004): an INSERT of an event into a (topic, day) that
-	// is already sealed. [AuditStore.Insert] reports it as audit.ErrSealed.
-	AuditDaySealed = "AU004"
-	// AuditSealStale (AU005): an INSERT of a seal whose event count or first
-	// and last Seq no longer match its day's events, or whose day holds an
-	// open event. [AuditStore.InsertSeal] reports it as audit.ErrSealStale.
-	AuditSealStale = "AU005"
-	// AuditIsolation (AU006): an INSERT of an event or a seal in a
-	// transaction stricter than READ COMMITTED, where the guards' checks
-	// would read a snapshot taken before a concurrent seal or event committed.
-	// The store runs its own writes under READ COMMITTED whatever the
-	// database's default.
-	AuditIsolation = "AU006"
-)
-
-// AuditRetentionSetting is the transaction-local setting that opens the
-// audit tables to retention: the AU002 guard refuses every DELETE of an event,
-// and the AU003 guard every purged_at stamp, unless it is 'on'.
-// [AuditStore.Purge] and [AuditStore.MarkPurged] set it with set_config(...,
-// true) inside their own transaction, so it never outlives them.
-const AuditRetentionSetting = "authlayer.audit_retention"
-
-// AuditNames are the table names the audit stores persist to; the zero
-// value means the defaults.
-type AuditNames struct {
-	Events string // default "audit_events"
-	Seals  string // default "audit_seals"
-	Keys   string // default "audit_subject_keys", used by [AuditKeyStore]
-}
-
-func (n AuditNames) withDefaults() AuditNames {
-	if n.Events == "" {
-		n.Events = "audit_events"
-	}
-	if n.Seals == "" {
-		n.Seals = "audit_seals"
-	}
-	if n.Keys == "" {
-		n.Keys = "audit_subject_keys"
-	}
-	return n
-}
-
-type auditSettings struct {
-	names   AuditNames
-	textIDs bool
-}
-
-// AuditOption customizes an [AuditStore] or [AuditDDL].
-type AuditOption func(*auditSettings)
-
-// WithAuditNames overrides the two table names.
-func WithAuditNames(n AuditNames) AuditOption {
-	return func(s *auditSettings) { s.names = n }
-}
-
-// WithAuditTextIDs types the event id column as text instead of uuid, for an
-// audit.Service whose id generator does not produce UUIDs
-// ([audit.WithRuntime]).
-func WithAuditTextIDs() AuditOption {
-	return func(s *auditSettings) { s.textIDs = true }
-}
-
-func newAuditSettings(opts []AuditOption) auditSettings {
-	var cfg auditSettings
-	for _, o := range opts {
-		if o != nil {
-			o(&cfg)
-		}
-	}
-	cfg.names = cfg.names.withDefaults()
-	return cfg
-}
-
-func quoteIdent(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
-
-// AuditDDL returns the statements that create the audit tables, their
-// indexes and the guard triggers, in order, each idempotent. Run them from a
-// migration, or let [AuditStore.CreateSchema] do it.
-//
-// The guards are what make the log append-only inside the database, so a bug
-// or a stray UPDATE in the application cannot rewrite it:
-//
-//   - AU001: an event may only be updated by the one transition that
-//     completes it (completed_at NULL to set, the completion columns
-//     written, resource and container filled only when empty), or by
-//     clearing its ip and user_agent on retention.
-//   - AU002: an event may be deleted only inside a retention transaction
-//     ([AuditRetentionSetting] on, as [AuditStore.Purge] sets it), and even
-//     then not while its day's seal is unpurged; the events table may not be
-//     truncated.
-//   - AU003: a seal may only get purged_at stamped, once, inside a retention
-//     transaction; seals are never deleted or truncated.
-//   - AU004: an event may not be inserted into a sealed (topic, day).
-//   - AU005: a seal may not be inserted unless the day's events still
-//     match it (count, first and last seq, none open).
-//   - AU006: neither an event nor a seal may be inserted in a transaction
-//     stricter than READ COMMITTED.
-//
-// AU004 and AU005 share an advisory lock per (topic, day): an event insert
-// holds it shared until it commits, the seal insert takes it exclusively and
-// then re-counts the day. An event in flight while Seal digested the day is
-// therefore either counted, which makes the seal stale so Seal digests the
-// day again, or starts after the seal committed and is refused. Both checks
-// need READ COMMITTED to see what committed while they waited for the lock,
-// hence AU006; [AuditStore] runs its own writes under READ COMMITTED whatever
-// the database's default_transaction_isolation.
-//
-// A role with ownership of the tables can still drop a trigger: the guards
-// stop mistakes and ordinary code, and the hash chain ([audit.Service.Verify])
-// detects what a privileged rewrite leaves behind. Run the application as a
-// role that does not own the tables.
-func AuditDDL(opts ...AuditOption) []string {
-	cfg := newAuditSettings(opts)
-	ev, sl := quoteIdent(cfg.names.Events), quoteIdent(cfg.names.Seals)
-	idType := "uuid"
-	if cfg.textIDs {
-		idType = "text"
-	}
-	q := func(suffix string) string { return quoteIdent(cfg.names.Events + suffix) }
-	qs := func(suffix string) string { return quoteIdent(cfg.names.Seals + suffix) }
-	const dayOf = "(%s.occurred_at AT TIME ZONE 'UTC')::date"
-	oldDay := fmt.Sprintf(dayOf, "OLD")
-	newDay := fmt.Sprintf(dayOf, "NEW")
-
-	return []string{
-		`CREATE TABLE IF NOT EXISTS ` + ev + ` (
-  id ` + idType + ` PRIMARY KEY,
-  seq bigint GENERATED ALWAYS AS IDENTITY NOT NULL UNIQUE,
-  occurred_at timestamptz NOT NULL,
-  completed_at timestamptz,
-  topic text NOT NULL,
-  action text NOT NULL,
-  source text NOT NULL,
-  origin text NOT NULL,
-  procedure text NOT NULL DEFAULT '',
-  actor_type text NOT NULL,
-  actor_id text NOT NULL DEFAULT '',
-  actor_display text NOT NULL DEFAULT '',
-  on_behalf_of text NOT NULL DEFAULT '',
-  session_id text NOT NULL DEFAULT '',
-  container_id text NOT NULL DEFAULT '',
-  resource_type text NOT NULL DEFAULT '',
-  resource_id text NOT NULL DEFAULT '',
-  outcome text NOT NULL DEFAULT '',
-  code text NOT NULL DEFAULT '',
-  reason text NOT NULL DEFAULT '',
-  request jsonb,
-  changes jsonb,
-  ip text NOT NULL DEFAULT '',
-  user_agent text NOT NULL DEFAULT '',
-  client_time timestamptz,
-  duration_ms bigint NOT NULL DEFAULT 0
-)`,
-		`CREATE TABLE IF NOT EXISTS ` + sl + ` (
-  topic text NOT NULL,
-  day date NOT NULL,
-  event_count bigint NOT NULL,
-  first_seq bigint NOT NULL,
-  last_seq bigint NOT NULL,
-  events_hash text NOT NULL,
-  prev_hash text NOT NULL DEFAULT '',
-  seal_hash text NOT NULL,
-  sealed_at timestamptz NOT NULL,
-  purged_at timestamptz,
-  PRIMARY KEY (topic, day)
-)`,
-		`CREATE INDEX IF NOT EXISTS ` + q("_topic_time") + ` ON ` + ev + ` (topic, occurred_at)`,
-		`CREATE INDEX IF NOT EXISTS ` + q("_open") + ` ON ` + ev + ` (occurred_at) WHERE completed_at IS NULL`,
-		`CREATE INDEX IF NOT EXISTS ` + q("_container") + ` ON ` + ev + ` (container_id, seq DESC) WHERE container_id <> ''`,
-		`CREATE INDEX IF NOT EXISTS ` + q("_client") + ` ON ` + ev + ` (topic, occurred_at) WHERE ip <> '' OR user_agent <> ''`,
-		`CREATE INDEX IF NOT EXISTS ` + q("_actor") + ` ON ` + ev + ` (actor_id, seq DESC) WHERE actor_id <> ''`,
-
-		// events: AU001 on update.
-		`CREATE OR REPLACE FUNCTION ` + q("_guard_update") + `() RETURNS trigger LANGUAGE plpgsql AS $authlayer$
-BEGIN
-  -- Clearing the client data (IP, user agent) on retention: nothing else may differ.
-  IF NEW.ip = '' AND NEW.user_agent = '' AND (OLD.ip <> '' OR OLD.user_agent <> '')
-     AND NEW.id = OLD.id AND NEW.seq = OLD.seq AND NEW.occurred_at = OLD.occurred_at
-     AND NEW.completed_at IS NOT DISTINCT FROM OLD.completed_at
-     AND NEW.topic = OLD.topic AND NEW.action = OLD.action AND NEW.source = OLD.source
-     AND NEW.origin = OLD.origin AND NEW.procedure = OLD.procedure
-     AND NEW.actor_type = OLD.actor_type AND NEW.actor_id = OLD.actor_id
-     AND NEW.actor_display = OLD.actor_display AND NEW.on_behalf_of = OLD.on_behalf_of
-     AND NEW.session_id = OLD.session_id AND NEW.container_id = OLD.container_id
-     AND NEW.resource_type = OLD.resource_type AND NEW.resource_id = OLD.resource_id
-     AND NEW.outcome = OLD.outcome AND NEW.code = OLD.code AND NEW.reason = OLD.reason
-     AND NEW.request IS NOT DISTINCT FROM OLD.request AND NEW.changes IS NOT DISTINCT FROM OLD.changes
-     AND NEW.client_time IS NOT DISTINCT FROM OLD.client_time AND NEW.duration_ms = OLD.duration_ms
-  THEN
-    RETURN NEW;
-  END IF;
-  IF OLD.completed_at IS NULL AND NEW.completed_at IS NOT NULL
-     AND NEW.id = OLD.id AND NEW.seq = OLD.seq AND NEW.occurred_at = OLD.occurred_at
-     AND NEW.topic = OLD.topic AND NEW.action = OLD.action AND NEW.source = OLD.source
-     AND NEW.origin = OLD.origin AND NEW.procedure = OLD.procedure
-     AND NEW.actor_type = OLD.actor_type AND NEW.actor_id = OLD.actor_id
-     AND NEW.actor_display = OLD.actor_display AND NEW.on_behalf_of = OLD.on_behalf_of
-     AND NEW.session_id = OLD.session_id AND NEW.request IS NOT DISTINCT FROM OLD.request
-     AND NEW.ip = OLD.ip AND NEW.user_agent = OLD.user_agent
-     AND NEW.client_time IS NOT DISTINCT FROM OLD.client_time
-     AND OLD.changes IS NULL
-     AND ((NEW.resource_type = OLD.resource_type AND NEW.resource_id = OLD.resource_id)
-          OR (OLD.resource_type = '' AND OLD.resource_id = ''))
-     AND (NEW.container_id = OLD.container_id OR OLD.container_id = '')
-  THEN
-    RETURN NEW;
-  END IF;
-  RAISE EXCEPTION 'authlayer audit: an event is immutable once written' USING ERRCODE = '` + AuditEventImmutable + `';
-END
-$authlayer$`,
-		`DROP TRIGGER IF EXISTS ` + q("_guard_update") + ` ON ` + ev,
-		`CREATE TRIGGER ` + q("_guard_update") + ` BEFORE UPDATE ON ` + ev +
-			` FOR EACH ROW EXECUTE FUNCTION ` + q("_guard_update") + `()`,
-
-		// events: AU002 on delete and truncate.
-		`CREATE OR REPLACE FUNCTION ` + q("_guard_delete") + `() RETURNS trigger LANGUAGE plpgsql AS $authlayer$
-BEGIN
-  IF TG_OP = 'TRUNCATE' THEN
-    RAISE EXCEPTION 'authlayer audit: events cannot be truncated' USING ERRCODE = '` + AuditEventProtected + `';
-  END IF;
-  IF current_setting('` + AuditRetentionSetting + `', true) IS DISTINCT FROM 'on' THEN
-    RAISE EXCEPTION 'authlayer audit: events are deleted only by retention' USING ERRCODE = '` + AuditEventProtected + `';
-  END IF;
-  IF EXISTS (SELECT 1 FROM ` + sl + ` s
-              WHERE s.topic = OLD.topic AND s.day = ` + oldDay + ` AND s.purged_at IS NULL) THEN
-    RAISE EXCEPTION 'authlayer audit: an event of a sealed day cannot be deleted before retention purges it'
-      USING ERRCODE = '` + AuditEventProtected + `';
-  END IF;
-  RETURN OLD;
-END
-$authlayer$`,
-		`DROP TRIGGER IF EXISTS ` + q("_guard_delete") + ` ON ` + ev,
-		`CREATE TRIGGER ` + q("_guard_delete") + ` BEFORE DELETE ON ` + ev +
-			` FOR EACH ROW EXECUTE FUNCTION ` + q("_guard_delete") + `()`,
-		`DROP TRIGGER IF EXISTS ` + q("_guard_truncate") + ` ON ` + ev,
-		`CREATE TRIGGER ` + q("_guard_truncate") + ` BEFORE TRUNCATE ON ` + ev +
-			` FOR EACH STATEMENT EXECUTE FUNCTION ` + q("_guard_delete") + `()`,
-
-		// events: AU004 on insert into a sealed day.
-		`CREATE OR REPLACE FUNCTION ` + q("_guard_insert") + `() RETURNS trigger LANGUAGE plpgsql AS $authlayer$
-BEGIN
-  IF current_setting('transaction_isolation') <> 'read committed' THEN
-    RAISE EXCEPTION 'authlayer audit: events must be inserted under READ COMMITTED' USING ERRCODE = '` + AuditIsolation + `';
-  END IF;
-  PERFORM pg_advisory_xact_lock_shared(hashtextextended(NEW.topic || '|' || ` + newDay + `::text, 0));
-  IF EXISTS (SELECT 1 FROM ` + sl + ` s WHERE s.topic = NEW.topic AND s.day = ` + newDay + `) THEN
-    RAISE EXCEPTION 'authlayer audit: the day is sealed' USING ERRCODE = '` + AuditDaySealed + `';
-  END IF;
-  RETURN NEW;
-END
-$authlayer$`,
-		`DROP TRIGGER IF EXISTS ` + q("_guard_insert") + ` ON ` + ev,
-		`CREATE TRIGGER ` + q("_guard_insert") + ` BEFORE INSERT ON ` + ev +
-			` FOR EACH ROW EXECUTE FUNCTION ` + q("_guard_insert") + `()`,
-
-		// seals: AU003 on update, delete and truncate; the insert takes the
-		// exclusive side of the lock the event insert shares.
-		`CREATE OR REPLACE FUNCTION ` + qs("_guard") + `() RETURNS trigger LANGUAGE plpgsql AS $authlayer$
-DECLARE
-  n bigint; lo bigint; hi bigint; open bigint;
-BEGIN
-  IF TG_OP = 'INSERT' THEN
-    IF current_setting('transaction_isolation') <> 'read committed' THEN
-      RAISE EXCEPTION 'authlayer audit: seals must be inserted under READ COMMITTED' USING ERRCODE = '` + AuditIsolation + `';
-    END IF;
-    -- Wait for every event insert in flight on the day, then check the seal
-    -- still describes the day: under READ COMMITTED this statement sees them.
-    PERFORM pg_advisory_xact_lock(hashtextextended(NEW.topic || '|' || NEW.day::text, 0));
-    SELECT count(*), coalesce(min(e.seq), 0), coalesce(max(e.seq), 0), count(*) FILTER (WHERE e.completed_at IS NULL)
-      INTO n, lo, hi, open
-      FROM ` + ev + ` e
-     WHERE e.topic = NEW.topic
-       AND e.occurred_at >= (NEW.day::timestamp AT TIME ZONE 'UTC')
-       AND e.occurred_at < ((NEW.day + 1)::timestamp AT TIME ZONE 'UTC');
-    IF n <> NEW.event_count OR lo <> NEW.first_seq OR hi <> NEW.last_seq OR open > 0 THEN
-      RAISE EXCEPTION 'authlayer audit: the seal no longer matches its day' USING ERRCODE = '` + AuditSealStale + `';
-    END IF;
-    RETURN NEW;
-  END IF;
-  IF TG_OP = 'UPDATE' AND OLD.purged_at IS NULL AND NEW.purged_at IS NOT NULL
-     AND current_setting('` + AuditRetentionSetting + `', true) IS NOT DISTINCT FROM 'on'
-     AND NEW.topic = OLD.topic AND NEW.day = OLD.day AND NEW.event_count = OLD.event_count
-     AND NEW.first_seq = OLD.first_seq AND NEW.last_seq = OLD.last_seq
-     AND NEW.events_hash = OLD.events_hash AND NEW.prev_hash = OLD.prev_hash
-     AND NEW.seal_hash = OLD.seal_hash AND NEW.sealed_at = OLD.sealed_at
-  THEN
-    RETURN NEW;
-  END IF;
-  RAISE EXCEPTION 'authlayer audit: a seal is immutable' USING ERRCODE = '` + AuditSealImmutable + `';
-END
-$authlayer$`,
-		`DROP TRIGGER IF EXISTS ` + qs("_guard") + ` ON ` + sl,
-		`CREATE TRIGGER ` + qs("_guard") + ` BEFORE INSERT OR UPDATE OR DELETE ON ` + sl +
-			` FOR EACH ROW EXECUTE FUNCTION ` + qs("_guard") + `()`,
-		`DROP TRIGGER IF EXISTS ` + qs("_guard_truncate") + ` ON ` + sl,
-		`CREATE TRIGGER ` + qs("_guard_truncate") + ` BEFORE TRUNCATE ON ` + sl +
-			` FOR EACH STATEMENT EXECUTE FUNCTION ` + qs("_guard") + `()`,
-	}
-}
-
 // AuditStore is a drops-backed audit.Store over two tables, with the guard
 // triggers of [AuditDDL] enforcing append-only at the database. It is pure
 // persistence: the audit.Service stamps ids, times and redaction.
@@ -351,16 +34,23 @@ func NewAuditStore(db *pg.DB, opts ...AuditOption) *AuditStore {
 	return &AuditStore{db: db, cfg: cfg, ev: quoteIdent(cfg.names.Events), sl: quoteIdent(cfg.names.Seals)}
 }
 
-// CreateSchema runs [AuditDDL]. Every statement is idempotent; like the other
-// stores it adds what is missing and alters nothing else, so deployments that
-// own their migrations should apply AuditDDL there instead.
+// CreateSchema runs [AuditDDL] in one transaction, under an advisory lock so
+// replicas booting together apply it one at a time. It creates the tables
+// and indexes that are missing and replaces the guard functions and triggers
+// in place, so they always match this version; it changes no table.
+// Deployments that own their migrations apply AuditDDL there instead.
 func (st *AuditStore) CreateSchema(ctx context.Context) error {
-	for _, stmt := range AuditDDL(func(s *auditSettings) { *s = st.cfg }) {
-		if _, err := st.db.Exec(ctx, stmt); err != nil {
+	return st.db.InTx(ctx, func(tx *pg.DB) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(auditSchemaLock)); err != nil {
 			return err
 		}
-	}
-	return nil
+		for _, stmt := range AuditDDL(func(s *auditSettings) { *s = st.cfg }) {
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // DropSchema drops both tables and the guard functions. It is for tests and
@@ -516,10 +206,38 @@ func auditWhere(f audit.Filter, args []any) (string, []any) {
 	return strings.Join(conds, " AND "), args
 }
 
+// canonicalUUID reports whether id is a UUID spelled the way the Service mints
+// one: lowercase hex, hyphenated. A uuid column accepts other spellings and
+// stores them canonicalized, so the stored id would not be the caller's.
+func canonicalUUID(id string) bool {
+	if len(id) != 36 {
+		return false
+	}
+	for i, r := range id {
+		switch {
+		case i == 8 || i == 13 || i == 18 || i == 23:
+			if r != '-' {
+				return false
+			}
+		case (r < '0' || r > '9') && (r < 'a' || r > 'f'):
+			return false
+		}
+	}
+	return true
+}
+
+// storable reports whether id fits the id column: anything with
+// [WithAuditTextLibraryIDs], a canonical UUID otherwise.
+func (st *AuditStore) storable(id string) bool { return st.cfg.textIDs || canonicalUUID(id) }
+
 // Insert stores e, or returns the stored row when its id exists; a sealed
 // (topic, day) is audit.ErrSealed, raised by the AU004 guard so the check and
-// the write are one step.
+// the write are one step. On a uuid-typed table an id that is not a
+// lowercase, hyphenated UUID is audit.ErrInvalidEvent.
 func (st *AuditStore) Insert(ctx context.Context, e audit.Event) (audit.Event, error) {
+	if !st.storable(e.ID) {
+		return audit.Event{}, fmt.Errorf("%w: id %q is not a lowercase UUID", audit.ErrInvalidEvent, e.ID)
+	}
 	if stored, err := st.Get(ctx, e.ID); err == nil {
 		return stored, nil
 	} else if !errors.Is(err, audit.ErrNotFound) {
@@ -555,6 +273,9 @@ RETURNING `+auditEventCols,
 
 // Complete writes c onto the open event id; see audit.Store.
 func (st *AuditStore) Complete(ctx context.Context, id string, c audit.Closing) (audit.Event, error) {
+	if !st.storable(id) {
+		return audit.Event{}, audit.ErrNotFound
+	}
 	rows, err := st.queryEvents(ctx,
 		`UPDATE `+st.ev+` SET completed_at = $2, outcome = $3, code = $4, reason = $5,
  changes = $6::jsonb, duration_ms = $7,
@@ -566,9 +287,6 @@ RETURNING `+auditEventCols,
 		id, c.At.UTC(), string(c.Outcome), c.Code, c.Reason, jsonArg(c.Changes), c.DurationMS,
 		c.Resource.Type, c.Resource.ID, c.ContainerID)
 	if err != nil {
-		if pgCode(err) == "22P02" { // not a uuid
-			return audit.Event{}, audit.ErrNotFound
-		}
 		return audit.Event{}, err
 	}
 	if len(rows) == 1 {
@@ -586,11 +304,11 @@ RETURNING `+auditEventCols,
 
 // Get loads one event, or audit.ErrNotFound.
 func (st *AuditStore) Get(ctx context.Context, id string) (audit.Event, error) {
+	if !st.storable(id) {
+		return audit.Event{}, audit.ErrNotFound
+	}
 	rows, err := st.queryEvents(ctx, `SELECT `+auditEventCols+` FROM `+st.ev+` WHERE id = $1`, id)
 	if err != nil {
-		if pgCode(err) == "22P02" {
-			return audit.Event{}, audit.ErrNotFound
-		}
 		return audit.Event{}, err
 	}
 	if len(rows) == 0 {

@@ -18,10 +18,16 @@ if err := st.CreateSchema(ctx); err != nil { // development; own the DDL in prod
 svc := audit.New(st, audit.WithTopics(audithook.Topics()...))
 ```
 
-`dropsstore.AuditDDL()` returns the same statements for a migration. Two tables,
-`audit_events` and `audit_seals` (rename with `WithAuditNames`); event ids are
-`uuid`, or `text` with `WithAuditTextIDs` for a generator that does not mint
-UUIDs.
+`dropsstore.AuditDDL()` returns the same statements for a deployment that owns
+its migrations: apply them all in one transaction, as the role that will own the
+tables (PostgreSQL 14 or later). Re-applying them on an upgrade replaces the
+guard functions and triggers in place, never leaving a table unguarded;
+`CreateSchema` does the same in one transaction under an advisory lock, so
+replicas may run it at once. Two tables, `audit_events` and `audit_seals`
+(rename with `WithAuditNames`; keep both in one schema). Event ids are `uuid`,
+accepted only in the lowercase hyphenated form the `Service` mints — another
+spelling is `ErrInvalidEvent` on insert and `ErrNotFound` on a lookup — or
+`text` with `WithAuditTextLibraryIDs` for a generator that does not mint UUIDs.
 
 ### The guards
 
@@ -51,6 +57,10 @@ snapshot taken before the seal. `AuditStore` therefore runs its inserts in
 `READ COMMITTED` transactions whatever the database's
 `default_transaction_isolation`, and the guards refuse (`AU006`) an insert
 written by hand in a stricter transaction.
+
+The guard functions run with a fixed `search_path` and find the other audit table
+in the schema of the table they fire on, so neither a caller's `search_path` nor
+a `TEMP` table named like an audit table can redirect them.
 
 <Warning>
 Triggers stop mistakes and ordinary code; an owner of the table can drop them.

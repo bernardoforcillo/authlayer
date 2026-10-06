@@ -259,15 +259,17 @@ func completeWritesOnce(t tb, st audit.Store) {
 func completeIdenticalRetryIsNil(t tb, st audit.Store) {
 	ctx := context.Background()
 	e := mustInsert(t, st, ev("t", day0))
+	// Exponent-form numbers: a store that normalizes JSON (jsonb) stores
+	// them respelled, and the retry must still count as identical.
 	c := audit.Closing{At: day0.Add(time.Second), Outcome: audit.OutcomeDenied, Code: "permission_denied", Reason: "r",
-		Changes: json.RawMessage(`{"k":{"before":1,"after":2}}`), DurationMS: 3}
+		Changes: json.RawMessage(`{"k":{"before":1e-7,"after":1E+2}}`), DurationMS: 3}
 	first, err := st.Complete(ctx, e.ID, c)
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
 	retry := c
 	retry.At = day0.Add(time.Minute)
-	retry.Changes = json.RawMessage(`{ "k": { "after": 2, "before": 1 } }`) // the same JSON value, spelled differently
+	retry.Changes = json.RawMessage(`{ "k": { "after": 100, "before": 0.0000001 } }`) // the same JSON value, spelled differently
 	got, err := st.Complete(ctx, e.ID, retry)
 	if err != nil {
 		t.Fatalf("identical retry err = %v, want nil", err)

@@ -74,9 +74,12 @@ once a 1.0 is cut. Until then, minor versions may break API.
   (an insert under an isolation stricter than READ COMMITTED). Event and seal
   inserts share an advisory lock per (topic, day), so an event in flight while a
   day is sealed is either covered by the seal or refused. `AuditDDL` returns
-  the statements for a migration;
-  `WithAuditNames` and `WithAuditTextIDs` adapt it. Run the application as a
-  role that does not own the tables.
+  the statements for a migration (PostgreSQL 14+, one transaction);
+  `CreateSchema` applies them in one transaction under an advisory lock, and
+  the guards pin their `search_path`. `WithAuditNames` and
+  `WithAuditTextLibraryIDs` adapt it. Indexes cover every `Filter` field a
+  trail is read by, `Member` included. Run the application as a role that does
+  not own the tables.
 - **`audit/audittest`.** `audit.Store`'s contract as an executable suite, run
   against `store/memory` and, in the integration lane, against PostgreSQL.
 - **`audit/audithook`.** Adapters from the lifecycle hooks of `auth`,

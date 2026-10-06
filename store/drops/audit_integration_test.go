@@ -9,8 +9,10 @@ package dropsstore_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,7 +149,7 @@ func TestAuditStoreTextIDs(t *testing.T) {
 	_, db := newLiveAuditStore(t)
 	ctx := context.Background()
 	st := dropsstore.NewAuditStore(db, dropsstore.WithAuditNames(dropsstore.AuditNames{Events: "ae_text", Seals: "as_text"}),
-		dropsstore.WithAuditTextIDs())
+		dropsstore.WithAuditTextLibraryIDs())
 	_ = st.DropSchema(ctx)
 	if err := st.CreateSchema(ctx); err != nil {
 		t.Fatal(err)
@@ -416,5 +418,164 @@ func TestAuditGuardsHoldUnderRepeatableReadLive(t *testing.T) {
 	clock = clock.Add(24 * time.Hour)
 	if _, err := svc.Seal(ctx, clock); err != nil {
 		t.Fatalf("Seal on a REPEATABLE READ default: %v", err)
+	}
+}
+
+// A TEMP table named like the seals table comes first on the session's
+// search_path; the guards must still read the real one.
+func TestAuditGuardsIgnoreATempShadowTableLive(t *testing.T) {
+	st, db := newLiveAuditStore(t)
+	ctx := context.Background()
+	d := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
+	if err := st.InsertSeal(ctx, audit.Seal{Topic: "t", Day: d, EventsHash: "e", SealHash: "s", SealedAt: d.Add(30 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	err := db.InTx(ctx, func(tx *pg.DB) error {
+		if _, err := tx.Exec(ctx, `CREATE TEMP TABLE audit_seals (topic text, day date, purged_at timestamptz) ON COMMIT DROP`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, rawAuditInsert, uid.NewV7(), d.Add(time.Hour))
+		return err
+	})
+	wantCode(t, err, dropsstore.AuditDaySealed)
+
+	// The delete guard too: with the retention setting on, an event of a
+	// sealed, unpurged day stays even when the shadow says nothing is sealed.
+	clock := d.Add(48*time.Hour + time.Hour)
+	svc := audit.New(st, audit.WithRuntime(core.Runtime{Clock: func() time.Time { return clock }}),
+		audit.WithTopics(audit.Topic{Key: "u"}))
+	clock = d.Add(24*time.Hour + time.Hour)
+	e, err := svc.Record(ctx, audit.Event{Topic: "u", Action: "a.b", Origin: "x", Outcome: audit.OutcomeOK,
+		Actor: audit.Actor{Type: audit.ActorSystem}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock = d.Add(48*time.Hour + time.Hour)
+	if _, err := svc.Seal(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	err = db.InTx(ctx, func(tx *pg.DB) error {
+		if _, err := tx.Exec(ctx, `CREATE TEMP TABLE audit_seals (topic text, day date, purged_at timestamptz) ON COMMIT DROP`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SELECT set_config($1, 'on', true)`, dropsstore.AuditRetentionSetting); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM audit_events WHERE id = $1`, e.ID)
+		return err
+	})
+	wantCode(t, err, dropsstore.AuditEventProtected)
+}
+
+func TestAuditIDsLive(t *testing.T) {
+	st, _ := newLiveAuditStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"not-a-uuid", "0192A3B4-C5D6-7E8F-9A0B-1C2D3E4F5A6B", "{0192a3b4-c5d6-7e8f-9a0b-1c2d3e4f5a6b}"} {
+		if _, err := st.Get(ctx, id); !errors.Is(err, audit.ErrNotFound) {
+			t.Errorf("Get(%q) err = %v, want ErrNotFound", id, err)
+		}
+		if _, err := st.Complete(ctx, id, audit.Closing{At: time.Now(), Outcome: audit.OutcomeOK}); !errors.Is(err, audit.ErrNotFound) {
+			t.Errorf("Complete(%q) err = %v, want ErrNotFound", id, err)
+		}
+		e := audit.Event{ID: id, OccurredAt: time.Now().UTC().Truncate(time.Microsecond), Topic: "t", Action: "a.b",
+			Source: audit.SourceServer, Origin: "x", Actor: audit.Actor{Type: audit.ActorSystem}}
+		if got, err := st.Insert(ctx, e); !errors.Is(err, audit.ErrInvalidEvent) {
+			t.Errorf("Insert(%q) = %q, %v; want ErrInvalidEvent", id, got.ID, err)
+		}
+	}
+}
+
+// Begin, Complete (and its identical retry), Seal and Verify survive the jsonb
+// round trip, which sorts keys and respells numbers.
+func TestAuditJSONBRoundTripVerifiesLive(t *testing.T) {
+	st, _ := newLiveAuditStore(t)
+	ctx := context.Background()
+	clock := time.Date(2026, 1, 10, 9, 0, 0, 0, time.UTC)
+	svc := audit.New(st, audit.WithRuntime(core.Runtime{Clock: func() time.Time { return clock }}),
+		audit.WithTopics(audit.Topic{Key: "t"}))
+	open, err := svc.Begin(ctx, audit.Event{Topic: "t", Action: "a.b", Origin: "x", Actor: audit.Actor{Type: audit.ActorSystem},
+		Request: json.RawMessage(`{"z":{"b":[1,{"y":2,"x":1}],"a":1.50},"a":1e-7,"m":"é"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := audit.Completion{Outcome: audit.OutcomeOK,
+		Before: json.RawMessage(`{"price":1.50,"tiny":1e-7}`), After: json.RawMessage(`{"price":2.50,"tiny":2E-7}`)}
+	if err := svc.Complete(ctx, open.ID, c); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Complete(ctx, open.ID, c); err != nil {
+		t.Fatalf("identical Complete retry after the jsonb round trip: %v", err)
+	}
+	clock = clock.Add(24 * time.Hour)
+	if _, err := svc.Seal(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	if sts, err := svc.Verify(ctx, nil, open.OccurredAt, open.OccurredAt); err != nil || sts[0].State != audit.DayOK {
+		t.Fatalf("Verify = %+v, %v; want ok", sts, err)
+	}
+}
+
+func TestAuditCompletionCannotOverwriteAResourceOrContainerLive(t *testing.T) {
+	st, db := newLiveAuditStore(t)
+	ctx := context.Background()
+	svc := audit.New(st, audit.WithTopics(audit.Topic{Key: "t"}))
+	open, err := svc.Begin(ctx, audit.Event{Topic: "t", Action: "a.b", Origin: "x", Actor: audit.Actor{Type: audit.ActorSystem},
+		Resource: audit.Resource{Type: "menu", ID: "m1"}, ContainerID: "org1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, set := range []string{"resource_id = 'm2'", "resource_type = 'lot'", "container_id = 'org2'"} {
+		_, err := db.Exec(ctx, `UPDATE audit_events SET completed_at = now(), outcome = 'ok', `+set+` WHERE id = $1`, open.ID)
+		wantCode(t, err, dropsstore.AuditEventImmutable)
+	}
+}
+
+// CreateSchema may run on several replicas at once.
+func TestAuditCreateSchemaConcurrentlyLive(t *testing.T) {
+	st, _ := newLiveAuditStore(t)
+	ctx := context.Background()
+	errs := make(chan error, 8)
+	for range 8 {
+		go func() { errs <- st.CreateSchema(ctx) }()
+	}
+	for range 8 {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent CreateSchema: %v", err)
+		}
+	}
+}
+
+// One person's trail (Filter.Member) can be read from indexes alone.
+func TestAuditMemberFilterUsesIndexesLive(t *testing.T) {
+	_, db := newLiveAuditStore(t)
+	ctx := context.Background()
+	var plan []string
+	err := db.InTx(ctx, func(tx *pg.DB) error {
+		if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `EXPLAIN SELECT count(*) FROM audit_events
+WHERE (actor_id = 'u' OR on_behalf_of = 'u' OR (resource_type = 'user' AND resource_id = 'u'))`)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				return err
+			}
+			plan = append(plan, line)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(plan, "\n")
+	for _, idx := range []string{"audit_events_actor", "audit_events_on_behalf_of", "audit_events_resource"} {
+		if !strings.Contains(joined, idx) {
+			t.Errorf("the Member plan does not use %s:\n%s", idx, joined)
+		}
 	}
 }
