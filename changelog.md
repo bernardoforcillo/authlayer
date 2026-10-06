@@ -8,6 +8,8 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-06
+
 ### Added
 
 - **Data protection (GDPR).** [`docs/privacy/data-protection`](docs/privacy/data-protection.mdx)
