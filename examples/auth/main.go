@@ -159,6 +159,16 @@ func main() {
 	must(err)
 	fmt.Printf("  bob id=%s\n", short(bobLogin.User.ID))
 
+	// AcceptInvite never compares the accepting subject to the invited address
+	// — the token is a bearer credential — so the application does, first.
+	// A holder of the token who is not bob (alice here, standing in for anyone
+	// the email was forwarded to) is refused, and the token is not spent.
+	if err := checkInvitee(ctx, inviteSvc, inviteToken, login.User); err == nil {
+		panic("a verified user other than the invitee must not pass checkInvitee")
+	}
+	fmt.Println("  alice presenting bob's token -> refused by checkInvitee")
+	must(checkInvitee(ctx, inviteSvc, inviteToken, bobLogin.User))
+
 	bob := org.WithSubject(ctx, bobLogin.User.ID)
 	joined, err := inviteSvc.AcceptInvite(bob, inviteToken)
 	must(err)
@@ -237,6 +247,29 @@ func can(svc *org.Service, ctx context.Context, resource string, actions ...acce
 	ok, err := svc.Can(ctx, resource, actions...)
 	must(err)
 	return ok
+}
+
+// errNotInvitee is what checkInvitee returns for any mismatch. One error for
+// every cause, so a caller cannot probe which addresses hold invitations.
+var errNotInvitee = errors.New("invitation is not for this account")
+
+// checkInvitee binds an email invitation to its recipient: the accepting user
+// must hold a VERIFIED address equal to the invited one. Run it in front of
+// every Service.AcceptInvite — the library admits whoever presents the token.
+//
+// PreviewInvite reads the invited address without consuming the token. A plain
+// == is correct: both sides are normalized by the same rule. Fail closed on an
+// unverified address (it proves nothing) and on a link preview (Email is empty
+// because a link names no recipient).
+func checkInvitee(ctx context.Context, svc *invite.Service[org.Organization, org.Member, *org.Organization, *org.Member], token string, user auth.UserBase) error {
+	p, err := svc.PreviewInvite(ctx, token)
+	if err != nil {
+		return err
+	}
+	if !p.Valid || p.Email == "" || user.EmailVerifiedAt == nil || p.Email != user.Email {
+		return errNotInvitee
+	}
+	return nil
 }
 
 func report(label string, allowed bool) {
