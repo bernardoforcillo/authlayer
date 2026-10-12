@@ -8,6 +8,17 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-12
+
+### Changed
+
+- `examples/auth` binds the email invitation to its recipient with a
+  `checkInvitee` helper in front of `AcceptInvite`: it reads the invited
+  address with `PreviewInvite` and requires the accepting user to hold a
+  verified address equal to it, failing closed otherwise. No library code
+  changed; `AcceptInvite` still admits whoever presents the token (see
+  [`docs/invitations/security`](docs/invitations/security.mdx)).
+
 ## [0.3.0] - 2026-10-06
 
 ### Added
@@ -2127,7 +2138,9 @@ OAuth) is not part of this release.
 - `github.com/jackc/pgx/v5` v5.10.0 (PostgreSQL store only)
 - Go 1.26+
 
-[Unreleased]: https://github.com/bernardoforcillo/authlayer/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/bernardoforcillo/authlayer/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/bernardoforcillo/authlayer/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/bernardoforcillo/authlayer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/bernardoforcillo/authlayer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bernardoforcillo/authlayer/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/bernardoforcillo/authlayer/releases/tag/v0.0.1
