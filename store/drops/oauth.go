@@ -375,6 +375,8 @@ func NewOAuthSchema(opts ...OAuthOption) *OAuthSchema {
 	idx(s.RefreshTokens, s.refresh, "client_id")
 	idx(s.RefreshTokens, s.refresh, "family_id")
 	// PurgeExpired deletes on expires_at (and, for grants, revoked_at).
+	addIndex(s.Grants, s.grants, "expires_at")
+	addIndex(s.Grants, s.grants, "revoked_at")
 	addIndex(s.Codes, s.codes, "expires_at")
 	addIndex(s.DeviceAuthorizations, s.devices, "expires_at")
 	addIndex(s.RefreshTokens, s.refresh, "expires_at")

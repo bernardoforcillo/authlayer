@@ -1,0 +1,96 @@
+---
+title: "Data-layer conventions"
+description: "The rules every store in store/drops and store/memory follows, and the tests that enforce them."
+---
+
+The stores are written to a small set of rules, so a new table, index or store
+looks like the ones beside it. Each rule below names the test that fails when it
+is broken; none of them is only prose.
+
+## One option type
+
+Every store and schema constructor in `store/drops` takes the same
+`dropsstore.Option`. A constructor reads the settings that concern it and ignores
+the rest, so one list configures a deployment:
+
+{/* verify:skip a one-line fragment: it needs no database, and the options it names are exercised by store/drops options_test.go */}
+```go
+opts := []dropsstore.Option{dropsstore.TextLibraryIDs()}
+```
+
+`WithAuthNames`, `WithOAuthNames` and the other `With*Names` options set one
+store's table names. `TextLibraryIDs()` and `TextUserIDs()` retype id columns
+from `uuid` to `text`; on the stores that own the users table (auth, identity,
+credential, MFA) the user ids are minted by the library, so `TextLibraryIDs`
+also retypes `user_id` and `TextUserIDs` is ignored. The per-store type names
+(`AuthOption`, `InviteOption`, ...) are aliases of `Option`.
+
+## Tables, constraints and indexes
+
+- **Default table names are unique** across all stores, so one database holds
+  every store without renaming (`TestContractDefaultTableNamesAreUnique`).
+- **An index is named for what it covers:** `<table>_<columns>_idx`
+  (`TestContractIndexNamesSayWhatTheyCover`).
+- **A column a janitor deletes by leads an index.** That is `expires_at` on every
+  table, and `revoked_at` on `api_keys` and `oauth_grants`, whose purge also
+  deletes by it (`TestContractPurgedColumnsAreIndexed`).
+- **Constraints that decide correctness are load-bearing.** A unique violation
+  is what turns a concurrent double-insert into a typed error, because the
+  engine does not pre-check, so they are emitted by `CreateSchema` and by the
+  migrations, never left to the in-memory registry.
+
+## Schema creation has one path
+
+`CreateSchema` and the migrations both build from the same table definitions, via
+one routine: `CREATE TABLE IF NOT EXISTS`, the composite constraints a `CREATE
+TABLE` cannot carry, then `CREATE INDEX IF NOT EXISTS` for each registered
+index. Every statement is idempotent and additive.
+
+## Migrations are a chain per store
+
+Each store's `Migrations()` returns nodes on the `authlayer` branch of drops'
+`TreeMigrator` (see [PostgreSQL](/storage/postgres)):
+
+- `-001_tables` is the root: no parent, no `Down`, because dropping a table is
+  data loss.
+- `-002_indexes` depends on it and is reversible. It carries every index added
+  after the 0.3.1 baseline, registered through `addIndex`.
+- A later release adds a new node whose parent is the previous one; it never
+  edits a node that has shipped.
+- IDs embed the store's first table name, so two instances of one generic store
+  under `WithNames` do not collide.
+
+`TestContractMigrationsAreAFormalChain` and `TestContractLateIndexesAreRegistered`
+enforce the shape, and an integration test runs the chain against PostgreSQL:
+fresh database, rollback and re-apply of the index step, and adopting a database
+`CreateSchema` already built.
+
+## Writing a store method
+
+The statements that carry meaning are written out: conditional `UPDATE`s,
+locking `SELECT`s and multi-step transactions. The plain ones go through four
+generic helpers that take a `*pg.DB`, so they work on a store's connection and
+inside `InTx` alike:
+
+| Helper | Does |
+|---|---|
+| `findOne[T]` | one row by predicate, or the store's not-found error |
+| `listWhere[T]` | every matching row; none is a nil slice, not an error |
+| `updateOne` | update by predicate, not-found error when no row matched |
+| `deleteOne` | delete by predicate, not-found error when no row matched |
+
+Housekeeping deletes go through `deleteBatched`, which removes rows in batches
+of 5000 per statement instead of one unbounded `DELETE`.
+
+## The in-memory store has the same shape
+
+`store/memory` keeps one `table[V]` per collection (`get`, `insert`, `update`,
+`remove`, `filter`). The table has no lock of its own: each store method holds
+the store's single mutex for its whole body, which is what keeps a
+check-then-write across two tables atomic.
+
+## Shared option helpers
+
+Every service's `WithClock`, `WithIDGenerator`, `WithRuntime` and `WithHooks` is
+built from `core.Override`, `core.Runtime.Apply` and `core.AppendNonNil`, so
+"a nil value is ignored" is written once.

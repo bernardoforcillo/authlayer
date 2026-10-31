@@ -142,6 +142,7 @@
           "storage/memory",
           "storage/postgres",
           "storage/schema",
+          "storage/conventions",
           "storage/custom-backends"
         ]
       },

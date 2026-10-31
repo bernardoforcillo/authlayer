@@ -15,8 +15,8 @@ once a 1.0 is cut. Until then, minor versions may break API.
   authorization guard runs on every action), `sessions (user_id)`,
   `organization_invite_links (container_id)`, and `expires_at` on sessions,
   verifications, invites, invite links, passkey challenges, trusted devices,
-  OAuth codes, device authorizations and refresh tokens, plus `expires_at` and
-  `revoked_at` on `api_keys`, for the `PurgeExpired` janitors. Re-running
+  OAuth grants, codes, device authorizations and refresh tokens, plus `revoked_at`
+  on `api_keys` and `oauth_grants`, for the `PurgeExpired` janitors. Re-running
   `CreateSchema` creates them on existing tables; the equivalent
   `CREATE INDEX CONCURRENTLY` statements are on `/storage/postgres`.
 
@@ -31,6 +31,14 @@ once a 1.0 is cut. Until then, minor versions may break API.
   that own the users table, `TextLibraryIDs` also retypes `user_id` and
   `TextUserIDs` is ignored. The per-store options (`WithAuthTextLibraryIDs`,
   `WithInviteTextUserIDs`, ...) keep working and are now thin aliases.
+
+- `docs/storage/conventions.mdx` writes down the data-layer rules, and
+  `store/drops/contract_test.go` enforces them: unique default table names,
+  index names that say what they cover, an index on every column a janitor
+  deletes by, and the shape of each store's migration chain.
+- `core.Override`, `core.Runtime.Apply` and `core.AppendNonNil` back the
+  `WithClock`, `WithIDGenerator`, `WithRuntime` and `WithHooks` options of every
+  service. Hook lists now drop nil entries everywhere.
 
 ### Changed
 
