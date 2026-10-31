@@ -303,29 +303,3 @@ func (st *Store[C, M]) WithTx(ctx context.Context, fn func(scope.Store[C, M]) er
 		return fn(&Store[C, M]{db: txdb, s: st.s})
 	})
 }
-
-// ── helpers ─────────────────────────────────────────────────────────────────
-
-// mapNoRows converts drops' ErrNoRows into a domain not-found sentinel.
-func mapNoRows(err, notFound error) error {
-	if errors.Is(err, pg.ErrNoRows) {
-		return notFound
-	}
-	return err
-}
-
-// affectedOrErr returns notFound when the statement matched no rows, else the
-// original error (or nil on success).
-func affectedOrErr(res drops.Result, err, notFound error) error {
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return notFound
-	}
-	return nil
-}

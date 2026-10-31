@@ -100,8 +100,6 @@ func newAuditSettings(opts []AuditOption) auditSettings {
 	return cfg
 }
 
-func quoteIdent(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
-
 func quoteLiteral(s string) string { return `'` + strings.ReplaceAll(s, `'`, `''`) + `'` }
 
 // auditSchemaLock is the advisory lock key [AuditStore.CreateSchema] holds
