@@ -47,9 +47,9 @@ import (
 // as the write it guards.
 type AuthStore struct {
 	mu            sync.Mutex
-	users         map[string]auth.UserBase
-	sessions      map[string]auth.Session
-	verifications map[string]auth.Verification
+	users         table[auth.UserBase]
+	sessions      table[auth.Session]
+	verifications table[auth.Verification]
 }
 
 // ErrTokenHashTaken reports that a Create call would have stored a second row
@@ -85,9 +85,9 @@ var ErrTokenHashTaken = errors.New("authlayer/store/memory: token hash already e
 // NewAuthStore returns an empty in-memory auth.Store.
 func NewAuthStore() *AuthStore {
 	return &AuthStore{
-		users:         map[string]auth.UserBase{},
-		sessions:      map[string]auth.Session{},
-		verifications: map[string]auth.Verification{},
+		users:         table[auth.UserBase]{},
+		sessions:      table[auth.Session]{},
+		verifications: table[auth.Verification]{},
 	}
 }
 
@@ -137,11 +137,7 @@ func (s *AuthStore) CreateUser(_ context.Context, u auth.UserBase) (auth.UserBas
 func (s *AuthStore) FindUserByID(_ context.Context, id string) (auth.UserBase, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	u, ok := s.users[id]
-	if !ok {
-		return auth.UserBase{}, auth.ErrUserNotFound
-	}
-	return u, nil
+	return s.users.get(id, auth.ErrUserNotFound)
 }
 
 // FindUserByEmail normalizes email (see [auth.NormalizeEmail]) and scans for
@@ -287,11 +283,7 @@ func (s *AuthStore) MarkUserDeleted(_ context.Context, userID, anonymizedEmail s
 func (s *AuthStore) DeleteUser(_ context.Context, userID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.users[userID]; !ok {
-		return auth.ErrUserNotFound
-	}
-	delete(s.users, userID)
-	return nil
+	return s.users.remove(userID, auth.ErrUserNotFound)
 }
 
 // --- Sessions ---
@@ -348,24 +340,14 @@ func (s *AuthStore) FindSessionByHash(_ context.Context, tokenHash string) (auth
 func (s *AuthStore) ListSessionsByUser(_ context.Context, userID string) ([]auth.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]auth.Session, 0)
-	for _, sess := range s.sessions {
-		if sess.UserID == userID {
-			out = append(out, sess)
-		}
-	}
-	return out, nil
+	return s.sessions.filter(func(sess auth.Session) bool { return sess.UserID == userID }), nil
 }
 
 // DeleteSession removes the session, or returns auth.ErrSessionNotFound.
 func (s *AuthStore) DeleteSession(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.sessions[id]; !ok {
-		return auth.ErrSessionNotFound
-	}
-	delete(s.sessions, id)
-	return nil
+	return s.sessions.remove(id, auth.ErrSessionNotFound)
 }
 
 // DeleteSessionsByFamily removes every session sharing familyID. Deleting
@@ -521,11 +503,7 @@ func (s *AuthStore) FindVerificationByHash(_ context.Context, tokenHash string) 
 func (s *AuthStore) DeleteVerification(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.verifications[id]; !ok {
-		return auth.ErrVerificationNotFound
-	}
-	delete(s.verifications, id)
-	return nil
+	return s.verifications.remove(id, auth.ErrVerificationNotFound)
 }
 
 // DeleteVerificationsByUserAndPurpose removes every verification for

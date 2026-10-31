@@ -60,8 +60,8 @@ import (
 // silently.
 type InviteStore struct {
 	mu           sync.Mutex
-	emailInvites map[string]invite.EmailInvite
-	links        map[string]invite.Link
+	emailInvites table[invite.EmailInvite]
+	links        table[invite.Link]
 }
 
 // ErrInviteEmailTaken reports that [InviteStore.CreateEmailInvite] would have
@@ -92,8 +92,8 @@ var ErrLinkCodeTaken = errors.New("authlayer/store/memory: link code already exi
 // NewInviteStore returns an empty in-memory invite.Store.
 func NewInviteStore() *InviteStore {
 	return &InviteStore{
-		emailInvites: map[string]invite.EmailInvite{},
-		links:        map[string]invite.Link{},
+		emailInvites: table[invite.EmailInvite]{},
+		links:        table[invite.Link]{},
 	}
 }
 
@@ -174,11 +174,7 @@ func (s *InviteStore) FindEmailInviteByTokenHash(_ context.Context, tokenHash st
 func (s *InviteStore) FindEmailInvite(_ context.Context, id string) (invite.EmailInvite, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	inv, ok := s.emailInvites[id]
-	if !ok {
-		return invite.EmailInvite{}, invite.ErrInviteNotFound
-	}
-	return inv, nil
+	return s.emailInvites.get(id, invite.ErrInviteNotFound)
 }
 
 // ListEmailInvites returns every invite in containerID. Order follows Go map
@@ -187,24 +183,14 @@ func (s *InviteStore) FindEmailInvite(_ context.Context, id string) (invite.Emai
 func (s *InviteStore) ListEmailInvites(_ context.Context, containerID string) ([]invite.EmailInvite, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]invite.EmailInvite, 0)
-	for _, inv := range s.emailInvites {
-		if inv.ContainerID == containerID {
-			out = append(out, inv)
-		}
-	}
-	return out, nil
+	return s.emailInvites.filter(func(inv invite.EmailInvite) bool { return inv.ContainerID == containerID }), nil
 }
 
 // DeleteEmailInvite removes the invite, or returns invite.ErrInviteNotFound.
 func (s *InviteStore) DeleteEmailInvite(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.emailInvites[id]; !ok {
-		return invite.ErrInviteNotFound
-	}
-	delete(s.emailInvites, id)
-	return nil
+	return s.emailInvites.remove(id, invite.ErrInviteNotFound)
 }
 
 // DeleteEmailInvitesFor normalizes email (see [invite.NormalizeEmail]) and
@@ -273,11 +259,7 @@ func (s *InviteStore) FindLinkByCode(_ context.Context, code string) (invite.Lin
 func (s *InviteStore) FindLink(_ context.Context, id string) (invite.Link, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	l, ok := s.links[id]
-	if !ok {
-		return invite.Link{}, invite.ErrLinkNotFound
-	}
-	return l, nil
+	return s.links.get(id, invite.ErrLinkNotFound)
 }
 
 // ListLinks returns every link in containerID, revoked or expired or not.
@@ -286,13 +268,7 @@ func (s *InviteStore) FindLink(_ context.Context, id string) (invite.Link, error
 func (s *InviteStore) ListLinks(_ context.Context, containerID string) ([]invite.Link, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]invite.Link, 0)
-	for _, l := range s.links {
-		if l.ContainerID == containerID {
-			out = append(out, l)
-		}
-	}
-	return out, nil
+	return s.links.filter(func(l invite.Link) bool { return l.ContainerID == containerID }), nil
 }
 
 // RevokeLink stamps RevokedAt with at, or returns invite.ErrLinkNotFound.

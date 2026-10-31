@@ -26,7 +26,7 @@ type Store[C scope.Container, M scope.Member,
 	}] struct {
 	mu         sync.Mutex
 	txMu       sync.Mutex
-	containers map[string]C
+	containers table[C]
 	members    map[string]map[string]M
 	roles      map[string]map[string]scope.RoleRecord
 }
@@ -315,7 +315,7 @@ func (s *Store[C, M, PC, PM]) WithTx(_ context.Context, fn func(scope.Store[C, M
 }
 
 type snapshot[C scope.Container, M scope.Member] struct {
-	containers map[string]C
+	containers table[C]
 	members    map[string]map[string]M
 	roles      map[string]map[string]scope.RoleRecord
 }

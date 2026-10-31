@@ -39,12 +39,12 @@ type IdentityStore struct {
 	// exactly one copy of the data and therefore no way for two indexes to
 	// disagree, the same trade FindUserByEmail and FindSessionByHash already
 	// make. store/drops indexes the columns.
-	identities map[string]auth.Identity
+	identities table[auth.Identity]
 }
 
 // NewIdentityStore returns an empty in-memory auth.IdentityStore.
 func NewIdentityStore() *IdentityStore {
-	return &IdentityStore{identities: map[string]auth.Identity{}}
+	return &IdentityStore{identities: table[auth.Identity]{}}
 }
 
 // CreateIdentity normalizes i.Email (see [auth.NormalizeEmail]), stores i
@@ -118,13 +118,7 @@ func (s *IdentityStore) FindIdentityByProviderSubject(_ context.Context, provide
 func (s *IdentityStore) ListIdentitiesByUser(_ context.Context, userID string) ([]auth.Identity, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]auth.Identity, 0)
-	for _, i := range s.identities {
-		if i.UserID == userID {
-			out = append(out, i)
-		}
-	}
-	return out, nil
+	return s.identities.filter(func(i auth.Identity) bool { return i.UserID == userID }), nil
 }
 
 // TouchIdentity stamps LastUsedAt with now on the identity, or returns
@@ -155,11 +149,7 @@ func (s *IdentityStore) TouchIdentity(_ context.Context, id string, now time.Tim
 func (s *IdentityStore) DeleteIdentity(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.identities[id]; !ok {
-		return auth.ErrIdentityNotFound
-	}
-	delete(s.identities, id)
-	return nil
+	return s.identities.remove(id, auth.ErrIdentityNotFound)
 }
 
 // DeleteIdentityIfNotLast removes every identity of userID at provider, but

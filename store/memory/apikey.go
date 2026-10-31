@@ -29,20 +29,20 @@ import (
 type APIKeyStore struct {
 	mu sync.Mutex
 	// accounts is keyed by service-account id.
-	accounts map[string]apikey.ServiceAccount
+	accounts table[apikey.ServiceAccount]
 	// keys is keyed by key id. Finding one by token hash, or an account's
 	// keys, is a linear scan rather than a second map: a reference store
 	// trades speed for having exactly one copy of the data and therefore no
 	// way for two indexes to disagree, the same trade every other store in
 	// this package makes. store/drops indexes the columns.
-	keys map[string]apikey.Key
+	keys table[apikey.Key]
 }
 
 // NewAPIKeyStore returns an empty in-memory apikey.Store.
 func NewAPIKeyStore() *APIKeyStore {
 	return &APIKeyStore{
-		accounts: map[string]apikey.ServiceAccount{},
-		keys:     map[string]apikey.Key{},
+		accounts: table[apikey.ServiceAccount]{},
+		keys:     table[apikey.Key]{},
 	}
 }
 
@@ -66,11 +66,7 @@ func (s *APIKeyStore) CreateServiceAccount(_ context.Context, sa apikey.ServiceA
 func (s *APIKeyStore) FindServiceAccount(_ context.Context, id string) (apikey.ServiceAccount, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sa, ok := s.accounts[id]
-	if !ok {
-		return apikey.ServiceAccount{}, apikey.ErrServiceAccountNotFound
-	}
-	return sa, nil
+	return s.accounts.get(id, apikey.ErrServiceAccountNotFound)
 }
 
 // ListServiceAccounts returns every account in containerID, disabled or not.
@@ -79,13 +75,7 @@ func (s *APIKeyStore) FindServiceAccount(_ context.Context, id string) (apikey.S
 func (s *APIKeyStore) ListServiceAccounts(_ context.Context, containerID string) ([]apikey.ServiceAccount, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]apikey.ServiceAccount, 0)
-	for _, sa := range s.accounts {
-		if sa.ContainerID == containerID {
-			out = append(out, sa)
-		}
-	}
-	return out, nil
+	return s.accounts.filter(func(sa apikey.ServiceAccount) bool { return sa.ContainerID == containerID }), nil
 }
 
 // SetServiceAccountDisabled writes DisabledAt = at and UpdatedAt = now, or
@@ -166,11 +156,7 @@ func (s *APIKeyStore) FindKeyByHash(_ context.Context, tokenHash string) (apikey
 func (s *APIKeyStore) FindKey(_ context.Context, id string) (apikey.Key, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	k, ok := s.keys[id]
-	if !ok {
-		return apikey.Key{}, apikey.ErrKeyNotFound
-	}
-	return k, nil
+	return s.keys.get(id, apikey.ErrKeyNotFound)
 }
 
 // ListKeys returns every key of serviceAccountID, revoked or expired or not.
@@ -178,13 +164,7 @@ func (s *APIKeyStore) FindKey(_ context.Context, id string) (apikey.Key, error) 
 func (s *APIKeyStore) ListKeys(_ context.Context, serviceAccountID string) ([]apikey.Key, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]apikey.Key, 0)
-	for _, k := range s.keys {
-		if k.ServiceAccountID == serviceAccountID {
-			out = append(out, k)
-		}
-	}
-	return out, nil
+	return s.keys.filter(func(k apikey.Key) bool { return k.ServiceAccountID == serviceAccountID }), nil
 }
 
 // RevokeKey stamps RevokedAt with now, or returns apikey.ErrKeyNotFound.
@@ -218,11 +198,7 @@ func (s *APIKeyStore) TouchKey(_ context.Context, id string, now time.Time) erro
 func (s *APIKeyStore) DeleteKey(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.keys[id]; !ok {
-		return apikey.ErrKeyNotFound
-	}
-	delete(s.keys, id)
-	return nil
+	return s.keys.remove(id, apikey.ErrKeyNotFound)
 }
 
 // PurgeExpired deletes every key whose ExpiresAt or RevokedAt is strictly

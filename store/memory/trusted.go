@@ -77,13 +77,7 @@ func (s *MFAStore) FindTrustedDeviceByHash(_ context.Context, tokenHash string) 
 func (s *MFAStore) ListTrustedDevices(_ context.Context, userID string) ([]auth.TrustedDevice, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]auth.TrustedDevice, 0)
-	for _, d := range s.devices {
-		if d.UserID == userID {
-			out = append(out, d)
-		}
-	}
-	return out, nil
+	return s.devices.filter(func(d auth.TrustedDevice) bool { return d.UserID == userID }), nil
 }
 
 // DeleteTrustedDevice removes the one device named by id, or returns
@@ -93,11 +87,7 @@ func (s *MFAStore) ListTrustedDevices(_ context.Context, userID string) ([]auth.
 func (s *MFAStore) DeleteTrustedDevice(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.devices[id]; !ok {
-		return auth.ErrTrustedDeviceNotFound
-	}
-	delete(s.devices, id)
-	return nil
+	return s.devices.remove(id, auth.ErrTrustedDeviceNotFound)
 }
 
 // DeleteTrustedDevicesByUser removes every device belonging to userID, and

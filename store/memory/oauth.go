@@ -39,21 +39,21 @@ var ErrUserCodeTaken = errors.New("authlayer/store/memory: user code already exi
 // interprets no bytes.
 type OAuthStore struct {
 	mu      sync.Mutex
-	clients map[string]oauth.Client
-	grants  map[string]oauth.Grant
-	codes   map[string]oauth.AuthorizationCode
-	devices map[string]oauth.DeviceAuthorization
-	refresh map[string]oauth.RefreshToken
+	clients table[oauth.Client]
+	grants  table[oauth.Grant]
+	codes   table[oauth.AuthorizationCode]
+	devices table[oauth.DeviceAuthorization]
+	refresh table[oauth.RefreshToken]
 }
 
 // NewOAuthStore returns an empty in-memory oauth.Store.
 func NewOAuthStore() *OAuthStore {
 	return &OAuthStore{
-		clients: map[string]oauth.Client{},
-		grants:  map[string]oauth.Grant{},
-		codes:   map[string]oauth.AuthorizationCode{},
-		devices: map[string]oauth.DeviceAuthorization{},
-		refresh: map[string]oauth.RefreshToken{},
+		clients: table[oauth.Client]{},
+		grants:  table[oauth.Grant]{},
+		codes:   table[oauth.AuthorizationCode]{},
+		devices: table[oauth.DeviceAuthorization]{},
+		refresh: table[oauth.RefreshToken]{},
 	}
 }
 
@@ -195,11 +195,7 @@ func (s *OAuthStore) CreateGrant(_ context.Context, g oauth.Grant) (oauth.Grant,
 func (s *OAuthStore) FindGrant(_ context.Context, id string) (oauth.Grant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	g, ok := s.grants[id]
-	if !ok {
-		return oauth.Grant{}, oauth.ErrGrantNotFound
-	}
-	return g, nil
+	return s.grants.get(id, oauth.ErrGrantNotFound)
 }
 
 // ListGrantsByUser returns every grant of userID, revoked or not. Order
@@ -207,13 +203,7 @@ func (s *OAuthStore) FindGrant(_ context.Context, id string) (oauth.Grant, error
 func (s *OAuthStore) ListGrantsByUser(_ context.Context, userID string) ([]oauth.Grant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]oauth.Grant, 0)
-	for _, g := range s.grants {
-		if g.UserID == userID {
-			out = append(out, g)
-		}
-	}
-	return out, nil
+	return s.grants.filter(func(g oauth.Grant) bool { return g.UserID == userID }), nil
 }
 
 // RevokeGrant stamps RevokedAt with now and deletes every refresh token of

@@ -33,29 +33,29 @@ type MFAStore struct {
 	// per user" rule — expressed as the data structure rather than checked
 	// on the way in, which is the in-memory equivalent of store/drops'
 	// PRIMARY KEY on the column.
-	factors map[string]auth.MFAFactor
+	factors table[auth.MFAFactor]
 	// codes is keyed by recovery-code id. Finding a user's codes is a
 	// linear scan rather than a second map: a reference store trades speed
 	// for having exactly one copy of the data and therefore no way for two
 	// indexes to disagree, the same trade FindUserByEmail and
 	// FindIdentityByProviderSubject already make. store/drops indexes the
 	// column.
-	codes map[string]auth.RecoveryCode
+	codes table[auth.RecoveryCode]
 	// devices is keyed by trusted-device id. Locating one by token hash, or
 	// locating a user's, is a linear scan for the same reason codes is: one
 	// copy of the data and therefore no way for two indexes to disagree.
 	// store/drops indexes user_id and constrains token_hash UNIQUE; here
 	// CreateTrustedDevice enforces that uniqueness under the same lock as
 	// the write it guards. trusted.go holds this type's trusted-device half.
-	devices map[string]auth.TrustedDevice
+	devices table[auth.TrustedDevice]
 }
 
 // NewMFAStore returns an empty in-memory auth.MFAStore.
 func NewMFAStore() *MFAStore {
 	return &MFAStore{
-		factors: map[string]auth.MFAFactor{},
-		codes:   map[string]auth.RecoveryCode{},
-		devices: map[string]auth.TrustedDevice{},
+		factors: table[auth.MFAFactor]{},
+		codes:   table[auth.RecoveryCode]{},
+		devices: table[auth.TrustedDevice]{},
 	}
 }
 
@@ -83,11 +83,7 @@ func (s *MFAStore) UpsertFactor(_ context.Context, f auth.MFAFactor) error {
 func (s *MFAStore) FindFactor(_ context.Context, userID string) (auth.MFAFactor, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	f, ok := s.factors[userID]
-	if !ok {
-		return auth.MFAFactor{}, auth.ErrFactorNotFound
-	}
-	return f, nil
+	return s.factors.get(userID, auth.ErrFactorNotFound)
 }
 
 // ConfirmFactor stamps ConfirmedAt with now if and only if it is still
@@ -158,11 +154,7 @@ func (s *MFAStore) AdvanceStep(_ context.Context, userID string, step int64) (bo
 func (s *MFAStore) DeleteFactor(_ context.Context, userID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.factors[userID]; !ok {
-		return auth.ErrFactorNotFound
-	}
-	delete(s.factors, userID)
-	return nil
+	return s.factors.remove(userID, auth.ErrFactorNotFound)
 }
 
 // ReplaceRecoveryCodes replaces the user's entire set with codes: every
@@ -254,11 +246,5 @@ func (s *MFAStore) ConsumeRecoveryCode(_ context.Context, userID, codeHash strin
 func (s *MFAStore) ListRecoveryCodes(_ context.Context, userID string) ([]auth.RecoveryCode, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]auth.RecoveryCode, 0)
-	for _, c := range s.codes {
-		if c.UserID == userID {
-			out = append(out, c)
-		}
-	}
-	return out, nil
+	return s.codes.filter(func(c auth.RecoveryCode) bool { return c.UserID == userID }), nil
 }

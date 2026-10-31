@@ -18,7 +18,7 @@ import (
 type AuditStore struct {
 	mu     sync.Mutex
 	seq    int64
-	events map[string]audit.Event
+	events table[audit.Event]
 	seals  map[auditSealKey]audit.Seal
 }
 
@@ -29,7 +29,7 @@ type auditSealKey struct {
 
 // NewAuditStore returns an empty in-memory audit.Store.
 func NewAuditStore() *AuditStore {
-	return &AuditStore{events: map[string]audit.Event{}, seals: map[auditSealKey]audit.Seal{}}
+	return &AuditStore{events: table[audit.Event]{}, seals: map[auditSealKey]audit.Seal{}}
 }
 
 // Compile-time proof the memory store satisfies the port.

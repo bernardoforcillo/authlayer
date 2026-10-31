@@ -42,17 +42,17 @@ type CredentialStore struct {
 	// same trade FindUserByEmail and FindIdentityByProviderSubject already
 	// make. []byte cannot key a Go map anyway. store/drops indexes the
 	// column.
-	credentials map[string]auth.Credential
+	credentials table[auth.Credential]
 	// challenges is keyed by Challenge.ID, with the hash lookup a scan for
 	// the same reason.
-	challenges map[string]auth.Challenge
+	challenges table[auth.Challenge]
 }
 
 // NewCredentialStore returns an empty in-memory auth.CredentialStore.
 func NewCredentialStore() *CredentialStore {
 	return &CredentialStore{
-		credentials: map[string]auth.Credential{},
-		challenges:  map[string]auth.Challenge{},
+		credentials: table[auth.Credential]{},
+		challenges:  table[auth.Challenge]{},
 	}
 }
 
@@ -119,13 +119,7 @@ func (s *CredentialStore) FindCredentialByCredentialID(_ context.Context, creden
 func (s *CredentialStore) ListCredentialsByUser(_ context.Context, userID string) ([]auth.Credential, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]auth.Credential, 0)
-	for _, c := range s.credentials {
-		if c.UserID == userID {
-			out = append(out, c)
-		}
-	}
-	return out, nil
+	return s.credentials.filter(func(c auth.Credential) bool { return c.UserID == userID }), nil
 }
 
 // UpdateSignCount is the port's compare-and-set: it applies newCount and
@@ -188,11 +182,7 @@ func (s *CredentialStore) TouchCredential(_ context.Context, id string, now time
 func (s *CredentialStore) DeleteCredential(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.credentials[id]; !ok {
-		return auth.ErrCredentialNotFound
-	}
-	delete(s.credentials, id)
-	return nil
+	return s.credentials.remove(id, auth.ErrCredentialNotFound)
 }
 
 // DeleteCredentialIfNotLast removes userID's credential named by id, but only
@@ -312,11 +302,7 @@ func (s *CredentialStore) FindChallengeByHash(_ context.Context, hash string) (a
 func (s *CredentialStore) DeleteChallenge(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.challenges[id]; !ok {
-		return auth.ErrChallengeNotFound
-	}
-	delete(s.challenges, id)
-	return nil
+	return s.challenges.remove(id, auth.ErrChallengeNotFound)
 }
 
 // PurgeExpiredChallenges deletes every challenge whose ExpiresAt is strictly
