@@ -12,7 +12,7 @@ import (
 func record(t *testing.T, svc *audit.Service, clk *testClock, n int) []audit.Event {
 	t.Helper()
 	var out []audit.Event
-	for i := 0; i < n; i++ {
+	for range n {
 		e, err := svc.Record(context.Background(), action(func(e *audit.Event) { e.Outcome = audit.OutcomeOK }))
 		if err != nil {
 			t.Fatalf("Record: %v", err)

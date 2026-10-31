@@ -260,7 +260,7 @@ func checkFindUserByEmailNotFound(t tb, st auth.Store) {
 func checkFindUserByEmailReadsItsOwnWrites(t tb, st auth.Store) {
 	t.Helper()
 	ctx := context.Background()
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		u := mustCreateUser(t, st, newUser(newEmail(), stamp()))
 		got, err := st.FindUserByEmail(ctx, u.Email)
 		if err != nil {

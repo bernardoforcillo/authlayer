@@ -110,9 +110,9 @@ func TestCreateContainerInsertsStampedOrg(t *testing.T) {
 
 	now := time.Now().UTC()
 	in := org.Organization{
-		ContainerBase: scope.ContainerBase{ID: "org1", OwnerID: "alice", CreatedAt: now, UpdatedAt: now},
-		Name:          "Acme",
-		Slug:          "acme",
+		ID: "org1", OwnerID: "alice", CreatedAt: now, UpdatedAt: now,
+		Name: "Acme",
+		Slug: "acme",
 	}
 	o, err := st.CreateContainer(context.Background(), in)
 	if err != nil {
@@ -128,7 +128,7 @@ func TestCreateContainerInsertsStampedOrg(t *testing.T) {
 
 func TestCreateContainerMapsUniqueViolation(t *testing.T) {
 	st := newStore(&fakeDriver{execErr: pg.ErrUniqueViolation})
-	in := org.Organization{ContainerBase: scope.ContainerBase{ID: "o"}, Slug: "acme"}
+	in := org.Organization{ID: "o", Slug: "acme"}
 	if _, err := st.CreateContainer(context.Background(), in); !errors.Is(err, org.ErrSlugTaken) {
 		t.Fatalf("err = %v, want ErrSlugTaken", err)
 	}
@@ -136,7 +136,7 @@ func TestCreateContainerMapsUniqueViolation(t *testing.T) {
 
 func TestAddMemberMapsUniqueViolationToAlreadyMember(t *testing.T) {
 	st := newStore(&fakeDriver{execErr: pg.ErrUniqueViolation})
-	m := org.Member{MemberBase: scope.MemberBase{ContainerID: "o", UserID: "u", RoleKey: "admin"}}
+	m := org.Member{ContainerID: "o", UserID: "u", RoleKey: "admin"}
 	if _, err := st.AddMember(context.Background(), m); !errors.Is(err, org.ErrAlreadyMember) {
 		t.Fatalf("err = %v, want ErrAlreadyMember", err)
 	}
@@ -278,9 +278,9 @@ func TestCreateContainerAcceptsNamedStringFields(t *testing.T) {
 
 	now := time.Now().UTC()
 	in := slugOrg{
-		ContainerBase: scope.ContainerBase{ID: "o1", OwnerID: "u1", CreatedAt: now, UpdatedAt: now},
-		Slug:          "acme",
-		Seats:         12,
+		ID: "o1", OwnerID: "u1", CreatedAt: now, UpdatedAt: now,
+		Slug:  "acme",
+		Seats: 12,
 	}
 	if _, err := st.CreateContainer(context.Background(), in); err != nil {
 		t.Fatalf("CreateContainer: %v", err)
@@ -309,8 +309,8 @@ func TestEmittedSQLNamesTheDerivedColumns(t *testing.T) {
 
 	now := time.Now().UTC()
 	if _, err := st.CreateContainer(ctx, org.Organization{
-		ContainerBase: scope.ContainerBase{ID: "o1", OwnerID: "u1", CreatedAt: now, UpdatedAt: now},
-		Name:          "Acme", Slug: "acme",
+		ID: "o1", OwnerID: "u1", CreatedAt: now, UpdatedAt: now,
+		Name: "Acme", Slug: "acme",
 	}); err != nil {
 		t.Fatalf("CreateContainer: %v", err)
 	}

@@ -140,11 +140,9 @@ func TestSealOnTwoReplicasAtOnce(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
 	for i, s := range []*audit.Service{svc, other} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, errs[i] = s.Seal(context.Background(), day(4))
-		}()
+		})
 	}
 	wg.Wait()
 	for i, err := range errs {

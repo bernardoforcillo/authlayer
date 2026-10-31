@@ -3,6 +3,7 @@ package token
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 )
 
 // Audience is the RFC 7519 §4.1.3 "aud" claim: the recipients a token is
@@ -22,12 +23,7 @@ type Audience []string
 // Contains reports whether aud names a — the check a verifier makes against
 // its own identifier. A nil or empty Audience contains nothing.
 func (a Audience) Contains(aud string) bool {
-	for _, v := range a {
-		if v == aud {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(a, aud)
 }
 
 // MarshalJSON writes a bare string for exactly one audience and an array

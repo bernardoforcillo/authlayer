@@ -404,7 +404,7 @@ func newSecret() (plain, hash string, err error) {
 // scopes, in order, ignoring repeats and surrounding whitespace.
 func splitScope(scopeStr string) []string {
 	var out []string
-	for _, sc := range strings.Fields(scopeStr) {
+	for sc := range strings.FieldsSeq(scopeStr) {
 		if !slices.Contains(out, sc) {
 			out = append(out, sc)
 		}

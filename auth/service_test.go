@@ -1621,10 +1621,8 @@ func TestVerifyEmailConcurrentSameTokenExactlyOneWinner(t *testing.T) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	successes, notFound, other := 0, 0, 0
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range n {
+		wg.Go(func() {
 			_, err := svc.VerifyEmail(context.Background(), res.VerifyToken)
 			mu.Lock()
 			defer mu.Unlock()
@@ -1636,7 +1634,7 @@ func TestVerifyEmailConcurrentSameTokenExactlyOneWinner(t *testing.T) {
 			default:
 				other++
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -1689,14 +1687,12 @@ func equalStrings(a, b []string) bool {
 // convention, even though the field is populated and non-empty in memory.
 func TestUserBasePasswordHashExcludedFromJSON(t *testing.T) {
 	u := testUser{
-		UserBase: auth.UserBase{
-			ID:           "user-1",
-			Email:        "jill@example.com",
-			PasswordHash: "$2a$04$thisIsALiveBcryptDigestDoNotLeakMe",
-			CreatedAt:    time.Now().UTC(),
-			UpdatedAt:    time.Now().UTC(),
-		},
-		DisplayName: "Jill",
+		ID:           "user-1",
+		Email:        "jill@example.com",
+		PasswordHash: "$2a$04$thisIsALiveBcryptDigestDoNotLeakMe",
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
+		DisplayName:  "Jill",
 	}
 
 	out, err := json.Marshal(u)
@@ -1915,7 +1911,7 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 	}
 
 	// Step 1: no user-returning method may be absent from the table above.
-	userBaseType := reflect.TypeOf(auth.UserBase{})
+	userBaseType := reflect.TypeFor[auth.UserBase]()
 	carriesUserBase := func(rt reflect.Type) bool {
 		if rt == userBaseType {
 			return true
@@ -1923,19 +1919,18 @@ func TestEveryPathReturningAUserBaseScrubsPasswordHash(t *testing.T) {
 		if rt.Kind() != reflect.Struct {
 			return false
 		}
-		for i := 0; i < rt.NumField(); i++ {
-			if rt.Field(i).Type == userBaseType {
+		for field := range rt.Fields() {
+			if field.Type == userBaseType {
 				return true
 			}
 		}
 		return false
 	}
-	svcType := reflect.TypeOf(&auth.Service{})
-	for i := 0; i < svcType.NumMethod(); i++ {
-		m := svcType.Method(i)
+	svcType := reflect.TypeFor[*auth.Service]()
+	for m := range svcType.Methods() {
 		returnsUser := false
-		for j := 0; j < m.Type.NumOut(); j++ {
-			if carriesUserBase(m.Type.Out(j)) {
+		for out := range m.Type.Outs() {
+			if carriesUserBase(out) {
 				returnsUser = true
 			}
 		}

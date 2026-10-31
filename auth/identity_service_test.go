@@ -567,11 +567,9 @@ func TestSignInWithClosesTheSubjectLookupWindowInTheStore(t *testing.T) {
 		resA auth.SignInResult
 		errA error
 	)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		resA, errA = svc.SignInWith(ctx, req)
-	}()
+	})
 
 	<-gated.parked // A has read "not found" and is holding it.
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -465,9 +466,7 @@ func TestCreateKeyGuardsTheAccountsRoleAgainstTheActor(t *testing.T) {
 	}
 	// One restricted to Full is still an owner key.
 	full := map[string][]access.Action{}
-	for res, acts := range scope.ControlStatements(org.ResourceOrganization) {
-		full[res] = acts
-	}
+	maps.Copy(full, scope.ControlStatements(org.ResourceOrganization))
 	full["project"] = []access.Action{"create", "read", "update", "delete"}
 	if _, _, err := f.svc.CreateKey(f.ctx("admin1"), sa.ID, "k", apikey.WithPermissions(full)); !errors.Is(err, scope.ErrPrivilegeEscalation) {
 		t.Fatalf("admin minting a Full-capped owner key = %v, want ErrPrivilegeEscalation", err)

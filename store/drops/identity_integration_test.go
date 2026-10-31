@@ -360,9 +360,7 @@ func TestIdentityStoreConcurrentFirstLinkExactlyOneWinnerLive(t *testing.T) {
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			_, err := st.CreateIdentity(ctx, liveIdentity(uid.NewV7(), "google", "contested-sub"))
 			mu.Lock()
@@ -375,7 +373,7 @@ func TestIdentityStoreConcurrentFirstLinkExactlyOneWinnerLive(t *testing.T) {
 			default:
 				others = append(others, err)
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
@@ -756,9 +754,7 @@ func TestDeleteIdentityIfNotLastIsAtomicUnderConcurrencyLive(t *testing.T) {
 			// Rotate the role by round so the goroutine the runtime readies
 			// first is not always unlinking the same provider.
 			provider := providers[(i+round)%len(providers)]
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				<-start
 				err := st.DeleteIdentityIfNotLast(ctx, user, provider, false)
 				mu.Lock()
@@ -773,7 +769,7 @@ func TestDeleteIdentityIfNotLastIsAtomicUnderConcurrencyLive(t *testing.T) {
 				default:
 					others = append(others, err)
 				}
-			}()
+			})
 		}
 		close(start)
 		wg.Wait()

@@ -1122,7 +1122,7 @@ func (s *Service) spendRecoveryCode(ctx context.Context, st MFAStore, userID, pl
 func (s *Service) newRecoveryCodes(userID string, now time.Time) ([]string, []RecoveryCode, error) {
 	plain := make([]string, 0, recoveryCodeCount)
 	records := make([]RecoveryCode, 0, recoveryCodeCount)
-	for i := 0; i < recoveryCodeCount; i++ {
+	for range recoveryCodeCount {
 		b := make([]byte, recoveryCodeBytes)
 		if _, err := rand.Read(b); err != nil {
 			return nil, nil, fmt.Errorf("authlayer/auth: read random recovery code: %w", err)

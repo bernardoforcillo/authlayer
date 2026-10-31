@@ -1442,24 +1442,20 @@ func TestSplitLockStoreProducesTwoWinners(t *testing.T) {
 	var okA bool
 	var errA error
 
-	wgA.Add(1)
-	go func() {
-		defer wgA.Done()
+	wgA.Go(func() {
 		_, ok, err := st.MarkRotated(ctx, "hash1", now)
 		okA, errA = ok, err
-	}()
+	})
 
 	<-st.parkedCh // block until A has claimed the gap and parked — no spin, no sleep
 
 	var wgB sync.WaitGroup
 	var okB bool
 	var errB error
-	wgB.Add(1)
-	go func() {
-		defer wgB.Done()
+	wgB.Go(func() {
 		_, ok, err := st.MarkRotated(ctx, "hash1", now)
 		okB, errB = ok, err
-	}()
+	})
 	wgB.Wait() // B has now run its entire read-decide-write cycle to completion
 
 	close(st.gate) // release A

@@ -54,12 +54,10 @@ func keyConcurrent(t tb, ks audit.KeyStore) {
 	const n = 8
 	out := make([][]byte, n)
 	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for i := range n {
+		wg.Go(func() {
 			out[i], _ = ks.PutKey(ctx, "u1", bytes.Repeat([]byte{byte(i + 1)}, 32))
-		}()
+		})
 	}
 	wg.Wait()
 	for i := range out {
@@ -76,7 +74,7 @@ func keyDelete(t tb, ks audit.KeyStore) {
 			t.Fatalf("PutKey: %v", err)
 		}
 	}
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		if err := ks.DeleteKey(ctx, "u1"); err != nil {
 			t.Fatalf("DeleteKey #%d: %v", i+1, err)
 		}

@@ -835,10 +835,8 @@ func TestRedeemMagicLinkConcurrentSameTokenExactlyOneWinner(t *testing.T) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	withTokens, notFound, other := 0, 0, 0
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range n {
+		wg.Go(func() {
 			res, err := svc.RedeemMagicLink(ctx, tok, "1.2.3.4", "agent")
 			mu.Lock()
 			defer mu.Unlock()
@@ -850,7 +848,7 @@ func TestRedeemMagicLinkConcurrentSameTokenExactlyOneWinner(t *testing.T) {
 			default:
 				other++
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

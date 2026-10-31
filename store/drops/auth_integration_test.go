@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1188,7 +1189,7 @@ func TestDeleteSessionsByFamilyConcurrentSameFamilyBothSucceedLive(t *testing.T)
 	userID := uid.NewV7()
 	familyID := uid.NewV7()
 
-	for i := 0; i < rows; i++ {
+	for i := range rows {
 		rotated := now
 		if _, err := st.CreateSession(ctx, auth.Session{
 			ID: uid.NewV7(), UserID: userID, TokenHash: uid.NewV7(), FamilyID: familyID,
@@ -1324,7 +1325,7 @@ func TestDeleteSessionsByFamilyOppositeLockOrderRequiresAdvisoryLockLive(t *test
 	{
 		var warm sync.WaitGroup
 		warm.Add(4)
-		for i := 0; i < 4; i++ {
+		for range 4 {
 			go func() {
 				defer warm.Done()
 				var one int
@@ -1348,7 +1349,7 @@ func TestDeleteSessionsByFamilyOppositeLockOrderRequiresAdvisoryLockLive(t *test
 	userID := uid.NewV7()
 	familyID := uid.NewV7()
 	ids := make([]string, 0, seedRows)
-	for i := 0; i < seedRows; i++ {
+	for i := range seedRows {
 		id := uid.NewV7()
 		rotated := now
 		if _, err := st.CreateSession(ctx, auth.Session{
@@ -1419,9 +1420,9 @@ func TestDeleteSessionsByFamilyOppositeLockOrderRequiresAdvisoryLockLive(t *test
 		// (much faster) sweep from the other end.
 		raceStart := time.Now()
 		aWonRace := false
-		for i := len(ids) - 1; i >= 0; i-- {
+		for i, id := range slices.Backward(ids) {
 			var locked string
-			if err := tx.QueryRowContext(ctx, "SELECT id FROM sessions WHERE id = $1 FOR UPDATE", ids[i]).Scan(&locked); err != nil {
+			if err := tx.QueryRowContext(ctx, "SELECT id FROM sessions WHERE id = $1 FOR UPDATE", id).Scan(&locked); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					// Call A won the advisory lock ahead of call B — exactly
 					// what the fix is SUPPOSED to allow — and has already
@@ -1489,7 +1490,7 @@ func warmPool(t *testing.T, sqlDB *sql.DB, n int) {
 	ctx := context.Background()
 	var wg sync.WaitGroup
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer wg.Done()
 			var one int
@@ -2053,12 +2054,12 @@ func TestDeleteVerificationsByUserAndPurposeUsesTheIndexLive(t *testing.T) {
 	purposes := []string{"signup", "email_change", "password_reset", "password_reset"}
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	var probeUser string
-	for i := 0; i < users; i++ {
+	for i := range users {
 		userID := uid.NewV7()
 		if i == users/2 {
 			probeUser = userID
 		}
-		for j := 0; j < perUser; j++ {
+		for j := range perUser {
 			_, err := st.CreateVerification(ctx, auth.Verification{
 				ID: uid.NewV7(), UserID: userID,
 				TokenHash: uid.NewV7() + uid.NewV7(),

@@ -77,9 +77,9 @@ func enrolWithSessions(t *testing.T, f mfaFixture, email string) steppedUp {
 	}
 
 	return steppedUp{
-		enrolled: enrolled{user: u, secret: secret, recovery: codes},
-		fresh:    sessionIDOf(t, f.svc, done.AccessToken),
-		stale:    stale,
+		user: u, secret: secret, recovery: codes,
+		fresh: sessionIDOf(t, f.svc, done.AccessToken),
+		stale: stale,
 	}
 }
 

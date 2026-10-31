@@ -40,7 +40,7 @@ func release(n int, fn func(i int)) {
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		go func(i int) {
 			defer wg.Done()
 			<-start
@@ -114,7 +114,7 @@ func checkConsumeLinkOneWinner(t tb, st invite.Store) {
 	ctx := context.Background()
 	at := stamp()
 
-	for round := 0; round < massRaceRounds; round++ {
+	for round := range massRaceRounds {
 		l := newLink(newID(), at)
 		l.MaxUses = 1
 		l = mustCreateLink(t, st, l)
@@ -165,7 +165,7 @@ func checkConsumeLinkNeverExceedsMaxUses(t tb, st invite.Store) {
 	at := stamp()
 	const limit = 4
 
-	for round := 0; round < massRaceRounds; round++ {
+	for round := range massRaceRounds {
 		l := newLink(newID(), at)
 		l.MaxUses = limit
 		l = mustCreateLink(t, st, l)
@@ -274,7 +274,7 @@ func checkDeleteEmailInviteOneWinner(t tb, st invite.Store) {
 	t.Helper()
 	ctx := context.Background()
 
-	for round := 0; round < massRaceRounds; round++ {
+	for round := range massRaceRounds {
 		at := stamp()
 		inv := mustCreateEmailInvite(t, st, newInvite(newID(), newEmail(), at))
 
@@ -321,7 +321,7 @@ func checkCreateEmailInviteSameHashOneWinner(t tb, st invite.Store) {
 	t.Helper()
 	ctx := context.Background()
 
-	for round := 0; round < massRaceRounds; round++ {
+	for round := range massRaceRounds {
 		at := stamp()
 		hash := newHash()
 		invites := make([]invite.EmailInvite, RaceGoroutines)
@@ -359,7 +359,7 @@ func checkCreateEmailInviteSamePairOneWinner(t tb, st invite.Store) {
 	t.Helper()
 	ctx := context.Background()
 
-	for round := 0; round < massRaceRounds; round++ {
+	for round := range massRaceRounds {
 		at := stamp()
 		containerID := newID()
 		email := newEmail()
@@ -389,7 +389,7 @@ func checkCreateLinkSameCodeOneWinner(t tb, st invite.Store) {
 	t.Helper()
 	ctx := context.Background()
 
-	for round := 0; round < massRaceRounds; round++ {
+	for round := range massRaceRounds {
 		at := stamp()
 		code := newCode()
 		links := make([]invite.Link, RaceGoroutines)
@@ -473,7 +473,7 @@ func checkReinviteRace(t tb, st invite.Store) {
 	t.Helper()
 	ctx := context.Background()
 
-	for round := 0; round < RaceRounds; round++ {
+	for round := range RaceRounds {
 		at := stamp()
 		containerID := newID()
 		email := newEmail()

@@ -7,7 +7,7 @@ func TestGenerateOpaqueDistinctValues(t *testing.T) {
 	const n = 1000
 	seenPlain := make(map[string]struct{}, n)
 	seenHash := make(map[string]struct{}, n)
-	for i := 0; i < n; i++ {
+	for range n {
 		plain, hash, err := GenerateOpaque()
 		if err != nil {
 			t.Fatalf("GenerateOpaque: %v", err)

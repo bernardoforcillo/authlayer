@@ -2,6 +2,7 @@ package dropsstore
 
 import (
 	"context"
+	"slices"
 
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
@@ -121,8 +122,8 @@ func tableMigrations(specs ...tableSpec) []pg.TreeMigration {
 			return nil
 		},
 		Down: func(ctx context.Context, db *pg.DB) error {
-			for i := len(late) - 1; i >= 0; i-- {
-				idx := late[i]
+			for _, idx := range slices.Backward(late) {
+
 				if _, err := db.ExecExpr(ctx, drops.ExprFunc(func(b *drops.Builder) {
 					b.WriteString("DROP INDEX IF EXISTS ")
 					b.WriteQualified(idx.Table().Schema(), idx.Name())

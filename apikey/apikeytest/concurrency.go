@@ -24,12 +24,10 @@ func release(fn func(i int)) {
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	for i := range RaceGoroutines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			fn(i)
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()

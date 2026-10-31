@@ -770,7 +770,7 @@ func checkUpdateSignCountOneWinner(t tb, st auth.CredentialStore) {
 	ctx := context.Background()
 	at := stamp()
 
-	for round := 0; round < massRaceRounds; round++ {
+	for round := range massRaceRounds {
 		c := mustCreateCredential(t, st, newCredential(newID(), at))
 		replayed := c.SignCount + 1
 		used := at.Add(time.Duration(round+1) * time.Minute)
@@ -824,7 +824,7 @@ func checkDeleteChallengeOneWinner(t tb, st auth.CredentialStore) {
 	ctx := context.Background()
 	at := stamp()
 
-	for round := 0; round < massRaceRounds; round++ {
+	for round := range massRaceRounds {
 		c := mustCreateChallenge(t, st, newLoginChallenge(at))
 
 		var mu sync.Mutex
@@ -878,7 +878,7 @@ func checkDeleteIfNotLastAtomic(t tb, st auth.CredentialStore) {
 	ctx := context.Background()
 	at := stamp()
 
-	for round := 0; round < RaceRounds; round++ {
+	for round := range RaceRounds {
 		user := newID()
 		first := mustCreateCredential(t, st, newCredential(user, at))
 		second := mustCreateCredential(t, st, newCredential(user, at))

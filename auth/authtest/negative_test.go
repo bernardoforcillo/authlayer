@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"runtime"
 	"sort"
 	"sync"
@@ -146,9 +147,7 @@ func (s *laggingReplicaReads) CreateUser(ctx context.Context, u auth.UserBase) (
 	s.replicaMu.Lock()
 	s.mu.Lock()
 	s.replica = make(map[string]auth.UserBase, len(s.users))
-	for id, existing := range s.users {
-		s.replica[id] = existing
-	}
+	maps.Copy(s.replica, s.users)
 	s.mu.Unlock()
 	s.replicaMu.Unlock()
 	return s.refStore.CreateUser(ctx, u)

@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/bernardoforcillo/authlayer"
@@ -150,8 +151,8 @@ func dump(ctx context.Context, svc *audit.Service, names map[string]string) {
 	}
 	events, _, err := svc.List(ctx, audit.Filter{}, audit.Page{})
 	must(err)
-	for i := len(events) - 1; i >= 0; i-- { // oldest first
-		e := events[i]
+	for _, e := range slices.Backward(events) { // oldest first
+
 		actor := name(e.Actor.ID)
 		if actor == "" {
 			actor = e.Actor.Type

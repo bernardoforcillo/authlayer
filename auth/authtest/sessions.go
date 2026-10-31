@@ -267,7 +267,7 @@ func checkDeleteSessionsByFamily(t tb, st auth.Store) {
 	userID := newID()
 	doomed := newID()
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		s := newSession(userID, doomed, at)
 		if i > 0 {
 			rotatedAt := at

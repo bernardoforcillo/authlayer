@@ -39,7 +39,7 @@ func release(n int, fn func(i int)) {
 	start := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		go func(i int) {
 			defer wg.Done()
 			<-start
@@ -105,7 +105,7 @@ func checkMarkRotatedOneWinner(t tb, st auth.Store) {
 	ctx := context.Background()
 	at := stamp()
 
-	for round := 0; round < massRaceRounds; round++ {
+	for round := range massRaceRounds {
 		s := mustCreateSession(t, st, newSession(newID(), newID(), at))
 		shared := at.Add(time.Duration(round+1) * time.Minute)
 
@@ -164,7 +164,7 @@ func checkCreateUserOneWinner(t tb, st auth.Store) {
 	t.Helper()
 	ctx := context.Background()
 
-	for round := 0; round < massRaceRounds; round++ {
+	for round := range massRaceRounds {
 		at := stamp()
 		email := newEmail()
 		users := make([]auth.UserBase, RaceGoroutines)
@@ -219,7 +219,7 @@ func checkUpdateUserEmailOneWinner(t tb, st auth.Store) {
 	t.Helper()
 	ctx := context.Background()
 
-	for round := 0; round < massRaceRounds; round++ {
+	for round := range massRaceRounds {
 		at := stamp()
 		movers := make([]auth.UserBase, RaceGoroutines)
 		for i := range movers {
@@ -292,7 +292,7 @@ func checkMarkEmailVerifiedRace(t tb, st auth.Store) {
 	t.Helper()
 	ctx := context.Background()
 
-	for round := 0; round < RaceRounds; round++ {
+	for round := range RaceRounds {
 		at := stamp()
 		u := mustCreateUser(t, st, newUser(newEmail(), at))
 		next := newEmail()
@@ -350,7 +350,7 @@ func checkSuccessorVersusRevocation(t tb, st auth.Store) {
 	t.Helper()
 	ctx := context.Background()
 
-	for round := 0; round < RaceRounds; round++ {
+	for round := range RaceRounds {
 		at := stamp()
 		userID := newID()
 		familyID := newID()
@@ -418,7 +418,7 @@ func checkConcurrentFamilyRevocations(t tb, st auth.Store) {
 	at := stamp()
 	userID := newID()
 	familyID := newID()
-	for i := 0; i < rows; i++ {
+	for range rows {
 		s := newSession(userID, familyID, at)
 		rotatedAt := at
 		s.RotatedAt = &rotatedAt
@@ -493,7 +493,7 @@ func checkMarkUserDeletedAtomic(t tb, st auth.Store) {
 	t.Helper()
 	ctx := context.Background()
 
-	for round := 0; round < RaceRounds; round++ {
+	for round := range RaceRounds {
 		at := stamp()
 		u := mustCreateUser(t, st, newUser(newEmail(), at))
 		wantNoErr(t, "MarkEmailVerified", st.MarkEmailVerified(ctx, u.ID, u.Email, at))

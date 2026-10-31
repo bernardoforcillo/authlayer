@@ -1,6 +1,6 @@
 module github.com/bernardoforcillo/authlayer
 
-go 1.26
+go 1.27
 
 require (
 	github.com/bernardoforcillo/drops v0.6.0

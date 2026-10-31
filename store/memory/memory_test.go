@@ -67,20 +67,19 @@ func TestListUserStandingsReturnsOneRowPerMembershipWithOwner(t *testing.T) {
 
 	// alice owns acme and is a plain member of globex.
 	if _, err := st.CreateContainer(ctx, org.Organization{
-		ContainerBase: scope.ContainerBase{ID: "acme", OwnerID: "alice"},
+		ID: "acme", OwnerID: "alice",
 	}); err != nil {
 		t.Fatalf("create acme: %v", err)
 	}
 	if _, err := st.CreateContainer(ctx, org.Organization{
-		ContainerBase: scope.ContainerBase{ID: "globex", OwnerID: "bob"},
+		ID: "globex", OwnerID: "bob",
 	}); err != nil {
 		t.Fatalf("create globex: %v", err)
 	}
 	add := func(container, user, role string) {
 		t.Helper()
-		if _, err := st.AddMember(ctx, org.Member{MemberBase: scope.MemberBase{
-			ContainerID: container, UserID: user, RoleKey: role,
-		}}); err != nil {
+		if _, err := st.AddMember(ctx, org.Member{
+			ContainerID: container, UserID: user, RoleKey: role}); err != nil {
 			t.Fatalf("add %s/%s: %v", container, user, err)
 		}
 	}
@@ -125,16 +124,15 @@ func TestListUserContainersReturnsTheContainersJoined(t *testing.T) {
 	ctx := context.Background()
 
 	for _, o := range []org.Organization{
-		{ContainerBase: scope.ContainerBase{ID: "acme", OwnerID: "alice"}, Name: "Acme"},
-		{ContainerBase: scope.ContainerBase{ID: "globex", OwnerID: "bob"}, Name: "Globex"},
+		{ID: "acme", OwnerID: "alice", Name: "Acme"},
+		{ID: "globex", OwnerID: "bob", Name: "Globex"},
 	} {
 		if _, err := st.CreateContainer(ctx, o); err != nil {
 			t.Fatalf("create %s: %v", o.ID, err)
 		}
 	}
-	if _, err := st.AddMember(ctx, org.Member{MemberBase: scope.MemberBase{
-		ContainerID: "acme", UserID: "alice", RoleKey: scope.RoleOwner,
-	}}); err != nil {
+	if _, err := st.AddMember(ctx, org.Member{
+		ContainerID: "acme", UserID: "alice", RoleKey: scope.RoleOwner}); err != nil {
 		t.Fatalf("add member: %v", err)
 	}
 

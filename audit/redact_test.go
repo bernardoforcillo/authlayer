@@ -68,7 +68,7 @@ func TestRedactTruncatesLongStrings(t *testing.T) {
 func TestRedactCapsTheWholePayload(t *testing.T) {
 	var b strings.Builder
 	b.WriteString(`{"rows":[`)
-	for i := 0; i < 5000; i++ {
+	for i := range 5000 {
 		if i > 0 {
 			b.WriteByte(',')
 		}

@@ -911,11 +911,9 @@ func TestFinishPasskeyLoginConcurrentClaimsAdmitExactlyOneWinner(t *testing.T) {
 		resA auth.LoginResult
 		errA error
 	)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		resA, errA = svc.FinishPasskeyLogin(ctx, assertion, "203.0.113.16", "agent-a")
-	}()
+	})
 
 	<-gated.parked // A has read a LIVE challenge and is holding that answer.
 
@@ -965,11 +963,9 @@ func TestFinishPasskeyRegistrationConcurrentClaimsAdmitExactlyOneWinner(t *testi
 		wg   sync.WaitGroup
 		errA error
 	)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		_, errA = svc.FinishPasskeyRegistration(ctx, u.ID, "", credA)
-	}()
+	})
 
 	<-gated.parked
 

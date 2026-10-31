@@ -89,8 +89,7 @@ const auditEventCols = `id, seq, occurred_at, completed_at, topic, action, sourc
 const auditSealCols = `topic, day, event_count, first_seq, last_seq, events_hash, prev_hash, seal_hash, sealed_at, purged_at`
 
 func pgCode(err error) string {
-	var pe *pgconn.PgError
-	if errors.As(err, &pe) {
+	if pe, ok := errors.AsType[*pgconn.PgError](err); ok {
 		return pe.Code
 	}
 	return ""

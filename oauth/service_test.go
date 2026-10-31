@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -129,9 +130,9 @@ func (f *fixture) mustCC(t *testing.T, spec oauth.ClientSpec) (oauth.Client, str
 }
 
 func (f *fixture) lastEvent(kind oauth.EventKind) (oauth.Event, bool) {
-	for i := len(f.events) - 1; i >= 0; i-- {
-		if f.events[i].Kind == kind {
-			return f.events[i], true
+	for _, v := range slices.Backward(f.events) {
+		if v.Kind == kind {
+			return v, true
 		}
 	}
 	return oauth.Event{}, false

@@ -155,9 +155,9 @@ func TestColSetRowProducesOneBindingPerColumnInOrder(t *testing.T) {
 	cs := newColSet(pg.NewTable("organizations"), org.Organization{}, uuidIDs())
 	at := time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC)
 	o := org.Organization{
-		ContainerBase: scope.ContainerBase{ID: "i", OwnerID: "o", CreatedAt: at, UpdatedAt: at},
-		Name:          "Acme",
-		Slug:          "acme",
+		ID: "i", OwnerID: "o", CreatedAt: at, UpdatedAt: at,
+		Name: "Acme",
+		Slug: "acme",
 	}
 	vals := cs.row(o)
 	if len(vals) != 6 {

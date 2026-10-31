@@ -39,7 +39,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -164,7 +164,7 @@ const timingWarmup = 5
 // judge the figures.
 func clockGranularity() time.Duration {
 	best := time.Duration(0)
-	for i := 0; i < 200000; i++ {
+	for range 200000 {
 		a := time.Now()
 		b := time.Now()
 		if d := b.Sub(a); d > 0 && (best == 0 || d < best) {
@@ -198,10 +198,7 @@ func (s *samples) percentile(p float64) time.Duration {
 	if len(s.d) == 0 {
 		return 0
 	}
-	rank := int(float64(len(s.d))*p/100 + 0.9999999)
-	if rank < 1 {
-		rank = 1
-	}
+	rank := max(int(float64(len(s.d))*p/100+0.9999999), 1)
 	if rank > len(s.d) {
 		rank = len(s.d)
 	}
@@ -221,7 +218,7 @@ func (s *samples) mean() time.Duration {
 
 // summarize sorts the samples in place and returns one report line.
 func (s *samples) summarize() string {
-	sort.Slice(s.d, func(i, j int) bool { return s.d[i] < s.d[j] })
+	slices.Sort(s.d)
 	return fmt.Sprintf(
 		"%-10s n=%d  min=%s  p5=%s  p25=%s  MEDIAN=%s  p75=%s  p95=%s  max=%s  mean=%s",
 		s.name, len(s.d),
@@ -347,7 +344,7 @@ func TestRequestPasswordResetTimingChannelLive(t *testing.T) {
 	batch := func(email string, wantOK bool, b int) time.Duration {
 		t.Helper()
 		start := time.Now()
-		for i := 0; i < b; i++ {
+		for range b {
 			call(email, wantOK)
 		}
 		return time.Since(start) / time.Duration(b)
@@ -355,7 +352,7 @@ func TestRequestPasswordResetTimingChannelLive(t *testing.T) {
 
 	// Warm up before calibrating, so calibration measures steady-state cost
 	// rather than first-call setup.
-	for i := 0; i < timingWarmup; i++ {
+	for range timingWarmup {
 		batch(knownEmail, true, 8)
 		batch(unknownEmail, false, 8)
 		batch(controlEmail, false, 8)
@@ -371,7 +368,7 @@ func TestRequestPasswordResetTimingChannelLive(t *testing.T) {
 	unknown := &samples{name: "unknown"}
 	control := &samples{name: "control"}
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		// Emulate autovacuum, OUTSIDE the timed batches — see vacuumer's
 		// doc for why this is restoring realism rather than hiding a cost.
 		if i%vacuumEvery == 0 {
@@ -443,10 +440,7 @@ func calibrate(t *testing.T, granularity, perCall time.Duration) int {
 		t.Fatalf("calibration measured a non-positive per-call cost (%s) — the clock is unusable for this harness", perCall)
 	}
 	const ticksPerBatch = 20
-	b := int((granularity*ticksPerBatch + perCall - 1) / perCall)
-	if b < 1 {
-		b = 1
-	}
+	b := max(int((granularity*ticksPerBatch+perCall-1)/perCall), 1)
 	if b > 512 {
 		// A clock this coarse relative to the work would make the run take
 		// hours. Cap it and let the log say so rather than hanging.
@@ -522,7 +516,7 @@ func medianOf(d []time.Duration) time.Duration {
 	}
 	c := make([]time.Duration, len(d))
 	copy(c, d)
-	sort.Slice(c, func(i, j int) bool { return c[i] < c[j] })
+	slices.Sort(c)
 	return c[len(c)/2]
 }
 

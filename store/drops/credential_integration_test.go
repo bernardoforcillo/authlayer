@@ -308,10 +308,8 @@ func TestCredentialStoreConcurrentRegistrationsAdmitOneWinnerLive(t *testing.T) 
 	var firstErr error
 	var wg sync.WaitGroup
 	start := make(chan struct{})
-	for i := 0; i < authtest.RaceGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range authtest.RaceGoroutines {
+		wg.Go(func() {
 			c := liveCredential(uid.NewV7(), at)
 			c.CredentialID = shared
 			<-start
@@ -327,7 +325,7 @@ func TestCredentialStoreConcurrentRegistrationsAdmitOneWinnerLive(t *testing.T) 
 					firstErr = err
 				}
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
@@ -371,10 +369,8 @@ func TestUpdateSignCountRefusesAConcurrentReplayLive(t *testing.T) {
 	var firstErr error
 	var wg sync.WaitGroup
 	start := make(chan struct{})
-	for i := 0; i < authtest.RaceGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range authtest.RaceGoroutines {
+		wg.Go(func() {
 			<-start
 			ok, err := st.UpdateSignCount(ctx, c.ID, replayed, at.Add(time.Minute))
 			mu.Lock()
@@ -388,7 +384,7 @@ func TestUpdateSignCountRefusesAConcurrentReplayLive(t *testing.T) {
 			case ok:
 				winners++
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()
@@ -428,7 +424,7 @@ func TestDeleteCredentialIfNotLastIsAtomicUnderConcurrencyLive(t *testing.T) {
 	ctx := context.Background()
 	at := time.Now().UTC().Truncate(time.Microsecond)
 
-	for round := 0; round < 5; round++ {
+	for round := range 5 {
 		user := uid.NewV7()
 		first := liveCredential(user, at)
 		second := liveCredential(user, at)

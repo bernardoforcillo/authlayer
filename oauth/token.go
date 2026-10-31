@@ -197,13 +197,7 @@ func (s *Service) verify(ctx context.Context, raw string, now time.Time) (verifi
 		return verified{}, DetailIssuerMismatch, fmt.Errorf("%w: issuer %q", ErrInvalidToken, claims.Issuer)
 	}
 	if len(s.cfg.audience) > 0 {
-		ok := false
-		for _, aud := range s.cfg.audience {
-			if claims.Audience.Contains(aud) {
-				ok = true
-				break
-			}
-		}
+		ok := slices.ContainsFunc(s.cfg.audience, claims.Audience.Contains)
 		if !ok {
 			return verified{}, DetailAudienceMismatch, fmt.Errorf("%w: audience %v", ErrInvalidToken, claims.Audience)
 		}

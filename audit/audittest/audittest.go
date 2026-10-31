@@ -538,7 +538,7 @@ func sealsInsertRefusesAStaleSeal(t tb, st audit.Store) {
 
 func purgeDeletesOnlyTopicBefore(t tb, st audit.Store) {
 	ctx := context.Background()
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		mustInsert(t, st, ev("t", day0.Add(time.Duration(i)*time.Hour), closeAs(audit.OutcomeOK)))
 	}
 	mustInsert(t, st, ev("t", day0.Add(25*time.Hour), closeAs(audit.OutcomeOK)))

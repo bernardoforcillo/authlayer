@@ -23,7 +23,7 @@ func newCWStore() cwStore {
 // owners that no single actor could all legitimately create.
 func seedContainer(t *testing.T, st cwStore, id, owner string) {
 	t.Helper()
-	c := testContainer{ContainerBase: ContainerBase{ID: id, OwnerID: owner}}
+	c := testContainer{ID: id, OwnerID: owner}
 	if _, err := st.CreateContainer(context.Background(), c); err != nil {
 		t.Fatalf("seed container %q: %v", id, err)
 	}
@@ -33,7 +33,7 @@ func seedContainer(t *testing.T, st cwStore, id, owner string) {
 // Service.AddMember's authorization and escalation checks.
 func seedMember(t *testing.T, st cwStore, containerID, userID, roleKey string) {
 	t.Helper()
-	m := testMember{MemberBase: MemberBase{ContainerID: containerID, UserID: userID, RoleKey: roleKey}}
+	m := testMember{ContainerID: containerID, UserID: userID, RoleKey: roleKey}
 	if _, err := st.AddMember(context.Background(), m); err != nil {
 		t.Fatalf("seed member %q in %q: %v", userID, containerID, err)
 	}

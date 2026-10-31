@@ -13,7 +13,7 @@ func TestClaimSucceedsOnce(t *testing.T) {
 	if !p.Claim() {
 		t.Fatal("first Claim = false")
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if p.Claim() {
 			t.Fatal("a later Claim = true")
 		}

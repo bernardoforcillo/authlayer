@@ -219,8 +219,7 @@ func typeName(t reflect.Type) string {
 // flattened here while the scanner binds it whole — a divergence that would
 // corrupt reads with no panic.
 func (c *colSet) walk(t reflect.Type, ids idTypes) {
-	for i := range t.NumField() {
-		f := t.Field(i)
+	for f := range t.Fields() {
 		if !f.IsExported() {
 			continue
 		}
@@ -270,7 +269,7 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, ids idTypes) {
 			def = def.Unique()
 		}
 		c.str[name] = pg.Add(c.tbl, def)
-	case ft == reflect.TypeOf((*string)(nil)):
+	case ft == reflect.TypeFor[*string]():
 		// Nullable, exactly as the *time.Time case below is: no NotNull, so
 		// the column can hold SQL NULL, and bind renders a nil pointer as the
 		// NULL keyword rather than a parameter. It is never a primary key —
@@ -303,17 +302,17 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, ids idTypes) {
 			def = def.Unique()
 		}
 		c.i64[name] = pg.Add(c.tbl, def)
-	case ft == reflect.TypeOf((*time.Time)(nil)):
+	case ft == reflect.TypeFor[*time.Time]():
 		// Nullable: no NotNull, so the column can hold SQL NULL. bind renders
 		// a nil pointer as the NULL keyword rather than a parameter.
 		c.ts[name] = pg.Add(c.tbl, pg.Timestamp(name, true))
-	case ft == reflect.TypeOf(time.Time{}):
+	case ft == reflect.TypeFor[time.Time]():
 		c.ts[name] = pg.Add(c.tbl, pg.Timestamp(name, true).NotNull())
-	case ft == reflect.TypeOf([]byte(nil)):
+	case ft == reflect.TypeFor[[]byte]():
 		c.bytes[name] = pg.Add(c.tbl, pg.Bytea(name).NotNull())
 	case ft.Kind() == reflect.Int || ft.Kind() == reflect.Int32:
 		c.i32[name] = pg.Add(c.tbl, pg.Integer(name).NotNull())
-	case ft == reflect.TypeOf((*int64)(nil)):
+	case ft == reflect.TypeFor[*int64]():
 		// Nullable: no NotNull, so the column can hold SQL NULL, and bind
 		// renders a nil pointer as the NULL keyword rather than a
 		// parameter — the same treatment *time.Time gets above.
@@ -322,7 +321,7 @@ func (c *colSet) add(name string, opts []string, ft reflect.Type, ids idTypes) {
 		c.i64[name] = pg.Add(c.tbl, pg.BigInt(name).NotNull())
 	case ft.Kind() == reflect.Bool:
 		c.bools[name] = pg.Add(c.tbl, pg.Boolean(name).NotNull())
-	case ft == reflect.TypeOf(json.RawMessage(nil)):
+	case ft == reflect.TypeFor[json.RawMessage]():
 		// NOT NULL like every other non-pointer column; a store that maps a
 		// nil Go slice onto it writes the JSON it means ("[]", say), never
 		// NULL, so a row always holds a document.

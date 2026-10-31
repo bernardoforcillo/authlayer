@@ -1245,7 +1245,7 @@ func TestCompleteMFAConcurrentSameChallengeExactlyOneWinner(t *testing.T) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	withTokens, notFound, other := 0, 0, 0
-	for i := 0; i < n; i++ {
+	for i := range n {
 		wg.Add(1)
 		go func(code string) {
 			defer wg.Done()
@@ -1295,7 +1295,7 @@ func TestCompleteMFAConcurrentSameTOTPCodeAdvancesOnce(t *testing.T) {
 
 	var wg sync.WaitGroup
 	var winners atomic.Int32
-	for i := 0; i < n; i++ {
+	for i := range n {
 		wg.Add(1)
 		go func(tok string) {
 			defer wg.Done()
