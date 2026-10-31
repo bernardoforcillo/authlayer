@@ -39,6 +39,33 @@ also retypes `user_id` and `TextUserIDs` is ignored. The per-store type names
   engine does not pre-check, so they are emitted by `CreateSchema` and by the
   migrations, never left to the in-memory registry.
 
+## The tables are a formal model
+
+`dropsstore.Tables()` returns every table as a `*pg.Table`, in creation order,
+and `dropsstore.SnapshotSchema()` returns drops' snapshot of them: each column
+with its SQL type and nullability, the keys, foreign keys and indexes, as a
+value that marshals to the same bytes every time. The scope tables carry the
+engine's base columns; audit and consent are SQL text with triggers and partial
+indexes and sit outside it.
+
+The model is frozen in `store/drops/testdata/schema.snapshot.json`.
+`TestSnapshotMatchesGolden` fails on any change to a table, column, type, key or
+index, so a schema change always appears as a diff in review. After an intended
+change, regenerate it with `UPDATE_GOLDEN=1 go test ./store/drops -run
+TestSnapshotMatchesGolden` and add a migration step. Diffing two releases'
+snapshots with drops' tooling shows what that step has to do.
+
+The column rules over those tables, each a test in `catalog_test.go`:
+
+| Rule | Test |
+|---|---|
+| Table and column names are lower snake_case | `TestContractNamesAreSnakeCase` |
+| Every table has a primary key; a single-column one is `id` (`mfa_factors`, one row per user, is keyed by `user_id`) | `TestContractEveryTableHasAKeyAndEntityKeysAreCalledID` |
+| `*_at` is `timestamptz`; `created_at` is `NOT NULL`; `permissions` is `NOT NULL bytea`; booleans are `NOT NULL`; `id` is `uuid` or `text` | `TestContractColumnTypes` |
+| A hash a bearer secret is resolved by is `UNIQUE`; only `password_hash`, `oauth_clients.secret_hash` and `mfa_recovery_codes.code_hash` are exempt | `TestContractLookupHashesAreUnique` |
+| A foreign key never crosses stores, and its column leads an index | `TestContractForeignKeys` |
+| `Tables()` lists exactly the tables the stores own | `TestTablesCoverEveryStoreTable` |
+
 ## Schema creation has one path
 
 `CreateSchema` and the migrations both build from the same table definitions, via

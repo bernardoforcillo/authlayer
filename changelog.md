@@ -36,6 +36,11 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `store/drops/contract_test.go` enforces them: unique default table names,
   index names that say what they cover, an index on every column a janitor
   deletes by, and the shape of each store's migration chain.
+- `dropsstore.Tables`, `TableSchema` and `SnapshotSchema` expose the data model
+  as `*pg.Table` values and as a deterministic drops snapshot. The model is
+  frozen in `store/drops/testdata/schema.snapshot.json`, and column-level rules
+  (naming, keys, types, unique lookup hashes, foreign keys that stay inside a
+  store and are indexed) are enforced by tests.
 - `core.Override`, `core.Runtime.Apply` and `core.AppendNonNil` back the
   `WithClock`, `WithIDGenerator`, `WithRuntime` and `WithHooks` options of every
   service. Hook lists now drop nil entries everywhere.
