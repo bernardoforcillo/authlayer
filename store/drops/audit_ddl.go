@@ -74,11 +74,24 @@ type auditSettings struct {
 }
 
 // AuditOption customizes an [AuditStore] or [AuditDDL].
-type AuditOption func(*auditSettings)
+type AuditOption interface{ applyAudit(*auditSettings) }
+
+// auditOptionFunc adapts a plain function to [AuditOption].
+type auditOptionFunc func(*auditSettings)
+
+func (f auditOptionFunc) applyAudit(s *auditSettings) { f(s) }
+
+// An IDOption's library half retypes the audit event id; there are no user-id
+// columns to retype.
+func (o IDOption) applyAudit(s *auditSettings) {
+	if o.library {
+		s.textIDs = true
+	}
+}
 
 // WithAuditNames overrides the two table names.
 func WithAuditNames(n AuditNames) AuditOption {
-	return func(s *auditSettings) { s.names = n }
+	return auditOptionFunc(func(s *auditSettings) { s.names = n })
 }
 
 // WithAuditTextLibraryIDs types the event id column as text instead of uuid,
@@ -86,14 +99,14 @@ func WithAuditNames(n AuditNames) AuditOption {
 // ([audit.WithRuntime]). Without it the store accepts only canonical
 // lowercase UUIDs as event ids.
 func WithAuditTextLibraryIDs() AuditOption {
-	return func(s *auditSettings) { s.textIDs = true }
+	return TextLibraryIDs()
 }
 
 func newAuditSettings(opts []AuditOption) auditSettings {
 	var cfg auditSettings
 	for _, o := range opts {
 		if o != nil {
-			o(&cfg)
+			o.applyAudit(&cfg)
 		}
 	}
 	cfg.names = cfg.names.withDefaults()

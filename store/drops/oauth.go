@@ -51,11 +51,18 @@ type oauthSettings struct {
 }
 
 // OAuthOption customizes an [OAuthSchema] or [OAuthStore] at construction.
-type OAuthOption func(*oauthSettings)
+type OAuthOption interface{ applyOAuth(*oauthSettings) }
+
+// oauthOptionFunc adapts a plain function to [OAuthOption].
+type oauthOptionFunc func(*oauthSettings)
+
+func (f oauthOptionFunc) applyOAuth(s *oauthSettings) { f(s) }
+
+func (o IDOption) applyOAuth(s *oauthSettings) { o.apply(&s.ids, false) }
 
 // WithOAuthNames overrides the five table names.
 func WithOAuthNames(n OAuthNames) OAuthOption {
-	return func(s *oauthSettings) { s.names = n }
+	return oauthOptionFunc(func(s *oauthSettings) { s.names = n })
 }
 
 // WithOAuthTextUserIDs types the two user-id columns — oauth_clients.created_by
@@ -65,7 +72,7 @@ func WithOAuthNames(n OAuthNames) OAuthOption {
 // the ids authlayer mints for itself; [WithOAuthTextLibraryIDs] is the
 // option for those, and the two compose.
 func WithOAuthTextUserIDs() OAuthOption {
-	return func(s *oauthSettings) { s.ids.user = false }
+	return TextUserIDs()
 }
 
 // WithOAuthTextLibraryIDs types the library-minted id columns — every
@@ -81,7 +88,7 @@ func WithOAuthTextUserIDs() OAuthOption {
 // [github.com/bernardoforcillo/authlayer/oauth.WithIDGenerator] produces
 // something PostgreSQL's uuid parser rejects.
 func WithOAuthTextLibraryIDs() OAuthOption {
-	return func(s *oauthSettings) { s.ids.library = false }
+	return TextLibraryIDs()
 }
 
 // clientRow is the table shape of an [oauth.Client]. It differs from the
@@ -350,7 +357,7 @@ type OAuthSchema struct {
 func NewOAuthSchema(opts ...OAuthOption) *OAuthSchema {
 	cfg := oauthSettings{ids: uuidIDs()}
 	for _, o := range opts {
-		o(&cfg)
+		o.applyOAuth(&cfg)
 	}
 	// The references between these tables hold ids oauth.Service mints, so
 	// they follow WithOAuthTextLibraryIDs — scoped to this schema; see

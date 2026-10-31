@@ -38,11 +38,18 @@ type apikeySettings struct {
 }
 
 // APIKeyOption customizes an [APIKeySchema] or [APIKeyStore] at construction.
-type APIKeyOption func(*apikeySettings)
+type APIKeyOption interface{ applyAPIKey(*apikeySettings) }
+
+// apikeyOptionFunc adapts a plain function to [APIKeyOption].
+type apikeyOptionFunc func(*apikeySettings)
+
+func (f apikeyOptionFunc) applyAPIKey(s *apikeySettings) { f(s) }
+
+func (o IDOption) applyAPIKey(s *apikeySettings) { o.apply(&s.ids, false) }
 
 // WithAPIKeyNames overrides the two table names.
 func WithAPIKeyNames(n APIKeyNames) APIKeyOption {
-	return func(s *apikeySettings) { s.names = n }
+	return apikeyOptionFunc(func(s *apikeySettings) { s.names = n })
 }
 
 // WithAPIKeyTextUserIDs types created_by — on both tables — as text rather
@@ -52,7 +59,7 @@ func WithAPIKeyNames(n APIKeyNames) APIKeyOption {
 // table's key type. It does not reach the ids authlayer mints for itself;
 // [WithAPIKeyTextLibraryIDs] is the option for those, and the two compose.
 func WithAPIKeyTextUserIDs() APIKeyOption {
-	return func(s *apikeySettings) { s.ids.user = false }
+	return TextUserIDs()
 }
 
 // WithAPIKeyTextLibraryIDs types the library-minted id columns — an
@@ -67,7 +74,7 @@ func WithAPIKeyTextUserIDs() APIKeyOption {
 // scope.WithIDGenerator, for the containers) produces something PostgreSQL's
 // uuid parser rejects.
 func WithAPIKeyTextLibraryIDs() APIKeyOption {
-	return func(s *apikeySettings) { s.ids.library = false }
+	return TextLibraryIDs()
 }
 
 // APIKeySchema holds the two service-account tables and their derived
@@ -152,7 +159,7 @@ type APIKeySchema struct {
 func NewAPIKeySchema(opts ...APIKeyOption) *APIKeySchema {
 	cfg := apikeySettings{ids: uuidIDs()}
 	for _, o := range opts {
-		o(&cfg)
+		o.applyAPIKey(&cfg)
 	}
 	names := cfg.names.withDefaults()
 

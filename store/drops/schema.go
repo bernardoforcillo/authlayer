@@ -44,7 +44,14 @@ type settings struct {
 }
 
 // Option customizes a Schema or Store at construction.
-type Option func(*settings)
+type Option interface{ applyScope(*settings) }
+
+// scopeOptionFunc adapts a plain function to [Option].
+type scopeOptionFunc func(*settings)
+
+func (f scopeOptionFunc) applyScope(s *settings) { f(s) }
+
+func (o IDOption) applyScope(s *settings) { o.apply(&s.ids, false) }
 
 // WithNames overrides the three table names, so a second scope instance (teams,
 // projects) can share this store implementation.
@@ -52,7 +59,7 @@ type Option func(*settings)
 //	dropsstore.New[team.Team, team.Member](db, dropsstore.WithNames(dropsstore.Names{
 //	    Containers: "teams", Members: "team_members", Roles: "team_roles",
 //	}))
-func WithNames(n Names) Option { return func(s *settings) { s.names = n } }
+func WithNames(n Names) Option { return scopeOptionFunc(func(s *settings) { s.names = n }) }
 
 // WithTextUserIDs types the user-id columns — user_id and owner_id — as text
 // rather than uuid.
@@ -63,7 +70,7 @@ func WithNames(n Names) Option { return func(s *settings) { s.names = n } }
 //
 // It does not reach the ids authlayer mints for itself; [WithTextLibraryIDs]
 // is the option for those, and the two compose.
-func WithTextUserIDs() Option { return func(s *settings) { s.ids.user = false } }
+func WithTextUserIDs() Option { return TextUserIDs() }
 
 // WithTextLibraryIDs types the library-minted id columns — id, parent_id and
 // container_id — as text rather than uuid.
@@ -92,7 +99,7 @@ func WithTextUserIDs() Option { return func(s *settings) { s.ids.user = false } 
 // does not exist yet. Like every other part of that call it will not migrate
 // a table that already exists — see [Store.CreateSchema] — so switch it
 // before the tables are created, or retype the columns in your own migration.
-func WithTextLibraryIDs() Option { return func(s *settings) { s.ids.library = false } }
+func WithTextLibraryIDs() Option { return TextLibraryIDs() }
 
 // Schema holds the three tables and their derived columns:
 //
@@ -143,7 +150,7 @@ type Schema[C any, M any] struct {
 func NewSchema[C any, M any](opts ...Option) *Schema[C, M] {
 	cfg := settings{ids: uuidIDs()}
 	for _, o := range opts {
-		o(&cfg)
+		o.applyScope(&cfg)
 	}
 	names := cfg.names.withDefaults()
 

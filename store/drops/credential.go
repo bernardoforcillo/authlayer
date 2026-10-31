@@ -38,13 +38,20 @@ type credentialSettings struct {
 
 // CredentialOption customizes a [CredentialSchema] or [CredentialStore] at
 // construction.
-type CredentialOption func(*credentialSettings)
+type CredentialOption interface{ applyCredential(*credentialSettings) }
+
+// credentialOptionFunc adapts a plain function to [CredentialOption].
+type credentialOptionFunc func(*credentialSettings)
+
+func (f credentialOptionFunc) applyCredential(s *credentialSettings) { f(s) }
+
+func (o IDOption) applyCredential(s *credentialSettings) { o.apply(&s.ids, true) }
 
 // WithCredentialNames overrides the two table names, so a consumer that
 // already owns a table called "credentials" for something else can point this
 // store elsewhere.
 func WithCredentialNames(n CredentialNames) CredentialOption {
-	return func(s *credentialSettings) { s.names = n }
+	return credentialOptionFunc(func(s *credentialSettings) { s.names = n })
 }
 
 // WithCredentialTextLibraryIDs types every id column on both tables as text
@@ -65,7 +72,7 @@ func WithCredentialNames(n CredentialNames) CredentialOption {
 // identifier, not an id this library mints, and it is matched byte-for-byte —
 // see [auth.Credential.CredentialID].
 func WithCredentialTextLibraryIDs() CredentialOption {
-	return func(s *credentialSettings) { s.ids = idTypes{library: false, user: false} }
+	return TextLibraryIDs()
 }
 
 // CredentialSchema holds the two passkey tables and their derived columns:
@@ -151,7 +158,7 @@ type CredentialSchema struct {
 func NewCredentialSchema(opts ...CredentialOption) *CredentialSchema {
 	cfg := credentialSettings{ids: uuidIDs()}
 	for _, o := range opts {
-		o(&cfg)
+		o.applyCredential(&cfg)
 	}
 	names := cfg.names.withDefaults()
 

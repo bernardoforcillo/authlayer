@@ -25,8 +25,21 @@ once a 1.0 is cut. Until then, minor versions may break API.
   the `authlayer` branch: a `-001_tables` step and, where a store has indexes
   added after 0.3.1, a reversible `-002_indexes` step. See `/storage/postgres`.
 
+- `dropsstore.TextLibraryIDs()` and `dropsstore.TextUserIDs()`: one `IDOption`
+  type accepted by every drops store and schema constructor (including the audit
+  stores), replacing the need to remember each store's own option. On the stores
+  that own the users table, `TextLibraryIDs` also retypes `user_id` and
+  `TextUserIDs` is ignored. The per-store options (`WithAuthTextLibraryIDs`,
+  `WithInviteTextUserIDs`, ...) keep working and are now thin aliases.
+
 ### Changed
 
+- The store option types (`AuthOption`, `InviteOption`, ...) are now interfaces
+  rather than function types, so one `IDOption` can satisfy all of them. Code
+  that only calls the `With*` constructors is unaffected.
+- `store/drops` shared helpers (`mapNoRows`, `affectedOrErr`,
+  `isPrimaryKeyViolation`, `quoteIdent`) moved to `common.go`; no behaviour
+  change.
 - `Store.CreateSchema` and `InviteStore.CreateSchema` now also emit the indexes
   registered on their tables (they previously emitted none). All stores share
   one `CreateSchema` loop.

@@ -39,13 +39,20 @@ type authSettings struct {
 }
 
 // AuthOption customizes an [AuthSchema] or [AuthStore] at construction.
-type AuthOption func(*authSettings)
+type AuthOption interface{ applyAuth(*authSettings) }
+
+// authOptionFunc adapts a plain function to [AuthOption].
+type authOptionFunc func(*authSettings)
+
+func (f authOptionFunc) applyAuth(s *authSettings) { f(s) }
+
+func (o IDOption) applyAuth(s *authSettings) { o.apply(&s.ids, true) }
 
 // WithAuthNames overrides the three table names, so a consumer that already
 // owns tables named "users" etc. for something else can point this store
 // elsewhere.
 func WithAuthNames(n AuthNames) AuthOption {
-	return func(s *authSettings) { s.names = n }
+	return authOptionFunc(func(s *authSettings) { s.names = n })
 }
 
 // WithAuthTextLibraryIDs types every id column on the three auth tables as
@@ -85,7 +92,7 @@ func WithAuthNames(n AuthNames) AuthOption {
 // does not exist yet; like every other part of that call it will not migrate
 // a table that already exists.
 func WithAuthTextLibraryIDs() AuthOption {
-	return func(s *authSettings) { s.ids = idTypes{library: false, user: false} }
+	return TextLibraryIDs()
 }
 
 // AuthSchema holds the three authentication tables and their derived
@@ -202,7 +209,7 @@ type AuthSchema struct {
 func NewAuthSchema(opts ...AuthOption) *AuthSchema {
 	cfg := authSettings{ids: uuidIDs()}
 	for _, o := range opts {
-		o(&cfg)
+		o.applyAuth(&cfg)
 	}
 	names := cfg.names.withDefaults()
 

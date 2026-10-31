@@ -36,13 +36,20 @@ type inviteSettings struct {
 }
 
 // InviteOption customizes an [InviteSchema] or [InviteStore] at construction.
-type InviteOption func(*inviteSettings)
+type InviteOption interface{ applyInvite(*inviteSettings) }
+
+// inviteOptionFunc adapts a plain function to [InviteOption].
+type inviteOptionFunc func(*inviteSettings)
+
+func (f inviteOptionFunc) applyInvite(s *inviteSettings) { f(s) }
+
+func (o IDOption) applyInvite(s *inviteSettings) { o.apply(&s.ids, false) }
 
 // WithInviteNames overrides the two table names, so a second scope instance
 // (teams, projects) can persist its own invitations without colliding with
 // another's.
 func WithInviteNames(n InviteNames) InviteOption {
-	return func(s *inviteSettings) { s.names = n }
+	return inviteOptionFunc(func(s *inviteSettings) { s.names = n })
 }
 
 // WithInviteTextUserIDs types invited_by and created_by as text rather than
@@ -52,7 +59,7 @@ func WithInviteNames(n InviteNames) InviteOption {
 // It does not reach the ids authlayer mints for itself;
 // [WithInviteTextLibraryIDs] is the option for those, and the two compose.
 func WithInviteTextUserIDs() InviteOption {
-	return func(s *inviteSettings) { s.ids.user = false }
+	return TextUserIDs()
 }
 
 // WithInviteTextLibraryIDs types the library-minted id columns — an
@@ -65,7 +72,7 @@ func WithInviteTextUserIDs() InviteOption {
 // [github.com/bernardoforcillo/authlayer/scope.WithIDGenerator] produces
 // something PostgreSQL's uuid parser rejects.
 func WithInviteTextLibraryIDs() InviteOption {
-	return func(s *inviteSettings) { s.ids.library = false }
+	return TextLibraryIDs()
 }
 
 // InviteSchema holds the two invitation tables and their derived columns:
@@ -123,7 +130,7 @@ type InviteSchema struct {
 func NewInviteSchema(opts ...InviteOption) *InviteSchema {
 	cfg := inviteSettings{ids: uuidIDs()}
 	for _, o := range opts {
-		o(&cfg)
+		o.applyInvite(&cfg)
 	}
 	names := cfg.names.withDefaults()
 

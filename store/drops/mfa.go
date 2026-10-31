@@ -39,12 +39,19 @@ type mfaSettings struct {
 }
 
 // MFAOption customizes an [MFASchema] or [MFAStore] at construction.
-type MFAOption func(*mfaSettings)
+type MFAOption interface{ applyMFA(*mfaSettings) }
+
+// mfaOptionFunc adapts a plain function to [MFAOption].
+type mfaOptionFunc func(*mfaSettings)
+
+func (f mfaOptionFunc) applyMFA(s *mfaSettings) { f(s) }
+
+func (o IDOption) applyMFA(s *mfaSettings) { o.apply(&s.ids, true) }
 
 // WithMFANames overrides the two table names, so a consumer that already
 // owns a table by either name can point this store elsewhere.
 func WithMFANames(n MFANames) MFAOption {
-	return func(s *mfaSettings) { s.names = n }
+	return mfaOptionFunc(func(s *mfaSettings) { s.names = n })
 }
 
 // WithMFATextLibraryIDs types every id column on the two MFA tables as text
@@ -71,7 +78,7 @@ func WithMFANames(n MFANames) MFAOption {
 // that does not exist yet. Like every other part of that call it will not
 // migrate a table that already exists.
 func WithMFATextLibraryIDs() MFAOption {
-	return func(s *mfaSettings) { s.ids = idTypes{library: false, user: false} }
+	return TextLibraryIDs()
 }
 
 // MFASchema holds the three second-factor tables and their derived columns:
@@ -178,7 +185,7 @@ type MFASchema struct {
 func NewMFASchema(opts ...MFAOption) *MFASchema {
 	cfg := mfaSettings{ids: uuidIDs()}
 	for _, o := range opts {
-		o(&cfg)
+		o.applyMFA(&cfg)
 	}
 	names := cfg.names.withDefaults()
 

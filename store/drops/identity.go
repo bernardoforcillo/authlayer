@@ -36,13 +36,20 @@ type identitySettings struct {
 
 // IdentityOption customizes an [IdentitySchema] or [IdentityStore] at
 // construction.
-type IdentityOption func(*identitySettings)
+type IdentityOption interface{ applyIdentity(*identitySettings) }
+
+// identityOptionFunc adapts a plain function to [IdentityOption].
+type identityOptionFunc func(*identitySettings)
+
+func (f identityOptionFunc) applyIdentity(s *identitySettings) { f(s) }
+
+func (o IDOption) applyIdentity(s *identitySettings) { o.apply(&s.ids, true) }
 
 // WithIdentityNames overrides the table name, so a consumer that already owns
 // a table named "identities" for something else can point this store
 // elsewhere.
 func WithIdentityNames(n IdentityNames) IdentityOption {
-	return func(s *identitySettings) { s.names = n }
+	return identityOptionFunc(func(s *identitySettings) { s.names = n })
 }
 
 // WithIdentityTextLibraryIDs types both id columns on the identities table as
@@ -86,7 +93,7 @@ func WithIdentityNames(n IdentityNames) IdentityOption {
 // NOT EXISTS, which is a no-op against a pre-existing table, so against one
 // the type choice this option makes is silently a no-op too.
 func WithIdentityTextLibraryIDs() IdentityOption {
-	return func(s *identitySettings) { s.ids = idTypes{library: false, user: false} }
+	return TextLibraryIDs()
 }
 
 // IdentitySchema holds the external-identity table and its derived columns:
@@ -152,7 +159,7 @@ type IdentitySchema struct {
 func NewIdentitySchema(opts ...IdentityOption) *IdentitySchema {
 	cfg := identitySettings{ids: uuidIDs()}
 	for _, o := range opts {
-		o(&cfg)
+		o.applyIdentity(&cfg)
 	}
 	names := cfg.names.withDefaults()
 
