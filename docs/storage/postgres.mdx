@@ -183,9 +183,43 @@ misses one is **rejected at construction** rather than at the first query.
 `st.Schema()` exposes the table definitions if you would rather generate the DDL
 and run it through your own migration tool.
 
-## Adding the indexes to a database you migrate yourself
+## Versioned migrations with drops' `TreeMigrator`
 
-Releases after 0.3.1 add indexes. Re-running `CreateSchema` creates them on
+Every store describes its schema as nodes for drops' `pg.TreeMigrator`, so
+authlayer's tables are migrated by the same tool, and tracked in the same
+place, as your own:
+
+{/* verify:skip needs a live PostgreSQL *pg.DB and stores built over it; the identical migrator run is executed against a real server by store/drops' TestMigrationsBuildTheSameSchemaAsCreateSchemaLive */}
+```go
+m := pg.NewTreeMigrator(db)
+dropsstore.AddMigrations(m, authStore, rbacStore, oauthStore, inviteStore)
+// your own migrations go on m too, on their own branch
+if err := m.Up(ctx); err != nil {
+    log.Fatal(err)
+}
+```
+
+Each store contributes a chain on the `authlayer` branch: `authlayer-<first
+table>-001_tables` (tables, composite constraints and the 0.3.1 indexes) and,
+where it has any, `authlayer-<first table>-002_indexes` (the indexes added
+since). IDs and statements follow the table names and ID options the store was
+built with, so a second `Store` under `WithNames` gets its own chain. The audit
+and consent stores contribute a single `-001` step that replays their DDL.
+
+- **Adopting an existing database is safe.** Every step is idempotent, so a
+  database `CreateSchema` already populated applies cleanly and gains only what
+  it is missing.
+- **Table steps cannot be rolled back.** They have no `Down`, because dropping a
+  table is data loss. Index steps do, and `DownTo` drops exactly the indexes
+  they created.
+- **Later releases add steps, never edit these.** A new index arrives as a new
+  node whose parent is the previous one.
+- **The steps are Go, not SQL text,** so the migrator's tamper check does not
+  cover them. They are generated from the same definitions `CreateSchema` uses.
+
+## Adding the indexes with your own SQL migrations
+
+If you do not use the `TreeMigrator`, releases after 0.3.1 add indexes. Re-running `CreateSchema` creates them on
 tables that already exist (every one is `CREATE INDEX IF NOT EXISTS`), but if
 you own these tables in your own migrations, run the statements below instead.
 On a large table use `CONCURRENTLY`, which cannot run inside a transaction

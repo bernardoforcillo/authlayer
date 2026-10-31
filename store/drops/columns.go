@@ -93,7 +93,11 @@ func uuidIDs() idTypes { return idTypes{library: true, user: true} }
 // Go type a nullable string column is declared from (*string) is not the type
 // its binding carries.
 type colSet struct {
-	tbl   *pg.Table
+	tbl *pg.Table
+	// late lists the indexes added after the 0.3.1 baseline, in registration
+	// order. Migrations() creates them in their own step, so the baseline step
+	// stays what 0.3.1 shipped. See [addIndex].
+	late  []*pg.Index
 	str   map[string]*pg.Col[string]
 	ts    map[string]*pg.Col[time.Time]
 	bytes map[string]*pg.Col[[]byte]

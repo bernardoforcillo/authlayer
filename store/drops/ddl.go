@@ -112,13 +112,18 @@ func idxName(table string, cols ...string) string {
 	return table + "_" + strings.Join(cols, "_") + "_idx"
 }
 
-// addIndex registers a plain btree index on cs's columns under [idxName].
+// addIndex registers a plain btree index on cs's columns under [idxName] and
+// records it as post-baseline: [tableMigrations] puts it in the index step, not
+// the table step. Use it for every index added after 0.3.1, and give a later
+// release its own step rather than editing the frozen ones.
 func addIndex(t *pg.Table, cs *colSet, cols ...string) {
 	exprs := make([]drops.Expression, len(cols))
 	for i, c := range cols {
 		exprs[i] = cs.col(c)
 	}
-	t.AddIndex(pg.NewIndex(idxName(t.Name(), cols...), t, exprs...))
+	idx := pg.NewIndex(idxName(t.Name(), cols...), t, exprs...)
+	t.AddIndex(idx)
+	cs.late = append(cs.late, idx)
 }
 
 // purgeBatchSize bounds how many rows one housekeeping DELETE removes. A

@@ -20,6 +20,11 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `CreateSchema` creates them on existing tables; the equivalent
   `CREATE INDEX CONCURRENTLY` statements are on `/storage/postgres`.
 
+- `dropsstore.AddMigrations` and a `Migrations()` method on every drops store
+  expose the schema as `pg.TreeMigration` nodes for drops' `TreeMigrator`, on
+  the `authlayer` branch: a `-001_tables` step and, where a store has indexes
+  added after 0.3.1, a reversible `-002_indexes` step. See `/storage/postgres`.
+
 ### Changed
 
 - `Store.CreateSchema` and `InviteStore.CreateSchema` now also emit the indexes

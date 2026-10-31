@@ -44,11 +44,17 @@ func NewAuditStore(db *pg.DB, opts ...AuditOption) *AuditStore {
 // in place, so they always match this version; it changes no table.
 // Deployments that own their migrations apply AuditDDL there instead.
 func (st *AuditStore) CreateSchema(ctx context.Context) error {
-	return st.db.InTx(ctx, func(tx *pg.DB) error {
+	return applyAuditDDL(ctx, st.db, st.cfg)
+}
+
+// applyAuditDDL is CreateSchema's body over any db, so the migration step runs
+// the identical transaction on the migrator's connection.
+func applyAuditDDL(ctx context.Context, db *pg.DB, cfg auditSettings) error {
+	return db.InTx(ctx, func(tx *pg.DB) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(auditSchemaLock)); err != nil {
 			return err
 		}
-		for _, stmt := range AuditDDL(func(s *auditSettings) { *s = st.cfg }) {
+		for _, stmt := range AuditDDL(func(s *auditSettings) { *s = cfg }) {
 			if _, err := tx.Exec(ctx, stmt); err != nil {
 				return err
 			}
