@@ -21,37 +21,19 @@ type MFANames struct {
 }
 
 func (n MFANames) withDefaults() MFANames {
-	if n.Factors == "" {
-		n.Factors = "mfa_factors"
-	}
-	if n.RecoveryCodes == "" {
-		n.RecoveryCodes = "mfa_recovery_codes"
-	}
-	if n.TrustedDevices == "" {
-		n.TrustedDevices = "trusted_devices"
-	}
+	defaulted(&n.Factors, "mfa_factors")
+	defaulted(&n.RecoveryCodes, "mfa_recovery_codes")
+	defaulted(&n.TrustedDevices, "trusted_devices")
 	return n
 }
 
-type mfaSettings struct {
-	names MFANames
-	ids   idTypes
-}
-
 // MFAOption customizes an [MFASchema] or [MFAStore] at construction.
-type MFAOption interface{ applyMFA(*mfaSettings) }
-
-// mfaOptionFunc adapts a plain function to [MFAOption].
-type mfaOptionFunc func(*mfaSettings)
-
-func (f mfaOptionFunc) applyMFA(s *mfaSettings) { f(s) }
-
-func (o IDOption) applyMFA(s *mfaSettings) { o.apply(&s.ids, true) }
+type MFAOption = Option
 
 // WithMFANames overrides the two table names, so a consumer that already
 // owns a table by either name can point this store elsewhere.
 func WithMFANames(n MFANames) MFAOption {
-	return mfaOptionFunc(func(s *mfaSettings) { s.names = n })
+	return optionFunc(func(c *config) { c.mfa = n })
 }
 
 // WithMFATextLibraryIDs types every id column on the two MFA tables as text
@@ -183,11 +165,9 @@ type MFASchema struct {
 // definitions without a store — to generate DDL for a migration, for
 // instance.
 func NewMFASchema(opts ...MFAOption) *MFASchema {
-	cfg := mfaSettings{ids: uuidIDs()}
-	for _, o := range opts {
-		o.applyMFA(&cfg)
-	}
-	names := cfg.names.withDefaults()
+	cfg := newConfig(opts)
+	ids := cfg.ids(true)
+	names := cfg.mfa.withDefaults()
 
 	s := &MFASchema{
 		Factors:        pg.NewTable(names.Factors),
@@ -197,9 +177,9 @@ func NewMFASchema(opts ...MFAOption) *MFASchema {
 	// One idTypes for all three tables, with both families always set the
 	// same way — see [WithMFATextLibraryIDs] for why these tables, like the
 	// auth and identity ones, have no text-user-id option of their own.
-	s.factors = newColSet(s.Factors, auth.MFAFactor{}, cfg.ids)
-	s.codes = newColSet(s.RecoveryCodes, auth.RecoveryCode{}, cfg.ids)
-	s.devices = newColSet(s.TrustedDevices, auth.TrustedDevice{}, cfg.ids)
+	s.factors = newColSet(s.Factors, auth.MFAFactor{}, ids)
+	s.codes = newColSet(s.RecoveryCodes, auth.RecoveryCode{}, ids)
+	s.devices = newColSet(s.TrustedDevices, auth.TrustedDevice{}, ids)
 
 	s.RecoveryCodes.AddIndex(pg.NewIndex(
 		names.RecoveryCodes+"_user_id_code_hash_idx", s.RecoveryCodes,

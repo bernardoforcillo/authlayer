@@ -23,33 +23,17 @@ type APIKeyNames struct {
 }
 
 func (n APIKeyNames) withDefaults() APIKeyNames {
-	if n.ServiceAccounts == "" {
-		n.ServiceAccounts = "service_accounts"
-	}
-	if n.Keys == "" {
-		n.Keys = "api_keys"
-	}
+	defaulted(&n.ServiceAccounts, "service_accounts")
+	defaulted(&n.Keys, "api_keys")
 	return n
 }
 
-type apikeySettings struct {
-	names APIKeyNames
-	ids   idTypes
-}
-
 // APIKeyOption customizes an [APIKeySchema] or [APIKeyStore] at construction.
-type APIKeyOption interface{ applyAPIKey(*apikeySettings) }
-
-// apikeyOptionFunc adapts a plain function to [APIKeyOption].
-type apikeyOptionFunc func(*apikeySettings)
-
-func (f apikeyOptionFunc) applyAPIKey(s *apikeySettings) { f(s) }
-
-func (o IDOption) applyAPIKey(s *apikeySettings) { o.apply(&s.ids, false) }
+type APIKeyOption = Option
 
 // WithAPIKeyNames overrides the two table names.
 func WithAPIKeyNames(n APIKeyNames) APIKeyOption {
-	return apikeyOptionFunc(func(s *apikeySettings) { s.names = n })
+	return optionFunc(func(c *config) { c.apikey = n })
 }
 
 // WithAPIKeyTextUserIDs types created_by — on both tables — as text rather
@@ -157,18 +141,16 @@ type APIKeySchema struct {
 // calls it, so use it directly only when you need the table definitions
 // without a store — to generate DDL for a migration, for instance.
 func NewAPIKeySchema(opts ...APIKeyOption) *APIKeySchema {
-	cfg := apikeySettings{ids: uuidIDs()}
-	for _, o := range opts {
-		o.applyAPIKey(&cfg)
-	}
-	names := cfg.names.withDefaults()
+	cfg := newConfig(opts)
+	ids := cfg.ids(false)
+	names := cfg.apikey.withDefaults()
 
 	s := &APIKeySchema{
 		ServiceAccounts: pg.NewTable(names.ServiceAccounts),
 		Keys:            pg.NewTable(names.Keys),
 	}
-	s.accounts = newColSet(s.ServiceAccounts, apikey.ServiceAccount{}, cfg.ids)
-	s.keys = newColSet(s.Keys, apikey.Key{}, cfg.ids)
+	s.accounts = newColSet(s.ServiceAccounts, apikey.ServiceAccount{}, ids)
+	s.keys = newColSet(s.Keys, apikey.Key{}, ids)
 
 	s.Keys.ForeignKey(s.keys.col("service_account_id"), s.accounts.col("id"), pg.OnDelete("CASCADE"))
 

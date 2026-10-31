@@ -219,7 +219,7 @@ func (st *AuditKeyStore) Migrations() []pg.TreeMigration {
 	cfg := st.cfg
 	return rawMigration("authlayer-"+cfg.names.Keys+"-001_tables", "audit subject keys",
 		func(ctx context.Context, db *pg.DB) error {
-			for _, stmt := range AuditKeyDDL(auditOptionFunc(func(s *auditSettings) { *s = cfg })) {
+			for _, stmt := range auditKeyDDL(cfg) {
 				if _, err := db.Exec(ctx, stmt); err != nil {
 					return err
 				}

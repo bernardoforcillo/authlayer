@@ -21,35 +21,19 @@ type InviteNames struct {
 }
 
 func (n InviteNames) withDefaults() InviteNames {
-	if n.EmailInvites == "" {
-		n.EmailInvites = "organization_invites"
-	}
-	if n.Links == "" {
-		n.Links = "organization_invite_links"
-	}
+	defaulted(&n.EmailInvites, "organization_invites")
+	defaulted(&n.Links, "organization_invite_links")
 	return n
 }
 
-type inviteSettings struct {
-	names InviteNames
-	ids   idTypes
-}
-
 // InviteOption customizes an [InviteSchema] or [InviteStore] at construction.
-type InviteOption interface{ applyInvite(*inviteSettings) }
-
-// inviteOptionFunc adapts a plain function to [InviteOption].
-type inviteOptionFunc func(*inviteSettings)
-
-func (f inviteOptionFunc) applyInvite(s *inviteSettings) { f(s) }
-
-func (o IDOption) applyInvite(s *inviteSettings) { o.apply(&s.ids, false) }
+type InviteOption = Option
 
 // WithInviteNames overrides the two table names, so a second scope instance
 // (teams, projects) can persist its own invitations without colliding with
 // another's.
 func WithInviteNames(n InviteNames) InviteOption {
-	return inviteOptionFunc(func(s *inviteSettings) { s.names = n })
+	return optionFunc(func(c *config) { c.invite = n })
 }
 
 // WithInviteTextUserIDs types invited_by and created_by as text rather than
@@ -128,18 +112,16 @@ type InviteSchema struct {
 // definitions without a store — to generate DDL for a migration, for
 // instance.
 func NewInviteSchema(opts ...InviteOption) *InviteSchema {
-	cfg := inviteSettings{ids: uuidIDs()}
-	for _, o := range opts {
-		o.applyInvite(&cfg)
-	}
-	names := cfg.names.withDefaults()
+	cfg := newConfig(opts)
+	ids := cfg.ids(false)
+	names := cfg.invite.withDefaults()
 
 	s := &InviteSchema{
 		EmailInvites: pg.NewTable(names.EmailInvites),
 		Links:        pg.NewTable(names.Links),
 	}
-	s.emailInvites = newColSet(s.EmailInvites, invite.EmailInvite{}, cfg.ids)
-	s.links = newColSet(s.Links, invite.Link{}, cfg.ids)
+	s.emailInvites = newColSet(s.EmailInvites, invite.EmailInvite{}, ids)
+	s.links = newColSet(s.Links, invite.Link{}, ids)
 
 	s.EmailInvites.AddUnique(names.EmailInvites+"_container_email",
 		s.emailInvites.col("container_id"), s.emailInvites.col("email"))

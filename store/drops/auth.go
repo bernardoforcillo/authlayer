@@ -21,38 +21,20 @@ type AuthNames struct {
 }
 
 func (n AuthNames) withDefaults() AuthNames {
-	if n.Users == "" {
-		n.Users = "users"
-	}
-	if n.Sessions == "" {
-		n.Sessions = "sessions"
-	}
-	if n.Verifications == "" {
-		n.Verifications = "verifications"
-	}
+	defaulted(&n.Users, "users")
+	defaulted(&n.Sessions, "sessions")
+	defaulted(&n.Verifications, "verifications")
 	return n
 }
 
-type authSettings struct {
-	names AuthNames
-	ids   idTypes
-}
-
 // AuthOption customizes an [AuthSchema] or [AuthStore] at construction.
-type AuthOption interface{ applyAuth(*authSettings) }
-
-// authOptionFunc adapts a plain function to [AuthOption].
-type authOptionFunc func(*authSettings)
-
-func (f authOptionFunc) applyAuth(s *authSettings) { f(s) }
-
-func (o IDOption) applyAuth(s *authSettings) { o.apply(&s.ids, true) }
+type AuthOption = Option
 
 // WithAuthNames overrides the three table names, so a consumer that already
 // owns tables named "users" etc. for something else can point this store
 // elsewhere.
 func WithAuthNames(n AuthNames) AuthOption {
-	return authOptionFunc(func(s *authSettings) { s.names = n })
+	return optionFunc(func(c *config) { c.auth = n })
 }
 
 // WithAuthTextLibraryIDs types every id column on the three auth tables as
@@ -207,11 +189,9 @@ type AuthSchema struct {
 // calls it, so use it directly only when you need the table definitions
 // without a store — to generate DDL for a migration, for instance.
 func NewAuthSchema(opts ...AuthOption) *AuthSchema {
-	cfg := authSettings{ids: uuidIDs()}
-	for _, o := range opts {
-		o.applyAuth(&cfg)
-	}
-	names := cfg.names.withDefaults()
+	cfg := newConfig(opts)
+	ids := cfg.ids(true)
+	names := cfg.auth.withDefaults()
 
 	s := &AuthSchema{
 		Users:         pg.NewTable(names.Users),
@@ -223,9 +203,9 @@ func NewAuthSchema(opts ...AuthOption) *AuthSchema {
 	// this store, unlike Schema/InviteSchema, has no text-user-id option of
 	// its own: it owns the users table sessions and verifications reference,
 	// so their user_id must be typed as users.id is, whichever that is.
-	s.users = newColSet(s.Users, auth.UserBase{}, cfg.ids)
-	s.sessions = newColSet(s.Sessions, auth.Session{}, cfg.ids)
-	s.verifications = newColSet(s.Verifications, auth.Verification{}, cfg.ids)
+	s.users = newColSet(s.Users, auth.UserBase{}, ids)
+	s.sessions = newColSet(s.Sessions, auth.Session{}, ids)
+	s.verifications = newColSet(s.Verifications, auth.Verification{}, ids)
 
 	s.Sessions.AddUnique(names.Sessions+"_token_hash", s.sessions.col("token_hash"))
 	s.Verifications.AddUnique(names.Verifications+"_token_hash", s.verifications.col("token_hash"))

@@ -56,15 +56,9 @@ type AuditNames struct {
 }
 
 func (n AuditNames) withDefaults() AuditNames {
-	if n.Events == "" {
-		n.Events = "audit_events"
-	}
-	if n.Seals == "" {
-		n.Seals = "audit_seals"
-	}
-	if n.Keys == "" {
-		n.Keys = "audit_subject_keys"
-	}
+	defaulted(&n.Events, "audit_events")
+	defaulted(&n.Seals, "audit_seals")
+	defaulted(&n.Keys, "audit_subject_keys")
 	return n
 }
 
@@ -73,25 +67,12 @@ type auditSettings struct {
 	textIDs bool
 }
 
-// AuditOption customizes an [AuditStore] or [AuditDDL].
-type AuditOption interface{ applyAudit(*auditSettings) }
-
-// auditOptionFunc adapts a plain function to [AuditOption].
-type auditOptionFunc func(*auditSettings)
-
-func (f auditOptionFunc) applyAudit(s *auditSettings) { f(s) }
-
-// An IDOption's library half retypes the audit event id; there are no user-id
-// columns to retype.
-func (o IDOption) applyAudit(s *auditSettings) {
-	if o.library {
-		s.textIDs = true
-	}
-}
+// AuditOption is an alias of [Option], kept for existing signatures.
+type AuditOption = Option
 
 // WithAuditNames overrides the two table names.
 func WithAuditNames(n AuditNames) AuditOption {
-	return auditOptionFunc(func(s *auditSettings) { s.names = n })
+	return optionFunc(func(c *config) { c.audit = n })
 }
 
 // WithAuditTextLibraryIDs types the event id column as text instead of uuid,
@@ -102,15 +83,9 @@ func WithAuditTextLibraryIDs() AuditOption {
 	return TextLibraryIDs()
 }
 
-func newAuditSettings(opts []AuditOption) auditSettings {
-	var cfg auditSettings
-	for _, o := range opts {
-		if o != nil {
-			o.applyAudit(&cfg)
-		}
-	}
-	cfg.names = cfg.names.withDefaults()
-	return cfg
+func newAuditSettings(opts []Option) auditSettings {
+	c := newConfig(opts)
+	return auditSettings{names: c.audit.withDefaults(), textIDs: c.textLibrary}
 }
 
 func quoteLiteral(s string) string { return `'` + strings.ReplaceAll(s, `'`, `''`) + `'` }
@@ -167,8 +142,9 @@ const auditSchemaLock = 0x617564697464646c // "auditddl"
 // stop mistakes and ordinary code, and the hash chain ([audit.Service.Verify])
 // detects what a privileged rewrite leaves behind. Run the application as a
 // role that does not own the tables.
-func AuditDDL(opts ...AuditOption) []string {
-	cfg := newAuditSettings(opts)
+func AuditDDL(opts ...AuditOption) []string { return auditDDL(newAuditSettings(opts)) }
+
+func auditDDL(cfg auditSettings) []string {
 	ev, sl := quoteIdent(cfg.names.Events), quoteIdent(cfg.names.Seals)
 	evLit, slLit := quoteLiteral(cfg.names.Events), quoteLiteral(cfg.names.Seals)
 	idType := "uuid"

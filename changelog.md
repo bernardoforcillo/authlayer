@@ -34,9 +34,12 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ### Changed
 
-- The store option types (`AuthOption`, `InviteOption`, ...) are now interfaces
-  rather than function types, so one `IDOption` can satisfy all of them. Code
-  that only calls the `With*` constructors is unaffected.
+- `store/drops` has one functional-option type, `dropsstore.Option`, accepted by
+  every store and schema constructor; each reads only the settings that concern
+  it. `AuthOption`, `InviteOption`, `APIKeyOption`, `IdentityOption`,
+  `CredentialOption`, `MFAOption`, `OAuthOption` and `AuditOption` are now
+  aliases of it, so existing signatures and `With*` calls compile unchanged.
+  The per-store settings structs and option adapters are gone.
 - `store/drops` shared helpers (`mapNoRows`, `affectedOrErr`,
   `isPrimaryKeyViolation`, `quoteIdent`) moved to `common.go`; no behaviour
   change.

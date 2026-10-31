@@ -54,7 +54,7 @@ func applyAuditDDL(ctx context.Context, db *pg.DB, cfg auditSettings) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(auditSchemaLock)); err != nil {
 			return err
 		}
-		for _, stmt := range AuditDDL(auditOptionFunc(func(s *auditSettings) { *s = cfg })) {
+		for _, stmt := range auditDDL(cfg) {
 			if _, err := tx.Exec(ctx, stmt); err != nil {
 				return err
 			}
@@ -569,8 +569,9 @@ func NewAuditKeyStore(db *pg.DB, opts ...AuditOption) *AuditKeyStore {
 }
 
 // AuditKeyDDL returns the statement creating the key table.
-func AuditKeyDDL(opts ...AuditOption) []string {
-	cfg := newAuditSettings(opts)
+func AuditKeyDDL(opts ...AuditOption) []string { return auditKeyDDL(newAuditSettings(opts)) }
+
+func auditKeyDDL(cfg auditSettings) []string {
 	return []string{`CREATE TABLE IF NOT EXISTS ` + quoteIdent(cfg.names.Keys) + ` (
   subject text PRIMARY KEY,
   key bytea,
@@ -581,7 +582,7 @@ func AuditKeyDDL(opts ...AuditOption) []string {
 
 // CreateSchema runs [AuditKeyDDL].
 func (st *AuditKeyStore) CreateSchema(ctx context.Context) error {
-	for _, stmt := range AuditKeyDDL(auditOptionFunc(func(s *auditSettings) { *s = st.cfg })) {
+	for _, stmt := range auditKeyDDL(st.cfg) {
 		if _, err := st.db.Exec(ctx, stmt); err != nil {
 			return err
 		}

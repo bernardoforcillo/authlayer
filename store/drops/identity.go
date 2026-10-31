@@ -23,33 +23,19 @@ type IdentityNames struct {
 }
 
 func (n IdentityNames) withDefaults() IdentityNames {
-	if n.Identities == "" {
-		n.Identities = "identities"
-	}
+	defaulted(&n.Identities, "identities")
 	return n
-}
-
-type identitySettings struct {
-	names IdentityNames
-	ids   idTypes
 }
 
 // IdentityOption customizes an [IdentitySchema] or [IdentityStore] at
 // construction.
-type IdentityOption interface{ applyIdentity(*identitySettings) }
-
-// identityOptionFunc adapts a plain function to [IdentityOption].
-type identityOptionFunc func(*identitySettings)
-
-func (f identityOptionFunc) applyIdentity(s *identitySettings) { f(s) }
-
-func (o IDOption) applyIdentity(s *identitySettings) { o.apply(&s.ids, true) }
+type IdentityOption = Option
 
 // WithIdentityNames overrides the table name, so a consumer that already owns
 // a table named "identities" for something else can point this store
 // elsewhere.
 func WithIdentityNames(n IdentityNames) IdentityOption {
-	return identityOptionFunc(func(s *identitySettings) { s.names = n })
+	return optionFunc(func(c *config) { c.identity = n })
 }
 
 // WithIdentityTextLibraryIDs types both id columns on the identities table as
@@ -157,11 +143,9 @@ type IdentitySchema struct {
 // table definition without a store — to generate DDL for a migration, for
 // instance.
 func NewIdentitySchema(opts ...IdentityOption) *IdentitySchema {
-	cfg := identitySettings{ids: uuidIDs()}
-	for _, o := range opts {
-		o.applyIdentity(&cfg)
-	}
-	names := cfg.names.withDefaults()
+	cfg := newConfig(opts)
+	ids := cfg.ids(true)
+	names := cfg.identity.withDefaults()
 
 	s := &IdentitySchema{Identities: pg.NewTable(names.Identities)}
 	// One idTypes, with both families always set the same way — see
@@ -169,7 +153,7 @@ func NewIdentitySchema(opts ...IdentityOption) *IdentitySchema {
 	// tables and unlike Schema/InviteSchema, has no text-user-id option of
 	// its own: user_id references the users table [AuthStore] owns, so it
 	// must be typed as users.id is, whichever that is.
-	s.identities = newColSet(s.Identities, auth.Identity{}, cfg.ids)
+	s.identities = newColSet(s.Identities, auth.Identity{}, ids)
 
 	s.Identities.AddUnique(names.Identities+"_provider_subject",
 		s.identities.col("provider"), s.identities.col("subject"))

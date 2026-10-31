@@ -22,36 +22,20 @@ type CredentialNames struct {
 }
 
 func (n CredentialNames) withDefaults() CredentialNames {
-	if n.Credentials == "" {
-		n.Credentials = "credentials"
-	}
-	if n.Challenges == "" {
-		n.Challenges = "passkey_challenges"
-	}
+	defaulted(&n.Credentials, "credentials")
+	defaulted(&n.Challenges, "passkey_challenges")
 	return n
-}
-
-type credentialSettings struct {
-	names CredentialNames
-	ids   idTypes
 }
 
 // CredentialOption customizes a [CredentialSchema] or [CredentialStore] at
 // construction.
-type CredentialOption interface{ applyCredential(*credentialSettings) }
-
-// credentialOptionFunc adapts a plain function to [CredentialOption].
-type credentialOptionFunc func(*credentialSettings)
-
-func (f credentialOptionFunc) applyCredential(s *credentialSettings) { f(s) }
-
-func (o IDOption) applyCredential(s *credentialSettings) { o.apply(&s.ids, true) }
+type CredentialOption = Option
 
 // WithCredentialNames overrides the two table names, so a consumer that
 // already owns a table called "credentials" for something else can point this
 // store elsewhere.
 func WithCredentialNames(n CredentialNames) CredentialOption {
-	return credentialOptionFunc(func(s *credentialSettings) { s.names = n })
+	return optionFunc(func(c *config) { c.credential = n })
 }
 
 // WithCredentialTextLibraryIDs types every id column on both tables as text
@@ -156,11 +140,9 @@ type CredentialSchema struct {
 // table definitions without a store — to generate DDL for a migration, for
 // instance.
 func NewCredentialSchema(opts ...CredentialOption) *CredentialSchema {
-	cfg := credentialSettings{ids: uuidIDs()}
-	for _, o := range opts {
-		o.applyCredential(&cfg)
-	}
-	names := cfg.names.withDefaults()
+	cfg := newConfig(opts)
+	ids := cfg.ids(true)
+	names := cfg.credential.withDefaults()
 
 	s := &CredentialSchema{
 		Credentials: pg.NewTable(names.Credentials),
@@ -168,8 +150,8 @@ func NewCredentialSchema(opts ...CredentialOption) *CredentialSchema {
 	}
 	// One idTypes for both tables, both families always set together — see
 	// [WithCredentialTextLibraryIDs].
-	s.credentials = newColSet(s.Credentials, auth.Credential{}, cfg.ids)
-	s.challenges = newColSet(s.Challenges, auth.Challenge{}, cfg.ids)
+	s.credentials = newColSet(s.Credentials, auth.Credential{}, ids)
+	s.challenges = newColSet(s.Challenges, auth.Challenge{}, ids)
 
 	s.Credentials.AddUnique(names.Credentials+"_credential_id",
 		s.credentials.col("credential_id"))

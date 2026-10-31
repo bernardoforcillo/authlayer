@@ -27,42 +27,20 @@ type OAuthNames struct {
 }
 
 func (n OAuthNames) withDefaults() OAuthNames {
-	if n.Clients == "" {
-		n.Clients = "oauth_clients"
-	}
-	if n.Grants == "" {
-		n.Grants = "oauth_grants"
-	}
-	if n.Codes == "" {
-		n.Codes = "oauth_codes"
-	}
-	if n.DeviceAuthorizations == "" {
-		n.DeviceAuthorizations = "oauth_device_authorizations"
-	}
-	if n.RefreshTokens == "" {
-		n.RefreshTokens = "oauth_refresh_tokens"
-	}
+	defaulted(&n.Clients, "oauth_clients")
+	defaulted(&n.Grants, "oauth_grants")
+	defaulted(&n.Codes, "oauth_codes")
+	defaulted(&n.DeviceAuthorizations, "oauth_device_authorizations")
+	defaulted(&n.RefreshTokens, "oauth_refresh_tokens")
 	return n
 }
 
-type oauthSettings struct {
-	names OAuthNames
-	ids   idTypes
-}
-
 // OAuthOption customizes an [OAuthSchema] or [OAuthStore] at construction.
-type OAuthOption interface{ applyOAuth(*oauthSettings) }
-
-// oauthOptionFunc adapts a plain function to [OAuthOption].
-type oauthOptionFunc func(*oauthSettings)
-
-func (f oauthOptionFunc) applyOAuth(s *oauthSettings) { f(s) }
-
-func (o IDOption) applyOAuth(s *oauthSettings) { o.apply(&s.ids, false) }
+type OAuthOption = Option
 
 // WithOAuthNames overrides the five table names.
 func WithOAuthNames(n OAuthNames) OAuthOption {
-	return oauthOptionFunc(func(s *oauthSettings) { s.names = n })
+	return optionFunc(func(c *config) { c.oauth = n })
 }
 
 // WithOAuthTextUserIDs types the two user-id columns — oauth_clients.created_by
@@ -355,15 +333,13 @@ type OAuthSchema struct {
 // calls it, so use it directly only when you need the table definitions
 // without a store — to generate DDL for a migration, for instance.
 func NewOAuthSchema(opts ...OAuthOption) *OAuthSchema {
-	cfg := oauthSettings{ids: uuidIDs()}
-	for _, o := range opts {
-		o.applyOAuth(&cfg)
-	}
+	cfg := newConfig(opts)
+	ids := cfg.ids(false)
 	// The references between these tables hold ids oauth.Service mints, so
 	// they follow WithOAuthTextLibraryIDs — scoped to this schema; see
 	// idTypes.extraLibrary for why not the global list.
-	cfg.ids.extraLibrary = map[string]bool{"client_id": true, "grant_id": true, "family_id": true}
-	names := cfg.names.withDefaults()
+	ids.extraLibrary = map[string]bool{"client_id": true, "grant_id": true, "family_id": true}
+	names := cfg.oauth.withDefaults()
 
 	s := &OAuthSchema{
 		Clients:              pg.NewTable(names.Clients),
@@ -372,11 +348,11 @@ func NewOAuthSchema(opts ...OAuthOption) *OAuthSchema {
 		DeviceAuthorizations: pg.NewTable(names.DeviceAuthorizations),
 		RefreshTokens:        pg.NewTable(names.RefreshTokens),
 	}
-	s.clients = newColSet(s.Clients, clientRow{}, cfg.ids)
-	s.grants = newColSet(s.Grants, oauth.Grant{}, cfg.ids)
-	s.codes = newColSet(s.Codes, oauth.AuthorizationCode{}, cfg.ids)
-	s.devices = newColSet(s.DeviceAuthorizations, deviceRow{}, cfg.ids)
-	s.refresh = newColSet(s.RefreshTokens, oauth.RefreshToken{}, cfg.ids)
+	s.clients = newColSet(s.Clients, clientRow{}, ids)
+	s.grants = newColSet(s.Grants, oauth.Grant{}, ids)
+	s.codes = newColSet(s.Codes, oauth.AuthorizationCode{}, ids)
+	s.devices = newColSet(s.DeviceAuthorizations, deviceRow{}, ids)
+	s.refresh = newColSet(s.RefreshTokens, oauth.RefreshToken{}, ids)
 
 	cascade := pg.OnDelete("CASCADE")
 	s.Grants.ForeignKey(s.grants.col("client_id"), s.clients.col("id"), cascade)

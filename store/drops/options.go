@@ -1,5 +1,75 @@
 package dropsstore
 
+// Option customizes any store or schema constructor in this package. There is
+// one option type, not one per store: each constructor reads only the settings
+// that concern it and ignores the rest, so a single list can configure a whole
+// deployment:
+//
+//	opts := []dropsstore.Option{dropsstore.TextLibraryIDs()}
+//	auth := dropsstore.NewAuthStore(db, opts...)
+//	rbac := dropsstore.New[org.Organization, org.Member](db, opts...)
+//
+// The per-store names (AuthOption, InviteOption, ...) are aliases of Option and
+// remain only so existing signatures keep compiling.
+type Option interface{ apply(*config) }
+
+// optionFunc adapts a plain function to [Option].
+type optionFunc func(*config)
+
+func (f optionFunc) apply(c *config) { f(c) }
+
+// config is everything an Option can set. The per-store table names live side
+// by side, so one value carries a whole deployment's naming.
+type config struct {
+	scope      Names
+	auth       AuthNames
+	invite     InviteNames
+	apikey     APIKeyNames
+	identity   IdentityNames
+	credential CredentialNames
+	mfa        MFANames
+	oauth      OAuthNames
+	audit      AuditNames
+
+	textLibrary, textUser bool
+}
+
+func newConfig(opts []Option) config {
+	var c config
+	for _, o := range opts {
+		if o != nil {
+			o.apply(&c)
+		}
+	}
+	return c
+}
+
+// ids resolves the id column types for one store. ownsUsers is true for the
+// stores whose user ids the library mints itself (auth, identity, credential,
+// MFA); there [TextLibraryIDs] also retypes user_id and [TextUserIDs] is
+// ignored.
+func (c config) ids(ownsUsers bool) idTypes {
+	ids := uuidIDs()
+	if c.textLibrary {
+		ids.library = false
+		if ownsUsers {
+			ids.user = false
+		}
+	}
+	if c.textUser && !ownsUsers {
+		ids.user = false
+	}
+	return ids
+}
+
+// defaulted sets *p to def when it is empty. It is what every Names type's
+// withDefaults is built from.
+func defaulted(p *string, def string) {
+	if *p == "" {
+		*p = def
+	}
+}
+
 // IDOption retypes id columns from uuid to text, and is accepted by every
 // store constructor in this package: [New], [NewAuthStore], [NewInviteStore],
 // [NewAPIKeyStore], [NewIdentityStore], [NewCredentialStore], [NewMFAStore] and
@@ -33,16 +103,7 @@ func TextLibraryIDs() IDOption { return IDOption{library: true} }
 // follow [TextLibraryIDs].
 func TextUserIDs() IDOption { return IDOption{user: true} }
 
-// apply folds o into ids. ownsUsers is true for the stores whose user ids are
-// library-minted.
-func (o IDOption) apply(ids *idTypes, ownsUsers bool) {
-	if o.library {
-		ids.library = false
-		if ownsUsers {
-			ids.user = false
-		}
-	}
-	if o.user && !ownsUsers {
-		ids.user = false
-	}
+func (o IDOption) apply(c *config) {
+	c.textLibrary = c.textLibrary || o.library
+	c.textUser = c.textUser || o.user
 }
