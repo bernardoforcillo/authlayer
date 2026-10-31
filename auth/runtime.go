@@ -7,12 +7,5 @@ import "github.com/bernardoforcillo/authlayer/core"
 // keeps every Service in a deployment on the same clock and id source; the
 // per-field [WithClock] and [WithIDGenerator] remain for a single override.
 func WithRuntime(r core.Runtime) Option {
-	return func(c *config) {
-		if r.Clock != nil {
-			c.clock = r.Clock
-		}
-		if r.IDs != nil {
-			c.idGen = r.IDs
-		}
-	}
+	return func(c *config) { r.Apply(&c.clock, &c.idGen) }
 }

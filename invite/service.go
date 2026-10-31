@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bernardoforcillo/authlayer/access"
+	"github.com/bernardoforcillo/authlayer/core"
 	"github.com/bernardoforcillo/authlayer/internal/uid"
 	"github.com/bernardoforcillo/authlayer/scope"
 )
@@ -146,11 +147,7 @@ func WithNotifier(n Notifier) Option {
 //
 //	svc := invite.New(sc, st, invite.WithTokens(func() string { return "fixed-token" }))
 func WithTokens(gen func() string) Option {
-	return func(c *config) {
-		if gen != nil {
-			c.tokens = gen
-		}
-	}
+	return func(c *config) { core.Override(&c.tokens, gen) }
 }
 
 // WithRecheckInviterOnAccept controls whether [Service.AcceptInvite] and

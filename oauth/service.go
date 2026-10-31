@@ -12,6 +12,7 @@ import (
 
 	"github.com/bernardoforcillo/authlayer/access"
 	"github.com/bernardoforcillo/authlayer/apikey"
+	"github.com/bernardoforcillo/authlayer/core"
 	"github.com/bernardoforcillo/authlayer/internal/uid"
 	"github.com/bernardoforcillo/authlayer/scope"
 	"github.com/bernardoforcillo/authlayer/token"
@@ -85,11 +86,7 @@ type Option func(*config)
 // The default is time.Now().UTC(). A nil clock is ignored. The signer keeps
 // its own clock for iat/exp, which this option does not reach.
 func WithClock(now func() time.Time) Option {
-	return func(c *config) {
-		if now != nil {
-			c.clock = now
-		}
-	}
+	return func(c *config) { core.Override(&c.clock, now) }
 }
 
 // WithIDGenerator sets the id generator for clients, grants, codes, device
@@ -99,18 +96,14 @@ func WithClock(now func() time.Time) Option {
 // dropsstore.WithOAuthTextLibraryIDs, or the first create fails with
 // SQLSTATE 22P02. A nil generator is ignored.
 func WithIDGenerator(gen func() string) Option {
-	return func(c *config) {
-		if gen != nil {
-			c.idgen = gen
-		}
-	}
+	return func(c *config) { core.Override(&c.idgen, gen) }
 }
 
 // WithHooks appends lifecycle hooks. It appends rather than replaces, so
 // several calls accumulate and hooks run in registration order. See [Hook]
 // for what a hook error does to the call that emitted it.
 func WithHooks(hooks ...Hook) Option {
-	return func(c *config) { c.hooks = append(c.hooks, hooks...) }
+	return func(c *config) { c.hooks = core.AppendNonNil(c.hooks, hooks...) }
 }
 
 // WithIssuer sets the iss claim of every token this Service mints and the

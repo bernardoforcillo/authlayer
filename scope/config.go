@@ -1,6 +1,7 @@
 package scope
 
 import (
+	"github.com/bernardoforcillo/authlayer/core"
 	"time"
 
 	"github.com/bernardoforcillo/authlayer/internal/uid"
@@ -87,11 +88,7 @@ type Option func(*config)
 //
 //	org.New(ac, store, org.WithIDGenerator(func() string { return uuid.NewString() }))
 func WithIDGenerator(gen func() string) Option {
-	return func(c *config) {
-		if gen != nil {
-			c.idgen = gen
-		}
-	}
+	return func(c *config) { core.Override(&c.idgen, gen) }
 }
 
 // WithClock sets the clock used for created/updated, joined-at, and event
@@ -102,11 +99,7 @@ func WithIDGenerator(gen func() string) Option {
 //	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 //	svc := org.New(ac, store, org.WithClock(func() time.Time { return at }))
 func WithClock(now func() time.Time) Option {
-	return func(c *config) {
-		if now != nil {
-			c.clock = now
-		}
-	}
+	return func(c *config) { core.Override(&c.clock, now) }
 }
 
 // WithPolicy replaces the authorization policy wholesale — escalation mode and
@@ -129,5 +122,5 @@ func WithPolicy(p Policy) Option {
 //	    return nil
 //	}))
 func WithHooks(hooks ...Hook) Option {
-	return func(c *config) { c.hooks = append(c.hooks, hooks...) }
+	return func(c *config) { c.hooks = core.AppendNonNil(c.hooks, hooks...) }
 }

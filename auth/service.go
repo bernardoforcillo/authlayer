@@ -695,11 +695,7 @@ func WithPasswordRequired(required bool) Option {
 // deterministic, matching [github.com/bernardoforcillo/authlayer/scope.WithClock]'s
 // own stance.
 func WithClock(now func() time.Time) Option {
-	return func(c *config) {
-		if now != nil {
-			c.clock = now
-		}
-	}
+	return func(c *config) { core.Override(&c.clock, now) }
 }
 
 // WithIDGenerator sets the id generator used for users, sessions, and
@@ -752,11 +748,7 @@ func WithClock(now func() time.Time) Option {
 // [github.com/bernardoforcillo/authlayer/scope.WithIDGenerator] carries the
 // identical requirement, for the identical reason.
 func WithIDGenerator(gen func() string) Option {
-	return func(c *config) {
-		if gen != nil {
-			c.idGen = gen
-		}
-	}
+	return func(c *config) { core.Override(&c.idGen, gen) }
 }
 
 // WithRateLimiter wires a [RateLimiter] that [Service.Login] and

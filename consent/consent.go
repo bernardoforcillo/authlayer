@@ -99,14 +99,7 @@ type Option func(*config)
 
 // WithRuntime takes the clock and id generator from a shared core.Runtime.
 func WithRuntime(r core.Runtime) Option {
-	return func(c *config) {
-		if r.Clock != nil {
-			c.clock = r.Clock
-		}
-		if r.IDs != nil {
-			c.idgen = r.IDs
-		}
-	}
+	return func(c *config) { r.Apply(&c.clock, &c.idgen) }
 }
 
 // Service records and answers consent over a Store. It caches nothing and is

@@ -302,13 +302,7 @@ type HookFunc = core.HookFunc[Event]
 // hooks behaves exactly as it did before hooks existed, and one whose hooks
 // all return nil is observably identical to it.
 func WithHooks(h ...Hook) Option {
-	return func(c *config) {
-		for _, hook := range h {
-			if hook != nil {
-				c.hooks = append(c.hooks, hook)
-			}
-		}
-	}
+	return func(c *config) { c.hooks = core.AppendNonNil(c.hooks, h...) }
 }
 
 // emit stamps e.At from the Service clock if unset and runs every hook in
