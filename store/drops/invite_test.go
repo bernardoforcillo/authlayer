@@ -158,9 +158,10 @@ func TestInviteStoreCreateSchemaEmitsUniqueConstraints(t *testing.T) {
 	}
 
 	// 2 CREATE TABLE + 3 ALTER TABLE ADD CONSTRAINT (container_email,
-	// token_hash on invites; code on links).
-	if len(fd.execs) != 5 {
-		t.Fatalf("CreateSchema issued %d statements, want 5:\n%s",
+	// token_hash on invites; code on links) + 3 CREATE INDEX IF NOT EXISTS
+	// (links.container_id, links.expires_at, invites.expires_at).
+	if len(fd.execs) != 8 {
+		t.Fatalf("CreateSchema issued %d statements, want 8:\n%s",
 			len(fd.execs), strings.Join(fd.execs, "\n--\n"))
 	}
 

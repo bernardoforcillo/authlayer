@@ -100,7 +100,7 @@ organization_members
   role_key
   joined_at
   PRIMARY KEY [container_id user_id]
-  indexes: 0
+  indexes: 1
 organization_roles
   id PK
   container_id
@@ -164,7 +164,7 @@ sessions
   ip
   mfa_at NULL
   UNIQUE [token_hash] as sessions_token_hash
-  indexes: 1
+  indexes: 3
 verifications
   id PK
   user_id
@@ -174,7 +174,7 @@ verifications
   expires_at
   created_at
   UNIQUE [token_hash] as verifications_token_hash
-  indexes: 1
+  indexes: 2
 ```
 
 <Note>
@@ -253,7 +253,7 @@ organization_invites
   created_at
   UNIQUE [container_id email] as organization_invites_container_email
   UNIQUE [token_hash] as organization_invites_token_hash
-  indexes: 0
+  indexes: 1
 organization_invite_links
   id PK
   container_id
@@ -266,7 +266,7 @@ organization_invite_links
   revoked_at NULL
   created_at
   UNIQUE [code] as organization_invite_links_code
-  indexes: 0
+  indexes: 2
 ```
 
 <Warning>
@@ -294,7 +294,7 @@ needed. See [addresses are normalized](/invitations/email-invites#addresses-are-
 Rows written by **v0.1.0**, which normalized nothing, may hold non-normalized
 addresses; the changelog carries the one-time migration.
 
-{/* verify:stdout "organizations\n  id PK\n  owner_id\n  created_at\n  updated_at\n  name\n  slug UNIQUE\n  indexes: 0\norganization_members\n  container_id\n  user_id\n  role_key\n  joined_at\n  PRIMARY KEY [container_id user_id]\n  indexes: 0\norganization_roles\n  id PK\n  container_id\n  key\n  name\n  permissions\n  created_at\n  UNIQUE [container_id key] as organization_roles_container_key\n  indexes: 0\nusers\n  id PK\n  email UNIQUE\n  email_verified_at NULL\n  password_hash\n  created_at\n  updated_at\n  deleted_at NULL\n  UNIQUE [email] as users_email_key\n  indexes: 0\nsessions\n  id PK\n  user_id\n  token_hash\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  user_agent\n  ip\n  mfa_at NULL\n  UNIQUE [token_hash] as sessions_token_hash\n  indexes: 1\nverifications\n  id PK\n  user_id\n  token_hash\n  purpose\n  email\n  expires_at\n  created_at\n  UNIQUE [token_hash] as verifications_token_hash\n  indexes: 1\norganization_invites\n  id PK\n  container_id\n  email\n  role_key\n  token_hash\n  invited_by\n  expires_at\n  created_at\n  UNIQUE [container_id email] as organization_invites_container_email\n  UNIQUE [token_hash] as organization_invites_token_hash\n  indexes: 0\norganization_invite_links\n  id PK\n  container_id\n  code\n  role_key\n  created_by\n  max_uses\n  use_count\n  expires_at NULL\n  revoked_at NULL\n  created_at\n  UNIQUE [code] as organization_invite_links_code\n  indexes: 0\nservice_accounts\n  id PK\n  container_id\n  name\n  description\n  created_by\n  created_at\n  updated_at\n  disabled_at NULL\n  indexes: 1\napi_keys\n  id PK\n  service_account_id\n  container_id\n  name\n  prefix\n  token_hash UNIQUE\n  permissions\n  expires_at NULL\n  last_used_at NULL\n  created_by\n  created_at\n  revoked_at NULL\n  indexes: 2\napi_keys.service_account_id -> service_accounts ON DELETE CASCADE\nidentities\n  id PK\n  user_id\n  provider\n  subject\n  email\n  created_at\n  last_used_at NULL\n  UNIQUE [provider subject] as identities_provider_subject\n  indexes: 1\noauth_clients\n  id PK\n  container_id NULL\n  name\n  secret_hash\n  public\n  redirect_uris\n  grant_types\n  scopes\n  service_account_id NULL\n  permissions\n  created_by NULL\n  created_at\n  updated_at\n  disabled_at NULL\n  indexes: 1\noauth_grants\n  id PK\n  client_id\n  user_id\n  container_id\n  scope\n  permissions\n  created_at\n  expires_at NULL\n  last_used_at NULL\n  revoked_at NULL\n  indexes: 2\noauth_codes\n  id PK\n  code_hash UNIQUE\n  client_id\n  grant_id\n  redirect_uri\n  code_challenge\n  expires_at\n  created_at\n  redeemed_at NULL\n  indexes: 2\noauth_device_authorizations\n  id PK\n  device_code_hash UNIQUE\n  user_code UNIQUE\n  client_id\n  scope\n  status\n  grant_id NULL\n  interval\n  last_polled_at NULL\n  expires_at\n  created_at\n  indexes: 1\noauth_refresh_tokens\n  id PK\n  token_hash UNIQUE\n  grant_id\n  client_id\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  indexes: 3\noauth_grants.client_id -> oauth_clients ON DELETE CASCADE\noauth_codes.client_id -> oauth_clients ON DELETE CASCADE\noauth_codes.grant_id -> oauth_grants ON DELETE CASCADE\noauth_device_authorizations.client_id -> oauth_clients ON DELETE CASCADE\noauth_refresh_tokens.grant_id -> oauth_grants ON DELETE CASCADE\noauth_refresh_tokens.client_id -> oauth_clients ON DELETE CASCADE\ndevice grant_id has a foreign key: false\npublic: boolean redirect_uris: jsonb\nCREATE TABLE IF NOT EXISTS \"audit_events\" (\nCREATE TABLE IF NOT EXISTS \"audit_seals\" (\nCREATE INDEX IF NOT EXISTS \"audit_events_topic_time\" ON \"audit_events\" (topic, occurred_at)\nCREATE INDEX IF NOT EXISTS \"audit_events_open\" ON \"audit_events\" (occurred_at) WHERE completed_at IS NULL\nCREATE INDEX IF NOT EXISTS \"audit_events_container\" ON \"audit_events\" (container_id, seq DESC) WHERE container_id <> ''\nCREATE INDEX IF NOT EXISTS \"audit_events_client\" ON \"audit_events\" (topic, occurred_at) WHERE ip <> '' OR user_agent <> ''\nCREATE INDEX IF NOT EXISTS \"audit_events_actor\" ON \"audit_events\" (actor_id, seq DESC) WHERE actor_id <> ''\nCREATE INDEX IF NOT EXISTS \"audit_events_resource\" ON \"audit_events\" (resource_type, resource_id, seq DESC) WHERE resource_id <> ''\nCREATE INDEX IF NOT EXISTS \"audit_events_on_behalf_of\" ON \"audit_events\" (on_behalf_of, seq DESC) WHERE on_behalf_of <> ''\nCREATE TABLE IF NOT EXISTS \"audit_subject_keys\" (" */}
+{/* verify:stdout "organizations\n  id PK\n  owner_id\n  created_at\n  updated_at\n  name\n  slug UNIQUE\n  indexes: 0\norganization_members\n  container_id\n  user_id\n  role_key\n  joined_at\n  PRIMARY KEY [container_id user_id]\n  indexes: 1\norganization_roles\n  id PK\n  container_id\n  key\n  name\n  permissions\n  created_at\n  UNIQUE [container_id key] as organization_roles_container_key\n  indexes: 0\nusers\n  id PK\n  email UNIQUE\n  email_verified_at NULL\n  password_hash\n  created_at\n  updated_at\n  deleted_at NULL\n  UNIQUE [email] as users_email_key\n  indexes: 0\nsessions\n  id PK\n  user_id\n  token_hash\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  user_agent\n  ip\n  mfa_at NULL\n  UNIQUE [token_hash] as sessions_token_hash\n  indexes: 3\nverifications\n  id PK\n  user_id\n  token_hash\n  purpose\n  email\n  expires_at\n  created_at\n  UNIQUE [token_hash] as verifications_token_hash\n  indexes: 2\norganization_invites\n  id PK\n  container_id\n  email\n  role_key\n  token_hash\n  invited_by\n  expires_at\n  created_at\n  UNIQUE [container_id email] as organization_invites_container_email\n  UNIQUE [token_hash] as organization_invites_token_hash\n  indexes: 1\norganization_invite_links\n  id PK\n  container_id\n  code\n  role_key\n  created_by\n  max_uses\n  use_count\n  expires_at NULL\n  revoked_at NULL\n  created_at\n  UNIQUE [code] as organization_invite_links_code\n  indexes: 2\nservice_accounts\n  id PK\n  container_id\n  name\n  description\n  created_by\n  created_at\n  updated_at\n  disabled_at NULL\n  indexes: 1\napi_keys\n  id PK\n  service_account_id\n  container_id\n  name\n  prefix\n  token_hash UNIQUE\n  permissions\n  expires_at NULL\n  last_used_at NULL\n  created_by\n  created_at\n  revoked_at NULL\n  indexes: 4\napi_keys.service_account_id -> service_accounts ON DELETE CASCADE\nidentities\n  id PK\n  user_id\n  provider\n  subject\n  email\n  created_at\n  last_used_at NULL\n  UNIQUE [provider subject] as identities_provider_subject\n  indexes: 1\noauth_clients\n  id PK\n  container_id NULL\n  name\n  secret_hash\n  public\n  redirect_uris\n  grant_types\n  scopes\n  service_account_id NULL\n  permissions\n  created_by NULL\n  created_at\n  updated_at\n  disabled_at NULL\n  indexes: 1\noauth_grants\n  id PK\n  client_id\n  user_id\n  container_id\n  scope\n  permissions\n  created_at\n  expires_at NULL\n  last_used_at NULL\n  revoked_at NULL\n  indexes: 2\noauth_codes\n  id PK\n  code_hash UNIQUE\n  client_id\n  grant_id\n  redirect_uri\n  code_challenge\n  expires_at\n  created_at\n  redeemed_at NULL\n  indexes: 3\noauth_device_authorizations\n  id PK\n  device_code_hash UNIQUE\n  user_code UNIQUE\n  client_id\n  scope\n  status\n  grant_id NULL\n  interval\n  last_polled_at NULL\n  expires_at\n  created_at\n  indexes: 2\noauth_refresh_tokens\n  id PK\n  token_hash UNIQUE\n  grant_id\n  client_id\n  family_id\n  expires_at\n  created_at\n  rotated_at NULL\n  indexes: 4\noauth_grants.client_id -> oauth_clients ON DELETE CASCADE\noauth_codes.client_id -> oauth_clients ON DELETE CASCADE\noauth_codes.grant_id -> oauth_grants ON DELETE CASCADE\noauth_device_authorizations.client_id -> oauth_clients ON DELETE CASCADE\noauth_refresh_tokens.grant_id -> oauth_grants ON DELETE CASCADE\noauth_refresh_tokens.client_id -> oauth_clients ON DELETE CASCADE\ndevice grant_id has a foreign key: false\npublic: boolean redirect_uris: jsonb\nCREATE TABLE IF NOT EXISTS \"audit_events\" (\nCREATE TABLE IF NOT EXISTS \"audit_seals\" (\nCREATE INDEX IF NOT EXISTS \"audit_events_topic_time\" ON \"audit_events\" (topic, occurred_at)\nCREATE INDEX IF NOT EXISTS \"audit_events_open\" ON \"audit_events\" (occurred_at) WHERE completed_at IS NULL\nCREATE INDEX IF NOT EXISTS \"audit_events_container\" ON \"audit_events\" (container_id, seq DESC) WHERE container_id <> ''\nCREATE INDEX IF NOT EXISTS \"audit_events_client\" ON \"audit_events\" (topic, occurred_at) WHERE ip <> '' OR user_agent <> ''\nCREATE INDEX IF NOT EXISTS \"audit_events_actor\" ON \"audit_events\" (actor_id, seq DESC) WHERE actor_id <> ''\nCREATE INDEX IF NOT EXISTS \"audit_events_resource\" ON \"audit_events\" (resource_type, resource_id, seq DESC) WHERE resource_id <> ''\nCREATE INDEX IF NOT EXISTS \"audit_events_on_behalf_of\" ON \"audit_events\" (on_behalf_of, seq DESC) WHERE on_behalf_of <> ''\nCREATE TABLE IF NOT EXISTS \"audit_subject_keys\" (" */}
 
 ## The service-account tables
 
@@ -331,7 +331,7 @@ api_keys
   created_by
   created_at
   revoked_at NULL
-  indexes: 2
+  indexes: 4
 api_keys.service_account_id -> service_accounts ON DELETE CASCADE
 ```
 
@@ -474,7 +474,7 @@ oauth_codes
   expires_at
   created_at
   redeemed_at NULL
-  indexes: 2
+  indexes: 3
 oauth_device_authorizations
   id PK
   device_code_hash UNIQUE
@@ -487,7 +487,7 @@ oauth_device_authorizations
   last_polled_at NULL
   expires_at
   created_at
-  indexes: 1
+  indexes: 2
 oauth_refresh_tokens
   id PK
   token_hash UNIQUE
@@ -497,7 +497,7 @@ oauth_refresh_tokens
   expires_at
   created_at
   rotated_at NULL
-  indexes: 3
+  indexes: 4
 oauth_grants.client_id -> oauth_clients ON DELETE CASCADE
 oauth_codes.client_id -> oauth_clients ON DELETE CASCADE
 oauth_codes.grant_id -> oauth_grants ON DELETE CASCADE

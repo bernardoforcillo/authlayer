@@ -1,7 +1,10 @@
 package dropsstore
 
 import (
+	"context"
 	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
@@ -71,4 +74,89 @@ func addConstraint(t *pg.Table, name, kind string, cols []*pg.Column) drops.Expr
 		b.WriteString(");\nEXCEPTION\n  WHEN duplicate_table OR duplicate_object OR " +
 			"invalid_table_definition THEN NULL;\nEND;\n$authlayer$")
 	})
+}
+
+// createTables is the one CreateSchema loop every store shares: for each table,
+// CREATE TABLE IF NOT EXISTS, then the composite constraints CREATE TABLE
+// cannot carry, then CREATE INDEX IF NOT EXISTS for every index registered on
+// it. Tables are created in the order given, so a referenced table must come
+// before the tables that reference it.
+//
+// Running the index step for tables that already exist is what lets a new
+// release add an index to a deployed schema: CREATE TABLE no-ops, the index is
+// created. It never alters or drops anything that is already there.
+func createTables(ctx context.Context, db *pg.DB, tables ...*pg.Table) error {
+	for _, t := range tables {
+		if _, err := db.ExecExpr(ctx, pg.CreateTableIfNotExists(t)); err != nil {
+			return err
+		}
+		for _, ddl := range compositeConstraintDDL(t) {
+			if _, err := db.ExecExpr(ctx, ddl); err != nil {
+				return err
+			}
+		}
+		for _, idx := range t.Indexes() {
+			if _, err := db.ExecExpr(ctx, pg.CreateIndexIfNotExists(idx)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// idxName is the single naming rule for a non-unique index declared through
+// pg.NewIndex: <table>_<col>[_<col>...]_idx. Every index added after the rule
+// follows it; the older ones already did, so no name changes on a deployed
+// database.
+func idxName(table string, cols ...string) string {
+	return table + "_" + strings.Join(cols, "_") + "_idx"
+}
+
+// addIndex registers a plain btree index on cs's columns under [idxName].
+func addIndex(t *pg.Table, cs *colSet, cols ...string) {
+	exprs := make([]drops.Expression, len(cols))
+	for i, c := range cols {
+		exprs[i] = cs.col(c)
+	}
+	t.AddIndex(pg.NewIndex(idxName(t.Name(), cols...), t, exprs...))
+}
+
+// purgeBatchSize bounds how many rows one housekeeping DELETE removes. A
+// single unbounded DELETE over a table that has accumulated a long expired
+// tail holds its row locks and bloats WAL for the whole statement; batches
+// keep each statement short and let autovacuum keep up.
+const purgeBatchSize = 5000
+
+// deleteBatched deletes every row of t matching where, purgeBatchSize rows per
+// statement, and returns the total removed. It selects victims by ctid, so it
+// needs no primary key and works for the composite-keyed tables too. Each
+// batch is its own autocommit statement: like the single DELETEs it replaces,
+// the purge is housekeeping and not atomic with anything.
+func deleteBatched(ctx context.Context, db *pg.DB, t *pg.Table, where drops.Expression) (int, error) {
+	total := 0
+	for {
+		res, err := db.ExecExpr(ctx, drops.ExprFunc(func(b *drops.Builder) {
+			b.WriteString("DELETE FROM ")
+			b.WriteQualified(t.Schema(), t.Name())
+			b.WriteString(" WHERE ctid IN (SELECT ctid FROM ")
+			b.WriteQualified(t.Schema(), t.Name())
+			b.WriteString(" WHERE ")
+			b.Append(where)
+			b.WriteString(" LIMIT " + strconv.Itoa(purgeBatchSize) + ")")
+		}))
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += int(n)
+		if n < purgeBatchSize {
+			return total, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+	}
 }

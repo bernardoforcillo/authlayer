@@ -170,15 +170,5 @@ func (st *MFAStore) TouchTrustedDevice(ctx context.Context, id string, now time.
 // ExpiresAt against the service clock on every sign-in, long before this
 // removes the row.
 func (st *MFAStore) PurgeExpiredTrustedDevices(ctx context.Context, before time.Time) (int, error) {
-	res, err := st.db.Delete(st.s.TrustedDevices).
-		Where(pg.Lt(st.s.devices.col("expires_at"), before)).
-		Exec(ctx)
-	if err != nil {
-		return 0, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	return int(n), nil
+	return deleteBatched(ctx, st.db, st.s.TrustedDevices, pg.Lt(st.s.devices.col("expires_at"), before))
 }

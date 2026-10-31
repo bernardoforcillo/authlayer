@@ -391,6 +391,10 @@ func NewOAuthSchema(opts ...OAuthOption) *OAuthSchema {
 	idx(s.RefreshTokens, s.refresh, "grant_id")
 	idx(s.RefreshTokens, s.refresh, "client_id")
 	idx(s.RefreshTokens, s.refresh, "family_id")
+	// PurgeExpired deletes on expires_at (and, for grants, revoked_at).
+	idx(s.Codes, s.codes, "expires_at")
+	idx(s.DeviceAuthorizations, s.devices, "expires_at")
+	idx(s.RefreshTokens, s.refresh, "expires_at")
 	return s
 }
 
@@ -436,22 +440,7 @@ func (st *OAuthStore) Schema() *OAuthSchema { return st.s }
 // that already exists — all live inside the CREATE TABLE that no-ops away
 // against a table that is already there (see [OAuthSchema]).
 func (st *OAuthStore) CreateSchema(ctx context.Context) error {
-	for _, t := range st.s.tables() {
-		if _, err := st.db.ExecExpr(ctx, pg.CreateTableIfNotExists(t)); err != nil {
-			return err
-		}
-		for _, ddl := range compositeConstraintDDL(t) {
-			if _, err := st.db.ExecExpr(ctx, ddl); err != nil {
-				return err
-			}
-		}
-		for _, idx := range t.Indexes() {
-			if _, err := st.db.ExecExpr(ctx, pg.CreateIndexIfNotExists(idx)); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return createTables(ctx, st.db, st.s.tables()...)
 }
 
 // classifyCreate maps a driver error from one of the five INSERTs: a

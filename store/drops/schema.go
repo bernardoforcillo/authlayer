@@ -166,5 +166,11 @@ func NewSchema[C any, M any](opts ...Option) *Schema[C, M] {
 	s.Roles.AddUnique(names.Roles+"_container_key",
 		s.roles.col("container_id"), s.roles.col("key"))
 
+	// ListUserStandings and ListUserContainers filter members by user_id alone,
+	// and the guard path runs the first on every authorized action. The
+	// (container_id, user_id) primary key leads with container_id, so it cannot
+	// serve that lookup.
+	addIndex(s.Members, s.members, "user_id")
+
 	return s
 }

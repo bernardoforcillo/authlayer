@@ -170,6 +170,8 @@ func NewCredentialSchema(opts ...CredentialOption) *CredentialSchema {
 		names.Credentials+"_user_id_idx", s.Credentials, s.credentials.col("user_id")))
 	s.Challenges.AddUnique(names.Challenges+"_challenge_hash",
 		s.challenges.col("challenge_hash"))
+	// expires_at serves PurgeExpiredChallenges.
+	addIndex(s.Challenges, s.challenges, "expires_at")
 
 	return s
 }
@@ -223,22 +225,7 @@ func (st *CredentialStore) Schema() *CredentialSchema { return st.s }
 // — and here it is also forced: [AuthStore] may be an entirely different
 // backend.
 func (st *CredentialStore) CreateSchema(ctx context.Context) error {
-	for _, tbl := range []*pg.Table{st.s.Credentials, st.s.Challenges} {
-		if _, err := st.db.ExecExpr(ctx, pg.CreateTableIfNotExists(tbl)); err != nil {
-			return err
-		}
-		for _, ddl := range compositeConstraintDDL(tbl) {
-			if _, err := st.db.ExecExpr(ctx, ddl); err != nil {
-				return err
-			}
-		}
-		for _, idx := range tbl.Indexes() {
-			if _, err := st.db.ExecExpr(ctx, pg.CreateIndexIfNotExists(idx)); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return createTables(ctx, st.db, st.s.Credentials, st.s.Challenges)
 }
 
 // ── Credentials ─────────────────────────────────────────────────────────
@@ -597,15 +584,5 @@ func (st *CredentialStore) DeleteChallenge(ctx context.Context, id string) error
 // same strictly-before boundary [AuthStore.PurgeExpired] uses so the two
 // janitors agree.
 func (st *CredentialStore) PurgeExpiredChallenges(ctx context.Context, before time.Time) (int, error) {
-	res, err := st.db.Delete(st.s.Challenges).
-		Where(pg.Lt(st.s.challenges.col("expires_at"), before)).
-		Exec(ctx)
-	if err != nil {
-		return 0, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	return int(n), nil
+	return deleteBatched(ctx, st.db, st.s.Challenges, pg.Lt(st.s.challenges.col("expires_at"), before))
 }

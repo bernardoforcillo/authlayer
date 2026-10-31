@@ -221,20 +221,7 @@ func (st *IdentityStore) Schema() *IdentitySchema { return st.s }
 // users table is declared, matching this codebase's other schemas — and here
 // it is also forced: [AuthStore] may be an entirely different backend.
 func (st *IdentityStore) CreateSchema(ctx context.Context) error {
-	if _, err := st.db.ExecExpr(ctx, pg.CreateTableIfNotExists(st.s.Identities)); err != nil {
-		return err
-	}
-	for _, ddl := range compositeConstraintDDL(st.s.Identities) {
-		if _, err := st.db.ExecExpr(ctx, ddl); err != nil {
-			return err
-		}
-	}
-	for _, idx := range st.s.Identities.Indexes() {
-		if _, err := st.db.ExecExpr(ctx, pg.CreateIndexIfNotExists(idx)); err != nil {
-			return err
-		}
-	}
-	return nil
+	return createTables(ctx, st.db, st.s.Identities)
 }
 
 // CreateIdentity normalizes i.Email (see [auth.NormalizeEmail]), inserts i,

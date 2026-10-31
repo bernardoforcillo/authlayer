@@ -187,9 +187,9 @@ func TestOAuthSchemaIndexes(t *testing.T) {
 	want := map[string][]string{
 		"oauth_clients":               {"oauth_clients_container_id_idx"},
 		"oauth_grants":                {"oauth_grants_user_id_idx", "oauth_grants_client_id_idx"},
-		"oauth_codes":                 {"oauth_codes_grant_id_idx", "oauth_codes_client_id_idx"},
-		"oauth_device_authorizations": {"oauth_device_authorizations_client_id_idx"},
-		"oauth_refresh_tokens":        {"oauth_refresh_tokens_grant_id_idx", "oauth_refresh_tokens_client_id_idx", "oauth_refresh_tokens_family_id_idx"},
+		"oauth_codes":                 {"oauth_codes_grant_id_idx", "oauth_codes_client_id_idx", "oauth_codes_expires_at_idx"},
+		"oauth_device_authorizations": {"oauth_device_authorizations_client_id_idx", "oauth_device_authorizations_expires_at_idx"},
+		"oauth_refresh_tokens":        {"oauth_refresh_tokens_grant_id_idx", "oauth_refresh_tokens_client_id_idx", "oauth_refresh_tokens_family_id_idx", "oauth_refresh_tokens_expires_at_idx"},
 	}
 	for _, tbl := range s.tables() {
 		var got []string
@@ -250,8 +250,8 @@ func TestOAuthStoreCreateSchemaEmitsTablesInDependencyOrderThenIndexes(t *testin
 	if err := newOAuthStore(fd).CreateSchema(context.Background()); err != nil {
 		t.Fatalf("CreateSchema: %v", err)
 	}
-	if len(fd.execs) != 14 {
-		t.Fatalf("CreateSchema issued %d statements, want 14 (five tables, nine indexes):\n%s", len(fd.execs), strings.Join(fd.execs, "\n"))
+	if len(fd.execs) != 17 {
+		t.Fatalf("CreateSchema issued %d statements, want 17 (five tables, twelve indexes):\n%s", len(fd.execs), strings.Join(fd.execs, "\n"))
 	}
 	order := []string{"oauth_clients", "oauth_grants", "oauth_codes", "oauth_device_authorizations", "oauth_refresh_tokens"}
 	last := -1

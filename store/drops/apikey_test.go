@@ -160,8 +160,8 @@ func TestAPIKeyStoreCreateSchemaEmitsTablesInOrderThenIndexes(t *testing.T) {
 	if err := newAPIKeyStore(fd).CreateSchema(context.Background()); err != nil {
 		t.Fatalf("CreateSchema: %v", err)
 	}
-	if len(fd.execs) != 5 {
-		t.Fatalf("CreateSchema issued %d statements, want 5 (two tables, three indexes):\n%s", len(fd.execs), strings.Join(fd.execs, "\n"))
+	if len(fd.execs) != 7 {
+		t.Fatalf("CreateSchema issued %d statements, want 7 (two tables, five indexes):\n%s", len(fd.execs), strings.Join(fd.execs, "\n"))
 	}
 	if !strings.Contains(fd.execs[0], `CREATE TABLE IF NOT EXISTS "service_accounts"`) {
 		t.Fatalf("first statement is not the service_accounts table: %s", fd.execs[0])
@@ -182,7 +182,7 @@ func TestAPIKeyStoreCreateSchemaEmitsTablesInOrderThenIndexes(t *testing.T) {
 	if !strings.Contains(keys, `"permissions" bytea NOT NULL`) {
 		t.Fatalf("api_keys DDL types permissions oddly:\n%s", keys)
 	}
-	for i, want := range []string{"api_keys_service_account_id_idx", "api_keys_container_id_idx"} {
+	for i, want := range []string{"api_keys_service_account_id_idx", "api_keys_container_id_idx", "api_keys_expires_at_idx", "api_keys_revoked_at_idx"} {
 		if got := fd.execs[3+i]; !strings.Contains(got, "CREATE INDEX IF NOT EXISTS") || !strings.Contains(got, want) {
 			t.Fatalf("statement %d = %s, want CREATE INDEX IF NOT EXISTS %s", 3+i, got, want)
 		}

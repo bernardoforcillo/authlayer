@@ -263,6 +263,11 @@ func NewAuthSchema(opts ...AuthOption) *AuthSchema {
 		names.Verifications+"_user_id_purpose_idx", s.Verifications,
 		s.verifications.col("user_id"), s.verifications.col("purpose"),
 	))
+	// sessions(user_id) serves listing and revoking one user's sessions;
+	// the expires_at indexes serve PurgeExpired's range delete.
+	addIndex(s.Sessions, s.sessions, "user_id")
+	addIndex(s.Sessions, s.sessions, "expires_at")
+	addIndex(s.Verifications, s.verifications, "expires_at")
 
 	return s
 }
@@ -314,22 +319,7 @@ func (st *AuthStore) Schema() *AuthSchema { return st.s }
 // the column absent — there is nothing this method could return that would
 // say otherwise, since every statement it issued genuinely succeeded.
 func (st *AuthStore) CreateSchema(ctx context.Context) error {
-	for _, t := range []*pg.Table{st.s.Users, st.s.Sessions, st.s.Verifications} {
-		if _, err := st.db.ExecExpr(ctx, pg.CreateTableIfNotExists(t)); err != nil {
-			return err
-		}
-		for _, ddl := range compositeConstraintDDL(t) {
-			if _, err := st.db.ExecExpr(ctx, ddl); err != nil {
-				return err
-			}
-		}
-		for _, idx := range t.Indexes() {
-			if _, err := st.db.ExecExpr(ctx, pg.CreateIndexIfNotExists(idx)); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return createTables(ctx, st.db, st.s.Users, st.s.Sessions, st.s.Verifications)
 }
 
 // isPrimaryKeyViolation reports whether a unique-violation error was
@@ -1177,27 +1167,10 @@ func (st *AuthStore) DeleteVerificationsByUser(ctx context.Context, userID strin
 // so it is two plain DELETEs rather than one statement, matching
 // [InviteStore.PurgeExpired].
 func (st *AuthStore) PurgeExpired(ctx context.Context, before time.Time) (int, error) {
-	res1, err := st.db.Delete(st.s.Sessions).
-		Where(pg.Lt(st.s.sessions.col("expires_at"), before)).
-		Exec(ctx)
+	n1, err := deleteBatched(ctx, st.db, st.s.Sessions, pg.Lt(st.s.sessions.col("expires_at"), before))
 	if err != nil {
-		return 0, err
+		return n1, err
 	}
-	a1, err := res1.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-
-	res2, err := st.db.Delete(st.s.Verifications).
-		Where(pg.Lt(st.s.verifications.col("expires_at"), before)).
-		Exec(ctx)
-	if err != nil {
-		return 0, err
-	}
-	a2, err := res2.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-
-	return int(a1 + a2), nil
+	n2, err := deleteBatched(ctx, st.db, st.s.Verifications, pg.Lt(st.s.verifications.col("expires_at"), before))
+	return n1 + n2, err
 }

@@ -171,6 +171,10 @@ func NewAPIKeySchema(opts ...APIKeyOption) *APIKeySchema {
 		names.Keys+"_service_account_id_idx", s.Keys, s.keys.col("service_account_id")))
 	s.Keys.AddIndex(pg.NewIndex(
 		names.Keys+"_container_id_idx", s.Keys, s.keys.col("container_id")))
+	// PurgeExpired deletes on expires_at OR revoked_at; one index per arm lets
+	// the planner combine them with a bitmap OR instead of scanning the table.
+	addIndex(s.Keys, s.keys, "expires_at")
+	addIndex(s.Keys, s.keys, "revoked_at")
 
 	return s
 }
@@ -212,22 +216,7 @@ func (st *APIKeyStore) Schema() *APIKeySchema { return st.s }
 // TABLE that no-ops away against a table that is already there (see
 // [APIKeySchema]).
 func (st *APIKeyStore) CreateSchema(ctx context.Context) error {
-	for _, t := range []*pg.Table{st.s.ServiceAccounts, st.s.Keys} {
-		if _, err := st.db.ExecExpr(ctx, pg.CreateTableIfNotExists(t)); err != nil {
-			return err
-		}
-		for _, ddl := range compositeConstraintDDL(t) {
-			if _, err := st.db.ExecExpr(ctx, ddl); err != nil {
-				return err
-			}
-		}
-		for _, idx := range t.Indexes() {
-			if _, err := st.db.ExecExpr(ctx, pg.CreateIndexIfNotExists(idx)); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return createTables(ctx, st.db, st.s.ServiceAccounts, st.s.Keys)
 }
 
 // ── Service accounts ────────────────────────────────────────────────────────
@@ -430,18 +419,8 @@ func (st *APIKeyStore) DeleteKey(ctx context.Context, id string) error {
 func (st *APIKeyStore) PurgeExpired(ctx context.Context, before time.Time) (int, error) {
 	expiresAt := st.s.keys.col("expires_at")
 	revokedAt := st.s.keys.col("revoked_at")
-	res, err := st.db.Delete(st.s.Keys).
-		Where(pg.Or(
-			pg.And(pg.IsNotNull(expiresAt), pg.Lt(expiresAt, before)),
-			pg.And(pg.IsNotNull(revokedAt), pg.Lt(revokedAt, before)),
-		)).
-		Exec(ctx)
-	if err != nil {
-		return 0, err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	return int(n), nil
+	return deleteBatched(ctx, st.db, st.s.Keys, pg.Or(
+		pg.And(pg.IsNotNull(expiresAt), pg.Lt(expiresAt, before)),
+		pg.And(pg.IsNotNull(revokedAt), pg.Lt(revokedAt, before)),
+	))
 }

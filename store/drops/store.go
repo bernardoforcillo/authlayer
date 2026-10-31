@@ -68,17 +68,7 @@ func (st *Store[C, M]) MembershipGuard(resourceContainerCol *pg.Column) pg.Guard
 // exactly as it stands, with no error. Production deployments should own these
 // tables in their own migrations and skip this call.
 func (st *Store[C, M]) CreateSchema(ctx context.Context) error {
-	for _, t := range []*pg.Table{st.s.Containers, st.s.Members, st.s.Roles} {
-		if _, err := st.db.ExecExpr(ctx, pg.CreateTableIfNotExists(t)); err != nil {
-			return err
-		}
-		for _, ddl := range compositeConstraintDDL(t) {
-			if _, err := st.db.ExecExpr(ctx, ddl); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return createTables(ctx, st.db, st.s.Containers, st.s.Members, st.s.Roles)
 }
 
 // ── Containers ──────────────────────────────────────────────────────────────

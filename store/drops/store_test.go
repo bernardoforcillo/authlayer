@@ -195,9 +195,10 @@ func TestCreateSchemaEmitsCompositeConstraints(t *testing.T) {
 		t.Fatalf("CreateSchema: %v", err)
 	}
 
-	// 3 CREATE TABLE + the members PK + the roles UNIQUE.
-	if len(fd.execs) != 5 {
-		t.Fatalf("CreateSchema issued %d statements, want 5:\n%s",
+	// 3 CREATE TABLE + the members PK + the roles UNIQUE + the members
+	// user_id index.
+	if len(fd.execs) != 6 {
+		t.Fatalf("CreateSchema issued %d statements, want 6:\n%s",
 			len(fd.execs), strings.Join(fd.execs, "\n--\n"))
 	}
 

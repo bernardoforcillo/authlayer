@@ -205,6 +205,8 @@ func NewMFASchema(opts ...MFAOption) *MFASchema {
 		names.TrustedDevices+"_user_id_idx", s.TrustedDevices,
 		s.devices.col("user_id"),
 	))
+	// expires_at serves PurgeExpiredTrustedDevices.
+	addIndex(s.TrustedDevices, s.devices, "expires_at")
 
 	return s
 }
@@ -262,22 +264,7 @@ func (st *MFAStore) Schema() *MFASchema { return st.s }
 // declared, matching this codebase's other schemas — and here it is also
 // forced: [AuthStore] may be a different backend.
 func (st *MFAStore) CreateSchema(ctx context.Context) error {
-	for _, t := range []*pg.Table{st.s.Factors, st.s.RecoveryCodes, st.s.TrustedDevices} {
-		if _, err := st.db.ExecExpr(ctx, pg.CreateTableIfNotExists(t)); err != nil {
-			return err
-		}
-		for _, ddl := range compositeConstraintDDL(t) {
-			if _, err := st.db.ExecExpr(ctx, ddl); err != nil {
-				return err
-			}
-		}
-		for _, idx := range t.Indexes() {
-			if _, err := st.db.ExecExpr(ctx, pg.CreateIndexIfNotExists(idx)); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return createTables(ctx, st.db, st.s.Factors, st.s.RecoveryCodes, st.s.TrustedDevices)
 }
 
 // UpsertFactor writes f as its user's one factor:

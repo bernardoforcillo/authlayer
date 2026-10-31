@@ -138,6 +138,12 @@ func NewInviteSchema(opts ...InviteOption) *InviteSchema {
 		s.emailInvites.col("container_id"), s.emailInvites.col("email"))
 	s.EmailInvites.AddUnique(names.EmailInvites+"_token_hash", s.emailInvites.col("token_hash"))
 	s.Links.AddUnique(names.Links+"_code", s.links.col("code"))
+	// ListLinks filters by container_id; email invites are already served by
+	// the leading column of UNIQUE (container_id, email). expires_at serves
+	// PurgeExpired.
+	addIndex(s.Links, s.links, "container_id")
+	addIndex(s.Links, s.links, "expires_at")
+	addIndex(s.EmailInvites, s.emailInvites, "expires_at")
 
 	return s
 }
@@ -171,17 +177,7 @@ func (st *InviteStore) Schema() *InviteSchema { return st.s }
 // adds what is missing and never alters what is already there, so production
 // deployments that own these tables via their own migrations should skip it.
 func (st *InviteStore) CreateSchema(ctx context.Context) error {
-	for _, t := range []*pg.Table{st.s.EmailInvites, st.s.Links} {
-		if _, err := st.db.ExecExpr(ctx, pg.CreateTableIfNotExists(t)); err != nil {
-			return err
-		}
-		for _, ddl := range compositeConstraintDDL(t) {
-			if _, err := st.db.ExecExpr(ctx, ddl); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return createTables(ctx, st.db, st.s.EmailInvites, st.s.Links)
 }
 
 // ── EmailInvite ─────────────────────────────────────────────────────────────
@@ -411,27 +407,11 @@ func (st *InviteStore) ConsumeLink(ctx context.Context, id string, now time.Time
 // this is not required to be atomic with anything else, so it is two plain
 // DELETEs rather than one statement.
 func (st *InviteStore) PurgeExpired(ctx context.Context, before time.Time) (int, error) {
-	res1, err := st.db.Delete(st.s.EmailInvites).
-		Where(pg.Lt(st.s.emailInvites.col("expires_at"), before)).
-		Exec(ctx)
+	n1, err := deleteBatched(ctx, st.db, st.s.EmailInvites, pg.Lt(st.s.emailInvites.col("expires_at"), before))
 	if err != nil {
-		return 0, err
+		return n1, err
 	}
-	a1, err := res1.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-
-	res2, err := st.db.Delete(st.s.Links).
-		Where(pg.IsNotNull(st.s.links.col("expires_at")), pg.Lt(st.s.links.col("expires_at"), before)).
-		Exec(ctx)
-	if err != nil {
-		return 0, err
-	}
-	a2, err := res2.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-
-	return int(a1 + a2), nil
+	n2, err := deleteBatched(ctx, st.db, st.s.Links,
+		pg.And(pg.IsNotNull(st.s.links.col("expires_at")), pg.Lt(st.s.links.col("expires_at"), before)))
+	return n1 + n2, err
 }

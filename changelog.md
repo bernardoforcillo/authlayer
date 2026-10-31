@@ -8,6 +8,27 @@ once a 1.0 is cut. Until then, minor versions may break API.
 
 ## [Unreleased]
 
+### Added
+
+- `store/drops` indexes for lookups that had none: `organization_members
+  (user_id)` (behind `ListUserStandings` and `ListUserContainers`, which the
+  authorization guard runs on every action), `sessions (user_id)`,
+  `organization_invite_links (container_id)`, and `expires_at` on sessions,
+  verifications, invites, invite links, passkey challenges, trusted devices,
+  OAuth codes, device authorizations and refresh tokens, plus `expires_at` and
+  `revoked_at` on `api_keys`, for the `PurgeExpired` janitors. Re-running
+  `CreateSchema` creates them on existing tables; the equivalent
+  `CREATE INDEX CONCURRENTLY` statements are on `/storage/postgres`.
+
+### Changed
+
+- `Store.CreateSchema` and `InviteStore.CreateSchema` now also emit the indexes
+  registered on their tables (they previously emitted none). All stores share
+  one `CreateSchema` loop.
+- `PurgeExpired` (auth, invites, api keys), `PurgeExpiredChallenges` and
+  `PurgeExpiredTrustedDevices` delete in batches of 5000 rows instead of one
+  unbounded `DELETE`. Signatures and return values are unchanged.
+
 ## [0.3.1] - 2026-10-12
 
 ### Changed
