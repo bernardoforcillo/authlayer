@@ -228,37 +228,38 @@ func (st *APIKeyStore) CreateServiceAccount(ctx context.Context, sa apikey.Servi
 // FindServiceAccount loads an account by id, mapping drops' ErrNoRows to
 // apikey.ErrServiceAccountNotFound.
 func (st *APIKeyStore) FindServiceAccount(ctx context.Context, id string) (apikey.ServiceAccount, error) {
-	var sa apikey.ServiceAccount
-	err := st.db.Select().From(st.s.ServiceAccounts).
-		Where(st.s.accounts.eq("id", id)).
-		One(ctx, &sa)
-	if err != nil {
-		return apikey.ServiceAccount{}, mapNoRows(err, apikey.ErrServiceAccountNotFound)
-	}
-	return sa, nil
+	return findOne[apikey.ServiceAccount](
+		ctx,
+		st.db,
+		st.s.ServiceAccounts,
+		apikey.ErrServiceAccountNotFound,
+		st.s.accounts.eq("id", id),
+	)
 }
 
 // ListServiceAccounts returns every account in containerID, disabled or not.
 // A container with none yields nil, not an error — the port permits either.
 func (st *APIKeyStore) ListServiceAccounts(ctx context.Context, containerID string) ([]apikey.ServiceAccount, error) {
-	var out []apikey.ServiceAccount
-	if err := st.db.Select().From(st.s.ServiceAccounts).
-		Where(st.s.accounts.eq("container_id", containerID)).
-		All(ctx, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return listWhere[apikey.ServiceAccount](
+		ctx,
+		st.db,
+		st.s.ServiceAccounts,
+		st.s.accounts.eq("container_id", containerID),
+	)
 }
 
 // SetServiceAccountDisabled writes disabled_at = at (NULL re-enables) and
 // updated_at = now, reporting apikey.ErrServiceAccountNotFound when no row
 // matched.
 func (st *APIKeyStore) SetServiceAccountDisabled(ctx context.Context, id string, at *time.Time, now time.Time) error {
-	res, err := st.db.Update(st.s.ServiceAccounts).
-		Set(st.s.accounts.bind("disabled_at", at), st.s.accounts.bind("updated_at", now)).
-		Where(st.s.accounts.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, apikey.ErrServiceAccountNotFound)
+	return updateOne(
+		ctx,
+		st.db,
+		st.s.ServiceAccounts,
+		apikey.ErrServiceAccountNotFound,
+		[]pg.ColumnValue{st.s.accounts.bind("disabled_at", at), st.s.accounts.bind("updated_at", now)},
+		st.s.accounts.eq("id", id),
+	)
 }
 
 // DeleteServiceAccount removes the account and its keys in ONE transaction:
@@ -330,69 +331,58 @@ func (st *APIKeyStore) CreateKey(ctx context.Context, k apikey.Key) (apikey.Key,
 // authentication performs, served by the UNIQUE index — mapping ErrNoRows to
 // apikey.ErrKeyNotFound. Revoked and expired keys are returned.
 func (st *APIKeyStore) FindKeyByHash(ctx context.Context, tokenHash string) (apikey.Key, error) {
-	var k apikey.Key
-	err := st.db.Select().From(st.s.Keys).
-		Where(st.s.keys.eq("token_hash", tokenHash)).
-		One(ctx, &k)
-	if err != nil {
-		return apikey.Key{}, mapNoRows(err, apikey.ErrKeyNotFound)
-	}
-	return k, nil
+	return findOne[apikey.Key](
+		ctx,
+		st.db,
+		st.s.Keys,
+		apikey.ErrKeyNotFound,
+		st.s.keys.eq("token_hash", tokenHash),
+	)
 }
 
 // FindKey loads a key by id, mapping ErrNoRows to apikey.ErrKeyNotFound.
 func (st *APIKeyStore) FindKey(ctx context.Context, id string) (apikey.Key, error) {
-	var k apikey.Key
-	err := st.db.Select().From(st.s.Keys).
-		Where(st.s.keys.eq("id", id)).
-		One(ctx, &k)
-	if err != nil {
-		return apikey.Key{}, mapNoRows(err, apikey.ErrKeyNotFound)
-	}
-	return k, nil
+	return findOne[apikey.Key](ctx, st.db, st.s.Keys, apikey.ErrKeyNotFound, st.s.keys.eq("id", id))
 }
 
 // ListKeys returns every key of serviceAccountID, revoked or expired or not.
 // An account with none yields nil, not an error.
 func (st *APIKeyStore) ListKeys(ctx context.Context, serviceAccountID string) ([]apikey.Key, error) {
-	var out []apikey.Key
-	if err := st.db.Select().From(st.s.Keys).
-		Where(st.s.keys.eq("service_account_id", serviceAccountID)).
-		All(ctx, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return listWhere[apikey.Key](ctx, st.db, st.s.Keys, st.s.keys.eq("service_account_id", serviceAccountID))
 }
 
 // RevokeKey stamps revoked_at with now, reporting apikey.ErrKeyNotFound when
 // no row matched. Revoking a revoked key overwrites the timestamp, matching
 // [InviteStore.RevokeLink].
 func (st *APIKeyStore) RevokeKey(ctx context.Context, id string, now time.Time) error {
-	res, err := st.db.Update(st.s.Keys).
-		Set(st.s.keys.bind("revoked_at", &now)).
-		Where(st.s.keys.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, apikey.ErrKeyNotFound)
+	return updateOne(
+		ctx,
+		st.db,
+		st.s.Keys,
+		apikey.ErrKeyNotFound,
+		[]pg.ColumnValue{st.s.keys.bind("revoked_at", &now)},
+		st.s.keys.eq("id", id),
+	)
 }
 
 // TouchKey stamps last_used_at with now, reporting apikey.ErrKeyNotFound when
 // no row matched. One UPDATE by primary key; the Service calls it on every
 // successful authentication and treats a failure as a logging event.
 func (st *APIKeyStore) TouchKey(ctx context.Context, id string, now time.Time) error {
-	res, err := st.db.Update(st.s.Keys).
-		Set(st.s.keys.bind("last_used_at", &now)).
-		Where(st.s.keys.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, apikey.ErrKeyNotFound)
+	return updateOne(
+		ctx,
+		st.db,
+		st.s.Keys,
+		apikey.ErrKeyNotFound,
+		[]pg.ColumnValue{st.s.keys.bind("last_used_at", &now)},
+		st.s.keys.eq("id", id),
+	)
 }
 
 // DeleteKey removes a key by id, reporting apikey.ErrKeyNotFound when no row
 // matched.
 func (st *APIKeyStore) DeleteKey(ctx context.Context, id string) error {
-	res, err := st.db.Delete(st.s.Keys).
-		Where(st.s.keys.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, apikey.ErrKeyNotFound)
+	return deleteOne(ctx, st.db, st.s.Keys, apikey.ErrKeyNotFound, st.s.keys.eq("id", id))
 }
 
 // PurgeExpired deletes, in one statement, every key whose expires_at OR

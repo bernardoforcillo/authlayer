@@ -298,14 +298,13 @@ func (st *MFAStore) UpsertFactor(ctx context.Context, f auth.MFAFactor) error {
 // auth.ErrFactorNotFound. At most one row can match, and that is enforced
 // by the database rather than assumed: user_id is the table's PRIMARY KEY.
 func (st *MFAStore) FindFactor(ctx context.Context, userID string) (auth.MFAFactor, error) {
-	var f auth.MFAFactor
-	err := st.db.Select().From(st.s.Factors).
-		Where(st.s.factors.eq("user_id", userID)).
-		One(ctx, &f)
-	if err != nil {
-		return auth.MFAFactor{}, mapNoRows(err, auth.ErrFactorNotFound)
-	}
-	return f, nil
+	return findOne[auth.MFAFactor](
+		ctx,
+		st.db,
+		st.s.Factors,
+		auth.ErrFactorNotFound,
+		st.s.factors.eq("user_id", userID),
+	)
 }
 
 // ConfirmFactor implements the port's confirmation compare-and-set as one
@@ -409,10 +408,7 @@ func (st *MFAStore) wonOrClassify(ctx context.Context, userID string, res interf
 // auth.MFAStore.DeleteFactor for why the extent of that cascade belongs to
 // the caller, and what the caller therefore owes when disabling MFA.
 func (st *MFAStore) DeleteFactor(ctx context.Context, userID string) error {
-	res, err := st.db.Delete(st.s.Factors).
-		Where(st.s.factors.eq("user_id", userID)).
-		Exec(ctx)
-	return affectedOrErr(res, err, auth.ErrFactorNotFound)
+	return deleteOne(ctx, st.db, st.s.Factors, auth.ErrFactorNotFound, st.s.factors.eq("user_id", userID))
 }
 
 // ReplaceRecoveryCodes replaces the user's whole set inside one
@@ -527,11 +523,5 @@ func (st *MFAStore) ConsumeRecoveryCode(ctx context.Context, userID, codeHash st
 // index through its leading column; see that type's doc, and the live
 // EXPLAIN test that proves the planner picks it.
 func (st *MFAStore) ListRecoveryCodes(ctx context.Context, userID string) ([]auth.RecoveryCode, error) {
-	var out []auth.RecoveryCode
-	if err := st.db.Select().From(st.s.RecoveryCodes).
-		Where(st.s.codes.eq("user_id", userID)).
-		All(ctx, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return listWhere[auth.RecoveryCode](ctx, st.db, st.s.RecoveryCodes, st.s.codes.eq("user_id", userID))
 }

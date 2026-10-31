@@ -149,13 +149,7 @@ func (st *Store[C, M]) FindMember(ctx context.Context, containerID, userID strin
 // members yields an empty slice rather than an error — the engine has already
 // established the caller's standing before calling in.
 func (st *Store[C, M]) ListMembers(ctx context.Context, containerID string) ([]M, error) {
-	var out []M
-	if err := st.db.Select().From(st.s.Members).
-		Where(st.s.members.eq("container_id", containerID)).
-		All(ctx, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return listWhere[M](ctx, st.db, st.s.Members, st.s.members.eq("container_id", containerID))
 }
 
 // ListUserStandings returns one standing per membership the user holds, across
@@ -207,20 +201,28 @@ func (st *Store[C, M]) ListUserContainers(ctx context.Context, userID string) ([
 // UpdateMemberRole rewrites role_key, reporting scope.ErrNotMember when the
 // UPDATE matched no row.
 func (st *Store[C, M]) UpdateMemberRole(ctx context.Context, containerID, userID, roleKey string) error {
-	res, err := st.db.Update(st.s.Members).
-		Set(st.s.members.bind("role_key", roleKey)).
-		Where(st.s.members.eq("container_id", containerID), st.s.members.eq("user_id", userID)).
-		Exec(ctx)
-	return affectedOrErr(res, err, scope.ErrNotMember)
+	return updateOne(
+		ctx,
+		st.db,
+		st.s.Members,
+		scope.ErrNotMember,
+		[]pg.ColumnValue{st.s.members.bind("role_key", roleKey)},
+		st.s.members.eq("container_id", containerID),
+		st.s.members.eq("user_id", userID),
+	)
 }
 
 // RemoveMember deletes the membership row, reporting scope.ErrNotMember when
 // the DELETE matched no row.
 func (st *Store[C, M]) RemoveMember(ctx context.Context, containerID, userID string) error {
-	res, err := st.db.Delete(st.s.Members).
-		Where(st.s.members.eq("container_id", containerID), st.s.members.eq("user_id", userID)).
-		Exec(ctx)
-	return affectedOrErr(res, err, scope.ErrNotMember)
+	return deleteOne(
+		ctx,
+		st.db,
+		st.s.Members,
+		scope.ErrNotMember,
+		st.s.members.eq("container_id", containerID),
+		st.s.members.eq("user_id", userID),
+	)
 }
 
 // CountMembersWithRole runs a COUNT over the members table. It backs the
@@ -252,45 +254,47 @@ func (st *Store[C, M]) CreateRole(ctx context.Context, r scope.RoleRecord) (scop
 // scope.ErrRoleNotFound. The permissions column is returned as opaque bytes for
 // the engine to decode.
 func (st *Store[C, M]) FindRole(ctx context.Context, containerID, key string) (scope.RoleRecord, error) {
-	var r scope.RoleRecord
-	err := st.db.Select().From(st.s.Roles).
-		Where(st.s.roles.eq("container_id", containerID), st.s.roles.eq("key", key)).
-		One(ctx, &r)
-	if err != nil {
-		return scope.RoleRecord{}, mapNoRows(err, scope.ErrRoleNotFound)
-	}
-	return r, nil
+	return findOne[scope.RoleRecord](
+		ctx,
+		st.db,
+		st.s.Roles,
+		scope.ErrRoleNotFound,
+		st.s.roles.eq("container_id", containerID),
+		st.s.roles.eq("key", key),
+	)
 }
 
 // ListRoles returns the container's custom roles. The code-defined defaults are
 // not stored, so they never appear here — scope.Service.ListRoles prepends them.
 func (st *Store[C, M]) ListRoles(ctx context.Context, containerID string) ([]scope.RoleRecord, error) {
-	var out []scope.RoleRecord
-	if err := st.db.Select().From(st.s.Roles).
-		Where(st.s.roles.eq("container_id", containerID)).
-		All(ctx, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return listWhere[scope.RoleRecord](ctx, st.db, st.s.Roles, st.s.roles.eq("container_id", containerID))
 }
 
 // UpdateRole replaces a custom role's name and encoded permissions, reporting
 // scope.ErrRoleNotFound when no row matched. The bytes are stored verbatim.
 func (st *Store[C, M]) UpdateRole(ctx context.Context, containerID, key, name string, permissions []byte) error {
-	res, err := st.db.Update(st.s.Roles).
-		Set(st.s.roles.bind("name", name), st.s.roles.bind("permissions", permissions)).
-		Where(st.s.roles.eq("container_id", containerID), st.s.roles.eq("key", key)).
-		Exec(ctx)
-	return affectedOrErr(res, err, scope.ErrRoleNotFound)
+	return updateOne(
+		ctx,
+		st.db,
+		st.s.Roles,
+		scope.ErrRoleNotFound,
+		[]pg.ColumnValue{st.s.roles.bind("name", name), st.s.roles.bind("permissions", permissions)},
+		st.s.roles.eq("container_id", containerID),
+		st.s.roles.eq("key", key),
+	)
 }
 
 // DeleteRole removes a custom role, reporting scope.ErrRoleNotFound when no row
 // matched. The engine has already verified no member holds it.
 func (st *Store[C, M]) DeleteRole(ctx context.Context, containerID, key string) error {
-	res, err := st.db.Delete(st.s.Roles).
-		Where(st.s.roles.eq("container_id", containerID), st.s.roles.eq("key", key)).
-		Exec(ctx)
-	return affectedOrErr(res, err, scope.ErrRoleNotFound)
+	return deleteOne(
+		ctx,
+		st.db,
+		st.s.Roles,
+		scope.ErrRoleNotFound,
+		st.s.roles.eq("container_id", containerID),
+		st.s.roles.eq("key", key),
+	)
 }
 
 // ── Transaction ─────────────────────────────────────────────────────────────

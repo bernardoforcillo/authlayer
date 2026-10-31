@@ -261,14 +261,14 @@ func (st *IdentityStore) CreateIdentity(ctx context.Context, i auth.Identity) (a
 // [github.com/bernardoforcillo/authlayer/auth.Service.SignInWith]'s ladder —
 // a fact rather than a coin flip over row order.
 func (st *IdentityStore) FindIdentityByProviderSubject(ctx context.Context, provider, subject string) (auth.Identity, error) {
-	var i auth.Identity
-	err := st.db.Select().From(st.s.Identities).
-		Where(st.s.identities.eq("provider", provider), st.s.identities.eq("subject", subject)).
-		One(ctx, &i)
-	if err != nil {
-		return auth.Identity{}, mapNoRows(err, auth.ErrIdentityNotFound)
-	}
-	return i, nil
+	return findOne[auth.Identity](
+		ctx,
+		st.db,
+		st.s.Identities,
+		auth.ErrIdentityNotFound,
+		st.s.identities.eq("provider", provider),
+		st.s.identities.eq("subject", subject),
+	)
 }
 
 // ListIdentitiesByUser returns every identity belonging to userID, and only
@@ -282,13 +282,7 @@ func (st *IdentityStore) FindIdentityByProviderSubject(ctx context.Context, prov
 // see that type's doc, and the live EXPLAIN test that proves the planner
 // picks it.
 func (st *IdentityStore) ListIdentitiesByUser(ctx context.Context, userID string) ([]auth.Identity, error) {
-	var out []auth.Identity
-	if err := st.db.Select().From(st.s.Identities).
-		Where(st.s.identities.eq("user_id", userID)).
-		All(ctx, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return listWhere[auth.Identity](ctx, st.db, st.s.Identities, st.s.identities.eq("user_id", userID))
 }
 
 // TouchIdentity stamps last_used_at with now, reporting
@@ -300,11 +294,14 @@ func (st *IdentityStore) ListIdentitiesByUser(ctx context.Context, userID string
 // NULL to a timestamp and never back. Nothing in the port can clear it again
 // — "never used" is a state a link leaves once and does not re-enter.
 func (st *IdentityStore) TouchIdentity(ctx context.Context, id string, now time.Time) error {
-	res, err := st.db.Update(st.s.Identities).
-		Set(st.s.identities.bind("last_used_at", &now)).
-		Where(st.s.identities.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, auth.ErrIdentityNotFound)
+	return updateOne(
+		ctx,
+		st.db,
+		st.s.Identities,
+		auth.ErrIdentityNotFound,
+		[]pg.ColumnValue{st.s.identities.bind("last_used_at", &now)},
+		st.s.identities.eq("id", id),
+	)
 }
 
 // DeleteIdentity removes the one row named by id — a single DELETE keyed on
@@ -318,10 +315,7 @@ func (st *IdentityStore) TouchIdentity(ctx context.Context, id string, now time.
 // for which callers may use it and why removing a credential without a check
 // is correct for each of them.
 func (st *IdentityStore) DeleteIdentity(ctx context.Context, id string) error {
-	res, err := st.db.Delete(st.s.Identities).
-		Where(st.s.identities.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, auth.ErrIdentityNotFound)
+	return deleteOne(ctx, st.db, st.s.Identities, auth.ErrIdentityNotFound, st.s.identities.eq("id", id))
 }
 
 // DeleteIdentityIfNotLast removes every one of userID's identities at

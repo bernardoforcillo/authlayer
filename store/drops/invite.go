@@ -195,49 +195,43 @@ func (st *InviteStore) CreateEmailInvite(ctx context.Context, inv invite.EmailIn
 // FindEmailInviteByTokenHash loads the invite whose TokenHash matches,
 // mapping drops' ErrNoRows to invite.ErrInviteNotFound.
 func (st *InviteStore) FindEmailInviteByTokenHash(ctx context.Context, tokenHash string) (invite.EmailInvite, error) {
-	var inv invite.EmailInvite
-	err := st.db.Select().From(st.s.EmailInvites).
-		Where(st.s.emailInvites.eq("token_hash", tokenHash)).
-		One(ctx, &inv)
-	if err != nil {
-		return invite.EmailInvite{}, mapNoRows(err, invite.ErrInviteNotFound)
-	}
-	return inv, nil
+	return findOne[invite.EmailInvite](
+		ctx,
+		st.db,
+		st.s.EmailInvites,
+		invite.ErrInviteNotFound,
+		st.s.emailInvites.eq("token_hash", tokenHash),
+	)
 }
 
 // FindEmailInvite loads an invite by id, mapping drops' ErrNoRows to
 // invite.ErrInviteNotFound.
 func (st *InviteStore) FindEmailInvite(ctx context.Context, id string) (invite.EmailInvite, error) {
-	var inv invite.EmailInvite
-	err := st.db.Select().From(st.s.EmailInvites).
-		Where(st.s.emailInvites.eq("id", id)).
-		One(ctx, &inv)
-	if err != nil {
-		return invite.EmailInvite{}, mapNoRows(err, invite.ErrInviteNotFound)
-	}
-	return inv, nil
+	return findOne[invite.EmailInvite](
+		ctx,
+		st.db,
+		st.s.EmailInvites,
+		invite.ErrInviteNotFound,
+		st.s.emailInvites.eq("id", id),
+	)
 }
 
 // ListEmailInvites returns every invite in containerID, expired or not — the
 // caller filters. A container with none yields nil, not an error — the port
 // permits either (see [invite.Store]).
 func (st *InviteStore) ListEmailInvites(ctx context.Context, containerID string) ([]invite.EmailInvite, error) {
-	var out []invite.EmailInvite
-	if err := st.db.Select().From(st.s.EmailInvites).
-		Where(st.s.emailInvites.eq("container_id", containerID)).
-		All(ctx, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return listWhere[invite.EmailInvite](
+		ctx,
+		st.db,
+		st.s.EmailInvites,
+		st.s.emailInvites.eq("container_id", containerID),
+	)
 }
 
 // DeleteEmailInvite removes an invite by id, reporting
 // invite.ErrInviteNotFound when no row matched.
 func (st *InviteStore) DeleteEmailInvite(ctx context.Context, id string) error {
-	res, err := st.db.Delete(st.s.EmailInvites).
-		Where(st.s.emailInvites.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, invite.ErrInviteNotFound)
+	return deleteOne(ctx, st.db, st.s.EmailInvites, invite.ErrInviteNotFound, st.s.emailInvites.eq("id", id))
 }
 
 // DeleteEmailInvitesFor normalizes email (see [invite.NormalizeEmail]) and
@@ -278,51 +272,34 @@ func (st *InviteStore) CreateLink(ctx context.Context, l invite.Link) (invite.Li
 // to invite.ErrLinkNotFound. Code is stored in clear (see [invite.Link]), so
 // this is a plain lookup, unlike FindEmailInviteByTokenHash.
 func (st *InviteStore) FindLinkByCode(ctx context.Context, code string) (invite.Link, error) {
-	var l invite.Link
-	err := st.db.Select().From(st.s.Links).
-		Where(st.s.links.eq("code", code)).
-		One(ctx, &l)
-	if err != nil {
-		return invite.Link{}, mapNoRows(err, invite.ErrLinkNotFound)
-	}
-	return l, nil
+	return findOne[invite.Link](ctx, st.db, st.s.Links, invite.ErrLinkNotFound, st.s.links.eq("code", code))
 }
 
 // FindLink loads a link by id, mapping drops' ErrNoRows to
 // invite.ErrLinkNotFound.
 func (st *InviteStore) FindLink(ctx context.Context, id string) (invite.Link, error) {
-	var l invite.Link
-	err := st.db.Select().From(st.s.Links).
-		Where(st.s.links.eq("id", id)).
-		One(ctx, &l)
-	if err != nil {
-		return invite.Link{}, mapNoRows(err, invite.ErrLinkNotFound)
-	}
-	return l, nil
+	return findOne[invite.Link](ctx, st.db, st.s.Links, invite.ErrLinkNotFound, st.s.links.eq("id", id))
 }
 
 // ListLinks returns every link in containerID, revoked or not, expired or
 // not — the caller filters. A container with none yields nil, not
 // an error.
 func (st *InviteStore) ListLinks(ctx context.Context, containerID string) ([]invite.Link, error) {
-	var out []invite.Link
-	if err := st.db.Select().From(st.s.Links).
-		Where(st.s.links.eq("container_id", containerID)).
-		All(ctx, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return listWhere[invite.Link](ctx, st.db, st.s.Links, st.s.links.eq("container_id", containerID))
 }
 
 // RevokeLink stamps RevokedAt with at, reporting invite.ErrLinkNotFound when
 // no row matched. Revoking an already-revoked link overwrites the timestamp
 // rather than erroring — revocation is idempotent, matching store/memory.
 func (st *InviteStore) RevokeLink(ctx context.Context, id string, at time.Time) error {
-	res, err := st.db.Update(st.s.Links).
-		Set(st.s.links.bind("revoked_at", &at)).
-		Where(st.s.links.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, invite.ErrLinkNotFound)
+	return updateOne(
+		ctx,
+		st.db,
+		st.s.Links,
+		invite.ErrLinkNotFound,
+		[]pg.ColumnValue{st.s.links.bind("revoked_at", &at)},
+		st.s.links.eq("id", id),
+	)
 }
 
 // ConsumeLink atomically increments UseCount in a single

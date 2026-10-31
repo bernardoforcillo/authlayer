@@ -347,28 +347,20 @@ func (st *AuthStore) CreateUser(ctx context.Context, u auth.UserBase) (auth.User
 // FindUserByID loads a user by id, mapping drops' ErrNoRows to
 // auth.ErrUserNotFound.
 func (st *AuthStore) FindUserByID(ctx context.Context, id string) (auth.UserBase, error) {
-	var u auth.UserBase
-	err := st.db.Select().From(st.s.Users).
-		Where(st.s.users.eq("id", id)).
-		One(ctx, &u)
-	if err != nil {
-		return auth.UserBase{}, mapNoRows(err, auth.ErrUserNotFound)
-	}
-	return u, nil
+	return findOne[auth.UserBase](ctx, st.db, st.s.Users, auth.ErrUserNotFound, st.s.users.eq("id", id))
 }
 
 // FindUserByEmail normalizes email (see [auth.NormalizeEmail]) and loads the
 // user with that normalized address, mapping drops' ErrNoRows to
 // auth.ErrUserNotFound.
 func (st *AuthStore) FindUserByEmail(ctx context.Context, email string) (auth.UserBase, error) {
-	var u auth.UserBase
-	err := st.db.Select().From(st.s.Users).
-		Where(st.s.users.eq("email", auth.NormalizeEmail(email))).
-		One(ctx, &u)
-	if err != nil {
-		return auth.UserBase{}, mapNoRows(err, auth.ErrUserNotFound)
-	}
-	return u, nil
+	return findOne[auth.UserBase](
+		ctx,
+		st.db,
+		st.s.Users,
+		auth.ErrUserNotFound,
+		st.s.users.eq("email", auth.NormalizeEmail(email)),
+	)
 }
 
 // MarkEmailVerified stamps EmailVerifiedAt and UpdatedAt with now as one
@@ -547,10 +539,7 @@ func (st *AuthStore) MarkUserDeleted(ctx context.Context, userID, anonymizedEmai
 // order the caller intended — which is worth knowing before adding the
 // constraint, not after.
 func (st *AuthStore) DeleteUser(ctx context.Context, userID string) error {
-	res, err := st.db.Delete(st.s.Users).
-		Where(st.s.users.eq("id", userID)).
-		Exec(ctx)
-	return affectedOrErr(res, err, auth.ErrUserNotFound)
+	return deleteOne(ctx, st.db, st.s.Users, auth.ErrUserNotFound, st.s.users.eq("id", userID))
 }
 
 // ── Sessions ────────────────────────────────────────────────────────────
@@ -590,36 +579,26 @@ func (st *AuthStore) insertSession(ctx context.Context, db *pg.DB, sess auth.Ses
 // FindSessionByHash loads the session whose TokenHash matches, mapping
 // drops' ErrNoRows to auth.ErrSessionNotFound.
 func (st *AuthStore) FindSessionByHash(ctx context.Context, tokenHash string) (auth.Session, error) {
-	var sess auth.Session
-	err := st.db.Select().From(st.s.Sessions).
-		Where(st.s.sessions.eq("token_hash", tokenHash)).
-		One(ctx, &sess)
-	if err != nil {
-		return auth.Session{}, mapNoRows(err, auth.ErrSessionNotFound)
-	}
-	return sess, nil
+	return findOne[auth.Session](
+		ctx,
+		st.db,
+		st.s.Sessions,
+		auth.ErrSessionNotFound,
+		st.s.sessions.eq("token_hash", tokenHash),
+	)
 }
 
 // ListSessionsByUser returns every session belonging to userID, rotated or
 // not, expired or not — the caller filters. A user with none yields nil,
 // not an error.
 func (st *AuthStore) ListSessionsByUser(ctx context.Context, userID string) ([]auth.Session, error) {
-	var out []auth.Session
-	if err := st.db.Select().From(st.s.Sessions).
-		Where(st.s.sessions.eq("user_id", userID)).
-		All(ctx, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return listWhere[auth.Session](ctx, st.db, st.s.Sessions, st.s.sessions.eq("user_id", userID))
 }
 
 // DeleteSession removes a session by id, reporting auth.ErrSessionNotFound
 // when no row matched.
 func (st *AuthStore) DeleteSession(ctx context.Context, id string) error {
-	res, err := st.db.Delete(st.s.Sessions).
-		Where(st.s.sessions.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, auth.ErrSessionNotFound)
+	return deleteOne(ctx, st.db, st.s.Sessions, auth.ErrSessionNotFound, st.s.sessions.eq("id", id))
 }
 
 // DeleteSessionsByFamily removes every session sharing familyID. Deleting
@@ -1047,23 +1026,25 @@ func (st *AuthStore) CreateVerification(ctx context.Context, v auth.Verification
 // FindVerificationByHash loads the verification whose TokenHash matches,
 // mapping drops' ErrNoRows to auth.ErrVerificationNotFound.
 func (st *AuthStore) FindVerificationByHash(ctx context.Context, tokenHash string) (auth.Verification, error) {
-	var v auth.Verification
-	err := st.db.Select().From(st.s.Verifications).
-		Where(st.s.verifications.eq("token_hash", tokenHash)).
-		One(ctx, &v)
-	if err != nil {
-		return auth.Verification{}, mapNoRows(err, auth.ErrVerificationNotFound)
-	}
-	return v, nil
+	return findOne[auth.Verification](
+		ctx,
+		st.db,
+		st.s.Verifications,
+		auth.ErrVerificationNotFound,
+		st.s.verifications.eq("token_hash", tokenHash),
+	)
 }
 
 // DeleteVerification removes a verification by id, reporting
 // auth.ErrVerificationNotFound when no row matched.
 func (st *AuthStore) DeleteVerification(ctx context.Context, id string) error {
-	res, err := st.db.Delete(st.s.Verifications).
-		Where(st.s.verifications.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, auth.ErrVerificationNotFound)
+	return deleteOne(
+		ctx,
+		st.db,
+		st.s.Verifications,
+		auth.ErrVerificationNotFound,
+		st.s.verifications.eq("id", id),
+	)
 }
 
 // DeleteVerificationsByUserAndPurpose removes every verification for

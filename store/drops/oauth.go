@@ -634,11 +634,14 @@ func (st *OAuthStore) RevokeGrant(ctx context.Context, id string, now time.Time)
 // TouchGrant stamps last_used_at with now, reporting oauth.ErrGrantNotFound
 // when no row matched.
 func (st *OAuthStore) TouchGrant(ctx context.Context, id string, now time.Time) error {
-	res, err := st.db.Update(st.s.Grants).
-		Set(st.s.grants.bind("last_used_at", &now)).
-		Where(st.s.grants.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, oauth.ErrGrantNotFound)
+	return updateOne(
+		ctx,
+		st.db,
+		st.s.Grants,
+		oauth.ErrGrantNotFound,
+		[]pg.ColumnValue{st.s.grants.bind("last_used_at", &now)},
+		st.s.grants.eq("id", id),
+	)
 }
 
 // ── Authorization codes ─────────────────────────────────────────────────
@@ -763,11 +766,14 @@ func (st *OAuthStore) SetDeviceStatus(ctx context.Context, id string, from, to o
 // TouchDevicePoll stamps last_polled_at with now, reporting
 // oauth.ErrDeviceNotFound when no row matched.
 func (st *OAuthStore) TouchDevicePoll(ctx context.Context, id string, now time.Time) error {
-	res, err := st.db.Update(st.s.DeviceAuthorizations).
-		Set(st.s.devices.bind("last_polled_at", &now)).
-		Where(st.s.devices.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, oauth.ErrDeviceNotFound)
+	return updateOne(
+		ctx,
+		st.db,
+		st.s.DeviceAuthorizations,
+		oauth.ErrDeviceNotFound,
+		[]pg.ColumnValue{st.s.devices.bind("last_polled_at", &now)},
+		st.s.devices.eq("id", id),
+	)
 }
 
 // ── Refresh tokens ──────────────────────────────────────────────────────

@@ -67,14 +67,13 @@ func (st *MFAStore) CreateTrustedDevice(ctx context.Context, d auth.TrustedDevic
 // folding either in here would make this method refuse for a reason it
 // cannot report.
 func (st *MFAStore) FindTrustedDeviceByHash(ctx context.Context, tokenHash string) (auth.TrustedDevice, error) {
-	var d auth.TrustedDevice
-	err := st.db.Select().From(st.s.TrustedDevices).
-		Where(st.s.devices.eq("token_hash", tokenHash)).
-		One(ctx, &d)
-	if err != nil {
-		return auth.TrustedDevice{}, mapNoRows(err, auth.ErrTrustedDeviceNotFound)
-	}
-	return d, nil
+	return findOne[auth.TrustedDevice](
+		ctx,
+		st.db,
+		st.s.TrustedDevices,
+		auth.ErrTrustedDeviceNotFound,
+		st.s.devices.eq("token_hash", tokenHash),
+	)
 }
 
 // ListTrustedDevices returns every device belonging to userID — expired ones
@@ -89,13 +88,7 @@ func (st *MFAStore) FindTrustedDeviceByHash(ctx context.Context, tokenHash strin
 // devices" screen, and the ownership scan auth.Service.RevokeTrustedDevice
 // performs on every revocation.
 func (st *MFAStore) ListTrustedDevices(ctx context.Context, userID string) ([]auth.TrustedDevice, error) {
-	var out []auth.TrustedDevice
-	if err := st.db.Select().From(st.s.TrustedDevices).
-		Where(st.s.devices.eq("user_id", userID)).
-		All(ctx, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return listWhere[auth.TrustedDevice](ctx, st.db, st.s.TrustedDevices, st.s.devices.eq("user_id", userID))
 }
 
 // DeleteTrustedDevice removes the one row named by id — a single DELETE
@@ -107,10 +100,13 @@ func (st *MFAStore) ListTrustedDevices(ctx context.Context, userID string) ([]au
 // scanning the caller's own devices, exactly as auth.Service.RevokeSession
 // does for sessions.
 func (st *MFAStore) DeleteTrustedDevice(ctx context.Context, id string) error {
-	res, err := st.db.Delete(st.s.TrustedDevices).
-		Where(st.s.devices.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, auth.ErrTrustedDeviceNotFound)
+	return deleteOne(
+		ctx,
+		st.db,
+		st.s.TrustedDevices,
+		auth.ErrTrustedDeviceNotFound,
+		st.s.devices.eq("id", id),
+	)
 }
 
 // DeleteTrustedDevicesByUser removes every device belonging to userID, and

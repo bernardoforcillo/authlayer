@@ -261,14 +261,13 @@ func (st *CredentialStore) CreateCredential(ctx context.Context, c auth.Credenti
 // assumed: [CredentialSchema]'s UNIQUE (credential_id) is what makes "the row
 // IS the account" a fact rather than a coin flip over row order.
 func (st *CredentialStore) FindCredentialByCredentialID(ctx context.Context, credentialID []byte) (auth.Credential, error) {
-	var c auth.Credential
-	err := st.db.Select().From(st.s.Credentials).
-		Where(st.s.credentials.eq("credential_id", credentialID)).
-		One(ctx, &c)
-	if err != nil {
-		return auth.Credential{}, mapNoRows(err, auth.ErrCredentialNotFound)
-	}
-	return c, nil
+	return findOne[auth.Credential](
+		ctx,
+		st.db,
+		st.s.Credentials,
+		auth.ErrCredentialNotFound,
+		st.s.credentials.eq("credential_id", credentialID),
+	)
 }
 
 // ListCredentialsByUser returns every credential belonging to userID, and
@@ -281,13 +280,7 @@ func (st *CredentialStore) FindCredentialByCredentialID(ctx context.Context, cre
 // column; see that type's doc, and the live EXPLAIN test that proves the
 // planner picks it.
 func (st *CredentialStore) ListCredentialsByUser(ctx context.Context, userID string) ([]auth.Credential, error) {
-	var out []auth.Credential
-	if err := st.db.Select().From(st.s.Credentials).
-		Where(st.s.credentials.eq("user_id", userID)).
-		All(ctx, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return listWhere[auth.Credential](ctx, st.db, st.s.Credentials, st.s.credentials.eq("user_id", userID))
 }
 
 // UpdateSignCount implements the port's compare-and-set as one statement:
@@ -357,11 +350,14 @@ func (st *CredentialStore) UpdateSignCount(ctx context.Context, id string, newCo
 // (see columns.go); the value is never nil here, so the column moves from
 // NULL to a timestamp and never back.
 func (st *CredentialStore) TouchCredential(ctx context.Context, id string, now time.Time) error {
-	res, err := st.db.Update(st.s.Credentials).
-		Set(st.s.credentials.bind("last_used_at", &now)).
-		Where(st.s.credentials.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, auth.ErrCredentialNotFound)
+	return updateOne(
+		ctx,
+		st.db,
+		st.s.Credentials,
+		auth.ErrCredentialNotFound,
+		[]pg.ColumnValue{st.s.credentials.bind("last_used_at", &now)},
+		st.s.credentials.eq("id", id),
+	)
 }
 
 // DeleteCredential removes the one row named by its surrogate id — a single
@@ -375,10 +371,7 @@ func (st *CredentialStore) TouchCredential(ctx context.Context, id string, now t
 // callers may use it and why removing a credential without a check is correct
 // for each of them.
 func (st *CredentialStore) DeleteCredential(ctx context.Context, id string) error {
-	res, err := st.db.Delete(st.s.Credentials).
-		Where(st.s.credentials.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, auth.ErrCredentialNotFound)
+	return deleteOne(ctx, st.db, st.s.Credentials, auth.ErrCredentialNotFound, st.s.credentials.eq("id", id))
 }
 
 // DeleteCredentialIfNotLast removes userID's credential named by id, but only
@@ -541,14 +534,13 @@ func (st *CredentialStore) CreateChallenge(ctx context.Context, c auth.Challenge
 //
 // At most one row can match: [CredentialSchema]'s UNIQUE (challenge_hash).
 func (st *CredentialStore) FindChallengeByHash(ctx context.Context, hash string) (auth.Challenge, error) {
-	var c auth.Challenge
-	err := st.db.Select().From(st.s.Challenges).
-		Where(st.s.challenges.eq("challenge_hash", hash)).
-		One(ctx, &c)
-	if err != nil {
-		return auth.Challenge{}, mapNoRows(err, auth.ErrChallengeNotFound)
-	}
-	return c, nil
+	return findOne[auth.Challenge](
+		ctx,
+		st.db,
+		st.s.Challenges,
+		auth.ErrChallengeNotFound,
+		st.s.challenges.eq("challenge_hash", hash),
+	)
 }
 
 // DeleteChallenge removes the challenge named by id — a single DELETE keyed
@@ -562,10 +554,7 @@ func (st *CredentialStore) FindChallengeByHash(ctx context.Context, hash string)
 // is issued before this returns nil — see [auth.Service.FinishPasskeyLogin]'s
 // "Claim before apply".
 func (st *CredentialStore) DeleteChallenge(ctx context.Context, id string) error {
-	res, err := st.db.Delete(st.s.Challenges).
-		Where(st.s.challenges.eq("id", id)).
-		Exec(ctx)
-	return affectedOrErr(res, err, auth.ErrChallengeNotFound)
+	return deleteOne(ctx, st.db, st.s.Challenges, auth.ErrChallengeNotFound, st.s.challenges.eq("id", id))
 }
 
 // PurgeExpiredChallenges deletes every challenge whose expires_at is strictly
