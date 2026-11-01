@@ -45,6 +45,15 @@ once a 1.0 is cut. Until then, minor versions may break API.
   `WithClock`, `WithIDGenerator`, `WithRuntime` and `WithHooks` options of every
   service. Hook lists now drop nil entries everywhere.
 
+- Composite foreign keys guard the three columns that repeat what a parent row
+  determines: `api_keys (service_account_id, container_id)` ->
+  `service_accounts (id, container_id)` and `oauth_codes` and
+  `oauth_refresh_tokens (grant_id, client_id)` -> `oauth_grants (id, client_id)`.
+  They are added `NOT VALID` (enforced for new rows, no table scan) with a new
+  `-003_relations` migration step that validates strictly. `CreateSchema` adds
+  them and validates when the data allows. See `/storage/conventions` and the SQL
+  on `/storage/postgres`.
+
 ### Changed
 
 - `store/drops` has one functional-option type, `dropsstore.Option`, accepted by

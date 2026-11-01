@@ -160,16 +160,19 @@ func TestAPIKeyStoreCreateSchemaEmitsTablesInOrderThenIndexes(t *testing.T) {
 	if err := newAPIKeyStore(fd).CreateSchema(context.Background()); err != nil {
 		t.Fatalf("CreateSchema: %v", err)
 	}
-	if len(fd.execs) != 7 {
-		t.Fatalf("CreateSchema issued %d statements, want 7 (two tables, five indexes):\n%s", len(fd.execs), strings.Join(fd.execs, "\n"))
+	if len(fd.execs) != 10 {
+		t.Fatalf("CreateSchema issued %d statements, want 10 (two tables, the id+container UNIQUE, the composite foreign key and its validation, five indexes):\n%s", len(fd.execs), strings.Join(fd.execs, "\n"))
 	}
 	if !strings.Contains(fd.execs[0], `CREATE TABLE IF NOT EXISTS "service_accounts"`) {
 		t.Fatalf("first statement is not the service_accounts table: %s", fd.execs[0])
 	}
-	if !strings.Contains(fd.execs[1], `"service_accounts_container_id_idx"`) {
-		t.Fatalf("second statement is not the service_accounts index: %s", fd.execs[1])
+	if !strings.Contains(fd.execs[1], `ADD CONSTRAINT "service_accounts_id_container_id_key" UNIQUE ("id", "container_id")`) {
+		t.Fatalf("second statement is not the (id, container_id) UNIQUE the composite key targets: %s", fd.execs[1])
 	}
-	keys := fd.execs[2]
+	if !strings.Contains(fd.execs[2], `"service_accounts_container_id_idx"`) {
+		t.Fatalf("third statement is not the service_accounts index: %s", fd.execs[2])
+	}
+	keys := fd.execs[3]
 	if !strings.Contains(keys, `CREATE TABLE IF NOT EXISTS "api_keys"`) {
 		t.Fatalf("third statement is not the api_keys table: %s", keys)
 	}
@@ -182,9 +185,18 @@ func TestAPIKeyStoreCreateSchemaEmitsTablesInOrderThenIndexes(t *testing.T) {
 	if !strings.Contains(keys, `"permissions" bytea NOT NULL`) {
 		t.Fatalf("api_keys DDL types permissions oddly:\n%s", keys)
 	}
+	fk := fd.execs[4]
+	for _, w := range []string{`ADD CONSTRAINT "api_keys_service_account_id_container_id_fkey"`, `FOREIGN KEY ("service_account_id", "container_id") REFERENCES "service_accounts" ("id", "container_id") ON DELETE CASCADE NOT VALID`} {
+		if !strings.Contains(fk, w) {
+			t.Fatalf("composite foreign key lacks %q:\n%s", w, fk)
+		}
+	}
+	if !strings.Contains(fd.execs[5], "VALIDATE CONSTRAINT") || !strings.Contains(fd.execs[5], "foreign_key_violation") {
+		t.Fatalf("the foreign key is not validated leniently:\n%s", fd.execs[5])
+	}
 	for i, want := range []string{"api_keys_service_account_id_idx", "api_keys_container_id_idx", "api_keys_expires_at_idx", "api_keys_revoked_at_idx"} {
-		if got := fd.execs[3+i]; !strings.Contains(got, "CREATE INDEX IF NOT EXISTS") || !strings.Contains(got, want) {
-			t.Fatalf("statement %d = %s, want CREATE INDEX IF NOT EXISTS %s", 3+i, got, want)
+		if got := fd.execs[6+i]; !strings.Contains(got, "CREATE INDEX IF NOT EXISTS") || !strings.Contains(got, want) {
+			t.Fatalf("statement %d = %s, want CREATE INDEX IF NOT EXISTS %s", 6+i, got, want)
 		}
 	}
 }

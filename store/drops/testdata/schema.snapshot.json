@@ -145,6 +145,22 @@
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
+        },
+        "api_keys_service_account_id_container_id_fkey": {
+          "name": "api_keys_service_account_id_container_id_fkey",
+          "tableFrom": "api_keys",
+          "columnsFrom": [
+            "service_account_id",
+            "container_id"
+          ],
+          "tableTo": "service_accounts",
+          "schemaTo": "",
+          "columnsTo": [
+            "id",
+            "container_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -661,6 +677,22 @@
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
+        },
+        "oauth_codes_grant_id_client_id_fkey": {
+          "name": "oauth_codes_grant_id_client_id_fkey",
+          "tableFrom": "oauth_codes",
+          "columnsFrom": [
+            "grant_id",
+            "client_id"
+          ],
+          "tableTo": "oauth_grants",
+          "schemaTo": "",
+          "columnsTo": [
+            "id",
+            "client_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
@@ -943,7 +975,16 @@
         }
       },
       "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
+      "uniqueConstraints": {
+        "oauth_grants_id_client_id_key": {
+          "name": "oauth_grants_id_client_id_key",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "client_id"
+          ]
+        }
+      },
       "policies": {},
       "checkConstraints": {},
       "isRLSEnabled": false
@@ -1076,6 +1117,22 @@
           "schemaTo": "",
           "columnsTo": [
             "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "oauth_refresh_tokens_grant_id_client_id_fkey": {
+          "name": "oauth_refresh_tokens_grant_id_client_id_fkey",
+          "tableFrom": "oauth_refresh_tokens",
+          "columnsFrom": [
+            "grant_id",
+            "client_id"
+          ],
+          "tableTo": "oauth_grants",
+          "schemaTo": "",
+          "columnsTo": [
+            "id",
+            "client_id"
           ],
           "onDelete": "cascade",
           "onUpdate": "no action"
@@ -1583,7 +1640,16 @@
       },
       "foreignKeys": {},
       "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
+      "uniqueConstraints": {
+        "service_accounts_id_container_id_key": {
+          "name": "service_accounts_id_container_id_key",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "container_id"
+          ]
+        }
+      },
       "policies": {},
       "checkConstraints": {},
       "isRLSEnabled": false

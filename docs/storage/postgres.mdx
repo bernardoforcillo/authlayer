@@ -254,6 +254,30 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS oauth_device_authorizations_expires_at_i
 CREATE INDEX CONCURRENTLY IF NOT EXISTS oauth_refresh_tokens_expires_at_idx ON oauth_refresh_tokens (expires_at);
 ```
 
+Releases after 0.3.1 also add composite foreign keys that guard repeated
+columns (see [conventions](/storage/conventions#normalization)). Each needs a
+`UNIQUE` on its parent first. Add the key `NOT VALID`, which enforces it for new
+rows without scanning the table, then validate it once the data allows:
+
+```sql
+ALTER TABLE service_accounts ADD CONSTRAINT service_accounts_id_container_id_key UNIQUE (id, container_id);
+ALTER TABLE api_keys ADD CONSTRAINT api_keys_service_account_id_container_id_fkey
+  FOREIGN KEY (service_account_id, container_id) REFERENCES service_accounts (id, container_id)
+  ON DELETE CASCADE NOT VALID;
+ALTER TABLE api_keys VALIDATE CONSTRAINT api_keys_service_account_id_container_id_fkey;
+
+ALTER TABLE oauth_grants ADD CONSTRAINT oauth_grants_id_client_id_key UNIQUE (id, client_id);
+ALTER TABLE oauth_codes ADD CONSTRAINT oauth_codes_grant_id_client_id_fkey
+  FOREIGN KEY (grant_id, client_id) REFERENCES oauth_grants (id, client_id) ON DELETE CASCADE NOT VALID;
+ALTER TABLE oauth_codes VALIDATE CONSTRAINT oauth_codes_grant_id_client_id_fkey;
+ALTER TABLE oauth_refresh_tokens ADD CONSTRAINT oauth_refresh_tokens_grant_id_client_id_fkey
+  FOREIGN KEY (grant_id, client_id) REFERENCES oauth_grants (id, client_id) ON DELETE CASCADE NOT VALID;
+ALTER TABLE oauth_refresh_tokens VALIDATE CONSTRAINT oauth_refresh_tokens_grant_id_client_id_fkey;
+```
+
+`VALIDATE` fails, naming the offending constraint, if a row already disagrees
+with its parent; fix or delete those rows and run it again.
+
 The `expires_at` indexes serve the `PurgeExpired` janitors. Those now delete in
 batches of 5000 rows per statement instead of one unbounded `DELETE`, so a long
 expired tail no longer holds its locks for the whole purge. `PurgeExpired` on the

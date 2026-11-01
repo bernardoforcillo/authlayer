@@ -2,7 +2,7 @@ package dropsstore
 
 import (
 	"context"
-	"slices"
+	"fmt"
 
 	"github.com/bernardoforcillo/drops"
 	"github.com/bernardoforcillo/drops/pg"
@@ -31,10 +31,13 @@ type MigrationSource interface {
 //
 // Each store contributes a chain on the "authlayer" branch, one node per step:
 //
-//	authlayer-<first table>-001_tables    tables, composite constraints and
-//	                                      the indexes of the 0.3.1 baseline
-//	authlayer-<first table>-002_indexes   indexes added since (omitted when
-//	                                      a store has none)
+//	authlayer-<first table>-001_tables     tables, composite constraints and
+//	                                       the indexes of the 0.3.1 baseline
+//	authlayer-<first table>-002_indexes    indexes added since (omitted when
+//	                                       a store has none)
+//	authlayer-<first table>-003_relations  composite foreign keys and their
+//	                                       UNIQUE targets (omitted when a
+//	                                       store has none)
 //
 // IDs embed the store's first table name, so two instances of one store type
 // under [WithNames] (organizations and teams) do not collide, and every name
@@ -63,15 +66,25 @@ type tableSpec struct {
 	cs *colSet
 }
 
-// tableMigrations builds the two-step chain for one store's tables, in
-// dependency order.
+// tableMigrations builds the chain for one store's tables, in dependency order:
+//
+//	001_tables     tables, the baseline composite keys and indexes
+//	002_indexes    indexes added since 0.3.1 (omitted when there are none)
+//	003_relations  UNIQUE targets and composite foreign keys added since
+//	               0.3.1 (omitted when there are none)
+//
+// Each step's parent is the step before it.
 func tableMigrations(specs ...tableSpec) []pg.TreeMigration {
 	base := "authlayer-" + specs[0].t.Name()
+	isLate := func(sp tableSpec, c constraint) bool {
+		return c.kind == kindForeignKey || (c.kind == kindUnique && sp.cs.lateUnique[c.name])
+	}
+
 	tables := pg.TreeMigration{
 		ID:          base + "-001_tables",
 		Name:        "tables of " + specs[0].t.Name(),
 		Branch:      MigrationBranch,
-		Description: "tables, composite constraints and baseline indexes",
+		Description: "tables, baseline composite keys and indexes",
 		Up: func(ctx context.Context, db *pg.DB) error {
 			for _, sp := range specs {
 				late := map[string]bool{}
@@ -81,8 +94,11 @@ func tableMigrations(specs ...tableSpec) []pg.TreeMigration {
 				if _, err := db.ExecExpr(ctx, pg.CreateTableIfNotExists(sp.t)); err != nil {
 					return err
 				}
-				for _, ddl := range compositeConstraintDDL(sp.t) {
-					if _, err := db.ExecExpr(ctx, ddl); err != nil {
+				for _, c := range constraintsOf(sp.t) {
+					if isLate(sp, c) {
+						continue
+					}
+					if _, err := db.ExecExpr(ctx, c.add); err != nil {
 						return err
 					}
 				}
@@ -99,41 +115,94 @@ func tableMigrations(specs ...tableSpec) []pg.TreeMigration {
 		},
 	}
 	out := []pg.TreeMigration{tables}
+	prev := tables.ID
 
-	var late []*pg.Index
+	var lateIdx []*pg.Index
 	for _, sp := range specs {
-		late = append(late, sp.cs.late...)
+		lateIdx = append(lateIdx, sp.cs.late...)
 	}
-	if len(late) == 0 {
-		return out
-	}
-	return append(out, pg.TreeMigration{
-		ID:          base + "-002_indexes",
-		Name:        "indexes of " + specs[0].t.Name(),
-		Branch:      MigrationBranch,
-		Parents:     []string{tables.ID},
-		Description: "lookup and purge indexes added after 0.3.1",
-		Up: func(ctx context.Context, db *pg.DB) error {
-			for _, idx := range late {
-				if _, err := db.ExecExpr(ctx, pg.CreateIndexIfNotExists(idx)); err != nil {
-					return err
+	if len(lateIdx) > 0 {
+		step := pg.TreeMigration{
+			ID:          base + "-002_indexes",
+			Name:        "indexes of " + specs[0].t.Name(),
+			Branch:      MigrationBranch,
+			Parents:     []string{prev},
+			Description: "lookup and purge indexes added after 0.3.1",
+			Up: func(ctx context.Context, db *pg.DB) error {
+				for _, idx := range lateIdx {
+					if _, err := db.ExecExpr(ctx, pg.CreateIndexIfNotExists(idx)); err != nil {
+						return err
+					}
 				}
-			}
-			return nil
-		},
-		Down: func(ctx context.Context, db *pg.DB) error {
-			for _, idx := range slices.Backward(late) {
+				return nil
+			},
+			Down: func(ctx context.Context, db *pg.DB) error {
+				for i := len(lateIdx) - 1; i >= 0; i-- {
+					idx := lateIdx[i]
+					if _, err := db.ExecExpr(ctx, drops.ExprFunc(func(b *drops.Builder) {
+						b.WriteString("DROP INDEX IF EXISTS ")
+						b.WriteQualified(idx.Table().Schema(), idx.Name())
+					})); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		}
+		out = append(out, step)
+		prev = step.ID
+	}
 
-				if _, err := db.ExecExpr(ctx, drops.ExprFunc(func(b *drops.Builder) {
-					b.WriteString("DROP INDEX IF EXISTS ")
-					b.WriteQualified(idx.Table().Schema(), idx.Name())
-				})); err != nil {
-					return err
-				}
+	// The relations step: the UNIQUE constraints that give a composite foreign
+	// key its target, then the keys themselves (NOT VALID, so adding them
+	// scans nothing), then a strict validation of each.
+	type owned struct {
+		t *pg.Table
+		c constraint
+	}
+	var uniques, fks []owned
+	for _, sp := range specs {
+		for _, c := range constraintsOf(sp.t) {
+			switch {
+			case c.kind == kindForeignKey:
+				fks = append(fks, owned{sp.t, c})
+			case isLate(sp, c):
+				uniques = append(uniques, owned{sp.t, c})
 			}
-			return nil
-		},
-	})
+		}
+	}
+	if len(uniques)+len(fks) > 0 {
+		out = append(out, pg.TreeMigration{
+			ID:          base + "-003_relations",
+			Name:        "relations of " + specs[0].t.Name(),
+			Branch:      MigrationBranch,
+			Parents:     []string{prev},
+			Description: "composite foreign keys that guard repeated columns",
+			Up: func(ctx context.Context, db *pg.DB) error {
+				for _, o := range append(append([]owned{}, uniques...), fks...) {
+					if _, err := db.ExecExpr(ctx, o.c.add); err != nil {
+						return err
+					}
+				}
+				for _, o := range fks {
+					if _, err := db.ExecExpr(ctx, o.c.validate); err != nil {
+						return fmt.Errorf("validating %s on %s: existing rows violate it; "+
+							"fix them and run the migration again: %w", o.c.name, o.t.Name(), err)
+					}
+				}
+				return nil
+			},
+			Down: func(ctx context.Context, db *pg.DB) error {
+				for _, o := range append(append([]owned{}, fks...), uniques...) {
+					if _, err := db.ExecExpr(ctx, o.c.drop); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		})
+	}
+	return out
 }
 
 // rawMigration is the single-step chain for the stores whose DDL is SQL text.

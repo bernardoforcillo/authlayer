@@ -122,20 +122,25 @@ func TestContractMigrationsAreAFormalChain(t *testing.T) {
 		if len(root.Parents) != 0 || root.Down != nil || !strings.HasSuffix(root.ID, "-001_tables") {
 			t.Errorf("%s: first step %q must be a parentless, irreversible -001_tables", st.name, root.ID)
 		}
-		late := 0
+		lateIdx, lateRel := 0, 0
 		for _, sp := range st.tables {
-			late += len(sp.cs.late)
+			lateIdx += len(sp.cs.late)
+			lateRel += len(sp.cs.lateUnique) + len(sp.t.CompositeForeignKeys())
 		}
-		if late == 0 && len(st.migrations) != 1 {
-			t.Errorf("%s: %d migrations but no post-baseline index", st.name, len(st.migrations))
+		var want []string
+		if lateIdx > 0 {
+			want = append(want, "-002_indexes")
 		}
-		if late > 0 {
-			if len(st.migrations) != 2 {
-				t.Fatalf("%s: %d post-baseline indexes need exactly one index step, have %d migrations", st.name, late, len(st.migrations))
-			}
-			step := st.migrations[1]
-			if len(step.Parents) != 1 || step.Parents[0] != root.ID || step.Down == nil || !strings.HasSuffix(step.ID, "-002_indexes") {
-				t.Errorf("%s: index step %q must depend on %s and have a Down", st.name, step.ID, root.ID)
+		if lateRel > 0 {
+			want = append(want, "-003_relations")
+		}
+		if len(st.migrations) != 1+len(want) {
+			t.Fatalf("%s: %d migrations, want the root plus %v", st.name, len(st.migrations), want)
+		}
+		for i, suffix := range want {
+			step, prev := st.migrations[i+1], st.migrations[i]
+			if len(step.Parents) != 1 || step.Parents[0] != prev.ID || step.Down == nil || !strings.HasSuffix(step.ID, suffix) {
+				t.Errorf("%s: step %q must be %s, depend on %s and have a Down", st.name, step.ID, suffix, prev.ID)
 			}
 		}
 		for _, m := range st.migrations {

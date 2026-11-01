@@ -118,8 +118,14 @@ func TestOAuthSchemaUniqueColumnsAreInline(t *testing.T) {
 		}
 	}
 	for _, tbl := range s.tables() {
-		if n := len(tbl.CompositeUniques()); n != 0 {
-			t.Fatalf("%s registers %d composite unique(s), want 0", tbl.Name(), n)
+		// The only composite UNIQUE is grants (id, client_id), the target of the
+		// composite foreign keys from codes and refresh tokens.
+		want := 0
+		if tbl.Name() == "oauth_grants" {
+			want = 1
+		}
+		if n := len(tbl.CompositeUniques()); n != want {
+			t.Fatalf("%s registers %d composite unique(s), want %d", tbl.Name(), n, want)
 		}
 	}
 }
@@ -250,8 +256,8 @@ func TestOAuthStoreCreateSchemaEmitsTablesInDependencyOrderThenIndexes(t *testin
 	if err := newOAuthStore(fd).CreateSchema(context.Background()); err != nil {
 		t.Fatalf("CreateSchema: %v", err)
 	}
-	if len(fd.execs) != 19 {
-		t.Fatalf("CreateSchema issued %d statements, want 19 (five tables, fourteen indexes):\n%s", len(fd.execs), strings.Join(fd.execs, "\n"))
+	if len(fd.execs) != 24 {
+		t.Fatalf("CreateSchema issued %d statements, want 24 (five tables, fourteen indexes, one UNIQUE, two composite foreign keys with their validations):\n%s", len(fd.execs), strings.Join(fd.execs, "\n"))
 	}
 	order := []string{"oauth_clients", "oauth_grants", "oauth_codes", "oauth_device_authorizations", "oauth_refresh_tokens"}
 	last := -1

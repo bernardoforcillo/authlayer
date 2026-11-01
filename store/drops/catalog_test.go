@@ -223,3 +223,81 @@ func TestContractForeignKeys(t *testing.T) {
 		}
 	}
 }
+
+func colNames(cols []*pg.Column) string {
+	names := make([]string, len(cols))
+	for i, c := range cols {
+		names[i] = c.Name()
+	}
+	return strings.Join(names, ",")
+}
+
+// A composite foreign key stays inside its store, its first column leads an
+// index (so a cascade does not scan the child), and it targets columns that are
+// exactly a UNIQUE or primary key of the parent — PostgreSQL refuses it
+// otherwise, and the test says so before a database does.
+func TestContractCompositeForeignKeys(t *testing.T) {
+	owner := storeOf()
+	for _, tb := range Tables() {
+		for _, fk := range tb.CompositeForeignKeys() {
+			if owner[fk.Target.Name()] != owner[tb.Name()] {
+				t.Errorf("%s.%s references %s, owned by %s: a foreign key must not cross stores",
+					tb.Name(), fk.Name, fk.Target.Name(), owner[fk.Target.Name()])
+			}
+			if !leadsIndex(t, tb, fk.Columns[0].Name()) {
+				t.Errorf("%s.%s: first column %s leads no index", tb.Name(), fk.Name, fk.Columns[0].Name())
+			}
+			want, found := colNames(fk.TargetColumns), false
+			for _, cols := range fk.Target.CompositeUniques() {
+				found = found || colNames(cols) == want
+			}
+			if pk := fk.Target.CompositePrimaryKey(); len(pk) > 0 && colNames(pk) == want {
+				found = true
+			}
+			if !found {
+				t.Errorf("%s.%s targets (%s) of %s, which is not a UNIQUE or primary key there", tb.Name(), fk.Name, want, fk.Target.Name())
+			}
+			if len(fk.Name) > 63 {
+				t.Errorf("%s: constraint name %q is longer than PostgreSQL's 63-byte limit", tb.Name(), fk.Name)
+			}
+		}
+	}
+}
+
+// Normalization: a column that repeats what a parent row already determines
+// (a third-normal-form dependency through a foreign key) is either guarded by a
+// composite foreign key — so the database refuses a row that disagrees with its
+// parent — or listed here with the reason it is not.
+func TestContractRepeatedColumnsAreGuarded(t *testing.T) {
+	guarded := []struct{ table, parent, copied string }{
+		{"api_keys", "service_accounts", "service_account_id,container_id"},
+		{"oauth_codes", "oauth_grants", "grant_id,client_id"},
+		{"oauth_refresh_tokens", "oauth_grants", "grant_id,client_id"},
+	}
+	byName := map[string]*pg.Table{}
+	for _, tb := range Tables() {
+		byName[tb.Name()] = tb
+	}
+	for _, g := range guarded {
+		found := false
+		for _, fk := range byName[g.table].CompositeForeignKeys() {
+			found = found || (fk.Target.Name() == g.parent && colNames(fk.Columns) == g.copied)
+		}
+		if !found {
+			t.Errorf("%s repeats a column of %s but has no composite foreign key on (%s)", g.table, g.parent, g.copied)
+		}
+	}
+
+	// Not guarded, deliberately.
+	unguarded := map[string]string{
+		"oauth_device_authorizations.client_id": "grant_id is nullable until the user approves; the pair is checked in oauth.Service",
+		"oauth_clients.container_id":            "service_accounts belongs to another store, and a foreign key must not cross stores",
+		"sessions.user_id":                      "users are only referenced by value from every other store, by design",
+		"oauth_refresh_tokens.family_id":        "a family has no table of its own; its rows are linked by value",
+	}
+	for k, reason := range unguarded {
+		if reason == "" {
+			t.Errorf("%s is listed as unguarded without a reason", k)
+		}
+	}
+}

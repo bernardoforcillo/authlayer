@@ -64,7 +64,47 @@ The column rules over those tables, each a test in `catalog_test.go`:
 | `*_at` is `timestamptz`; `created_at` is `NOT NULL`; `permissions` is `NOT NULL bytea`; booleans are `NOT NULL`; `id` is `uuid` or `text` | `TestContractColumnTypes` |
 | A hash a bearer secret is resolved by is `UNIQUE`; only `password_hash`, `oauth_clients.secret_hash` and `mfa_recovery_codes.code_hash` are exempt | `TestContractLookupHashesAreUnique` |
 | A foreign key never crosses stores, and its column leads an index | `TestContractForeignKeys` |
+| A composite foreign key stays in its store, leads an index, and targets a `UNIQUE` or primary key; a repeated column is guarded or listed with a reason | `TestContractCompositeForeignKeys`, `TestContractRepeatedColumnsAreGuarded` |
 | `Tables()` lists exactly the tables the stores own | `TestTablesCoverEveryStoreTable` |
+
+## Normalization
+
+The tables are in first normal form except where a column holds a set the engine
+always reads whole (`permissions` as encoded grant names, `oauth_clients`'
+`redirect_uris`, `grant_types` and `scopes` as JSON arrays, the space-separated
+OAuth `scope`). They are in second normal form: the two composite-keyed tables,
+`organization_members` and `organization_roles`, have only attributes that depend
+on their whole key.
+
+Third normal form is where a column can repeat what a parent row already
+determines. Three do, and each is now guarded by a composite foreign key, so the
+database refuses a row that disagrees with its parent instead of trusting the
+code that wrote it:
+
+| Child column pair | Parent | Guards against |
+|---|---|---|
+| `api_keys (service_account_id, container_id)` | `service_accounts (id, container_id)` | a key in a different container than its account |
+| `oauth_codes (grant_id, client_id)` | `oauth_grants (id, client_id)` | a code for a different client than its grant |
+| `oauth_refresh_tokens (grant_id, client_id)` | `oauth_grants (id, client_id)` | a refresh token for a different client than its grant |
+
+The copies stay, rather than being dropped in favour of a join, because the
+lookup that matters (`FindKeyByHash`, redeeming a code) reads them on the hot
+path and the ports expose them. A composite foreign key needs a `UNIQUE` on the
+parent's referenced pair, which is why `service_accounts (id, container_id)` and
+`oauth_grants (id, client_id)` are unique.
+
+Four repeats are deliberately not guarded, and `TestContractRepeatedColumnsAreGuarded`
+lists each with its reason: `oauth_device_authorizations.client_id` (its
+`grant_id` is null until the user approves), `oauth_clients.container_id` (its
+service account belongs to another store), `sessions.user_id` and
+`oauth_refresh_tokens.family_id` (a family has no table of its own).
+
+The keys are added `NOT VALID`: PostgreSQL enforces them on every new write at
+once, without scanning the table or failing on old rows. `CreateSchema` then
+validates them if the data allows and otherwise leaves them `NOT VALID` without
+error, so a deployment's startup never depends on old data. The `-003_relations`
+migration validates strictly and fails, naming the constraint, when existing
+rows already disagree; fix them and run it again.
 
 ## Schema creation has one path
 
@@ -82,6 +122,9 @@ Each store's `Migrations()` returns nodes on the `authlayer` branch of drops'
   data loss.
 - `-002_indexes` depends on it and is reversible. It carries every index added
   after the 0.3.1 baseline, registered through `addIndex`.
+- `-003_relations` depends on the step before it and is reversible. It adds the
+  `UNIQUE` targets (registered through `addUnique`) and the composite foreign
+  keys, then validates each strictly.
 - A later release adds a new node whose parent is the previous one; it never
   edits a node that has shipped.
 - IDs embed the store's first table name, so two instances of one generic store

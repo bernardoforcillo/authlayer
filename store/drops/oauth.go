@@ -362,6 +362,15 @@ func NewOAuthSchema(opts ...OAuthOption) *OAuthSchema {
 	s.RefreshTokens.ForeignKey(s.refresh.col("grant_id"), s.grants.col("id"), cascade)
 	s.RefreshTokens.ForeignKey(s.refresh.col("client_id"), s.clients.col("id"), cascade)
 
+	// codes.client_id and refresh_tokens.client_id repeat grants.client_id,
+	// which the row's grant already determines. The composite foreign keys make
+	// the database refuse a code or refresh token whose client differs from its
+	// grant's. Device authorizations carry a nullable grant_id and are not
+	// constrained.
+	addUnique(s.Grants, s.grants, "id", "client_id")
+	addCompositeFK(s.Codes, s.codes, []string{"grant_id", "client_id"}, s.Grants, s.grants, []string{"id", "client_id"})
+	addCompositeFK(s.RefreshTokens, s.refresh, []string{"grant_id", "client_id"}, s.Grants, s.grants, []string{"id", "client_id"})
+
 	idx := func(t *pg.Table, cs *colSet, col string) {
 		t.AddIndex(pg.NewIndex(t.Name()+"_"+col+"_idx", t, cs.col(col)))
 	}

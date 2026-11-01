@@ -97,11 +97,14 @@ type colSet struct {
 	// late lists the indexes added after the 0.3.1 baseline, in registration
 	// order. Migrations() creates them in their own step, so the baseline step
 	// stays what 0.3.1 shipped. See [addIndex].
-	late  []*pg.Index
-	str   map[string]*pg.Col[string]
-	ts    map[string]*pg.Col[time.Time]
-	bytes map[string]*pg.Col[[]byte]
-	i32   map[string]*pg.Col[int32]
+	late []*pg.Index
+	// lateUnique names the composite UNIQUE constraints added after the 0.3.1
+	// baseline; they belong to the relations migration step. See [addUnique].
+	lateUnique map[string]bool
+	str        map[string]*pg.Col[string]
+	ts         map[string]*pg.Col[time.Time]
+	bytes      map[string]*pg.Col[[]byte]
+	i32        map[string]*pg.Col[int32]
 	// i64 holds bigint columns. Two independent needs put them here: the
 	// pointer form is nullable, exactly as *time.Time is, for
 	// auth.MFAFactor.LastStep — where nil means "this factor has

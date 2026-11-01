@@ -153,6 +153,12 @@ func NewAPIKeySchema(opts ...APIKeyOption) *APIKeySchema {
 	s.keys = newColSet(s.Keys, apikey.Key{}, ids)
 
 	s.Keys.ForeignKey(s.keys.col("service_account_id"), s.accounts.col("id"), pg.OnDelete("CASCADE"))
+	// api_keys.container_id repeats service_accounts.container_id, which the
+	// key's account already determines. The composite foreign key makes the
+	// database refuse a key whose container differs from its account's.
+	addUnique(s.ServiceAccounts, s.accounts, "id", "container_id")
+	addCompositeFK(s.Keys, s.keys, []string{"service_account_id", "container_id"},
+		s.ServiceAccounts, s.accounts, []string{"id", "container_id"})
 
 	s.ServiceAccounts.AddIndex(pg.NewIndex(
 		names.ServiceAccounts+"_container_id_idx", s.ServiceAccounts, s.accounts.col("container_id")))
