@@ -38,24 +38,7 @@ func NewConsentStore(db *pg.DB, table string) *ConsentStore {
 
 // ConsentDDL returns the statements creating the table and its index.
 func ConsentDDL(table string) []string {
-	if table == "" {
-		table = "consent_records"
-	}
-	t := quoteIdent(table)
-	return []string{
-		`CREATE TABLE IF NOT EXISTS ` + t + ` (
-  id text PRIMARY KEY,
-  subject_id text NOT NULL,
-  purpose text NOT NULL,
-  version text NOT NULL,
-  source text NOT NULL DEFAULT '',
-  granted_at timestamptz NOT NULL,
-  ended_at timestamptz,
-  end_reason text NOT NULL DEFAULT ''
-)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS ` + quoteIdent(table+"_current") + ` ON ` + t + ` (subject_id, purpose) WHERE ended_at IS NULL`,
-		`CREATE INDEX IF NOT EXISTS ` + quoteIdent(table+"_subject") + ` ON ` + t + ` (subject_id, granted_at)`,
-	}
+	return tableStatements(NewConsentSchema(table).Records)
 }
 
 // CreateSchema runs [ConsentDDL]; idempotent.

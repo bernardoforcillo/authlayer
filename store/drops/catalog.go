@@ -14,9 +14,9 @@ import (
 //
 // The scope tables carry only the engine's base columns
 // ([scope.ContainerBase], [scope.MemberBase]); a custom scope adds its own
-// fields to them. The audit and consent tables are SQL text with guard
-// triggers and partial indexes, not [pg.Table]s, and are not included — see
-// [AuditDDL] and [ConsentDDL].
+// fields to them. The audit and consent tables are declared in raw_tables.go;
+// the audit guard functions and triggers are SQL text, not tables, and are
+// reachable only through [AuditDDL].
 func Tables(opts ...Option) []*pg.Table {
 	var out []*pg.Table
 	sc := NewSchema[scope.ContainerBase, scope.MemberBase](opts...)
@@ -35,6 +35,9 @@ func Tables(opts ...Option) []*pg.Table {
 	out = append(out, mf.Factors, mf.RecoveryCodes, mf.TrustedDevices)
 	oa := NewOAuthSchema(opts...)
 	out = append(out, oa.tables()...)
+	au2 := NewAuditSchema(opts...)
+	out = append(out, au2.Events, au2.Seals, au2.Keys)
+	out = append(out, NewConsentSchema("").Records)
 	return out
 }
 

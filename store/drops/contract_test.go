@@ -25,6 +25,8 @@ func contractStores() []contractStore {
 	fd := &fakeDriver{}
 	sc, au, in, ak := newStore(fd), newAuthStore(fd), newInviteStore(fd), newAPIKeyStore(fd)
 	id, cr, mf, oa := newIdentityStore(fd), newCredentialStore(fd), newMFAStore(fd), newOAuthStore(fd)
+	aud, cons := NewAuditSchema(), NewConsentSchema("")
+	none := &colSet{}
 	return []contractStore{
 		{"scope", sc.Migrations(), []tableSpec{{sc.s.Containers, sc.s.containers}, {sc.s.Members, sc.s.members}, {sc.s.Roles, sc.s.roles}}},
 		{"auth", au.Migrations(), []tableSpec{{au.s.Users, au.s.users}, {au.s.Sessions, au.s.sessions}, {au.s.Verifications, au.s.verifications}}},
@@ -36,6 +38,9 @@ func contractStores() []contractStore {
 		{"oauth", oa.Migrations(), []tableSpec{
 			{oa.s.Clients, oa.s.clients}, {oa.s.Grants, oa.s.grants}, {oa.s.Codes, oa.s.codes},
 			{oa.s.DeviceAuthorizations, oa.s.devices}, {oa.s.RefreshTokens, oa.s.refresh}}},
+		{"audit", NewAuditStore(nil).Migrations(), []tableSpec{{aud.Events, none}, {aud.Seals, none}}},
+		{"audit-keys", NewAuditKeyStore(nil).Migrations(), []tableSpec{{aud.Keys, none}}},
+		{"consent", NewConsentStore(nil, "").Migrations(), []tableSpec{{cons.Records, none}}},
 	}
 }
 
@@ -75,8 +80,15 @@ func TestContractDefaultTableNamesAreUnique(t *testing.T) {
 // Every registered index is named <table>_<columns>_idx, where <columns> is
 // its own column list, so a name always says what the index covers.
 func TestContractIndexNamesSayWhatTheyCover(t *testing.T) {
+	// The audit event and consent indexes shipped before the rule, with names
+	// that cannot state a partial predicate anyway; renaming them would leave a
+	// duplicate of each on every deployed database.
+	legacy := map[string]bool{"audit_events": true, "consent_records": true}
 	for _, st := range contractStores() {
 		for _, sp := range st.tables {
+			if legacy[sp.t.Name()] {
+				continue
+			}
 			for _, idx := range sp.t.Indexes() {
 				want := idxName(sp.t.Name(), indexColumns(t, idx)...)
 				if idx.Name() != want {

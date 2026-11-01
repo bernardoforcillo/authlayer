@@ -280,33 +280,15 @@ func (st *OAuthStore) Migrations() []pg.TreeMigration {
 func (st *AuditStore) Migrations() []pg.TreeMigration {
 	cfg := st.cfg
 	return rawMigration("authlayer-"+cfg.names.Events+"-001_tables", "audit tables and guards",
-		func(ctx context.Context, db *pg.DB) error { return applyAuditDDL(ctx, db, cfg) })
+		func(ctx context.Context, db *pg.DB) error { return execAuditDDL(ctx, db, cfg) })
 }
 
 // Migrations implements [MigrationSource].
 func (st *AuditKeyStore) Migrations() []pg.TreeMigration {
-	cfg := st.cfg
-	return rawMigration("authlayer-"+cfg.names.Keys+"-001_tables", "audit subject keys",
-		func(ctx context.Context, db *pg.DB) error {
-			for _, stmt := range auditKeyDDL(cfg) {
-				if _, err := db.Exec(ctx, stmt); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
+	return tableMigrations(tableSpec{newAuditKeys(st.cfg), &colSet{}})
 }
 
 // Migrations implements [MigrationSource].
 func (st *ConsentStore) Migrations() []pg.TreeMigration {
-	raw := st.raw
-	return rawMigration("authlayer-"+raw+"-001_tables", "consent records",
-		func(ctx context.Context, db *pg.DB) error {
-			for _, stmt := range ConsentDDL(raw) {
-				if _, err := db.Exec(ctx, stmt); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
+	return tableMigrations(tableSpec{NewConsentSchema(st.raw).Records, &colSet{}})
 }

@@ -147,10 +147,7 @@ func AuditDDL(opts ...AuditOption) []string { return auditDDL(newAuditSettings(o
 func auditDDL(cfg auditSettings) []string {
 	ev, sl := quoteIdent(cfg.names.Events), quoteIdent(cfg.names.Seals)
 	evLit, slLit := quoteLiteral(cfg.names.Events), quoteLiteral(cfg.names.Seals)
-	idType := "uuid"
-	if cfg.textIDs {
-		idType = "text"
-	}
+	sch := newAuditSchema(cfg)
 	q := func(suffix string) string { return quoteIdent(cfg.names.Events + suffix) }
 	qs := func(suffix string) string { return quoteIdent(cfg.names.Seals + suffix) }
 	// Every guard runs with this search_path and reaches the tables only as
@@ -169,58 +166,7 @@ func auditDDL(cfg auditSettings) []string {
 			` FOR EACH ` + each + ` EXECUTE FUNCTION ` + fn + `()`
 	}
 
-	return []string{
-		`CREATE TABLE IF NOT EXISTS ` + ev + ` (
-  id ` + idType + ` PRIMARY KEY,
-  seq bigint GENERATED ALWAYS AS IDENTITY NOT NULL UNIQUE,
-  occurred_at timestamptz NOT NULL,
-  completed_at timestamptz,
-  topic text NOT NULL,
-  action text NOT NULL,
-  source text NOT NULL,
-  origin text NOT NULL,
-  procedure text NOT NULL DEFAULT '',
-  actor_type text NOT NULL,
-  actor_id text NOT NULL DEFAULT '',
-  actor_display text NOT NULL DEFAULT '',
-  on_behalf_of text NOT NULL DEFAULT '',
-  session_id text NOT NULL DEFAULT '',
-  container_id text NOT NULL DEFAULT '',
-  resource_type text NOT NULL DEFAULT '',
-  resource_id text NOT NULL DEFAULT '',
-  outcome text NOT NULL DEFAULT '',
-  code text NOT NULL DEFAULT '',
-  reason text NOT NULL DEFAULT '',
-  request jsonb,
-  changes jsonb,
-  ip text NOT NULL DEFAULT '',
-  user_agent text NOT NULL DEFAULT '',
-  client_time timestamptz,
-  duration_ms bigint NOT NULL DEFAULT 0
-)`,
-		`CREATE TABLE IF NOT EXISTS ` + sl + ` (
-  topic text NOT NULL,
-  day date NOT NULL,
-  event_count bigint NOT NULL,
-  first_seq bigint NOT NULL,
-  last_seq bigint NOT NULL,
-  events_hash text NOT NULL,
-  prev_hash text NOT NULL DEFAULT '',
-  seal_hash text NOT NULL,
-  sealed_at timestamptz NOT NULL,
-  purged_at timestamptz,
-  PRIMARY KEY (topic, day)
-)`,
-		`CREATE INDEX IF NOT EXISTS ` + q("_topic_time") + ` ON ` + ev + ` (topic, occurred_at)`,
-		`CREATE INDEX IF NOT EXISTS ` + q("_open") + ` ON ` + ev + ` (occurred_at) WHERE completed_at IS NULL`,
-		`CREATE INDEX IF NOT EXISTS ` + q("_container") + ` ON ` + ev + ` (container_id, seq DESC) WHERE container_id <> ''`,
-		`CREATE INDEX IF NOT EXISTS ` + q("_client") + ` ON ` + ev + ` (topic, occurred_at) WHERE ip <> '' OR user_agent <> ''`,
-		`CREATE INDEX IF NOT EXISTS ` + q("_actor") + ` ON ` + ev + ` (actor_id, seq DESC) WHERE actor_id <> ''`,
-		// Filter.Member ORs actor_id, on_behalf_of and the user resource: with an
-		// index behind each branch the planner answers it with a BitmapOr.
-		`CREATE INDEX IF NOT EXISTS ` + q("_resource") + ` ON ` + ev + ` (resource_type, resource_id, seq DESC) WHERE resource_id <> ''`,
-		`CREATE INDEX IF NOT EXISTS ` + q("_on_behalf_of") + ` ON ` + ev + ` (on_behalf_of, seq DESC) WHERE on_behalf_of <> ''`,
-
+	return append(tableStatements(sch.Events, sch.Seals), []string{
 		// events: AU001 on update.
 		`CREATE OR REPLACE FUNCTION ` + q("_guard_update") + `() RETURNS trigger` + guarded + `
 BEGIN
@@ -343,5 +289,5 @@ END
 $authlayer$`,
 		trigger(qs("_guard"), "BEFORE INSERT OR UPDATE OR DELETE", sl, "ROW", qs("_guard")),
 		trigger(qs("_guard_truncate"), "BEFORE TRUNCATE", sl, "STATEMENT", qs("_guard")),
-	}
+	}...)
 }

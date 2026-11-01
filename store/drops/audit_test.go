@@ -7,13 +7,13 @@ import (
 
 func TestAuditDDLNamesAndGuards(t *testing.T) {
 	ddl := strings.Join(AuditDDL(WithAuditNames(AuditNames{Events: `e"v`, Seals: "sl"}), WithAuditTextLibraryIDs()), ";\n")
-	for _, want := range []string{`"e""v"`, `"sl"`, "id text PRIMARY KEY", AuditEventImmutable,
+	for _, want := range []string{`"e""v"`, `"sl"`, `"id" text PRIMARY KEY`, AuditEventImmutable,
 		AuditEventProtected, AuditSealImmutable, AuditDaySealed} {
 		if !strings.Contains(ddl, want) {
 			t.Errorf("AuditDDL lacks %q", want)
 		}
 	}
-	if def := strings.Join(AuditDDL(), ";"); !strings.Contains(def, "id uuid PRIMARY KEY") || !strings.Contains(def, `"audit_seals"`) {
+	if def := strings.Join(AuditDDL(), ";"); !strings.Contains(def, `"id" uuid PRIMARY KEY`) || !strings.Contains(def, `"audit_seals"`) {
 		t.Error("default DDL is not uuid ids over audit_events/audit_seals")
 	}
 }
@@ -24,13 +24,13 @@ func TestAuditDDLNamesAndGuards(t *testing.T) {
 func TestAuditDDLIndexes(t *testing.T) {
 	ddl := strings.Join(AuditDDL(), ";\n")
 	for _, want := range []string{
-		`"audit_events_topic_time" ON "audit_events" (topic, occurred_at)`,
-		`"audit_events_open" ON "audit_events" (occurred_at) WHERE completed_at IS NULL`,
-		`"audit_events_container" ON "audit_events" (container_id, seq DESC) WHERE container_id <> ''`,
-		`"audit_events_actor" ON "audit_events" (actor_id, seq DESC) WHERE actor_id <> ''`,
-		`"audit_events_resource" ON "audit_events" (resource_type, resource_id, seq DESC) WHERE resource_id <> ''`,
-		`"audit_events_on_behalf_of" ON "audit_events" (on_behalf_of, seq DESC) WHERE on_behalf_of <> ''`,
-		`"audit_events_client" ON "audit_events" (topic, occurred_at) WHERE ip <> '' OR user_agent <> ''`,
+		`"audit_events_topic_time" ON "audit_events" ("topic", "occurred_at")`,
+		`"audit_events_open" ON "audit_events" ("occurred_at") WHERE completed_at IS NULL`,
+		`"audit_events_container" ON "audit_events" ("container_id", "seq" DESC) WHERE container_id <> ''`,
+		`"audit_events_actor" ON "audit_events" ("actor_id", "seq" DESC) WHERE actor_id <> ''`,
+		`"audit_events_resource" ON "audit_events" ("resource_type", "resource_id", "seq" DESC) WHERE resource_id <> ''`,
+		`"audit_events_on_behalf_of" ON "audit_events" ("on_behalf_of", "seq" DESC) WHERE on_behalf_of <> ''`,
+		`"audit_events_client" ON "audit_events" ("topic", "occurred_at") WHERE ip <> '' OR user_agent <> ''`,
 	} {
 		if !strings.Contains(ddl, want) {
 			t.Errorf("AuditDDL lacks the index %s", want)

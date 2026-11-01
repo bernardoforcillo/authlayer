@@ -132,9 +132,10 @@ func TestContractNamesAreSnakeCase(t *testing.T) {
 
 // Keys: every table has a primary key; a single-column one is called id.
 func TestContractEveryTableHasAKeyAndEntityKeysAreCalledID(t *testing.T) {
-	// keyedByOwner lists the tables with exactly one row per user, which are
-	// keyed by that user rather than by a row id of their own.
-	keyedByOwner := map[string]string{"mfa_factors": "user_id"}
+	// keyedByOwner lists the tables with exactly one row per owner, which are
+	// keyed by that owner (a user, an audit subject) rather than by a row id of
+	// their own.
+	keyedByOwner := map[string]string{"mfa_factors": "user_id", "audit_subject_keys": "subject"}
 	for _, tb := range Tables() {
 		single := ""
 		for _, c := range tb.Columns() {
@@ -189,6 +190,10 @@ func TestContractLookupHashesAreUnique(t *testing.T) {
 		"users.password_hash":          true,
 		"oauth_clients.secret_hash":    true,
 		"mfa_recovery_codes.code_hash": true,
+		// Integrity hashes of the audit chain, not bearer secrets.
+		"audit_seals.events_hash": true,
+		"audit_seals.prev_hash":   true,
+		"audit_seals.seal_hash":   true,
 	}
 	for _, tb := range Tables() {
 		for _, c := range tb.Columns() {

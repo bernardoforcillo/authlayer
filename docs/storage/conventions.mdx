@@ -30,7 +30,9 @@ also retypes `user_id` and `TextUserIDs` is ignored. The per-store type names
 - **Default table names are unique** across all stores, so one database holds
   every store without renaming (`TestContractDefaultTableNamesAreUnique`).
 - **An index is named for what it covers:** `<table>_<columns>_idx`
-  (`TestContractIndexNamesSayWhatTheyCover`).
+  (`TestContractIndexNamesSayWhatTheyCover`). The audit event and consent
+  indexes predate the rule and keep their names, because renaming would leave a
+  duplicate of each on every deployed database.
 - **A column a janitor deletes by leads an index.** That is `expires_at` on every
   table, and `revoked_at` on `api_keys` and `oauth_grants`, whose purge also
   deletes by it (`TestContractPurgedColumnsAreIndexed`).
@@ -44,9 +46,10 @@ also retypes `user_id` and `TextUserIDs` is ignored. The per-store type names
 `dropsstore.Tables()` returns every table as a `*pg.Table`, in creation order,
 and `dropsstore.SnapshotSchema()` returns drops' snapshot of them: each column
 with its SQL type and nullability, the keys, foreign keys and indexes, as a
-value that marshals to the same bytes every time. The scope tables carry the
-engine's base columns; audit and consent are SQL text with triggers and partial
-indexes and sit outside it.
+value that marshals to the same bytes every time. All 25 tables are in it,
+audit and consent included (`raw_tables.go`): their partial indexes and defaults
+are declared on the table, and only the audit guard functions and triggers stay
+SQL text. The scope tables carry the engine's base columns.
 
 The model is frozen in `store/drops/testdata/schema.snapshot.json`.
 `TestSnapshotMatchesGolden` fails on any change to a table, column, type, key or

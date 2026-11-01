@@ -50,17 +50,22 @@ func (st *AuditStore) CreateSchema(ctx context.Context) error {
 // applyAuditDDL is CreateSchema's body over any db, so the migration step runs
 // the identical transaction on the migrator's connection.
 func applyAuditDDL(ctx context.Context, db *pg.DB, cfg auditSettings) error {
-	return db.InTx(ctx, func(tx *pg.DB) error {
-		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(auditSchemaLock)); err != nil {
+	return db.InTx(ctx, func(tx *pg.DB) error { return execAuditDDL(ctx, tx, cfg) })
+}
+
+// execAuditDDL takes the schema lock and runs the DDL on db as it stands. The
+// TreeMigrator already hands a migration a transaction, in which a second
+// InTx is refused, so the migration step calls this directly.
+func execAuditDDL(ctx context.Context, db *pg.DB, cfg auditSettings) error {
+	if _, err := db.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(auditSchemaLock)); err != nil {
+		return err
+	}
+	for _, stmt := range auditDDL(cfg) {
+		if _, err := db.Exec(ctx, stmt); err != nil {
 			return err
 		}
-		for _, stmt := range auditDDL(cfg) {
-			if _, err := tx.Exec(ctx, stmt); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 // DropSchema drops both tables and the guard functions. It is for tests and
@@ -571,14 +576,7 @@ func NewAuditKeyStore(db *pg.DB, opts ...AuditOption) *AuditKeyStore {
 // AuditKeyDDL returns the statement creating the key table.
 func AuditKeyDDL(opts ...AuditOption) []string { return auditKeyDDL(newAuditSettings(opts)) }
 
-func auditKeyDDL(cfg auditSettings) []string {
-	return []string{`CREATE TABLE IF NOT EXISTS ` + quoteIdent(cfg.names.Keys) + ` (
-  subject text PRIMARY KEY,
-  key bytea,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  erased_at timestamptz
-)`}
-}
+func auditKeyDDL(cfg auditSettings) []string { return tableStatements(newAuditKeys(cfg)) }
 
 // CreateSchema runs [AuditKeyDDL].
 func (st *AuditKeyStore) CreateSchema(ctx context.Context) error {

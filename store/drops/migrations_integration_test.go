@@ -5,6 +5,7 @@ package dropsstore_test
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	"github.com/bernardoforcillo/drops/pg"
@@ -127,4 +128,59 @@ func TestMigrationsBuildTheSameSchemaAsCreateSchemaLive(t *testing.T) {
 		t.Fatalf("Up over a CreateSchema-built database: %v", err)
 	}
 	check("after adoption")
+}
+
+// TestAuditAndConsentMigrationsMatchTheirSchemaLive: the audit and consent
+// tables, now declared as pg.Tables, are created by the migrator with the same
+// primary keys, partial indexes and guard triggers the stores' CreateSchema
+// makes.
+func TestAuditAndConsentMigrationsMatchTheirSchemaLive(t *testing.T) {
+	sqlDB, db := openLiveDB(t)
+	ctx := context.Background()
+	const trackSchema = "authlayer_audit_migrations_test"
+	audit := dropsstore.NewAuditStore(db)
+	keys := dropsstore.NewAuditKeyStore(db)
+	consent := dropsstore.NewConsentStore(db, "")
+	cleanup := func() {
+		if _, err := sqlDB.ExecContext(ctx, `DROP SCHEMA IF EXISTS `+trackSchema+` CASCADE`); err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range []interface{ DropSchema(context.Context) error }{audit, keys, consent} {
+			if err := d.DropSchema(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	m := pg.NewTreeMigrator(db).WithSchema(trackSchema)
+	dropsstore.AddMigrations(m, audit, keys, consent)
+	if err := m.Up(ctx); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+
+	for table, want := range map[string][]string{
+		"audit_events":    {"audit_events_pkey", "audit_events_seq_key", "audit_events_topic_time", "audit_events_open", "audit_events_container", "audit_events_resource"},
+		"audit_seals":     {"audit_seals_pkey"},
+		"consent_records": {"consent_records_pkey", "consent_records_current", "consent_records_subject"},
+	} {
+		got := indexNames(t, sqlDB, table)
+		for _, n := range want {
+			if !got[n] {
+				t.Fatalf("%s lacks %s after the migrations; have %v", table, n, got)
+			}
+		}
+	}
+	// The partial predicate survived the move to drops.
+	var def string
+	if err := sqlDB.QueryRowContext(ctx, `SELECT indexdef FROM pg_indexes WHERE indexname = 'consent_records_current'`).Scan(&def); err != nil ||
+		!strings.Contains(def, "UNIQUE") || !strings.Contains(def, "ended_at IS NULL") {
+		t.Fatalf("consent_records_current = %q (err %v), want a UNIQUE partial index", def, err)
+	}
+	// The guards are still there: an event cannot be deleted outside retention.
+	var triggers int
+	if err := sqlDB.QueryRowContext(ctx, `SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgrelid IN ('audit_events'::regclass, 'audit_seals'::regclass)`).Scan(&triggers); err != nil || triggers < 4 {
+		t.Fatalf("audit guard triggers = %d (err %v), want at least 4", triggers, err)
+	}
 }

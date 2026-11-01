@@ -54,6 +54,18 @@ once a 1.0 is cut. Until then, minor versions may break API.
   them and validates when the data allows. See `/storage/conventions` and the SQL
   on `/storage/postgres`.
 
+- The audit and consent tables are declared as `pg.Table`s (`NewAuditSchema`,
+  `NewConsentSchema`), so all 25 tables are in `Tables()`, the frozen snapshot,
+  the contract tests and the migrations. `AuditDDL`, `AuditKeyDDL` and
+  `ConsentDDL` still return the DDL, now rendered from those tables: the same
+  columns, keys, defaults and partial indexes under the same index names, with
+  identifiers quoted. Only the audit guard functions and triggers remain SQL text.
+
+### Fixed
+
+- The audit migration step ran the audit DDL inside a second transaction, which
+  the `TreeMigrator` refuses; it now runs on the migration's own.
+
 ### Changed
 
 - `store/drops` has one functional-option type, `dropsstore.Option`, accepted by
